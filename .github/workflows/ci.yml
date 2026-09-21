@@ -42,11 +42,42 @@ jobs:
         # step. Without it a dependency could resolve differently here than in the
         # test step, so a lint verdict would not describe the tree that was tested.
         #
-        # This step failing on only some operating systems usually means a
-        # platform-gated lint: `#[cfg(unix)]` or `#[cfg(windows)]` code is not
-        # compiled by the other runners, so a warning it produces is invisible
-        # there. The matrix is what catches it.
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        # `--message-format=short` prints one line per diagnostic as
+        # `file:line:column: level: message`, which the next step can turn into a
+        # GitHub annotation. Output is redirected rather than piped so the exit code
+        # is clippy's own: in a pipeline it would be the last command's, and a lint
+        # failure would report success.
+        #
+        # This step failing on only some operating systems means a platform-gated
+        # lint: `#[cfg(unix)]` or `#[cfg(windows)]` code is not compiled by the other
+        # runners, so a warning it produces is invisible there. Two such failures were
+        # diagnosed by inference, because `jarvis-storage` and `jarvis-models` cannot
+        # be cross-linted on a machine without a C toolchain (bundled SQLite and
+        # The job log itself requires repository authentication and is not readable
+        # from an anonymous fetch, so the annotation step exists to make the next
+        # occurrence readable rather than deduced.
+        #
+        # `shell: bash` is explicit. The default shell on windows-latest is PowerShell,
+        # where redirecting a native command's stderr makes PowerShell treat it as an
+        # error record and fail the step even on success -- the same reason this
+        # repository's local runs read `$LASTEXITCODE` from a file instead of a pipe.
+        shell: bash
+        run: cargo clippy --workspace --all-targets --all-features --locked --message-format=short -- -D warnings > clippy.txt 2>&1
+      - name: Annotate lint failures
+        if: failure()
+        shell: bash
+        run: |
+          # Echo each diagnostic as a `::error` workflow command, which GitHub turns
+          # into a file-annotated error. Annotations are readable through the REST API
+          # without repository authentication, unlike the raw job log. `/` is the sed
+          # delimiter because `|` appears inside the grep alternation.
+          grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt \
+            | sed -E 's/^([^ :]+):([0-9]+):([0-9]+): /::error file=\1,line=\2,col=\3::/' \
+            | head -n 60 || true
+          echo "--- clippy diagnostics ---"
+          grep -E ': (error|warning)' clippy.txt | head -n 60 || true
+          echo "--- tail ---"
+          tail -n 20 clippy.txt || true
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate

@@ -131,6 +131,11 @@ fn reapply_directory_permissions(paths: &AppPaths) -> RepairReport {
 ///
 /// The detection and the verification intentionally share one implementation so a
 /// repair cannot pass a weaker check than the one that failed.
+///
+/// The condition is a single let-chain rather than a nested `if`: with edition 2024
+/// let-chains are stable, so `clippy::collapsible_if` rejects the nested form. That
+/// lint fires only on unix builds, which is why this compiled and linted clean on
+/// Windows while both unix CI runners failed at the same step.
 #[cfg(unix)]
 fn insecure_directories(paths: &AppPaths) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
@@ -142,10 +147,10 @@ fn insecure_directories(paths: &AppPaths) -> Vec<String> {
         ("runtime", paths.runtime()),
         ("logs", paths.logs()),
     ] {
-        if let Ok(metadata) = fs::metadata(path) {
-            if metadata.permissions().mode() & 0o077 != 0 {
-                insecure.push(label.to_owned());
-            }
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            insecure.push(label.to_owned());
         }
     }
     insecure
