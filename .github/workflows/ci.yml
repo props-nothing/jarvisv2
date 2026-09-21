@@ -67,17 +67,36 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # Echo each diagnostic as a `::error` workflow command, which GitHub turns
-          # into a file-annotated error. Annotations are readable through the REST API
-          # without repository authentication, unlike the raw job log. `/` is the sed
-          # delimiter because `|` appears inside the grep alternation.
-          grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt \
+          # Reporting is deliberately unconditional. The first version of this step
+          # grepped for a diagnostic shape and produced NO annotations at all when the
+          # failure did not match it, so the cause stayed invisible: the annotations API
+          # then returned only the runner's generic "Process completed with exit code N",
+          # and the raw job log needs repository authentication (anonymous fetch is 403).
+          # A reporting step that silently reports nothing is worse than none, because it
+          # looks like it worked.
+          #
+          # 1. Diagnostics that carry a span become file-annotated errors.
+          grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt 2>/dev/null \
             | sed -E 's/^([^ :]+):([0-9]+):([0-9]+): /::error file=\1,line=\2,col=\3::/' \
-            | head -n 60 || true
-          echo "--- clippy diagnostics ---"
-          grep -E ': (error|warning)' clippy.txt | head -n 60 || true
+            | head -n 40 || true
+
+          # 2. The first lines of the raw output are echoed regardless of shape, so a
+          #    span-less failure (a build script, a linker error, `could not compile`)
+          #    is still readable through the API.
+          if [ -f clippy.txt ]; then
+            line_count=$(wc -l < clippy.txt)
+            echo "::error::clippy.txt has ${line_count} lines; first 15 follow"
+            head -n 15 clippy.txt | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          else
+            echo "::error::clippy.txt was not created by the lint step"
+          fi
+
+          echo "--- diagnostics ---"
+          grep -E ': (error|warning)' clippy.txt 2>/dev/null | head -n 60 || true
           echo "--- tail ---"
-          tail -n 20 clippy.txt || true
+          tail -n 25 clippy.txt 2>/dev/null || true
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate
