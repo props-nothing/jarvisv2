@@ -87,31 +87,67 @@ jobs:
           # was dropped. Fewer lines is the point: the goal is that the error survives
           # the cap.
           #
-          # One line PER DIAGNOSTIC, not a region around the first one.
+          # One line per diagnostic, PLUS the tail unconditionally.
           #
-          # This is the third iteration of this reporting and the reason it keeps
-          # changing is that GitHub caps annotations per check run and silently drops the
-          # rest, while rustc reports every error it finds. Emitting a context region for
-          # the first error therefore spent the whole annotation budget on one problem,
-          # and each CI run revealed exactly one lint. Emitting only the short-format
-          # `file:line:col: error: message` lines puts as many distinct diagnostics as the
-          # cap allows into the annotations, so one run can reveal several at once.
-          #
-          # A rustc diagnostic carries a code (`error[E0433]`); a lint promoted by
-          # `-D warnings` has none (`error: ...` or `warning: ...`). Both shapes are
-          # short-format lines matching this pattern.
-          grep -a -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt | head -n 12 | while IFS= read -r line; do
-            echo "::error::$line"
+          # The per-diagnostic lines are what make a single run reveal several lints,
+          # since GitHub caps annotations and drops the rest. But they assumed a
+          # short-format diagnostic exists at all, and an annotation set containing only
+          # "Process completed with exit code 101" proves the output had none -- a
+          # build-script failure, a linker error, or output the short format does not
+          # cover. So the tail is always emitted too, and the two together are the whole
+          # story: what the lints were, and what the process actually exited on.
+          grep -a -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt | head -n 10 | while IFS= read -r line; do
+            echo "::error::diag: $line"
           done
-          echo "===== all diagnostics ====="
+          tail -n 6 clippy.txt | while IFS= read -r line; do
+            echo "::error::tail: $line"
+          done
+          echo "===== diagnostics ====="
           grep -a -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt | head -n 60 || true
-          echo "===== tail ====="
-          tail -n 10 clippy.txt || true
+          echo "===== tail 40 ====="
+          tail -n 40 clippy.txt || true
 
           echo "===== diagnostic (full) ====="
           cat clippy.txt
       - name: Test workspace
-        run: cargo test --workspace --all-features --locked
+        # Output is captured to a file so a failure can be reported through annotations,
+        # which are the only channel readable without repository authentication. The lint
+        # step got this treatment after five rounds of inference; the test step needs it
+        # for the same reason, because the failing crates cannot be compiled locally for
+        # a non-native target and so their unix-only tests run ONLY on this runner.
+        #
+        # `shell: bash` because the default shell on windows-latest is PowerShell, where
+        # redirecting a native command's stderr fails the step even on success.
+        shell: bash
+        run: cargo test --workspace --all-features --locked > test.txt 2>&1
+      - name: Annotate test failures
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          [ -f test.txt ] || { echo "::error::test.txt was not created by the test step"; exit 0; }
+
+          # A failing test reports `test <name> ... FAILED`, a `---- <name> stdout ----`
+          # block containing the panic, and a final `test result: FAILED` summary. Each
+          # pattern is emitted separately and labelled, because GitHub caps annotations
+          # and the label is what says which kind of line arrived.
+          grep -a -E '^test .* FAILED|^failures:' test.txt | head -n 8 | while IFS= read -r line; do
+            echo "::error::failed: $line"
+          done
+          grep -a -E 'panicked at|assertion|left:|right:' test.txt | head -n 10 | while IFS= read -r line; do
+            echo "::error::panic: $line"
+          done
+          grep -a -E '^test result: FAILED' test.txt | head -n 4 | while IFS= read -r line; do
+            echo "::error::summary: $line"
+          done
+          grep -a -E '^error(\[|:)' test.txt | head -n 6 | while IFS= read -r line; do
+            echo "::error::error: $line"
+          done
+
+          echo "===== failures and panics ====="
+          grep -a -B2 -A12 -E '^failures:|panicked at' test.txt | head -n 120 || true
+          echo "===== tail 30 ====="
+          tail -n 30 test.txt || true
       - name: Phase 1 acceptance gate
         # Runs the real jarvisd and jarvis binaries against a temporary portable
         # root on this native OS. The gate exits with a skip when the binaries are
