@@ -85,6 +85,40 @@ payload
 
 Clients reconnect with the last observed event/sequence. The server replays from durable records within retention or returns an explicit resync requirement. Heartbeats are protocol events, not fake content.
 
+### The Durable Record Behind Replay (P2-007b)
+
+The replay requirement is satisfied by `run_events`, a per-run ordered log added by migration
+`0004_run_events.sql`. `sequence` is scoped to one run and starts at 1, and the writer
+allocates it **inside** the insert, so a gapless stream is a constraint rather than a
+convention. Decision and rejected alternatives: [ADR-0011](../adr/0011-run-events-and-http-transport.md).
+
+Three properties are enforced rather than assumed:
+
+- **A settled run emits nothing more.** An append to a terminal run is refused, so the
+transcript cannot continue after settlement.
+- **A terminal event is always last.** This spans the whole stream, not the returned page,
+because that is a property of the stream rather than of one row; a page that ended before
+the terminal event would otherwise hide a later row.
+- **A requested position beyond the stored stream is a resync, not an empty reply.** For a
+reconnecting client the two are otherwise indistinguishable.
+
+An event kind is a closed set, because a client switches on it. Unknown **additive fields**
+are tolerated; an unknown **kind** is refused at the writer.
+
+### HTTP Is A Peer Transport, Not A Fallback
+
+The `/api/v1` surface is a first-class daemon transport alongside local IPC, not the
+platform-constraint fallback described below. It exists for clients that cannot speak a
+named pipe or a Unix socket: a browser, the Tauri web view, and provider callbacks such as
+an OpenAI-compatible voice brain. Local IPC stays the preferred transport for the CLI and
+desktop because it is OS-protected and needs no port.
+
+Loopback binding by default, the **same** profile-bound credential, and the **same**
+`WireError` envelope as protocol v1 — one authentication implementation and one error shape
+across transports. Both dispatch into the same application commands. Routing code lives in
+`apps/jarvisd` and REST DTOs in `jarvis-protocol`; the domain crates gain no HTTP dependency.
+Reaching a non-loopback interface is remote mode (`P10-004`).
+
 ## Error Envelope
 
 Errors have a stable code, safe message, retryability, correlation ID, and optional field violations. Internal/provider details are logged in redacted form and not returned by default.

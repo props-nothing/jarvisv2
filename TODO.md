@@ -19,6 +19,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [x] `P0-005` Define runtime, model, tool, connector, memory, workflow, storage, protocol, voice, and security architecture.
 - [x] `P0-006` Record foundational ADRs.
 - [x] `P0-007` Inventory the Python prototype and license boundary.
+      Retirement is tracked separately by `P9-008` and `P9-009`: this item records the
+      inventory, not permission to delete. `docs/migration/python-prototype.md` defines the
+      gate, and `docs/adr/0009-clean-room-prototype-migration.md` is `Accepted`.
 - [x] `P0-008` Add external documentation research rules and templates.
 - [x] `P0-009` Define acceptance tests, test strategy, release plan, and definition of done.
 
@@ -87,12 +90,40 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `Authoritative` content may instruct the model, and untrusted content must be quoted, so
       external content labelled as policy is rejected at construction rather than at the
       assembly step. The step-1 budget reservation is arithmetic rather than ordering advice:
-      retrieved content draws only on the unreserved remainder. 23 tests, including one that
+      retrieved content draws only on the unreserved remainder. 24 tests, including one that
       falsified a real defect in the first implementation, where required and retrieved
       spending shared one counter and silently evicted retrieval results that fitted.
       Also fixed four stale `database_schema: 2` fixture literals in `jarvis-protocol` left
       behind by the round-2 schema bump to version 3.
+- [x] `P2-007a` Research the selected Rust HTTP server framework and fix the gateway boundary.
+      Record: `docs/research/integrations/rust-http-server-and-sse.md`. Selected **axum 0.8.9**
+      (MIT, MSRV 1.80), pinned exactly because `main` is mid-0.9 and documented as breaking.
+      The deciding evidence is reuse rather than novelty: `hyper` 1.11.1, `http` 1.5.0,
+      `tower` 0.5.3, and `tower-http` 0.6.11 are **already resolved** through `reqwest` 0.13.5,
+      so this adds ~3 packages instead of a parallel HTTP stack. Also recorded: `DefaultBodyLimit`
+      defaults to 2 MB and is local rather than global; `Sse::keep_alive` needs the `tokio`
+      feature and defaults off; `axum::serve` never returns an error and retries socket errors
+      itself, which contradicts this daemon's fail-fast listener. Boundary fixed by
+      `docs/adr/0011-run-events-and-http-transport.md`: HTTP is a first-class peer transport to
+      local IPC, routing lives in `apps/jarvisd`, REST DTOs in `jarvis-protocol`, and
+      `jarvis-core`/`jarvis-application`/`jarvis-storage` stay framework-free.
+- [x] `P2-007b` Persist an ordered, sequence-numbered run-event record.
+      Migration `0004_run_events.sql` (schema version 4) adds `run_events` with
+      `UNIQUE (run_id, sequence)`. `jarvis_core::run_event` owns `RunEventKind`,
+      `RunEventSequence`, `EventSummary`, `RunEventPayload`, and `ReplayRequest` (10 tests);
+      `jarvis_storage::run_event_repository` makes it durable (13 tests). Two guards are
+      falsified rather than asserted: a settled run cannot emit another event, and a stored
+      stream that continues after a terminal event is reported rather than replayed. The
+      append is ONE `INSERT ... SELECT` that allocates its own sequence, because the
+      read-then-insert form fails with `SQLITE_BUSY_SNAPSHOT` when two writers race. Also
+      fixed the schema-bump fixture trap this change re-triggered: `inspect.rs` hard-coded
+      `user_version = 3` twice and asserted `Inconsistent { user_version: 3 }`, which the
+      documented rule predicted. Those now derive from `CURRENT_SCHEMA_VERSION`.
 - [ ] `P2-007` Add `POST /api/v1/runs`, run status, cancel, and SSE activity/output streams.
+      Depends on `P2-007a` and `P2-007b`. Both are prerequisites rather than parallel work:
+      the SSE contract requires replay from durable records (`docs/architecture/protocols.md`),
+      and a server framework is a new dependency that `docs/development/external-research.md`
+      requires be researched before adapter code is written.
 - [ ] `P2-008` Add CLI `ask` and `chat` using the daemon API; the CLI must contain no orchestration logic.
 - [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
@@ -189,6 +220,19 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P9-005` Build native signed artifacts for supported targets; generate SBOM, checksums, signatures, provenance, and release notes.
 - [ ] `P9-006` Implement atomic update, schema preflight, backup, health verification, rollback, channels, and split-brain version diagnosis.
 - [ ] `P9-007` Test install, update, rollback, repair, and uninstall on clean native VMs/runners without a development toolchain.
+- [ ] `P9-008` Implement the `jarvis migrate mark-liv` importer specified by
+      `docs/migration/python-prototype.md`: dry-run manifest, source/destination display, rejection of
+      API keys and certificates, `legacy_import` provenance, backup and rollback before finalization,
+      truncated/invalid/duplicate reporting, and explicit user confirmation before writing canonical
+      memory. Until it exists, `example/memory/long_term.json` is the only readable source for a real
+      user's prototype data, so deleting `example/` first would discard it.
+- [ ] `P9-009` Retire `example/` against the documented gate: installation, conversation, safe tools,
+      memory, local voice, visual geometry, proactive workflows, and cross-platform behavior all have
+      equivalent or deliberately superseding acceptance evidence; license obligations are settled;
+      user migration is complete or explicitly abandoned by ADR; and `THIRD_PARTY.md`, `SECURITY.md`,
+      `README.md`, `AGENTS.md`, `.gitignore`, and the ~11 files linking into `example/` are updated in
+      the same change. `docs/research/evaluated-prototypes.md` records the required sequence: findings
+      become dated records first, then the prototype is deleted.
 
 ## P10: Server And Multi-Device
 

@@ -456,6 +456,21 @@ mod tests {
             .unwrap_or_else(|error| panic!("close fixture: {error}"));
     }
 
+    /// Returns a `'static` statement derived from the current schema version.
+    ///
+    /// `sqlx::query` requires `'static` SQL text, so a version number that must track
+    /// [`CURRENT_SCHEMA_VERSION`] has to be produced at runtime. Leaking the string is
+    /// bounded and test-only, and the alternative is worse: the previous fixture
+    /// hard-coded `3`, so the bump to 4 would have left it silently describing a schema
+    /// that no longer exists while every assertion still passed.
+    fn schema_statement(template: &str) -> &'static str {
+        Box::leak(
+            template
+                .replace("{v}", &CURRENT_SCHEMA_VERSION.to_string())
+                .into_boxed_str(),
+        )
+    }
+
     #[tokio::test]
     async fn a_missing_database_is_reported_without_creating_it() {
         let directory = TempDirectory::new();
@@ -479,11 +494,11 @@ mod tests {
             &path,
             &[
                 "PRAGMA application_id = 1245794902",
-                "PRAGMA user_version = 3",
+                schema_statement("PRAGMA user_version = {v}"),
                 "CREATE TABLE jarvis_storage_metadata (singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL)",
-                "INSERT INTO jarvis_storage_metadata VALUES (1, 3)",
+                schema_statement("INSERT INTO jarvis_storage_metadata VALUES (1, {v})"),
                 "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
-                "INSERT INTO _sqlx_migrations VALUES (3, 'fixture', '2026-01-01T00:00:00Z', TRUE, x'00', 0)",
+                schema_statement("INSERT INTO _sqlx_migrations VALUES ({v}, 'fixture', '2026-01-01T00:00:00Z', TRUE, x'00', 0)"),
             ],
         )
         .await;
@@ -546,11 +561,11 @@ mod tests {
             &path,
             &[
                 "PRAGMA application_id = 1245794902",
-                "PRAGMA user_version = 3",
+                schema_statement("PRAGMA user_version = {v}"),
                 "CREATE TABLE jarvis_storage_metadata (singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL)",
                 "INSERT INTO jarvis_storage_metadata VALUES (1, 1)",
                 "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
-                "INSERT INTO _sqlx_migrations VALUES (3, 'fixture', '2026-01-01T00:00:00Z', TRUE, x'00', 0)",
+                schema_statement("INSERT INTO _sqlx_migrations VALUES ({v}, 'fixture', '2026-01-01T00:00:00Z', TRUE, x'00', 0)"),
             ],
         )
         .await;
@@ -558,11 +573,13 @@ mod tests {
         let inspection = inspect_database(&path)
             .await
             .unwrap_or_else(|error| panic!("inspect: {error}"));
+        // Derived from the constant, not written as a literal. The `metadata_version`
+        // stays deliberately at 1 so the marker disagreement this test is about remains.
         assert_eq!(
             inspection.state,
             DatabaseState::Inconsistent {
-                user_version: 3,
-                migration_version: 3,
+                user_version: CURRENT_SCHEMA_VERSION,
+                migration_version: CURRENT_SCHEMA_VERSION,
                 metadata_version: Some(1)
             }
         );

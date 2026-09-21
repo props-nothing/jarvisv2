@@ -7,6 +7,7 @@ mod error;
 mod id;
 mod loglevel;
 mod run;
+mod run_event;
 mod secret;
 mod sensitivity;
 mod timestamp;
@@ -32,6 +33,10 @@ pub use loglevel::LogLevel;
 pub use run::{
     ExpectedRunState, InvalidRunErrorCode, InvalidRunState, MAX_RUN_ERROR_CODE_CHARS, RunErrorCode,
     RunOutcome, RunState, RunTransition, RunTransitionError,
+};
+pub use run_event::{
+    EventSummary, InvalidRunEvent, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_SUMMARY_CHARS,
+    MAX_REPLAY_EVENTS, ReplayRequest, RunEventKind, RunEventPayload, RunEventSequence,
 };
 pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};

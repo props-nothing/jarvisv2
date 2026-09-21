@@ -24,6 +24,7 @@ Every external integration requires a dated record based on current official sou
 | Local daemon protocol / IPC | no usable `llms.txt`; official Microsoft named-pipe and `std::os::unix` docs, Tokio `net` docs | [local-daemon-protocol.md](local-daemon-protocol.md) | P1-008 implemented and tested on Windows |
 | OpenAI-compatible model API | https://developers.openai.com/api/docs/llms.txt; https://docs.ollama.com/llms.txt | [openai-compatible-model-api.md](openai-compatible-model-api.md) | P2-001 researched; Chat Completions selected over Responses |
 | Rust HTTP client and SSE | no usable `llms.txt`; `cargo info` plus the official `reqwest` changelog and docs.rs API index | [rust-http-client-and-sse.md](rust-http-client-and-sse.md) | P2-003 dependencies researched; system-proxy default rejected |
+| Rust HTTP server and SSE response | no `llms.txt`; official `axum` changelog/README/rustdoc plus `cargo info` and the resolved lock file | [rust-http-server-and-sse.md](rust-http-server-and-sse.md) | P2-007 dependencies researched; `axum` 0.8.9 pinned; HTTP core already resolved via `reqwest` |
 | OpenClaw | https://docs.openclaw.ai/llms.txt | create before adapter implementation | upstream patterns only |
 | OpenAI Agents SDK | https://openai.github.io/openai-agents-python/llms.txt | create before adapter implementation | upstream patterns only |
 | LangGraph | https://docs.langchain.com/oss/python/langgraph/llms.txt | create before adapter implementation | upstream patterns only |

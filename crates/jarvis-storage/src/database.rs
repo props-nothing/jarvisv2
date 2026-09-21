@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -267,6 +267,37 @@ pub enum DatabaseError {
     /// visible.
     #[error("the stored agent run has an invalid {field}")]
     StoredRunInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// Fields required to append a run event failed bounded validation.
+    #[error("the run event {field} is invalid")]
+    InvalidRunEventRequest {
+        /// Stable field name without the rejected value.
+        field: &'static str,
+    },
+    /// No run event exists for the requested identifier.
+    #[error("no run event exists for the requested identifier")]
+    RunEventNotFound,
+    /// A run event write lost a race for its sequence number.
+    ///
+    /// The stored stream was **not** renumbered. The caller must re-read the highest
+    /// stored sequence and retry, because another writer allocated the position it read.
+    #[error("the run event sequence was taken by another writer")]
+    RunEventConflict,
+    /// A run event was appended to a run that had already settled.
+    ///
+    /// A settled run emits nothing more, so accepting this would leave a stream whose
+    /// terminal event is not last — the stream would claim the run settled twice.
+    #[error("a settled agent run cannot emit another event")]
+    RunEventAfterSettlement,
+    /// A stored run event row contradicted the domain's own validity rules.
+    ///
+    /// A storage-integrity finding rather than a caller mistake: the row was written by
+    /// another build, restored from a backup, or edited outside JARVIS. Reported as data
+    /// rather than silently repaired or dropped, so the finding stays visible.
+    #[error("the stored run event has an invalid {field}")]
+    StoredRunEventInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
     },

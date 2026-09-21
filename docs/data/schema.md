@@ -86,6 +86,22 @@ Run/step, provider/model, request policy, prompt/context hashes, capability requ
 Usage is recorded here per call and summarized on `agent_runs`. There is no separate
 usage table: a duplicated total could disagree with the parts it summarizes.
 
+### `run_events`
+
+Run, per-run monotonic `sequence`, canonical event kind, bounded operational summary,
+bounded JSON payload, correlation ID, occurred/recorded timestamps. Unique on
+`(run_id, sequence)`. Append-only.
+
+The durable source for the run activity/output stream. `sequence` is scoped to one run and
+starts at 1, and the writer allocates it inside the insert so a stream cannot have a gap or
+a duplicate. A terminal event is always the last event of its run, which is verified on
+read because that is a property of the stream rather than of one row.
+
+This is **not** the Phase 6 `events` / `event_inbox` / `event_outbox` bus. Those are
+cross-aggregate records with lease, attempt, and dead-letter semantics; a run stream needs
+per-run total ordering and replay for one watching client. See
+[ADR-0011](../adr/0011-run-events-and-http-transport.md).
+
 ### `artifacts`
 
 Workspace/run/tool/workflow ownership, object key, media type, size, hash, sensitivity, retention, origin, created/deleted timestamps.
@@ -289,6 +305,7 @@ from an unimplemented obligation until someone checks.
 | 1 | `0001_initialize.sql` | `jarvis_storage_metadata` |
 | 2 | `0002_daemon_instances.sql` | `daemon_instances` |
 | 3 | `0003_conversation_state.sql` | `users`, `workspaces`, `sessions`, `messages`, `agent_runs`, `agent_steps`, `model_calls` |
+| 4 | `0004_run_events.sql` | `run_events` |
 
 Two decisions in migration 3 are worth recording because they are structural, not
 typographical:
