@@ -389,12 +389,21 @@ fn check_permissions(paths: &AppPaths) -> CheckResult {
 /// On Unix this is a mode check. Windows ACL inspection would need a new process
 /// per path, so the check reports `None` there rather than claiming a verdict it
 /// did not measure.
+///
+/// The group/other test is written as `trailing_zeros() >= 6`. The low **six** bits
+/// of a permission mode are the group and other bits (owner bits are the next three),
+/// so six trailing zeros means no group or other permission is set. The obvious
+/// bitwise form `mode & 0o077 == 0` trips `clippy::verbose_bit_mask`, which fires on
+/// unix builds ONLY: `Permissions::mode()` returns `u32` while the literal infers a
+/// signed type. That is why this crate compiled and linted clean on Windows while both
+/// unix CI runners failed, and why the lint's own recommended form is used here rather
+/// than a different bit trick that could trip a neighbouring lint.
 #[cfg(unix)]
 fn world_accessible(path: &Path) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = fs::metadata(path).ok()?.permissions().mode() & 0o777;
-    if mode & 0o077 == 0 {
+    if mode.trailing_zeros() >= 6 {
         None
     } else {
         Some(format!("mode {mode:o} allows group or other access"))

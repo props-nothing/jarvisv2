@@ -140,8 +140,10 @@ fn reapply_directory_permissions(paths: &AppPaths) -> RepairReport {
 /// Windows, which is why the local build and lint were clean. Keep the import local to
 /// the platform-gated function so the dependency is stated where it is used.
 ///
-/// The condition is a single let-chain rather than a nested `if`: with edition 2024
-/// let-chains are stable, so `clippy::collapsible_if` rejects the nested form.
+/// The group/other test is `trailing_zeros() < 6`, matching the equivalent check in
+/// `doctor::world_accessible`. The low six bits are the group and other permission bits,
+/// so fewer than six trailing zeros means one is set. The bitwise form
+/// `mode & 0o077 != 0` trips `clippy::verbose_bit_mask` on unix builds only.
 #[cfg(unix)]
 fn insecure_directories(paths: &AppPaths) -> Vec<String> {
     use std::fs;
@@ -155,7 +157,7 @@ fn insecure_directories(paths: &AppPaths) -> Vec<String> {
         ("logs", paths.logs()),
     ] {
         if let Ok(metadata) = fs::metadata(path)
-            && metadata.permissions().mode() & 0o077 != 0
+            && metadata.permissions().mode().trailing_zeros() < 6
         {
             insecure.push(label.to_owned());
         }
