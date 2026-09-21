@@ -38,7 +38,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # `--locked` keeps the lint run on the committed lockfile, like every other
+        # step. Without it a dependency could resolve differently here than in the
+        # test step, so a lint verdict would not describe the tree that was tested.
+        #
+        # This step failing on only some operating systems usually means a
+        # platform-gated lint: `#[cfg(unix)]` or `#[cfg(windows)]` code is not
+        # compiled by the other runners, so a warning it produces is invisible
+        # there. The matrix is what catches it.
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate

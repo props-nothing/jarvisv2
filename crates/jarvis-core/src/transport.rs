@@ -205,9 +205,13 @@ impl LocalListener {
 #[cfg(unix)]
 impl Drop for LocalListener {
     fn drop(&mut self) {
-        if let Self::Unix { path, .. } = self {
-            let _ = std::fs::remove_file(path);
-        }
+        // Destructured with an irrefutable `let` rather than `if let`: on unix
+        // `LocalListener` has exactly one variant, so a conditional pattern is
+        // unreachable and `clippy::irrefutable_let_patterns` rejects it under
+        // `-D warnings`. That lint only fires on unix builds, which is why this
+        // compiled and linted clean on Windows and failed on Linux and macOS.
+        let Self::Unix { path, .. } = self;
+        let _ = std::fs::remove_file(path);
     }
 }
 
