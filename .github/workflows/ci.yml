@@ -67,36 +67,44 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # Reporting is deliberately unconditional. The first version of this step
-          # grepped for a diagnostic shape and produced NO annotations at all when the
-          # failure did not match it, so the cause stayed invisible: the annotations API
-          # then returned only the runner's generic "Process completed with exit code N",
-          # and the raw job log needs repository authentication (anonymous fetch is 403).
-          # A reporting step that silently reports nothing is worse than none, because it
-          # looks like it worked.
+          # Reporting is deliberately unconditional and ordered by usefulness.
           #
-          # 1. Diagnostics that carry a span become file-annotated errors.
+          # Two rounds were spent inferring the cause of a unix-only lint failure because
+          # this step reported the wrong thing: first nothing at all, then the FIRST
+          # lines of the output, which are cargo's `Downloading crates ...` progress
+          # noise. Errors come from a compiler or build script, so they appear at the
+          # END. A reporting step that reports the wrong lines is as bad as one that
+          # reports none, because both look like they worked.
+          #
+          # GitHub caps annotations per check run, so the most diagnostic output is
+          # emitted first: error lines, then the tail, then file-annotated diagnostics.
+          if [ ! -f clippy.txt ]; then
+            echo "::error::clippy.txt was not created by the lint step"
+            exit 0
+          fi
+          echo "::error::clippy.txt has $(wc -l < clippy.txt) lines"
+
+          # 1. Every line mentioning an error, with its line number in the output.
+          #    `-a` treats the file as text so a binary byte cannot stop the scan.
+          grep -n -a -iE '(^|[^a-z])error' clippy.txt | head -n 20 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+
+          # 2. The tail, where a span-less compile or link failure appears.
+          echo "::error::--- last 20 lines ---"
+          tail -n 20 clippy.txt | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+
+          # 3. Diagnostics that carry a span become file-annotated errors.
           grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt 2>/dev/null \
             | sed -E 's/^([^ :]+):([0-9]+):([0-9]+): /::error file=\1,line=\2,col=\3::/' \
-            | head -n 40 || true
+            | head -n 15 || true
 
-          # 2. The first lines of the raw output are echoed regardless of shape, so a
-          #    span-less failure (a build script, a linker error, `could not compile`)
-          #    is still readable through the API.
-          if [ -f clippy.txt ]; then
-            line_count=$(wc -l < clippy.txt)
-            echo "::error::clippy.txt has ${line_count} lines; first 15 follow"
-            head -n 15 clippy.txt | while IFS= read -r line; do
-              echo "::error::${line}"
-            done
-          else
-            echo "::error::clippy.txt was not created by the lint step"
-          fi
-
-          echo "--- diagnostics ---"
-          grep -E ': (error|warning)' clippy.txt 2>/dev/null | head -n 60 || true
-          echo "--- tail ---"
-          tail -n 25 clippy.txt 2>/dev/null || true
+          echo "===== error lines ====="
+          grep -n -a -iE '(^|[^a-z])error' clippy.txt 2>/dev/null | head -n 80 || true
+          echo "===== tail ====="
+          tail -n 60 clippy.txt 2>/dev/null || true
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate
