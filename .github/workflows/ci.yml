@@ -79,29 +79,33 @@ jobs:
           set +e
 
           [ -f clippy.txt ] || { echo "::error::clippy.txt was not created by the lint step"; exit 0; }
-          echo "::error::clippy.txt has $(wc -l < clippy.txt) lines; error region follows"
 
-          # Print from the first diagnostic to the end, so the error code, its
-          # ` --> file:line:col` span, the source line, and any `= help:` notes are all
-          # visible. Annotations are the only diagnostic channel readable without
-          # authenticating, and this environment cannot compile the failing crates
-          # locally: `jarvis-storage`, `jarvis-diagnostics` and `jarvis-models` need a C
-          # toolchain for a non-native target and no C compiler is installed here.
-          first="$(grep -n -a -m1 -iE 'error(\[|:)' clippy.txt | cut -d: -f1)"
-          if [ -n "$first" ]; then
-            tail -n "+$first" clippy.txt | head -n 45 | while IFS= read -r line; do
+          # Emit a SMALL, targeted region. GitHub caps annotations per check run and
+          # silently drops the rest, so the previous version -- which emitted up to 45
+          # lines from the first match to the end of the output -- had its annotations
+          # filled with cargo's `Checking ...` progress lines while the actual diagnostic
+          # was dropped. Fewer lines is the point: the goal is that the error survives
+          # the cap.
+          #
+          # A rustc diagnostic is `error[E0433]: message`, a ` --> file:line:col` span,
+          # the source line, and a caret. Six lines after the first `error[E` is enough
+          # to identify the code and the location.
+          diag="$(grep -a -n -A6 -m1 'error\[E' clippy.txt)"
+          if [ -z "$diag" ]; then
+            diag="$(grep -a -n -A4 -m1 '^error: ' clippy.txt)"
+          fi
+          if [ -n "$diag" ]; then
+            echo "$diag" | head -n 8 | while IFS= read -r line; do
               echo "::error::$line"
             done
           else
-            tail -n 45 clippy.txt | while IFS= read -r line; do
+            tail -n 4 clippy.txt | while IFS= read -r line; do
               echo "::error::$line"
             done
           fi
 
-          echo "===== error region ====="
-          if [ -n "$first" ]; then
-            tail -n "+$first" clippy.txt | head -n 120
-          fi
+          echo "===== diagnostic (full) ====="
+          cat clippy.txt
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate
