@@ -673,15 +673,17 @@ mod tests {
                     .unwrap_or_else(|| base.data_dir())
                     .join(application_component())
             );
-            match base.runtime_dir() {
-                Some(runtime) => {
-                    assert_eq!(paths.runtime(), runtime.join(application_component()));
-                    assert_eq!(paths.runtime_source(), RuntimePathSource::Native);
-                }
-                None => {
-                    assert_eq!(paths.runtime(), paths.state().join("runtime"));
-                    assert_eq!(paths.runtime_source(), RuntimePathSource::StateFallback);
-                }
+            // `if let`/`else` rather than a two-arm `match`: the arms have different
+            // bodies, so clippy's `single_match_else` rejects the `match` form. That lint
+            // compiles only under `#[cfg(target_os = "linux")]`, which is why this file
+            // linted clean on Windows and macOS-failing Linux runners caught it. The two
+            // shapes are equivalent here; the `if let` form is the one the lint accepts.
+            if let Some(runtime) = base.runtime_dir() {
+                assert_eq!(paths.runtime(), runtime.join(application_component()));
+                assert_eq!(paths.runtime_source(), RuntimePathSource::Native);
+            } else {
+                assert_eq!(paths.runtime(), paths.state().join("runtime"));
+                assert_eq!(paths.runtime_source(), RuntimePathSource::StateFallback);
             }
         }
     }
