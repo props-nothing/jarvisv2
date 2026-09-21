@@ -67,35 +67,46 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # Reporting is deliberately unconditional and ordered by usefulness.
+          # Reporting is deliberately unconditional and complete for the error region.
           #
-          # Two rounds were spent inferring the cause of a unix-only lint failure because
-          # this step reported the wrong thing: first nothing at all, then the FIRST
-          # lines of the output, which are cargo's `Downloading crates ...` progress
-          # noise. Errors come from a compiler or build script, so they appear at the
-          # END. A reporting step that reports the wrong lines is as bad as one that
-          # reports none, because both look like they worked.
+          # Several rounds were spent INFERRING the cause because each version of this
+          # step reported something unusable: nothing at all, then cargo's
+          # `Downloading crates ...` progress noise, then a grep that matched only the
+          # `could not compile` summaries. The reason it matters is that this environment
+          # cannot check the failing code locally: `jarvis-storage`, `jarvis-diagnostics`
+          # and `jarvis-models` need a C toolchain for a non-native target (bundled SQLite
+          # and aws-lc-sys), and no C compiler is installed, so their `#[cfg(unix)]` code
+          # is only ever compiled by CI. Annotations are the only diagnostic channel
+          # readable without authenticating, so they have to carry the whole story.
           #
-          # GitHub caps annotations per check run, so the most diagnostic output is
-          # emitted first: error lines, then the tail, then file-annotated diagnostics.
+          # Everything from the first diagnostic to the end of the output is emitted, so
+          # the error code, its ` --> file:line:col` span, any `note:` lines, and the
+          # per-crate summaries all appear. GitHub caps annotations per check run, hence
+          # the 45-line bound and the absence of any other decoration.
           if [ ! -f clippy.txt ]; then
             echo "::error::clippy.txt was not created by the lint step"
             exit 0
           fi
-          echo "::error::clippy.txt has $(wc -l < clippy.txt) lines"
+          echo "::error::clippy.txt has $(wc -l < clippy.txt) lines; error region follows"
 
-          # 1. The decisive output, with two lines of leading context per hit. An error
-          #    is `error[E0432]: ...` followed by a ` --> file:line:col` location, so the
-          #    context lines are what identify the code, not the summary line. GitHub
-          #    caps annotations per check run, so this is emitted first and alone.
-          grep -n -a -B2 -iE 'error(\[|:)' clippy.txt | head -n 30 | while IFS= read -r line; do
-            echo "::error::${line}"
-          done
+          # Print from the first diagnostic to the end, so the span and the notes are
+          # included rather than just the summary line.
+          first=$(grep -n -a -m1 -iE 'error(\[|:)' clippy.txt | cut -d: -f1)
+          if [ -n "${first:-}" ]; then
+            tail -n "+${first}" clippy.txt | head -n 45 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          else
+            echo "::error::no 'error' line found; last 45 lines follow"
+            tail -n 45 clippy.txt | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
 
-          echo "===== error lines with context ====="
-          grep -n -a -B2 -iE 'error(\[|:)' clippy.txt 2>/dev/null | head -n 80 || true
-          echo "===== tail ====="
-          tail -n 40 clippy.txt 2>/dev/null || true
+          echo "===== error region ====="
+          if [ -n "${first:-}" ]; then
+            tail -n "+${first}" clippy.txt | head -n 120 || true
+          fi
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate
