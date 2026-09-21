@@ -60,11 +60,28 @@ Given deliberately mismatched config/state paths, an unavailable database, stale
 
 Given a scripted streaming model and an active run, when `jarvisd` is terminated at every persisted run transition, then restart either resumes from the documented boundary or marks the run with a truthful terminal/recoverable state. It never emits duplicated final output or loses an accepted user message.
 
+**Not yet satisfied.** `P2-007` delivered the durable half: `run_events` is a per-run ordered record
+with `UNIQUE (run_id, sequence)`, a run's first event is written in the same transaction as the run,
+and the SSE stream replays from that record by sequence cursor, so a reconnect after a restart can ask
+for everything after a known position rather than trusting an in-memory counter. What is missing is the
+other half of the sentence: "an active run" and "a scripted streaming model" do not exist yet, because
+nothing in `jarvisd` invokes a model, so a run cannot reach a transition to be terminated at. The
+criterion is therefore unproven rather than partially proven, and it closes with `P2-009` (scripted
+model adapter) and `P2-010` (restart at every persisted boundary).
+
 ## A04: Cancellation
 
 **Phase:** 2
 
 Given a run streaming model output, waiting on a tool, and waiting on approval in separate cases, when an authorized client cancels it, then new work stops, adapters receive cancellation, state settles once, and the client receives a terminal cancellation event.
+
+**Not yet satisfied, but one requirement is now enforced rather than assumed.** `P2-007` guarantees
+that cancellation is recorded as a **request**: `POST /api/v1/runs/{id}/cancel` writes
+`cancellation_requested_at` and returns the run in its current state, so the daemon cannot report "state
+settles once" by settling on the request and then settling again when the in-flight step notices.
+Cancelling also requires the caller's `expected_version`, so a client cannot cancel a run it has not
+actually read. The remaining clauses ("new work stops", "adapters receive cancellation", "a terminal
+cancellation event") require an executor to cancel and do not close until `P2-009`.
 
 ## A05: Tool Approval Cannot Be Forged
 

@@ -119,11 +119,34 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       fixed the schema-bump fixture trap this change re-triggered: `inspect.rs` hard-coded
       `user_version = 3` twice and asserted `Inconsistent { user_version: 3 }`, which the
       documented rule predicted. Those now derive from `CURRENT_SCHEMA_VERSION`.
-- [ ] `P2-007` Add `POST /api/v1/runs`, run status, cancel, and SSE activity/output streams.
+- [x] `P2-007` Add `POST /api/v1/runs`, run status, cancel, and SSE activity/output streams.
       Depends on `P2-007a` and `P2-007b`. Both are prerequisites rather than parallel work:
       the SSE contract requires replay from durable records (`docs/architecture/protocols.md`),
       and a server framework is a new dependency that `docs/development/external-research.md`
       requires be researched before adapter code is written.
+      **Delivered:** REST DTOs in `jarvis-protocol/src/rest.rs` (requests `deny_unknown_fields`,
+      responses additive-tolerant, every failure reusing the v1 `WireError` envelope); the
+      authenticated router in `apps/jarvisd/src/gateway.rs` with the body limit applied as a
+      router layer so a later route cannot omit it; run use cases in `run_service.rs`; the SSE
+      stream in `sse.rs` driven by a `Last-Event-ID` sequence cursor over the durable log, with
+      keep-alives as **comment** frames rather than `heartbeat` events (a heartbeat event would
+      occupy a sequence number and enter the log). Storage side: `SessionId`/`RunId`/
+      `SessionChannel`/`SessionStatus` in the domain, and `session_repository::start_run`, which
+      writes the session, the run, and the run's first event in **one** transaction because
+      three calls could leave a run whose stream is empty — indistinguishable from a run whose
+      events were lost. The HTTP transport is separately enabled
+      (`daemon.http_enabled`, `JARVIS_HTTP_ENABLED`, default off), loopback-only, and bound
+      *before* serving, with the serving task's completion as a third `select!` branch, because
+      `axum::serve` never returns an error and so cannot report its own death.
+      **Two real defects were found by the tests rather than by reading:** the bearer extractor
+      trimmed whitespace and therefore accepted a padded token, and
+      `GET /runs/{id}/stream` answered `200` for a run that did not exist, because
+      `highest_run_event_sequence` returns `None` for both "no run" and "run with no events".
+      **Honest limits:** this slice is a *transport*, not an executor. Nothing invokes a model,
+      so a run reaches `received` and stays there until `P2-009` supplies an adapter.
+      `idempotency_key` is refused with `Unsupported` rather than silently ignored, because no
+      deduplication ledger exists and ignoring it would tell a retrying client its request was
+      deduplicated while two runs had in fact been created.
 - [ ] `P2-008` Add CLI `ask` and `chat` using the daemon API; the CLI must contain no orchestration logic.
 - [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
