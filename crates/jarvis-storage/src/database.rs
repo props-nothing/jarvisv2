@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -298,6 +298,16 @@ pub enum DatabaseError {
     /// rather than silently repaired or dropped, so the finding stays visible.
     #[error("the stored run event has an invalid {field}")]
     StoredRunEventInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// A profile did not contain the local identity migration `0005` seeds.
+    ///
+    /// A real failure rather than an empty result: without this row no session and no
+    /// run can be created, so reporting `Ok(None)` would defer the cause to the first
+    /// write that trips a foreign key, where it is much harder to attribute.
+    #[error("this profile is missing its seeded local {field}")]
+    LocalIdentityMissing {
         /// Stable field name without the offending value.
         field: &'static str,
     },

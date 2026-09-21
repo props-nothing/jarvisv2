@@ -21,8 +21,11 @@
 -- * Secret values never appear here. `provider_request_id` is an opaque trace
 --   reference, and error text is a JARVIS-owned safe message, never the provider's
 --   own message, which can echo the prompt.
--- * There is exactly one local user and one local workspace in Phase 2, so those
---   rows are seeded rather than created per client.
+-- * There is exactly one local user and one local workspace in Phase 2. Those rows
+--   are seeded by migration `0005_seed_local_identity.sql` rather than created per
+--   client. That migration exists because this file originally CLAIMED the seeding
+--   happened while no migration performed it, so a fresh profile had no identity
+--   for `sessions` to reference and no client could create a run.
 
 CREATE TABLE users (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),

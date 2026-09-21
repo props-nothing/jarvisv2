@@ -284,9 +284,19 @@ fn run_gate_steps(daemon: &Path, client: &Path) -> String {
     // Integrity: the schema is intact after two lifecycles.
     assert_schema_intact(&root);
 
+    // Identity: the profile has the local user and workspace it needs to run
+    // anything. Asserted here, against the database a real daemon produced, because
+    // the storage tests supply those rows themselves and so cannot detect their
+    // absence in a real profile.
+    restarted.stop();
+    assert_local_identity_seeded(&root);
+
     // Healthy diagnosis, then a deliberately broken configuration.
+    let mut third = RunningDaemon::start(daemon, &root.0, &[]);
+    let third_pid = third.child.id();
+    third.wait_until_ready(&root.0, third_pid);
     assert_doctor_healthy(client, &root.0);
-    let stderr = restarted.stop();
+    let stderr = third.stop();
     assert_doctor_diagnoses_broken_configuration(client, &root.0, &paths);
     stderr
 }
@@ -366,6 +376,35 @@ fn assert_schema_intact(root: &TempRoot) {
         "schema should still match this build after restart"
     );
     assert!(inspection.integrity_ok, "database integrity must hold");
+}
+
+/// Proves a profile that ran a real daemon has the local identity it needs.
+///
+/// This is the process-level counterpart of the storage test for the same thing, and
+/// it is the assertion that was missing when migration `0003` claimed to seed the
+/// local user and workspace while no migration did. Every storage test passed, because
+/// the fixtures wrote those rows themselves; a real profile had none, so no client
+/// could create a run. Asserting it against the database a real `jarvisd` produced is
+/// what makes that class of gap visible.
+fn assert_local_identity_seeded(root: &TempRoot) {
+    let database = futures_lite_block_on(jarvis_storage::SqliteDatabase::open(&root.database()))
+        .unwrap_or_else(|error| panic!("open database: {error}"));
+    let identity = futures_lite_block_on(jarvis_storage::load_local_identity(&database))
+        .unwrap_or_else(|error| {
+            panic!("a profile that ran a daemon must have a local identity: {error}")
+        });
+
+    assert_eq!(
+        identity.user_id(),
+        jarvis_storage::LOCAL_USER_ID,
+        "the seeded local user must be the identity this build expects"
+    );
+    assert_eq!(
+        identity.workspace_id(),
+        jarvis_storage::LOCAL_WORKSPACE_ID,
+        "the seeded local workspace must be the identity this build expects"
+    );
+    futures_lite_block_on(database.close());
 }
 
 /// Proves doctor reports a healthy installation with no blocking findings.

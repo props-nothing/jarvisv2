@@ -3,6 +3,7 @@
 mod config;
 mod credential;
 mod database;
+mod identity_repository;
 mod inspect;
 mod paths;
 mod run_event_repository;
@@ -16,6 +17,9 @@ pub use credential::{CREDENTIAL_FILE_NAME, CredentialStore, CredentialStoreError
 pub use database::{
     CURRENT_SCHEMA_VERSION, DEFAULT_DATABASE_FILENAME, DaemonInstanceStart, DaemonStopReason,
     DatabaseError, SqliteDatabase,
+};
+pub use identity_repository::{
+    LOCAL_USER_ID, LOCAL_WORKSPACE_ID, LocalIdentity, load_local_identity,
 };
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
 pub use paths::{
