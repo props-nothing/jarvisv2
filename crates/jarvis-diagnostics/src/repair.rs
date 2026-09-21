@@ -132,12 +132,19 @@ fn reapply_directory_permissions(paths: &AppPaths) -> RepairReport {
 /// The detection and the verification intentionally share one implementation so a
 /// repair cannot pass a weaker check than the one that failed.
 ///
+/// `std::fs` is imported HERE rather than at module scope. This function is
+/// `#[cfg(unix)]`, and the module previously had no `fs` import at all: it compiled
+/// only because a separate `#[cfg(windows)]` block elsewhere in the file brought
+/// `std::fs` into scope. On unix that block is removed, so this function referenced an
+/// unresolved `fs` and the crate did not compile -- on Linux and macOS, and never on
+/// Windows, which is why the local build and lint were clean. Keep the import local to
+/// the platform-gated function so the dependency is stated where it is used.
+///
 /// The condition is a single let-chain rather than a nested `if`: with edition 2024
-/// let-chains are stable, so `clippy::collapsible_if` rejects the nested form. That
-/// lint fires only on unix builds, which is why this compiled and linted clean on
-/// Windows while both unix CI runners failed at the same step.
+/// let-chains are stable, so `clippy::collapsible_if` rejects the nested form.
 #[cfg(unix)]
 fn insecure_directories(paths: &AppPaths) -> Vec<String> {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     let mut insecure = Vec::new();
