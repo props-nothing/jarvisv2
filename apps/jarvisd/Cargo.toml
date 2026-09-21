@@ -7,14 +7,28 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Routing lives here, not in a domain crate: ADR-0011 places the HTTP gateway in the
+# composition root and forbids Axum in `jarvis-core`, `jarvis-application`, and
+# `jarvis-storage`. DTOs stay in `jarvis-protocol`.
+axum = { workspace = true }
 jarvis-application.workspace = true
 jarvis-core.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
 jarvis-storage.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+# `unfold` builds the SSE stream without a generator macro, so the stream type stays a plain
+# `Stream` impl and no `async-stream` dependency is introduced for one call site.
+futures-util.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing.workspace = true
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives a `Router` without binding a socket, so the gateway's
+# authentication and routing are tested as a real `tower` service rather than by calling the
+# handlers directly, which would bypass the layers the tests exist to falsify.
+tower.workspace = true
 
 [lints]
 workspace = true

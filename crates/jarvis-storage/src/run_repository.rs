@@ -41,19 +41,24 @@ pub const MAX_OBJECTIVE_CHARS: usize = 4096;
 
 /// One agent run as stored, limited to what the state machine reads and writes.
 ///
-/// A full `agent_runs` read model belongs with the run queries (`P2-007`). This type exists
-/// so a transition can return the state it produced without the caller re-reading the row.
+/// `objective` and `started_at` were added for the REST read model (`P2-007`), which must
+/// report what a run was asked to do and when it began. They are read-only here: nothing in
+/// this module writes them after creation, because a run's objective is its accepted input
+/// and silently rewriting it would make the stored record disagree with what the model was
+/// actually given.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredRun {
     id: String,
     session_id: String,
     workspace_id: String,
+    objective: String,
     state: RunState,
     version: i64,
     cancellation_requested_at: Option<UtcTimestamp>,
     terminal_outcome: Option<RunOutcome>,
     completed_at: Option<UtcTimestamp>,
     error_code: Option<String>,
+    started_at: UtcTimestamp,
 }
 
 impl StoredRun {
@@ -73,6 +78,22 @@ impl StoredRun {
     #[must_use]
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
+    }
+
+    /// Returns the objective the run was created with.
+    ///
+    /// Read-only for this struct's lifetime: an objective is the run's accepted input, and
+    /// a writer that rewrote it would leave the stored record disagreeing with the text the
+    /// model was actually given.
+    #[must_use]
+    pub fn objective(&self) -> &str {
+        &self.objective
+    }
+
+    /// Returns when the run was created.
+    #[must_use]
+    pub const fn started_at(&self) -> UtcTimestamp {
+        self.started_at
     }
 
     /// Returns the current lifecycle state.
@@ -232,8 +253,9 @@ pub async fn create_run(
 /// [`DatabaseError::Sqlite`] when the read fails.
 pub async fn find_run(database: &SqliteDatabase, id: &str) -> Result<StoredRun, DatabaseError> {
     let row = sqlx::query(
-        "SELECT id, session_id, workspace_id, state, version, \
-                cancellation_requested_at, terminal_outcome, completed_at, error_code \
+        "SELECT id, session_id, workspace_id, objective, state, version, \
+                cancellation_requested_at, terminal_outcome, completed_at, error_code, \
+                started_at \
          FROM agent_runs WHERE id = ?1",
     )
     .bind(id)
@@ -396,6 +418,7 @@ fn decode_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, DatabaseError>
         id: text_field(row, "id")?,
         session_id: text_field(row, "session_id")?,
         workspace_id: text_field(row, "workspace_id")?,
+        objective: text_field(row, "objective")?,
         state,
         version: row
             .try_get("version")
@@ -411,6 +434,11 @@ fn decode_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, DatabaseError>
             .map_err(|source| DatabaseError::Sqlite {
                 operation: "decode a stored run error code",
                 source,
+            })?,
+        started_at: text_field(row, "started_at")?
+            .parse::<UtcTimestamp>()
+            .map_err(|_| DatabaseError::StoredRunInvalid {
+                field: "start timestamp",
             })?,
     };
 

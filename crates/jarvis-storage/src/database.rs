@@ -311,6 +311,26 @@ pub enum DatabaseError {
         /// Stable field name without the offending value.
         field: &'static str,
     },
+    /// Fields required to create a session failed bounded validation.
+    #[error("the session {field} is invalid")]
+    InvalidSessionRequest {
+        /// Stable field name without the rejected value.
+        field: &'static str,
+    },
+    /// No session exists for the requested identifier.
+    #[error("no session exists for the requested identifier")]
+    SessionNotFound,
+    /// A stored session row contradicted the domain's own closed sets.
+    ///
+    /// A storage-integrity finding rather than a caller mistake: the row was written by
+    /// another build, restored from a backup, or edited outside JARVIS. Reported rather
+    /// than defaulted, because a defaulted `channel` would produce a session evaluated
+    /// against a policy nobody chose.
+    #[error("the stored session has an invalid {field}")]
+    StoredSessionInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
 }
 
 /// An initialized local SQLite database owned by JARVIS.

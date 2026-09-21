@@ -62,11 +62,32 @@ impl LoggingConfig {
     }
 }
 
+/// The default loopback port the HTTP transport binds.
+///
+/// ADR-0011 makes the HTTP transport a separately-enabled peer to local IPC, bound to
+/// loopback by default. The port is fixed rather than ephemeral so a client has something to
+/// name, and loopback-only so enabling it does not expose the daemon to the network.
+pub const DEFAULT_HTTP_PORT: u16 = 8765;
+
 /// Daemon lifecycle configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     shutdown_timeout_seconds: u16,
+    /// Whether the loopback HTTP transport is served at all.
+    ///
+    /// Off by default. ADR-0011 makes it separately enabled rather than always on, because a
+    /// listening port is a larger attack surface than an OS-protected pipe, and a daemon that
+    /// opened one unasked would contradict the reason local IPC is preferred.
+    #[serde(default)]
+    http_enabled: bool,
+    /// The loopback port the HTTP transport binds when enabled.
+    #[serde(default = "default_http_port")]
+    http_port: u16,
+}
+
+fn default_http_port() -> u16 {
+    DEFAULT_HTTP_PORT
 }
 
 impl DaemonConfig {
@@ -75,12 +96,26 @@ impl DaemonConfig {
     pub const fn shutdown_timeout_seconds(&self) -> u16 {
         self.shutdown_timeout_seconds
     }
+
+    /// Returns whether the loopback HTTP transport is served.
+    #[must_use]
+    pub const fn http_enabled(&self) -> bool {
+        self.http_enabled
+    }
+
+    /// Returns the loopback port the HTTP transport binds.
+    #[must_use]
+    pub const fn http_port(&self) -> u16 {
+        self.http_port
+    }
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             shutdown_timeout_seconds: 15,
+            http_enabled: false,
+            http_port: DEFAULT_HTTP_PORT,
         }
     }
 }
@@ -114,6 +149,7 @@ impl Config {
             logging: LoggingConfig { level: log_level },
             daemon: DaemonConfig {
                 shutdown_timeout_seconds,
+                ..DaemonConfig::default()
             },
         };
         config.validate()?;
@@ -162,6 +198,7 @@ impl Config {
                         },
                         daemon: DaemonConfig {
                             shutdown_timeout_seconds: legacy.shutdown_timeout_seconds,
+                            ..DaemonConfig::default()
                         },
                     },
                     Some(ConfigMigration::V0ToV1),
@@ -221,6 +258,12 @@ impl Config {
         }
         if !(1..=MAX_SHUTDOWN_TIMEOUT_SECONDS).contains(&self.daemon.shutdown_timeout_seconds) {
             return Err(ConfigError::InvalidShutdownTimeout);
+        }
+        // Port 0 is refused. It asks the operating system to pick an ephemeral port, which
+        // would leave a client with no port it could name and make the transport unusable by
+        // construction rather than by policy.
+        if self.daemon.http_enabled && self.daemon.http_port == 0 {
+            return Err(ConfigError::InvalidHttpPort);
         }
         Ok(())
     }
@@ -409,6 +452,12 @@ pub enum ConfigError {
     /// The graceful shutdown deadline is outside the supported range.
     #[error("daemon.shutdown_timeout_seconds must be between 1 and 300")]
     InvalidShutdownTimeout,
+    /// The HTTP transport was enabled with a port that cannot be named.
+    ///
+    /// Port 0 is refused because it asks the operating system to pick an ephemeral port, which
+    /// leaves a client with no port it could name.
+    #[error("daemon.http_port must be between 1 and 65535 when http_enabled is true")]
+    InvalidHttpPort,
     /// A prefixed environment key is not part of the explicit override contract.
     #[error("unknown configuration environment variable: {key}")]
     UnknownEnvironmentKey {
@@ -497,7 +546,12 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
     if version == CURRENT_CONFIG_VERSION {
         collect_nested_unknown(table, "profile", &["name"], &mut unknown);
         collect_nested_unknown(table, "logging", &["level"], &mut unknown);
-        collect_nested_unknown(table, "daemon", &["shutdown_timeout_seconds"], &mut unknown);
+        collect_nested_unknown(
+            table,
+            "daemon",
+            &["shutdown_timeout_seconds", "http_enabled", "http_port"],
+            &mut unknown,
+        );
     }
 
     unknown.sort();
@@ -565,6 +619,24 @@ where
                         .map_err(|_| ConfigError::InvalidEnvironmentValue {
                             key: "JARVIS_SHUTDOWN_TIMEOUT_SECONDS",
                         })?;
+            }
+            "JARVIS_HTTP_ENABLED" => {
+                // Parsed as a strict boolean rather than coerced from truthiness. A value such
+                // as "yes" or "1" that silently meant `false` would leave an operator believing
+                // the transport was enabled when it was not, and the failure would appear as a
+                // refused connection rather than as a rejected setting.
+                config.daemon.http_enabled = environment_text(&value, "JARVIS_HTTP_ENABLED")?
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvironmentValue {
+                        key: "JARVIS_HTTP_ENABLED",
+                    })?;
+            }
+            "JARVIS_HTTP_PORT" => {
+                config.daemon.http_port = environment_text(&value, "JARVIS_HTTP_PORT")?
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvironmentValue {
+                        key: "JARVIS_HTTP_PORT",
+                    })?;
             }
             _ => {
                 return Err(ConfigError::UnknownEnvironmentKey {

@@ -253,6 +253,31 @@ impl fmt::Display for RunEventSequence {
     }
 }
 
+// Serialization is manual rather than derived, matching `RunState`. A derived
+// newtype representation would put the value inside a one-field object, so the wire
+// form would be `{"sequence":{"0":3}}` rather than `"sequence":3`. More importantly,
+// deserialization must go through `RunEventSequence::new` so a wire value of 0 is
+// rejected here rather than becoming a stored sequence the migration forbids. A derived
+// impl would bypass that check entirely.
+impl Serialize for RunEventSequence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunEventSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
 /// A bounded operational summary attached to an event.
 ///
 /// Counted in **characters** because the migration bounds the column with `length()` on
@@ -529,5 +554,27 @@ mod tests {
 
         let parsed: Option<RunEventKind> = serde_json::from_str("\"run_failed\"").ok();
         assert_eq!(parsed, Some(RunEventKind::RunFailed));
+    }
+
+    /// The sequence serializes as a bare number, not a wrapped object, and a wire value of
+    /// zero is refused. This is why the impls are hand-written: a derived impl would use
+    /// the newtype form and would accept 0, producing a value the storage constraint
+    /// rejects later as an opaque failure.
+    #[test]
+    fn a_sequence_serializes_as_a_number_and_rejects_zero_on_the_wire() {
+        let sequence = RunEventSequence::first();
+        assert_eq!(
+            serde_json::to_string(&sequence).ok().as_deref(),
+            Some("1"),
+            "a derived impl would emit {{\"0\":1}}"
+        );
+
+        let parsed: Option<RunEventSequence> = serde_json::from_str("7").ok();
+        assert_eq!(parsed.map(RunEventSequence::get), Some(7));
+
+        assert!(
+            serde_json::from_str::<RunEventSequence>("0").is_err(),
+            "a wire sequence of 0 must be refused, not stored"
+        );
     }
 }

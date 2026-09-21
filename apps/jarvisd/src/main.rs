@@ -2,8 +2,11 @@
 
 mod build_info;
 mod control;
+mod gateway;
 mod health;
+mod run_service;
 mod singleton;
+mod sse;
 
 use std::{env, future::Future, io, path::Path, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -55,6 +58,14 @@ enum DaemonError {
     UnknownArgument(String),
     #[error("failed to listen for a shutdown signal")]
     Signal(#[source] io::Error),
+    #[error("failed to bind the loopback HTTP transport on port {port}")]
+    HttpBind {
+        /// The configured port, without the resolved address.
+        port: u16,
+        /// The underlying operating-system error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// How the daemon was told to locate its profile.
@@ -140,7 +151,9 @@ struct Running {
     paths: AppPaths,
     logging: Logging,
     singleton: SingletonGuard,
-    database: SqliteDatabase,
+    database: Arc<SqliteDatabase>,
+    credential: jarvis_core::ClientCredential,
+    http_port: Option<u16>,
     daemon_id: DaemonRunId,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
@@ -212,17 +225,155 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         daemon_id,
         started_at,
     ));
-    let context = Arc::new(control.server_context(credential));
+    let context = Arc::new(control.server_context(credential.clone()));
+
+    // ADR-0011 makes the HTTP transport separately enabled and loopback-bound. Reading the
+    // setting here rather than inside the gateway keeps the gateway itself free of policy about
+    // whether it should exist.
+    let http_port = loaded_config
+        .config()
+        .daemon()
+        .http_enabled()
+        .then(|| loaded_config.config().daemon().http_port());
 
     Ok(Running {
         health,
         paths,
         logging,
         singleton,
-        database,
+        database: Arc::new(database),
+        credential,
+        http_port,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
+}
+
+/// A bound and served loopback HTTP transport.
+///
+/// Owning the serving task rather than dropping it into a detached spawn is what makes a dead
+/// listener detectable. `axum::serve` never returns an error and retries socket errors itself, so
+/// its return value carries no information; the task's **completion** does. [`Self::bind`]
+/// therefore also hands back a stop signal the caller can await.
+struct HttpTransport {
+    port: u16,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl HttpTransport {
+    /// Binds loopback, starts serving the gateway, and returns the transport and its stop signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::HttpBind`] when the loopback address cannot be bound. Binding is the
+    /// step that fails fast: an occupied port is reported here rather than becoming a listener the
+    /// daemon believes it has.
+    async fn bind(
+        port: u16,
+        database: Arc<SqliteDatabase>,
+        credential: jarvis_core::ClientCredential,
+    ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
+        // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
+        // explicit TLS-terminated configuration rather than something that happens by default.
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|source| DaemonError::HttpBind { port, source })?;
+
+        let app = gateway::router(gateway::GatewayState::new(database, credential));
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+            // Sent explicitly, because this is the only observable evidence that the listener
+            // stopped. `axum::serve`'s own return value says nothing about why.
+            let _ = stopped_tx.send(());
+        });
+
+        Ok((
+            Self {
+                port,
+                shutdown,
+                handle,
+            },
+            stopped,
+        ))
+    }
+
+    /// Returns the bound loopback port.
+    const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Stops the transport, letting in-flight responses close.
+    ///
+    /// Graceful rather than abrupt so an SSE stream ends at an event boundary. A severed stream
+    /// looks to a client like a lost event, leaving it to decide whether to resume from its last
+    /// sequence or discard its position.
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.handle.await;
+    }
+}
+
+/// The outcome of the daemon's main wait.
+struct WaitOutcome {
+    shutdown: io::Result<()>,
+    accept_failure: Option<jarvis_core::TransportError>,
+    http_stopped: bool,
+}
+
+/// Waits for a shutdown signal, a local-listener failure, or an HTTP-listener failure.
+///
+/// The HTTP listener is a third branch of the same select rather than a detached task, so a
+/// listener that dies takes the shutdown path instead of leaving the daemon reporting itself ready
+/// with no transport behind it.
+async fn wait_for_exit<F>(
+    shutdown: F,
+    accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
+    http_stop: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> WaitOutcome
+where
+    F: Future<Output = io::Result<()>>,
+{
+    // A pinned receiver so the select polls it by reference, keeping ownership inside this
+    // function. Awaiting it by value in an arm would move it out of the `if let`, and the other
+    // arms would then have to return it.
+    if let Some(receiver) = http_stop {
+        let mut stop = Box::pin(receiver);
+        tokio::select! {
+            result = shutdown => WaitOutcome {
+                shutdown: result,
+                accept_failure: None,
+                http_stopped: false,
+            },
+            failure = accept_loop => WaitOutcome {
+                shutdown: Ok(()),
+                accept_failure: Some(failure),
+                http_stopped: false,
+            },
+            _ = &mut stop => WaitOutcome {
+                shutdown: Ok(()),
+                accept_failure: None,
+                http_stopped: true,
+            },
+        }
+    } else {
+        let (shutdown, accept_failure) = tokio::select! {
+            result = shutdown => (result, None),
+            failure = accept_loop => (Ok(()), Some(failure)),
+        };
+        WaitOutcome {
+            shutdown,
+            accept_failure,
+            http_stopped: false,
+        }
+    }
 }
 
 async fn run<F>(build: BuildInfo, root: Option<PathBuf>, shutdown: F) -> Result<(), DaemonError>
@@ -235,6 +386,8 @@ where
         logging,
         singleton,
         database,
+        credential,
+        http_port,
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
@@ -251,13 +404,36 @@ where
         database_schema = build.database_schema(),
         mode = if root.is_some() { "portable" } else { "native" },
         secrets_masked = logging.secret_count(),
+        http_port = http_port.unwrap_or(0),
         "daemon ready"
     );
 
-    let (shutdown_result, accept_failure) = tokio::select! {
-        result = shutdown => (result, None),
-        failure = accept_loop => (Ok(()), Some(failure)),
+    // The listener is bound before it is served, and binding is what fails fast: an occupied port
+    // is reported here rather than becoming a listener nobody notices is dead.
+    let (http, http_stop) = match http_port {
+        Some(port) => {
+            let (transport, stop) =
+                HttpTransport::bind(port, Arc::clone(&database), credential.clone()).await?;
+            (Some(transport), Some(stop))
+        }
+        None => (None, None),
     };
+
+    let outcome = wait_for_exit(shutdown, accept_loop, http_stop).await;
+    if let Some(transport) = http {
+        let port = transport.port();
+        transport.shutdown().await;
+        tracing::info!(port, "HTTP transport stopped");
+    }
+    if outcome.http_stopped {
+        tracing::error!(
+            port = http_port.unwrap_or(0),
+            "the HTTP transport stopped unexpectedly"
+        );
+    }
+
+    let shutdown_result = outcome.shutdown;
+    let accept_failure = outcome.accept_failure;
     health.begin_shutdown()?;
     let stop_reason = if shutdown_result.is_ok() && accept_failure.is_none() {
         DaemonStopReason::Signal

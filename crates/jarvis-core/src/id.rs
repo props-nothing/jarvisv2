@@ -180,6 +180,18 @@ typed_id!(
     /// Identifies one daemon process lifecycle record.
     DaemonRunId
 );
+typed_id!(
+    /// Identifies one conversation session.
+    ///
+    /// Distinct from [`DaemonRunId`]: a session is a conversation, while a daemon run is one
+    /// process lifetime. Collapsing them would let a restart be recorded as a new
+    /// conversation.
+    SessionId
+);
+typed_id!(
+    /// Identifies one agent run within a session.
+    RunId
+);
 
 #[cfg(test)]
 mod tests {

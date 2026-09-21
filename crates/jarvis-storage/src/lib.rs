@@ -8,6 +8,7 @@ mod inspect;
 mod paths;
 mod run_event_repository;
 mod run_repository;
+mod session_repository;
 
 pub use config::{
     CURRENT_CONFIG_VERSION, Config, ConfigError, ConfigMigration, ConfigStore, DaemonConfig,
@@ -33,4 +34,8 @@ pub use run_event_repository::{
 pub use run_repository::{
     MAX_OBJECTIVE_CHARS, NewRun, StoredRun, create_run, find_run, request_run_cancellation,
     transition_run,
+};
+pub use session_repository::{
+    API_SESSION_CHANNEL, NewSession, StartRunInput, StartedRun, StoredSession, find_session,
+    start_run,
 };

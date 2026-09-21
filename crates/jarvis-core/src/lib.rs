@@ -10,6 +10,7 @@ mod run;
 mod run_event;
 mod secret;
 mod sensitivity;
+mod session;
 mod timestamp;
 #[cfg(any(unix, windows))]
 mod transport;
@@ -27,7 +28,7 @@ pub use endpoint::{
 pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessageReason};
 pub use id::{
     ClientId, CorrelationId, DaemonRunId, IdGenerator, InvalidId, InvalidIdReason, ProfileId,
-    RequestId, SystemIdGenerator,
+    RequestId, RunId, SessionId, SystemIdGenerator,
 };
 pub use loglevel::LogLevel;
 pub use run::{
@@ -40,6 +41,7 @@ pub use run_event::{
 };
 pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};
+pub use session::{InvalidSessionField, MAX_SESSION_TITLE_CHARS, SessionChannel, SessionStatus};
 pub use timestamp::{Clock, InvalidTimestamp, SystemClock, UtcTimestamp};
 #[cfg(any(unix, windows))]
 pub use transport::{LocalListener, LocalStream, TransportError, connect};
