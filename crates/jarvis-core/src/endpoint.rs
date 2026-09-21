@@ -247,10 +247,19 @@ mod tests {
         }
     }
 
+    /// Two installations with the same profile name must not contend for one pipe, so
+    /// the name is derived from the runtime directory as well.
+    ///
+    /// `#[cfg(windows)]` because the behaviour under test is Windows-specific in two
+    /// ways: the pipe name is what must differ, and Windows path comparison is
+    /// case-insensitive. On unix this test previously ran with `r"C:\one\runtime"`,
+    /// which is a RELATIVE path there, so the constructor correctly refused it with
+    /// `RelativeRuntimeDirectory` and the assertion failed. The production code was
+    /// right and the test was platform-wrong, which is why it surfaced only on the unix
+    /// CI runners.
+    #[cfg(windows)]
     #[test]
     fn distinct_roots_never_share_a_windows_pipe_name() {
-        // Two installations with the same profile name must not contend for one
-        // pipe, so the name is derived from the runtime directory as well.
         let first = LocalEndpoint::named_pipe_in_root(Path::new(r"C:\one\runtime"), "default");
         let second = LocalEndpoint::named_pipe_in_root(Path::new(r"C:\two\runtime"), "default");
         assert_ne!(first, second);
@@ -267,12 +276,21 @@ mod tests {
 
     #[test]
     fn scoped_endpoints_still_reject_unsafe_inputs() {
+        // A relative runtime directory is refused on every platform, so this case is not
+        // gated. An absolute root is supplied per platform rather than reusing a Windows
+        // path: `C:\runtime` is relative on unix, so the previous fixture asserted the
+        // wrong error for the wrong reason there.
         assert_eq!(
             LocalEndpoint::named_pipe_in_root(Path::new("relative"), "default"),
             Err(EndpointError::RelativeRuntimeDirectory)
         );
+        let absolute = if cfg!(windows) {
+            Path::new(r"C:\runtime")
+        } else {
+            Path::new("/run/jarvis")
+        };
         assert_eq!(
-            LocalEndpoint::named_pipe_in_root(Path::new(r"C:\runtime"), "bad/name"),
+            LocalEndpoint::named_pipe_in_root(absolute, "bad/name"),
             Err(EndpointError::InvalidProfileName)
         );
     }
