@@ -87,22 +87,26 @@ jobs:
           # was dropped. Fewer lines is the point: the goal is that the error survives
           # the cap.
           #
-          # A rustc diagnostic is `error[E0433]: message`, a ` --> file:line:col` span,
-          # the source line, and a caret. Six lines after the first `error[E` is enough
-          # to identify the code and the location.
-          diag="$(grep -a -n -A6 -m1 'error\[E' clippy.txt)"
-          if [ -z "$diag" ]; then
-            diag="$(grep -a -n -A4 -m1 '^error: ' clippy.txt)"
-          fi
-          if [ -n "$diag" ]; then
-            echo "$diag" | head -n 8 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-          else
-            tail -n 4 clippy.txt | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-          fi
+          # One line PER DIAGNOSTIC, not a region around the first one.
+          #
+          # This is the third iteration of this reporting and the reason it keeps
+          # changing is that GitHub caps annotations per check run and silently drops the
+          # rest, while rustc reports every error it finds. Emitting a context region for
+          # the first error therefore spent the whole annotation budget on one problem,
+          # and each CI run revealed exactly one lint. Emitting only the short-format
+          # `file:line:col: error: message` lines puts as many distinct diagnostics as the
+          # cap allows into the annotations, so one run can reveal several at once.
+          #
+          # A rustc diagnostic carries a code (`error[E0433]`); a lint promoted by
+          # `-D warnings` has none (`error: ...` or `warning: ...`). Both shapes are
+          # short-format lines matching this pattern.
+          grep -a -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt | head -n 12 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          echo "===== all diagnostics ====="
+          grep -a -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt | head -n 60 || true
+          echo "===== tail ====="
+          tail -n 10 clippy.txt || true
 
           echo "===== diagnostic (full) ====="
           cat clippy.txt
