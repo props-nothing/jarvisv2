@@ -1,0 +1,53 @@
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+ignore = []
+
+[licenses]
+# `CDLA-Permissive-2.0` is a permissive license for *data*, not code. It is the
+# license of the CA certificate bundle distributed by `webpki-root-certs`, which
+# arrives through `reqwest` -> `rustls-platform-verifier`. Allowing it grants no
+# rights over executable code; it authorizes redistribution of the root
+# certificate list. It sits alongside the existing `CC0-1.0` and `Unicode-DFS-2016`
+# data/content licenses for the same reason.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.93
+include-dev = true
+unused-allowed-license = "allow"
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = true
+unused = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
+allow-git = []
+unused-allowed-source = "allow"

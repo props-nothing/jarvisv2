@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "apps/jarvis-cli",
+    "apps/jarvisd",
+    "crates/jarvis-application",
+    "crates/jarvis-core",
+    "crates/jarvis-diagnostics",
+    "crates/jarvis-models",
+    "crates/jarvis-observability",
+    "crates/jarvis-protocol",
+    "crates/jarvis-storage",
+    "tests/e2e",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+
+[workspace.dependencies]
+atomic-write-file = "0.3.1"
+async-trait = "0.1.92"
+bytes = "1.12.0"
+etcetera = "0.11.0"
+futures-core = "0.3.34"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+jarvis-application = { path = "crates/jarvis-application", version = "0.1.0" }
+jarvis-core = { path = "crates/jarvis-core", version = "0.1.0" }
+jarvis-diagnostics = { path = "crates/jarvis-diagnostics", version = "0.1.0" }
+jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
+jarvis-observability = { path = "crates/jarvis-observability", version = "0.1.0" }
+jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
+jarvis-storage = { path = "crates/jarvis-storage", version = "0.1.0" }
+libsqlite3-sys = { version = "=0.37.0", features = ["bundled"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["http2", "json", "rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "=0.9.0", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite-bundled"] }
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["serde", "serde-well-known"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt"] }
+toml = "1.1.6"
+tracing = { version = "=0.1.44", features = ["attributes"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std"] }
+uuid = { version = "1.26.1", features = ["v7"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

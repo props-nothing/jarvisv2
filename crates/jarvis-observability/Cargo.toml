@@ -1,0 +1,16 @@
+[package]
+name = "jarvis-observability"
+description = "Structured logging, correlation, and secret redaction for JARVIS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

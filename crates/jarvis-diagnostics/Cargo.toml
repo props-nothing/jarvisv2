@@ -1,0 +1,22 @@
+[package]
+name = "jarvis-diagnostics"
+description = "Offline, non-mutating diagnosis and repair for a local JARVIS installation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+jarvis-observability.workspace = true
+jarvis-protocol.workspace = true
+jarvis-storage.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

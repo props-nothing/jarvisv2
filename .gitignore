@@ -1,0 +1,70 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python prototype and worker environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# JavaScript and desktop builds
+node_modules/
+dist/
+.vite/
+coverage/
+ui/web/.env.local
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+*.swp
+
+# Environment and local overrides
+.env
+.env.*
+!.env.example
+*.local.toml
+*.local.json
+
+# Secrets, credentials, certificates, and tokens
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.token
+/secrets/
+/credentials/
+example/config/api_keys.json
+example/config/certs/
+
+# User data and generated runtime state
+/data/
+/state/
+/logs/
+/recordings/
+/transcripts/
+/backups/
+example/memory/long_term.json
+
+# Local databases and sidecars (migrations and committed fixtures use explicit paths)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Test and tooling artifacts
+/artifacts/
+/test-results/
+playwright-report/
+.coverage
+*.profraw
+*.profdata

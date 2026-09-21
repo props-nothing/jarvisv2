@@ -1,0 +1,19 @@
+[package]
+name = "jarvis-acceptance"
+description = "Process-level acceptance gate: proves the installed platform, not libraries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A test-only package: the library target is empty so the gate lives entirely in
+# integration tests and never becomes a dependency of shipped code.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+jarvis-storage.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "jarvis-storage"
+description = "Storage adapters and migration infrastructure for JARVIS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+atomic-write-file.workspace = true
+etcetera.workspace = true
+jarvis-core.workspace = true
+libsqlite3-sys.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+jarvis-protocol.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+
+[lints]
+workspace = true
