@@ -14,7 +14,10 @@ The CLI and desktop use a local transport by default:
 
 - Unix domain socket on Linux and macOS
 - named pipe on Windows
-- authenticated loopback HTTP fallback only where platform/library constraints require it
+- authenticated loopback HTTP as a **peer transport**, not a fallback. ADR-0011 settled this:
+  the HTTP surface is how clients that cannot speak a pipe or socket (a browser, the Tauri web
+  view, an OpenAI-compatible voice brain) reach the daemon, while local IPC stays **preferred**
+  for the CLI and desktop because it is OS-protected and needs no port.
 
 Local transport still binds requests to a client identity and profile. Filesystem presence or local-user status is not automatically authorization for every operation. Socket/pipe permissions are restrictive and `doctor` verifies them.
 
@@ -30,7 +33,34 @@ The first local slice is implemented and verified end to end on Windows:
 - Authentication: a per-profile 32-byte credential stored beside the configuration (Unix `0600`, Windows current-user-only ACL through the private config directory). Comparison is length-independent and content-constant-time; an accepted-or-rejected handshake is the only outcome.
 - Endpoint: Unix domain socket at `runtime/jarvis.sock`; Windows byte-mode named pipe `\\.\pipe\jarvis-<profile>-<root-hash>` with remote clients rejected and first-instance protection on the daemon's initial instance. Windows pipe names are machine-global, so the runtime directory is folded in through a stable hash: otherwise a portable profile named `default` would collide with a natively installed `default`.
 - Commands: `status` and `health`. Requests are bounded per connection and the daemon returns a stable `WireError` envelope with a correlation ID.
-- The authenticated loopback HTTP fallback remains unbuilt; it is required only if a platform/library constraint makes native IPC unavailable.
+
+### Implemented HTTP Transport (`P2-007`)
+
+ADR-0011 makes the HTTP API a first-class, **separately enabled** peer transport. What exists:
+
+- Routes: `POST /api/v1/runs`, `GET /api/v1/runs/{id}`, `POST /api/v1/runs/{id}/cancel`,
+  `GET /api/v1/runs/{id}/events`, `GET /api/v1/runs/{id}/stream`, plus `/health/live` and
+  `/health/ready`.
+- Authentication is the **same** profile credential, verified through the same
+  `ClientCredential::matches`, presented only in the `Authorization: Bearer` header. There is no
+  second authentication implementation and no third-party auth middleware, so the two transports
+  cannot disagree about who is admitted. The health routes are authenticated too: an
+  unauthenticated liveness endpoint would tell any local process whether a daemon is running.
+- Errors reuse `WireError`, so one error vocabulary spans transports. A test asserts the HTTP
+  refusal carries `ErrorCode::Authentication`, which is the same code the local transport
+  reports for the same condition.
+- The stream is replayable from the durable `run_events` record by sequence cursor
+  (`Last-Event-ID`), and a cursor beyond what the daemon holds is an explicit resync
+  (`409`) rather than an empty success. A malformed cursor is refused rather than defaulted:
+  defaulting it downward replays events the client already holds, and defaulting it upward skips
+  events, and both failures look like a working stream.
+- Bound to loopback and **off by default** (`daemon.http_enabled`, `JARVIS_HTTP_ENABLED`;
+  `daemon.http_port`, `JARVIS_HTTP_PORT`, default `8765`). Reaching a non-loopback interface is
+  remote mode, owned by `P10-004` as an explicit TLS-terminated configuration.
+
+Still unbuilt from the surface below: `sessions`, `tools`, `approvals`, `memories`,
+`connectors`, `runtimes`, and `models`. **Nothing invokes a model yet**, so a run reaches
+`received` and stays there; the run executor is `P2-009`.
 
 ## HTTP API
 
