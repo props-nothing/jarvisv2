@@ -84,27 +84,18 @@ jobs:
           fi
           echo "::error::clippy.txt has $(wc -l < clippy.txt) lines"
 
-          # 1. Every line mentioning an error, with its line number in the output.
-          #    `-a` treats the file as text so a binary byte cannot stop the scan.
-          grep -n -a -iE '(^|[^a-z])error' clippy.txt | head -n 20 | while IFS= read -r line; do
+          # 1. The decisive output, with two lines of leading context per hit. An error
+          #    is `error[E0432]: ...` followed by a ` --> file:line:col` location, so the
+          #    context lines are what identify the code, not the summary line. GitHub
+          #    caps annotations per check run, so this is emitted first and alone.
+          grep -n -a -B2 -iE 'error(\[|:)' clippy.txt | head -n 30 | while IFS= read -r line; do
             echo "::error::${line}"
           done
 
-          # 2. The tail, where a span-less compile or link failure appears.
-          echo "::error::--- last 20 lines ---"
-          tail -n 20 clippy.txt | while IFS= read -r line; do
-            echo "::error::${line}"
-          done
-
-          # 3. Diagnostics that carry a span become file-annotated errors.
-          grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.txt 2>/dev/null \
-            | sed -E 's/^([^ :]+):([0-9]+):([0-9]+): /::error file=\1,line=\2,col=\3::/' \
-            | head -n 15 || true
-
-          echo "===== error lines ====="
-          grep -n -a -iE '(^|[^a-z])error' clippy.txt 2>/dev/null | head -n 80 || true
+          echo "===== error lines with context ====="
+          grep -n -a -B2 -iE 'error(\[|:)' clippy.txt 2>/dev/null | head -n 80 || true
           echo "===== tail ====="
-          tail -n 60 clippy.txt 2>/dev/null || true
+          tail -n 40 clippy.txt 2>/dev/null || true
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Phase 1 acceptance gate
