@@ -67,45 +67,40 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # Reporting is deliberately unconditional and complete for the error region.
+          # `set +e` first, because a reporting step must never be the thing that fails.
           #
-          # Several rounds were spent INFERRING the cause because each version of this
-          # step reported something unusable: nothing at all, then cargo's
-          # `Downloading crates ...` progress noise, then a grep that matched only the
-          # `could not compile` summaries. The reason it matters is that this environment
-          # cannot check the failing code locally: `jarvis-storage`, `jarvis-diagnostics`
-          # and `jarvis-models` need a C toolchain for a non-native target (bundled SQLite
-          # and aws-lc-sys), and no C compiler is installed, so their `#[cfg(unix)]` code
-          # is only ever compiled by CI. Annotations are the only diagnostic channel
-          # readable without authenticating, so they have to carry the whole story.
-          #
-          # Everything from the first diagnostic to the end of the output is emitted, so
-          # the error code, its ` --> file:line:col` span, any `note:` lines, and the
-          # per-crate summaries all appear. GitHub caps annotations per check run, hence
-          # the 45-line bound and the absence of any other decoration.
-          if [ ! -f clippy.txt ]; then
-            echo "::error::clippy.txt was not created by the lint step"
-            exit 0
-          fi
+          # GitHub runs `bash` steps with `-e -o pipefail`. Under `-e`, a `grep` that
+          # finds nothing exits 1 and aborts the script, so the previous version of this
+          # step FAILED ITSELF with exit code 1 and emitted only its first line -- the
+          # annotations showed "clippy.txt has 397 lines" and then nothing, which is why
+          # the underlying compile error stayed unreadable. It was validated locally with
+          # `set -u` only, which does not reproduce the runner's errexit. Validate shell
+          # steps with `bash -eo pipefail`.
+          set +e
+
+          [ -f clippy.txt ] || { echo "::error::clippy.txt was not created by the lint step"; exit 0; }
           echo "::error::clippy.txt has $(wc -l < clippy.txt) lines; error region follows"
 
-          # Print from the first diagnostic to the end, so the span and the notes are
-          # included rather than just the summary line.
-          first=$(grep -n -a -m1 -iE 'error(\[|:)' clippy.txt | cut -d: -f1)
-          if [ -n "${first:-}" ]; then
-            tail -n "+${first}" clippy.txt | head -n 45 | while IFS= read -r line; do
-              echo "::error::${line}"
+          # Print from the first diagnostic to the end, so the error code, its
+          # ` --> file:line:col` span, the source line, and any `= help:` notes are all
+          # visible. Annotations are the only diagnostic channel readable without
+          # authenticating, and this environment cannot compile the failing crates
+          # locally: `jarvis-storage`, `jarvis-diagnostics` and `jarvis-models` need a C
+          # toolchain for a non-native target and no C compiler is installed here.
+          first="$(grep -n -a -m1 -iE 'error(\[|:)' clippy.txt | cut -d: -f1)"
+          if [ -n "$first" ]; then
+            tail -n "+$first" clippy.txt | head -n 45 | while IFS= read -r line; do
+              echo "::error::$line"
             done
           else
-            echo "::error::no 'error' line found; last 45 lines follow"
             tail -n 45 clippy.txt | while IFS= read -r line; do
-              echo "::error::${line}"
+              echo "::error::$line"
             done
           fi
 
           echo "===== error region ====="
-          if [ -n "${first:-}" ]; then
-            tail -n "+${first}" clippy.txt | head -n 120 || true
+          if [ -n "$first" ]; then
+            tail -n "+$first" clippy.txt | head -n 120
           fi
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
