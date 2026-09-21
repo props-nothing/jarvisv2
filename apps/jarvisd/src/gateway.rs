@@ -427,11 +427,18 @@ mod tests {
     /// **The falsification test for the authentication guard.** A valid credential succeeds and
     /// every other shape fails closed. Only asserting the happy path would pass with the
     /// middleware removed entirely.
+    ///
+    /// The refusal is also decoded and asserted to carry [`ErrorCode::Authentication`], which is
+    /// the code the local IPC transport reports from `ClientSession::connect` for the same
+    /// condition (`crates/jarvis-protocol/tests/local_transport.rs`,
+    /// `a_wrong_credential_is_refused_over_native_transport`). ADR-0011 requires one error
+    /// vocabulary across transports, so asserting only a status here would let the two diverge
+    /// while both still "refused the client".
     #[tokio::test]
     async fn a_request_without_the_credential_is_refused() {
         let (app, presented, _profile) = test_router().await;
         let truncated = presented[..presented.len() - 1].to_owned();
-        let padded = format!("  {presented}");
+        let padded = format!(" {presented}");
         let wrong = "0".repeat(presented.len());
 
         for (label, supplied) in [
@@ -450,6 +457,15 @@ mod tests {
                 response.status(),
                 StatusCode::UNAUTHORIZED,
                 "{label} must be refused"
+            );
+
+            let body = body_text(response).await;
+            let error: jarvis_protocol::WireError = serde_json::from_str(&body)
+                .unwrap_or_else(|error| panic!("decode {label} refusal {body}: {error}"));
+            assert_eq!(
+                error.code,
+                ErrorCode::Authentication,
+                "{label} must report the same authentication code the local transport reports"
             );
         }
 
