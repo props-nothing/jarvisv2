@@ -47,6 +47,15 @@
 //! dropping one**, because dropping one would make the reachable tool set depend on configuration
 //! order.
 //!
+//! A fifth rule follows from rule 1 rather than standing beside it. **A server's change of
+//! self-description is recorded, not refused.** Because rule 1 means the server's own name is never
+//! an identity, nothing else in the protocol can notice that the process behind an operator's chosen
+//! name has changed — so [`McpCatalog`] compares each server's [`ReportedIdentity`] against a previous
+//! observation and reports an [`IdentityDrift`] when the name it claims differs. It is deliberately
+//! not an error: a vendor renaming its product is ordinary, and making that an outage would be
+//! worse than the thing it guards against. What matters is that the operator who classified *that
+//! name* can find out.
+//!
 //! # A note on what is not yet proven
 //!
 //! Nothing here has been exercised against a real MCP server. The rules are derived from the
@@ -64,7 +73,8 @@ mod definition;
 mod server;
 
 pub use catalog::{
-    CatalogEntry, CatalogError, CatalogExclusion, ConfiguredServer, MAX_MCP_SERVERS, McpCatalog,
+    CatalogEntry, CatalogError, CatalogExclusion, ConfiguredServer, IdentityDrift, MAX_MCP_SERVERS,
+    McpCatalog, ObservedServer, ServerListing,
 };
 pub use conformance::{
     ConformanceError, ConformanceReport, HEADER_ANNOTATION, MAX_CONFORMANCE_PROBLEMS,

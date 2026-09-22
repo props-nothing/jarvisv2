@@ -39,7 +39,7 @@ use jarvis_tools::{MAX_REGISTERED_TOOLS, ToolDefinition};
 use crate::definition::{
     ListingOutcome, McpToolListing, ToolEffectPolicy, TranslatedTool, translate_listing,
 };
-use crate::server::{NameAssignments, NamingStrategy, ServerName};
+use crate::server::{NameAssignments, NamingStrategy, ReportedIdentity, ServerName};
 
 /// The most MCP servers one catalog will hold.
 ///
@@ -62,6 +62,21 @@ pub struct ConfiguredServer {
     pub policy: ToolEffectPolicy,
 }
 
+/// One server's listing, as the caller obtained it.
+///
+/// Carries what the server said about **itself**, because that is evidence a catalog has to record
+/// rather than discard: a change in it between two `tools/list` refreshes is the only observable
+/// signal that the thing behind an operator's chosen name is now a different process.
+#[derive(Clone, Debug)]
+pub struct ServerListing<'a> {
+    /// Which configured server this came from.
+    pub server: ServerName,
+    /// What the server reported in its result metadata.
+    pub reported: ReportedIdentity,
+    /// The tools it offered.
+    pub tools: Vec<McpToolListing<'a>>,
+}
+
 /// Explains why a listing could not be added to the catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogError {
@@ -73,6 +88,15 @@ pub enum CatalogError {
     /// visible, rather than silently tolerated.
     DuplicateServer {
         /// The server name that appeared twice.
+        server: String,
+    },
+    /// Two listings claim one server.
+    ///
+    /// Refused rather than resolved by first-match, for the same reason a cross-server collision is: the
+    /// two are different observations of one server, and which one won would depend on argument order —
+    /// the order-dependence this whole module exists to eliminate.
+    DuplicateListing {
+        /// The server named by both listings.
         server: String,
     },
     /// The catalog holds as many servers as it will.
@@ -88,6 +112,10 @@ impl fmt::Display for CatalogError {
             Self::DuplicateServer { server } => write!(
                 formatter,
                 "the MCP server {server} is configured more than once"
+            ),
+            Self::DuplicateListing { server } => write!(
+                formatter,
+                "the MCP server {server} was listed more than once"
             ),
             Self::TooManyServers { limit } => {
                 write!(formatter, "an MCP catalog holds at most {limit} servers")
@@ -120,6 +148,42 @@ pub struct CatalogEntry {
     pub remote: String,
 }
 
+/// What a server asserted about itself, as seen during one catalog build.
+///
+/// Recorded per server rather than folded into the entries, because the question it answers is about
+/// the *server* — and it is the only evidence that connects an operator's chosen name to the process
+/// that answered for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedServer {
+    /// The operator-chosen name the listing was requested under.
+    pub server: ServerName,
+    /// What the server said about itself.
+    pub reported: ReportedIdentity,
+}
+
+/// A server whose self-report changed between two builds.
+///
+/// # Why this is a security signal rather than a curiosity
+///
+/// An operator chose a name, and a policy, for *a server*. If the thing answering under that name has
+/// changed — a different version, or a different vendor's process — then the tools being catalogued
+/// are not the tools the operator classified, and the posture applied to them is a statement about
+/// something else. Nothing else in the protocol ties an operator's decision to an implementation: the
+/// specification explicitly says the server's own name "is not guaranteed to be unique across servers".
+///
+/// JARVIS deliberately does **not** refuse on a drift. A version bump is a legitimate reason for the
+/// report to change, and refusing would make every ordinary upgrade an outage. What it does instead is
+/// make the change **visible and actionable** rather than silent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityDrift {
+    /// The server, by the operator's name.
+    pub server: String,
+    /// What was recorded before.
+    pub before: ReportedIdentity,
+    /// What is reported now.
+    pub after: ReportedIdentity,
+}
+
 /// Every tool a set of configured servers offers.
 ///
 /// Holds **routing**, not authority: `definition` carries the effects, risk, and approval posture,
@@ -138,48 +202,44 @@ pub struct McpCatalog {
     /// error would silently stop the catalog refusing. The category is data, not prose.
     collisions: Vec<CatalogExclusion>,
     truncations: Vec<CatalogExclusion>,
+    /// What each server said about itself during this build, in server-name order.
+    observed: Vec<ObservedServer>,
+    /// Servers whose self-report changed since the previous build, in server-name order.
+    drifts: Vec<IdentityDrift>,
 }
 
 impl McpCatalog {
     /// Translates every listing, refusing any tool that collides across servers.
     ///
-    /// `listings` is paired with `servers` by the returned entries rather than by position: a server
-    /// whose name is unknown is refused, so a caller cannot supply listings in an order that
-    /// silently attributes one server's tools to another.
+    /// `seen_before` is what each server reported on an earlier build — a prior catalog's
+    /// [`Self::observed`] — and a change is recorded as an [`IdentityDrift`] rather than refused. Pass
+    /// an empty slice on the first build.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError`] when a server appears twice in `servers`, or when there are more
-    /// servers than [`MAX_MCP_SERVERS`]. Neither is a per-tool condition: both mean the configuration
-    /// itself is ambiguous, and serving a subset of an ambiguous configuration would hide that.
+    /// Returns [`CatalogError`] when a server appears twice in `servers`, when there are more servers
+    /// than [`MAX_MCP_SERVERS`], or when two listings claim one server. None is a per-tool condition:
+    /// each means the configuration itself is ambiguous, and serving a subset of an ambiguous
+    /// configuration would hide that.
     pub fn build(
         servers: &[ConfiguredServer],
-        listings: &[(ServerName, Vec<McpToolListing<'_>>)],
+        listings: &[ServerListing<'_>],
         strategy: NamingStrategy,
+        seen_before: &[ObservedServer],
     ) -> Result<Self, CatalogError> {
-        let mut seen = BTreeSet::new();
-        for configured in servers {
-            if !seen.insert(configured.name.clone()) {
-                return Err(CatalogError::DuplicateServer {
-                    server: configured.name.to_string(),
-                });
-            }
-        }
-        if servers.len() > MAX_MCP_SERVERS {
-            return Err(CatalogError::TooManyServers {
-                limit: MAX_MCP_SERVERS,
-            });
-        }
+        admit_configuration(servers, listings)?;
 
         let mut assignments = NameAssignments::new();
         let mut entries: Vec<CatalogEntry> = Vec::new();
         let mut exclusions = Vec::new();
         let mut collisions = Vec::new();
+        let mut observed = Vec::new();
+        let mut drifts = Vec::new();
 
         for configured in servers {
-            let Some((_, tools)) = listings
+            let Some(listing) = listings
                 .iter()
-                .find(|(server, _)| server == &configured.name)
+                .find(|listing| listing.server == configured.name)
             else {
                 // A configured server with no listing contributed no tools. Not an error: a server may
                 // be unreachable, or may simply offer nothing. Reported as an exclusion so the absence
@@ -191,11 +251,22 @@ impl McpCatalog {
                 });
                 continue;
             };
+            let (observation, drift) =
+                observe_identity(&configured.name, &listing.reported, seen_before);
+            observed.push(observation);
+            if let Some(drift) = drift {
+                drifts.push(drift);
+            }
 
             let ListingOutcome {
                 tools: translated,
                 excluded,
-            } = translate_listing(&configured.name, tools, strategy, &configured.policy);
+            } = translate_listing(
+                &configured.name,
+                &listing.tools,
+                strategy,
+                &configured.policy,
+            );
 
             for exclusion in excluded {
                 exclusions.push(CatalogExclusion {
@@ -224,45 +295,7 @@ impl McpCatalog {
             }
         }
 
-        // Deterministic output order, so a catalog built from the same configuration twice is equal
-        // and a discovery list does not depend on iteration order.
-        entries.sort_by(|left, right| left.definition.id().cmp(right.definition.id()));
-        let sort_exclusions = |list: &mut Vec<CatalogExclusion>| {
-            list.sort_by(|left, right| {
-                left.server
-                    .cmp(&right.server)
-                    .then_with(|| left.tool.cmp(&right.tool))
-            });
-        };
-        sort_exclusions(&mut exclusions);
-        sort_exclusions(&mut collisions);
-
-        // The registry bound is enforced here rather than discovered at registration, because a
-        // catalog that silently exceeded it would fail later, in a different component, with an
-        // error that names the registry rather than the configuration that caused it.
-        let mut kept = Vec::with_capacity(entries.len().min(MAX_REGISTERED_TOOLS));
-        let mut truncations = Vec::new();
-        for entry in entries {
-            if kept.len() >= MAX_REGISTERED_TOOLS {
-                truncations.push(CatalogExclusion {
-                    server: entry.server.to_string(),
-                    tool: entry.remote,
-                    reason: format!(
-                        "the registry holds at most {MAX_REGISTERED_TOOLS} tools, and this one was \
-                         beyond the bound"
-                    ),
-                });
-                continue;
-            }
-            kept.push(entry);
-        }
-
-        Ok(Self {
-            entries: kept,
-            exclusions,
-            collisions,
-            truncations,
-        })
+        Ok(finalize(entries, exclusions, collisions, observed, drifts))
     }
 
     /// Returns the tools the catalog will offer, in identifier order.
@@ -300,6 +333,21 @@ impl McpCatalog {
     #[must_use]
     pub fn collisions(&self) -> &[CatalogExclusion] {
         &self.collisions
+    }
+
+    /// Returns what each server said about itself during this build.
+    ///
+    /// This is the value to pass back as `seen_before` on the next build, which is what turns a
+    /// self-report change into an observable [`IdentityDrift`].
+    #[must_use]
+    pub fn observed(&self) -> &[ObservedServer] {
+        &self.observed
+    }
+
+    /// Returns the servers whose self-report changed since `seen_before`.
+    #[must_use]
+    pub fn drifts(&self) -> &[IdentityDrift] {
+        &self.drifts
     }
 
     /// Returns the definitions, ready for `ToolRegistry::define_all`.
@@ -345,6 +393,122 @@ impl McpCatalog {
     }
 }
 
+/// Refuses a configuration that cannot be answered unambiguously before any of it is translated.
+///
+/// These three checks are the ones where a later failure would name the wrong thing: a duplicate
+/// server would produce two entries that a caller cannot tell apart, exceeding the bound would be
+/// discovered at registration rather than here, and two listings for one server would make an
+/// observation depend on argument order.
+fn admit_configuration(
+    servers: &[ConfiguredServer],
+    listings: &[ServerListing<'_>],
+) -> Result<(), CatalogError> {
+    let mut seen = BTreeSet::new();
+    for configured in servers {
+        if !seen.insert(configured.name.clone()) {
+            return Err(CatalogError::DuplicateServer {
+                server: configured.name.to_string(),
+            });
+        }
+    }
+    if servers.len() > MAX_MCP_SERVERS {
+        return Err(CatalogError::TooManyServers {
+            limit: MAX_MCP_SERVERS,
+        });
+    }
+    let mut listed = BTreeSet::new();
+    for listing in listings {
+        if !listed.insert(listing.server.clone()) {
+            return Err(CatalogError::DuplicateListing {
+                server: listing.server.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Records what a server said about itself, and whether that differs from what it said before.
+///
+/// The drift is deliberately **not** fatal. A vendor legitimately renames a product, and turning that
+/// into a refusal would make an ordinary upgrade an outage. The point is visibility: an operator
+/// classified *a server by name*, and if the process behind the name changed, the posture applies to
+/// something the operator may never have seen. Nothing else in the protocol records that, because a
+/// server's own name is explicitly not treated as an identity.
+fn observe_identity(
+    server: &ServerName,
+    reported: &ReportedIdentity,
+    seen_before: &[ObservedServer],
+) -> (ObservedServer, Option<IdentityDrift>) {
+    let observation = ObservedServer {
+        server: server.clone(),
+        reported: reported.clone(),
+    };
+    let drift = seen_before
+        .iter()
+        .find(|previous| previous.server == *server)
+        .filter(|previous| !previous.reported.agrees_with(reported))
+        .map(|previous| IdentityDrift {
+            server: server.to_string(),
+            before: previous.reported.clone(),
+            after: reported.clone(),
+        });
+    (observation, drift)
+}
+
+/// Sorts every list into a deterministic order and applies the registry bound.
+///
+/// Sorting here rather than at each call site means a catalog built twice from the same arguments is
+/// equal, and a discovery list cannot depend on iteration order.
+fn finalize(
+    mut entries: Vec<CatalogEntry>,
+    mut exclusions: Vec<CatalogExclusion>,
+    mut collisions: Vec<CatalogExclusion>,
+    mut observed: Vec<ObservedServer>,
+    mut drifts: Vec<IdentityDrift>,
+) -> McpCatalog {
+    entries.sort_by(|left, right| left.definition.id().cmp(right.definition.id()));
+    let sort_exclusions = |list: &mut Vec<CatalogExclusion>| {
+        list.sort_by(|left, right| {
+            left.server
+                .cmp(&right.server)
+                .then_with(|| left.tool.cmp(&right.tool))
+        });
+    };
+    sort_exclusions(&mut exclusions);
+    sort_exclusions(&mut collisions);
+    observed.sort_by(|left, right| left.server.cmp(&right.server));
+    drifts.sort_by(|left, right| left.server.cmp(&right.server));
+
+    // The registry bound is enforced here rather than discovered at registration, because a catalog
+    // that silently exceeded it would fail later, in a different component, with an error that names
+    // the registry rather than the configuration that caused it.
+    let mut kept = Vec::with_capacity(entries.len().min(MAX_REGISTERED_TOOLS));
+    let mut truncations = Vec::new();
+    for entry in entries {
+        if kept.len() >= MAX_REGISTERED_TOOLS {
+            truncations.push(CatalogExclusion {
+                server: entry.server.to_string(),
+                tool: entry.remote,
+                reason: format!(
+                    "the registry holds at most {MAX_REGISTERED_TOOLS} tools, and this one was \
+                     beyond the bound"
+                ),
+            });
+            continue;
+        }
+        kept.push(entry);
+    }
+
+    McpCatalog {
+        entries: kept,
+        exclusions,
+        collisions,
+        truncations,
+        observed,
+        drifts,
+    }
+}
+
 /// Records an assignment, returning the renderable collision reason when one occurred.
 fn record(
     assignments: &mut NameAssignments,
@@ -385,12 +549,11 @@ mod tests {
         }
     }
 
-    /// Builds a listing pair for one server offering the given tool names.
-    fn offers<'a>(
-        name: &str,
-        tools: &'a [String],
-        schema: &'a Value,
-    ) -> (ServerName, Vec<McpToolListing<'a>>) {
+    /// Builds a listing for one server offering the given tool names.
+    ///
+    /// Reports a fixed self-identity, because most tests are about tools rather than about identity;
+    /// the drift tests build their own listings so the identity is explicit at the point it matters.
+    fn offers<'a>(name: &str, tools: &'a [String], schema: &'a Value) -> ServerListing<'a> {
         let listings = tools
             .iter()
             .map(|tool| McpToolListing {
@@ -401,7 +564,32 @@ mod tests {
                 output_schema: None,
             })
             .collect();
-        (server(name), listings)
+        ServerListing {
+            server: server(name),
+            reported: ReportedIdentity::new("fixture-server", Some("Fixture")),
+            tools: listings,
+        }
+    }
+
+    /// Builds a listing with an explicit self-identity, for the drift tests.
+    fn offers_as<'a>(
+        name: &str,
+        reported_name: &str,
+        tools: &'a [String],
+        schema: &'a Value,
+    ) -> ServerListing<'a> {
+        let mut listing = offers(name, tools, schema);
+        listing.reported = ReportedIdentity::new(reported_name, None);
+        listing
+    }
+
+    /// Builds a catalog with no prior observation, which is the first-build case.
+    fn build(
+        servers: &[ConfiguredServer],
+        listings: &[ServerListing<'_>],
+        strategy: NamingStrategy,
+    ) -> Result<McpCatalog, CatalogError> {
+        McpCatalog::build(servers, listings, strategy, &[])
     }
 
     fn names(tools: &[&str]) -> Vec<String> {
@@ -413,7 +601,7 @@ mod tests {
         let schema = schema();
         let first = names(&["search"]);
         let second = names(&["list_issues"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha"), configured("bravo")],
             &[
                 offers("alpha", &first, &schema),
@@ -444,7 +632,7 @@ mod tests {
     fn a_cross_server_collision_is_reported_not_resolved() {
         let schema = schema();
         let shared = names(&["search"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha"), configured("bravo")],
             &[
                 offers("alpha", &shared, &schema),
@@ -479,7 +667,7 @@ mod tests {
         let schema = schema();
         let shared = names(&["search"]);
         for order in [["alpha", "bravo"], ["bravo", "alpha"]] {
-            let catalog = McpCatalog::build(
+            let catalog = build(
                 &[configured(order[0]), configured(order[1])],
                 &[
                     offers("alpha", &shared, &schema),
@@ -501,7 +689,7 @@ mod tests {
     fn the_prefixed_strategy_keeps_two_servers_apart() {
         let schema = schema();
         let shared = names(&["search"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha"), configured("bravo")],
             &[
                 offers("alpha", &shared, &schema),
@@ -519,7 +707,7 @@ mod tests {
     fn each_entry_carries_the_server_and_the_remote_name() {
         let schema = schema();
         let tools = names(&["Search"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha")],
             &[offers("alpha", &tools, &schema)],
             NamingStrategy::Hashed,
@@ -550,7 +738,7 @@ mod tests {
     fn an_unknown_identifier_is_not_routed() {
         let schema = schema();
         let tools = names(&["search"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha")],
             &[offers("alpha", &tools, &schema)],
             NamingStrategy::Prefixed,
@@ -565,7 +753,7 @@ mod tests {
     fn a_server_configured_twice_is_refused() {
         let schema = schema();
         let tools = names(&["search"]);
-        let error = McpCatalog::build(
+        let error = build(
             &[configured("alpha"), configured("alpha")],
             &[offers("alpha", &tools, &schema)],
             NamingStrategy::Prefixed,
@@ -584,7 +772,7 @@ mod tests {
     fn a_server_with_no_listing_is_visible_rather_than_absent() {
         let schema = schema();
         let tools = names(&["search"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha"), configured("silent")],
             &[offers("alpha", &tools, &schema)],
             NamingStrategy::Prefixed,
@@ -611,19 +799,20 @@ mod tests {
             "type": "object",
             "properties": { "q": { "$ref": "https://example.invalid/x.json" } }
         });
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha"), configured("bravo")],
             &[
-                (
-                    server("alpha"),
-                    vec![McpToolListing {
+                ServerListing {
+                    server: server("alpha"),
+                    reported: ReportedIdentity::new("fixture-server", Some("Fixture")),
+                    tools: vec![McpToolListing {
                         name: "broken",
                         title: None,
                         description: None,
                         input_schema: &bad,
                         output_schema: None,
                     }],
-                ),
+                },
                 offers("bravo", &names(&["fine"]), &good),
             ],
             NamingStrategy::Prefixed,
@@ -648,7 +837,7 @@ mod tests {
         let many: Vec<String> = (0..(MAX_REGISTERED_TOOLS + 3))
             .map(|index| format!("tool_{index}"))
             .collect();
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha")],
             &[offers("alpha", &many, &schema)],
             NamingStrategy::Prefixed,
@@ -679,24 +868,24 @@ mod tests {
         let servers: Vec<ConfiguredServer> = (0..=MAX_MCP_SERVERS)
             .map(|index| configured(&format!("s{index}")))
             .collect();
-        let listings: Vec<(ServerName, Vec<McpToolListing<'_>>)> = servers
+        let listings: Vec<ServerListing<'_>> = servers
             .iter()
-            .map(|configured| {
-                (
-                    configured.name.clone(),
-                    tool.iter()
-                        .map(|name| McpToolListing {
-                            name: name.as_str(),
-                            title: None,
-                            description: None,
-                            input_schema: &schema,
-                            output_schema: None,
-                        })
-                        .collect::<Vec<_>>(),
-                )
+            .map(|configured| ServerListing {
+                server: configured.name.clone(),
+                reported: ReportedIdentity::new("fixture-server", Some("Fixture")),
+                tools: tool
+                    .iter()
+                    .map(|name| McpToolListing {
+                        name: name.as_str(),
+                        title: None,
+                        description: None,
+                        input_schema: &schema,
+                        output_schema: None,
+                    })
+                    .collect(),
             })
             .collect();
-        let error = McpCatalog::build(&servers, &listings, NamingStrategy::Prefixed)
+        let error = build(&servers, &listings, NamingStrategy::Prefixed)
             .err()
             .unwrap_or_else(|| panic!("more servers than the bound must be refused"));
         assert_eq!(
@@ -712,7 +901,7 @@ mod tests {
     fn definitions_are_ready_for_the_registry() {
         let schema = schema();
         let tools = names(&["search", "list_issues"]);
-        let catalog = McpCatalog::build(
+        let catalog = build(
             &[configured("alpha")],
             &[offers("alpha", &tools, &schema)],
             NamingStrategy::Prefixed,
@@ -733,10 +922,162 @@ mod tests {
 
     #[test]
     fn an_empty_configuration_produces_an_empty_catalog() {
-        let catalog = McpCatalog::build(&[], &[], NamingStrategy::Prefixed)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let catalog =
+            build(&[], &[], NamingStrategy::Prefixed).unwrap_or_else(|error| panic!("{error}"));
         assert!(catalog.is_empty());
         assert_eq!(catalog.len(), 0);
         assert!(!catalog.has_cross_server_collision());
+        assert!(catalog.observed().is_empty());
+        assert!(catalog.drifts().is_empty());
+    }
+
+    /// **The observable that ties an operator's decision to the process answering for it.** An
+    /// operator classified *a server*; if the thing behind the name changed, the posture applies to
+    /// something the operator never saw. Nothing else in the protocol records that, because the
+    /// server's own name is explicitly not a reliable identity.
+    #[test]
+    fn a_changed_self_report_is_recorded_as_a_drift() {
+        let schema = schema();
+        let tools = names(&["search"]);
+
+        let first = build(
+            &[configured("alpha")],
+            &[offers_as("alpha", "vendor-product", &tools, &schema)],
+            NamingStrategy::Prefixed,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            first.drifts().is_empty(),
+            "a first build has nothing to compare"
+        );
+        assert_eq!(first.observed().len(), 1);
+        assert_eq!(first.observed()[0].reported.name, "vendor-product");
+
+        // Second build: the same operator name, a different process answering.
+        let changed = McpCatalog::build(
+            &[configured("alpha")],
+            &[offers_as("alpha", "different-vendor", &tools, &schema)],
+            NamingStrategy::Prefixed,
+            first.observed(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(changed.drifts().len(), 1, "the change must be reported");
+        let drift = &changed.drifts()[0];
+        assert_eq!(drift.server, "alpha");
+        assert_eq!(drift.before.name, "vendor-product");
+        assert_eq!(drift.after.name, "different-vendor");
+        // It is a report, not a refusal: an ordinary version bump must not be an outage.
+        assert_eq!(changed.len(), 1, "the tools are still offered");
+    }
+
+    /// The positive control: an unchanged report produces no drift, or the check would fire on every
+    /// refresh and be ignored.
+    #[test]
+    fn an_unchanged_self_report_is_not_a_drift() {
+        let schema = schema();
+        let tools = names(&["search"]);
+        let listings = [offers_as("alpha", "vendor-product", &tools, &schema)];
+
+        let first = build(&[configured("alpha")], &listings, NamingStrategy::Prefixed)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = McpCatalog::build(
+            &[configured("alpha")],
+            &listings,
+            NamingStrategy::Prefixed,
+            first.observed(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(second.drifts().is_empty(), "{:?}", second.drifts());
+        assert_eq!(second.len(), 1);
+    }
+
+    /// A drift is about the report, not the tools, so a server that changes what it says about itself
+    /// while offering the same tools still has its tools routed normally.
+    #[test]
+    fn a_drift_does_not_disturb_routing() {
+        let schema = schema();
+        let tools = names(&["search"]);
+        let first = build(
+            &[configured("alpha")],
+            &[offers_as("alpha", "before", &tools, &schema)],
+            NamingStrategy::Prefixed,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let changed = McpCatalog::build(
+            &[configured("alpha")],
+            &[offers_as("alpha", "after", &tools, &schema)],
+            NamingStrategy::Prefixed,
+            first.observed(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(changed.drifts().len(), 1);
+        let entry = &changed.entries()[0];
+        assert_eq!(entry.server.as_str(), "alpha");
+        assert_eq!(entry.remote, "search");
+    }
+
+    /// A server present in `seen_before` but absent now is not a drift: it was simply not listed, and
+    /// that case is already reported as an exclusion.
+    #[test]
+    fn a_server_that_stops_listing_is_not_a_drift() {
+        let schema = schema();
+        let tools = names(&["search"]);
+        let first = build(
+            &[configured("alpha"), configured("bravo")],
+            &[
+                offers_as("alpha", "a", &tools, &schema),
+                offers_as("bravo", "b", &tools, &schema),
+            ],
+            NamingStrategy::Prefixed,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let second = McpCatalog::build(
+            &[configured("alpha"), configured("bravo")],
+            &[offers_as("alpha", "a", &tools, &schema)],
+            NamingStrategy::Prefixed,
+            first.observed(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(second.drifts().is_empty(), "{:?}", second.drifts());
+        assert!(
+            second
+                .exclusions()
+                .iter()
+                .any(|exclusion| exclusion.server == "bravo"),
+            "the missing listing is reported as an exclusion instead"
+        );
+    }
+
+    /// Two listings for one server would be two observations of one thing, and which won would depend
+    /// on argument order — the order-dependence this module exists to eliminate.
+    #[test]
+    fn two_listings_for_one_server_are_refused() {
+        let schema = schema();
+        let tools = names(&["search"]);
+        let error = build(
+            &[configured("alpha")],
+            &[
+                offers_as("alpha", "one", &tools, &schema),
+                offers_as("alpha", "two", &tools, &schema),
+            ],
+            NamingStrategy::Prefixed,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("two listings for one server must be refused"));
+        assert_eq!(
+            error,
+            CatalogError::DuplicateListing {
+                server: "alpha".to_owned()
+            }
+        );
+        assert!(
+            error.to_string().contains("listed more than once"),
+            "{error}"
+        );
     }
 }

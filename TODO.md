@@ -715,10 +715,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       aggregate's job, and the test drives the cross-server case directly rather than pretending one call sees
       two servers.
 - [x] `P3-008c` Aggregate several servers into one catalog, and refuse to serve an ambiguous one.
-      **Closes two limits recorded by `P3-008a`/`P3-008b` rather than deferring them again**: a per-listing
+      **Closes a limit recorded by `P3-008a`/`P3-008b` rather than deferring it again**: a per-listing
       translation builds its own assignment set, so it *structurally* could not see a collision between two
-      servers — and `ReportedIdentity::agrees_with` had a test and no caller. New module
-      `crates/jarvis-mcp/src/catalog.rs`. **67 crate tests; 759 workspace tests.**
+      servers. New module `crates/jarvis-mcp/src/catalog.rs`. **67 crate tests; 759 workspace tests.**
       `McpCatalog` owns **one** `NameAssignments` across every server, so a collision is detected exactly
       where the information exists. `McpCatalog::build` is the first function in this crate that can answer
       "what happens when two servers offer the same name", and the answer is the interesting part:
@@ -750,10 +749,63 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       arguments, so nothing constructs one from `config.toml` and `MAX_MCP_SERVERS`/the strategy cannot be
       set by an operator. Still **nothing exercised against a real MCP server**. The catalog holds
       **routing, not authority** — it carries definitions and server names, and a caller still passes them
-      through the pipeline. Listings are matched by server name rather than by position, but a **duplicate
-      entry in `listings`** is resolved by first-match rather than refused, which is a gap the config layer
-      will need to close since it is the layer that can see duplicate keys. `has_cross_server_collision` is a
-      method, and **nothing calls it yet** — the daemon that would refuse to serve is `P3-009`.
+      through the pipeline. `has_cross_server_collision` is a method, and **nothing calls it yet** — the
+      daemon that would refuse to serve is `P3-009`.
+      **CORRECTION (2026-09-22): this entry's first line and last sentence were both FALSE when written.**
+      The commit message for this slice claimed it "closes two limits ... including `ReportedIdentity::agrees_with`
+      having a test and no caller" — a grep at `1ecbb8e` showed `agrees_with` appeared only in `server.rs`
+      (definition plus a test) and the `lib.rs` re-export, i.e. **still no production caller**. It also claimed a
+      "duplicate entry in `listings`" is **resolved by first-match rather than refused**; that limit is **also
+      false now**, because duplicates are refused (`CatalogError::DuplicateListing`) — but the claim was written
+      as a *deferral to the config layer*, so it read as a live gap and made the slice look honest while the
+      code it described was changing underneath it. This is the **second** time this session that a
+      plausible-sounding recorded claim was false (`expected_version` was the first, at `P3-006c`), and the
+      pattern is the same: **a commit message or ADR reads to the next reader as verified evidence**, so an
+      overclaim propagates exactly like a wrong external doc — the thing this repository's external-research
+      rule exists to prevent, arriving through the door marked "our own notes". The rule that follows is
+      recorded in `docs/development/definition-of-done.md`: **before building on a recorded claim, check the
+      claim; before writing one, check the code.**
+      The work that made the first half true, and closed the second, is the identity-drift slice below.
+- [x] `P3-008d` Report a server whose self-description changed, and refuse two listings for one server.
+      **This is the slice that makes `P3-008c`'s commit message true a day late**, and it is written as its own
+      entry rather than folded into `P3-008c` so that the overclaim stays legible. `ReportedIdentity::agrees_with`
+      now has a **non-test caller** — verified by grep, not by recollection: it appears at exactly one non-test
+      site, `observe_identity`, which is reached from the public `McpCatalog::build`. That is a narrower claim
+      than "it is used in production" and deliberately so, because the wider one would be false: see the limits
+      below. The first-match gap is closed by a refusal.
+      `ServerListing` gives `McpCatalog::build` the server's **`ReportedIdentity`** alongside its tools, and
+      `build` takes `seen_before: &[ObservedServer]`. Where a server's self-report **disagrees with a previous
+      observation**, the difference is recorded as an `IdentityDrift { server, before, after }` and exposed via
+      `drifts()`. **The drift is deliberately not fatal**: a vendor legitimately renames a product, and turning
+      that into a refusal would make an ordinary upgrade an outage. The point is visibility, exactly as with
+      `P3-008a`'s decision that a server does not name itself — an operator classified *a server by name*, and if
+      the process behind the name changed, the posture they chose applies to something they may never have seen.
+      Nothing else in the protocol records that, because the server's own name is explicitly not an identity, so
+      this is the only place the fact can be observed. `agrees_with` is the right predicate for it because it is
+      **deliberately tolerant of a changed `title` and only strict about a changed `name`** — the name is what
+      the operator's decision is bound to.
+      **A duplicate listing is now refused, not first-matched.** Two listings for one server are two
+      *observations of one thing*, and which one wins would depend on argument order — the same
+      order-dependence the collision rule refuses one level down, and the same reason a server configured twice
+      is refused. `CatalogError::DuplicateListing { server }` names the server rather than the index, because an
+      operator acts on a config file, not on a `Vec` position.
+      Four tests, each aimed at a way the check could be wrong rather than a way it could pass: a **first build
+      has nothing to compare** and must report no drift (or the check would be vacuous); a **changed** report
+      produces exactly one drift naming before and after; an **unchanged** report produces none (the positive
+      control — without it, a check that fired on every refresh would be ignored and therefore absent); and a
+      drift **does not disturb routing** (it is about the report, not the tools) and **does not stop the catalog
+      being built**. A server present in `seen_before` but absent now is **not** a drift — it simply was not
+      listed, and that is already reported as an exclusion.
+      **Honest limits.** The drift is reported to whoever calls `build`; **nothing calls it with a prior
+      observation yet**, so in practice every build is a first build until `P3-009` owns the process that
+      persists an observation. `ObservedServer` is not stored anywhere, so a daemon restart loses the baseline
+      and a drift across a restart is invisible. A drift records **that** the report changed and the two texts;
+      it does not classify *how* (rename vs. a different server that reuses a name), because the protocol
+      supplies nothing that could distinguish them — which is precisely why it is a report and not a refusal.
+      Clippy's `too_many_lines` (122/100) on `build` was **right**: the function had grown a second
+      responsibility, so it was split into `admit_configuration`, `observe_identity`, and `finalize` — each one
+      now states a single decision, and `admit_configuration` is where the three "refuse before translating"
+      checks can be read together.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

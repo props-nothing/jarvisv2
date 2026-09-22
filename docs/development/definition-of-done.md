@@ -67,6 +67,24 @@ A TODO item is done only when every applicable section passes. "Code exists," "i
 - [ ] Commands actually run and results are reported.
 - [ ] No unrelated changes, credentials, personal data, build output, or local state are included.
 
+## Recorded Claims
+
+A completion note — a `TODO.md` entry, an ADR, or a commit message — is read by the next person as
+**verified evidence**. Nothing distinguishes a claim that was checked from one that was assumed, so an
+overclaim propagates exactly like a wrong external doc, and it does so behind a door marked "our own
+notes" that the external-research rule does not cover.
+
+- [ ] Every claim in the note was checked against the code at the moment of writing, not against the
+      intent of the change. "Closes limit X" is a claim about a *caller existing*, so it requires a grep
+      for the caller, not a recollection of adding the function.
+- [ ] A limit stated as deferred is still true. Deferring a gap to a later component reads as honesty,
+      so a false deferral survives review longer than a false achievement.
+- [ ] Before building on a recorded claim, check the claim. Two false records have been found this way
+      (`expected_version` in ADR-0022, and a "closes two limits" note at `P3-008c`); both had been read
+      past several times.
+- [ ] A correction is written as a **CORRECTION block on the original entry** with the date and what was
+      false, rather than by editing the entry so it was never wrong. The overclaim is part of the record.
+
 ## Phase Gate
 
 A roadmap phase completes only when all phase TODOs pass this definition and the corresponding scenarios in [acceptance-tests.md](../quality/acceptance-tests.md) are proven on the required platforms. Research completion is not implementation completion; implementation completion is not live verification unless the phase requires it.
