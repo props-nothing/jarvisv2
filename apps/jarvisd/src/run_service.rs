@@ -26,8 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jarvis_core::{
-    CorrelationId, ErrorCode, ExpectedRunState, RunId, SafeMessage, SessionId, SystemClock,
-    UtcTimestamp,
+    CorrelationId, ErrorCode, RunId, SafeMessage, SessionId, SystemClock, UtcTimestamp,
 };
 use jarvis_protocol::{RunReply, StartRunRequest, rest_error, safe};
 use jarvis_storage::{
@@ -167,28 +166,21 @@ impl RunService {
 
     /// Requests cancellation of one run.
     ///
+    /// Takes no expected version, deliberately, and `request_run_cancellation` documents why: a
+    /// cancellation is **operator intent**, and every progress write advances a running run's version,
+    /// so a client's version is stale immediately and the request would be refused with a conflict the
+    /// client cannot resolve. The guard that remains is the one that cannot go stale — a **settled** run
+    /// refuses a cancellation, because there is no work left to stop.
+    ///
+    /// A repeat request is idempotent: the first request time is preserved.
+    ///
     /// # Errors
     ///
-    /// Returns [`RunServiceError`] when the run is absent, the supplied version is stale, or
-    /// the run already settled.
-    pub async fn cancel(
-        &self,
-        id: &str,
-        expected_version: i64,
-    ) -> Result<RunReply, RunServiceError> {
-        let current = find_run(&self.database, id)
+    /// Returns [`RunServiceError`] when the run is absent or has already settled.
+    pub async fn cancel(&self, id: &str) -> Result<RunReply, RunServiceError> {
+        let run = request_run_cancellation(&self.database, id, UtcTimestamp::now(&SystemClock))
             .await
             .map_err(|error| map_database_error(&error))?;
-        let expected = ExpectedRunState::new(current.state(), expected_version);
-
-        let run = request_run_cancellation(
-            &self.database,
-            id,
-            expected,
-            UtcTimestamp::now(&SystemClock),
-        )
-        .await
-        .map_err(|error| map_database_error(&error))?;
         Ok(reply::from_stored(&run))
     }
 }

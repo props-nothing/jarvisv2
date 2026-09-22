@@ -661,41 +661,48 @@ pub async fn settle_run(
 /// `docs/quality/acceptance-tests.md` A04 requires ("new work stops, state settles once").
 /// Marking the run terminal here would report a stopped run before anything stopped.
 ///
+/// # Why there is no expected version
+///
+/// Cancellation is **operator intent**, and `docs/adr/0013-restart-settles-interrupted-runs.md`
+/// establishes that such intent "already outranks the interruption". A version guard on this write was
+/// therefore wrong in two ways, and both were observed rather than theorised:
+///
+/// 1. **A cancel could be lost to the system's own activity.** Every progress write advances the run's
+///    version while the run executes, so a client's version is stale almost immediately. The request
+///    then failed with [`DatabaseError::RunConflict`], which a client cannot act on and cannot resolve —
+///    the version it needs is changing several times a second. The user asked to stop a run and was
+///    refused because the run was running.
+/// 2. **A concurrent-cancel test was flaky for the same reason**, failing only under load and only
+///    intermittently, because the window between reading the version and writing it is where the
+///    executor's next write lands.
+///
+/// The guard that *is* meaningful is kept: a **settled** run refuses a cancellation request, because
+/// there is no work left to stop. That is a fact about the run rather than about who is asking, so it
+/// cannot go stale.
+///
+/// A repeat request is idempotent: `COALESCE` keeps the first request time, so the interval between
+/// asking and stopping stays measurable.
+///
 /// # Errors
 ///
-/// Returns [`DatabaseError::RunTransitionRefused`] for an already-settled run,
-/// [`DatabaseError::RunConflict`] when the expected version is stale, and
+/// Returns [`DatabaseError::RunNotFound`] when no run has that identifier,
+/// [`DatabaseError::RunTransitionRefused`] for an already-settled run, and
 /// [`DatabaseError::Sqlite`] for any other persistence failure.
 pub async fn request_run_cancellation(
     database: &SqliteDatabase,
     id: &str,
-    expected: ExpectedRunState,
     at: UtcTimestamp,
 ) -> Result<StoredRun, DatabaseError> {
-    if expected.state().is_terminal() {
-        return Err(DatabaseError::RunTransitionRefused {
-            source: jarvis_core::RunTransitionError::TerminalStateImmutable {
-                from: expected.state(),
-            },
-        });
-    }
-
-    // The `state NOT IN (...)` clause is not redundant with the expected-state comparison:
-    // it keeps the guard correct even when a caller passes a non-terminal expected state
-    // for a row that has already settled, which the version alone would not catch.
     let result = sqlx::query(
         "UPDATE agent_runs \
-         SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?3), \
-             updated_at = ?4, \
+         SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2), \
+             updated_at = ?2, \
              version = version + 1 \
-         WHERE id = ?1 AND state = ?2 AND version = ?5 \
+         WHERE id = ?1 \
            AND state NOT IN ('completed', 'cancelled', 'failed')",
     )
     .bind(id)
-    .bind(expected.state().as_str())
     .bind(at.to_string())
-    .bind(at.to_string())
-    .bind(expected.version())
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -703,7 +710,24 @@ pub async fn request_run_cancellation(
         source,
     })?;
 
-    require_run_transition(result.rows_affected())?;
+    if result.rows_affected() == 0 {
+        // Either the run is absent or it has settled, and the two are different answers for a caller,
+        // so which one it is comes from reading rather than from guessing. A `RunNotFound` propagates
+        // from the read, which is where identity is actually known.
+        let current = find_run(database, id).await?;
+        if current.state().is_terminal() {
+            return Err(DatabaseError::RunTransitionRefused {
+                source: jarvis_core::RunTransitionError::TerminalStateImmutable {
+                    from: current.state(),
+                },
+            });
+        }
+        // Non-terminal and unmatched is not reachable through the statement above, so reaching it means
+        // a racing writer changed the row between the write and this read. A conflict is the honest
+        // report; silently succeeding would claim a request that was not recorded.
+        return Err(DatabaseError::RunConflict);
+    }
+
     find_run(database, id).await
 }
 
@@ -1275,12 +1299,14 @@ mod tests {
     #[tokio::test]
     async fn cancellation_is_recorded_as_a_request_before_the_run_settles() {
         let (_directory, database) = seeded_database().await;
-        let run = one_run(&database, RUN_A).await;
+        // A run must exist; its version is deliberately NOT read, because a cancellation carries no
+        // expectation for the same reason a client cannot supply a current one: the run's own progress
+        // writes invalidate it.
+        one_run(&database, RUN_A).await;
 
         // A request must not settle the run: acceptance test A04 requires the run to settle
         // once, after the in-flight work has actually stopped.
-        let requested =
-            must(request_run_cancellation(&database, RUN_A, run.expectation(), at(3)).await);
+        let requested = must(request_run_cancellation(&database, RUN_A, at(3)).await);
         assert_eq!(requested.state(), RunState::Received);
         assert_eq!(requested.terminal_outcome(), None);
         assert_eq!(requested.cancellation_requested_at(), Some(at(3)));
@@ -1298,12 +1324,18 @@ mod tests {
     #[tokio::test]
     async fn a_second_cancellation_request_keeps_the_first_request_time() {
         let (_directory, database) = seeded_database().await;
-        let run = one_run(&database, RUN_A).await;
+        one_run(&database, RUN_A).await;
 
-        let first =
-            must(request_run_cancellation(&database, RUN_A, run.expectation(), at(3)).await);
-        let second =
-            must(request_run_cancellation(&database, RUN_A, first.expectation(), at(9)).await);
+        let first = must(request_run_cancellation(&database, RUN_A, at(3)).await);
+        assert_eq!(
+            first.cancellation_requested_at(),
+            Some(at(3)),
+            "the first request records the time"
+        );
+        // The second request is made **without** the version the first one returned, which is the
+        // property that matters: a cancellation carries no expectation, so a caller whose version was
+        // invalidated by the run's own progress writes is still able to ask.
+        let second = must(request_run_cancellation(&database, RUN_A, at(9)).await);
 
         assert_eq!(second.cancellation_requested_at(), Some(at(3)));
         assert_eq!(second.version(), 3);
@@ -1314,7 +1346,7 @@ mod tests {
     async fn cancelling_a_settled_run_is_refused() {
         let (_directory, database) = seeded_database().await;
         let run = one_run(&database, RUN_A).await;
-        let failed = must(
+        must(
             transition_run(
                 &database,
                 RUN_A,
@@ -1325,7 +1357,7 @@ mod tests {
             .await,
         );
 
-        let outcome = request_run_cancellation(&database, RUN_A, failed.expectation(), at(2)).await;
+        let outcome = request_run_cancellation(&database, RUN_A, at(2)).await;
         assert!(
             matches!(
                 outcome,
@@ -1338,7 +1370,6 @@ mod tests {
             "a settled run must not accept a cancellation request, got {outcome:?}"
         );
     }
-
     #[tokio::test]
     async fn a_missing_run_is_reported_and_never_created_by_a_transition() {
         let (_directory, database) = seeded_database().await;
@@ -1812,7 +1843,7 @@ mod tests {
     async fn an_interrupted_run_that_was_already_cancelled_settles_as_cancelled() {
         let (_directory, database) = seeded_database().await;
         let run = at_responding(&database).await;
-        must(request_run_cancellation(&database, run.id(), run.expectation(), at(2)).await);
+        must(request_run_cancellation(&database, run.id(), at(2)).await);
 
         let recovered = must(recover_interrupted_runs(&database, at(3)).await);
         assert_eq!(recovered, vec![run.id().to_owned()]);

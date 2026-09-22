@@ -379,11 +379,14 @@ impl RunClient {
     }
 
     /// Requests cancellation and returns the status the daemon answered with.
-    async fn cancel_run(&self, run_id: &str, expected_version: i64) -> u16 {
+    ///
+    /// Sends **no body**: a cancellation is operator intent and carries no version, because the run's
+    /// own progress writes invalidate a client's version almost immediately. See
+    /// `jarvis_storage::request_run_cancellation`.
+    async fn cancel_run(&self, run_id: &str) -> u16 {
         let path = format!("/runs/{run_id}/cancel");
         let response = self
             .request(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({ "expected_version": expected_version }))
             .send()
             .await
             .unwrap_or_else(|error| panic!("cancel run: {error}"));
@@ -505,13 +508,12 @@ async fn phase2_gate_proves_runs_survive_restart_on_this_platform() {
 
 /// Proves a cancellation is recorded as a request while the run stays in flight.
 async fn assert_cancellation_is_a_request(client: &RunClient) -> String {
-    let (run_id, version) = client.start_run("cancel this run").await;
+    let (run_id, _version) = client.start_run("cancel this run").await;
     assert_eq!(
-        client.cancel_run(&run_id, version).await,
+        client.cancel_run(&run_id).await,
         200,
-        "a cancellation against the current version must be accepted"
+        "a cancellation needs no version, so it is accepted while the run is in flight"
     );
-
     let observed = client.read_run(&run_id).await;
     assert_in_flight(&observed, "a cancelled-before-restart run");
     assert!(

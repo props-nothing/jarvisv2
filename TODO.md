@@ -477,6 +477,36 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       adapter call) and the seam is correct and tested but **not driven**. `P3-012` owns that. Also recorded:
       the digest covers tool, version, and arguments but **not the actor or workspace**, so two actors with the
       same tool and arguments currently produce the same digest — a question `P3-012` should answer.
+- [x] `P3-006b` Bind a tool execution request to the receipt it carries.
+      Found by deliberately hunting the `P3-006a` defect class in the next seam. `ToolExecutionRequest::new`
+      checked only that the receipt had not expired; it never compared the request's `tool`, `tool_version`,
+      or `arguments` against what the receipt authorized. An adapter cannot tell an authorized call from an
+      unauthorized one, so that constructor is the last place the binding can be enforced — the
+      `NotImplemented` path only catches a tool an adapter happens not to implement. Fixed with
+      `ToolNotAuthorized` (tool AND version as a pair) and `ArgumentsNotAuthorized`, which **recomputes**
+      `CanonicalIntentHash` rather than comparing JSON, so key order is not significant. **The evidence it
+      was live rather than theoretical: five existing tests started failing**, because they built requests
+      whose arguments did not match their receipt's digest — one asked for an extra `subject` key the
+      receipt never covered, and had been passing.
+- [x] `P3-006c` Fix the cancellation contract: operator intent cannot be stale.
+      Surfaced from the P3-006b work as an intermittent test failure, which turned out to be a **real
+      user-facing defect in existing code**. `POST /api/v1/runs/{id}/cancel` required `expected_version`,
+      justified in `acceptance-tests.md` as "a client cannot cancel a run it has not read". That is wrong as
+      a control: the executor advances a running run's version at **every state-machine step**, so a
+      client's version is stale almost immediately and the cancel was refused with a `409` the client could
+      not resolve — the user asked to stop a run and was told the run had changed. `RunService::cancel` made
+      it worse by **re-reading the run and then discarding what it read**. `ADR-0013` already establishes
+      that a cancellation request is operator intent which "already outranks the interruption", and `COALESCE`
+      already made a repeat idempotent, so the version guard had no safety role left. Now: no version; the
+      guard is the one that cannot go stale (**a settled run refuses**, because there is no work left to
+      stop); zero-rows-affected is resolved by reading, so `RunNotFound` and `TerminalStateImmutable` stay
+      distinguishable; `CancelRunRequest` is **deleted** from the protocol rather than left with a permissive
+      decoder, and the route takes no body. The flakiness is gone **structurally** — verified by 12
+      consecutive passes — because there is no read-then-write window left. ADR-0022.
+      Honest limits: `expected_version` remains on run start and on approval decisions, and neither has been
+      re-examined against the same reasoning. No `jarvis cancel` CLI verb exists, so the endpoint is
+      exercised only by the gateway test and the e2e gate. Whether a cancellation *request* should emit a
+      `run_events` row is not answered here.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.

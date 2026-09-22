@@ -118,8 +118,17 @@ because a cancellation is recorded by a different request and the value the loop
 The Phase 2 process gate adds the durable half: `POST /api/v1/runs/{id}/cancel` writes
 `cancellation_requested_at` and returns the run in its current state, so the daemon cannot report
 "state settles once" by settling on the request and then settling again when the step notices. The
-request also carries `expected_version`, so a client cannot cancel a run it has not read, and the gate
-proves a cancellation requested before a restart settles as `cancelled` rather than `failed`.
+request carries **no version**, and the gate proves a cancellation requested before a restart settles as
+`cancelled` rather than `failed`. A settled run refuses the request; a repeat keeps the first request
+time, so the request is idempotent.
+
+> **Corrected (ADR-0022).** This paragraph previously said the request "also carries
+> `expected_version`, so a client cannot cancel a run it has not read". That was **wrong as a control**:
+> the executor advances a running run's version as it walks the state machine, so a client's version is
+> stale almost immediately and the request was refused with a `CONFLICT` the client could not resolve —
+> the user asked to stop a run and was told the run had changed. It also made a concurrency test fail
+> intermittently. Cancellation is operator intent, which `ADR-0013` establishes already outranks the
+> interruption, so it now carries no expectation.
 
 **What this does not claim.** Two clauses are unreachable in this phase, and saying so is the honest
 report rather than a partial pass:

@@ -9,8 +9,8 @@ mod wire;
 
 pub use frame::{FrameError, MAX_FRAME_BYTES, decode_frame, encode_frame, read_frame, write_frame};
 pub use rest::{
-    CancelRunRequest, JSON_CONTENT_TYPE, MAX_STREAM_PAGE, RESYNC_HINT_SECONDS, RunEventPageReply,
-    RunEventReply, RunReply, SSE_CONTENT_TYPE, StartRunRequest, rest_error, safe,
+    JSON_CONTENT_TYPE, MAX_STREAM_PAGE, RESYNC_HINT_SECONDS, RunEventPageReply, RunEventReply,
+    RunReply, SSE_CONTENT_TYPE, StartRunRequest, rest_error, safe,
 };
 pub use run_api::{
     API_BASE_PATH, ERROR_EVENT_NAME, JSON_BODY_CONTENT_TYPE, MAX_PATH_SEGMENT_CHARS,

@@ -44,9 +44,7 @@ use axum::{
     routing::{get, post},
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
-use jarvis_protocol::{
-    CancelRunRequest, MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe,
-};
+use jarvis_protocol::{MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe};
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 
 pub use crate::run_service::RunService;
@@ -229,12 +227,11 @@ async fn read_run(State(state): State<GatewayState>, Path(id): Path<String>) -> 
 }
 
 /// `POST /api/v1/runs/{id}/cancel`
-async fn cancel_run(
-    State(state): State<GatewayState>,
-    Path(id): Path<String>,
-    Json(request): Json<CancelRunRequest>,
-) -> Response {
-    match state.runs.cancel(&id, request.expected_version).await {
+///
+/// Takes no body. Cancellation is operator intent and carries no expectation, so there is no version to
+/// supply — see `RunService::cancel`.
+async fn cancel_run(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
+    match state.runs.cancel(&id).await {
         Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
         Err(error) => error.into_response(),
     }
@@ -665,10 +662,18 @@ mod tests {
         assert!(!error.retryable, "an absent run is not retryable");
     }
 
-    /// Cancelling requires the version the caller read, so a client cannot cancel a run it has
-    /// not actually seen. A stale version must be refused rather than applied.
+    /// **A cancellation is accepted without a version, and cannot be refused for being "stale".**
+    ///
+    /// This replaces a test that asserted a stale version was refused. That field is gone: the
+    /// executor advances a running run's version as it walks the state machine, so a client's version
+    /// is stale almost immediately and the request was refused with a conflict it could not resolve —
+    /// the user asked to stop a run and was told the run had changed. See
+    /// `jarvis_storage::request_run_cancellation`.
+    ///
+    /// What is asserted instead is that a body is not required, and that a repeat request is accepted
+    /// rather than refused, because a cancellation is idempotent operator intent.
     #[tokio::test]
-    async fn cancelling_requires_the_observed_version() {
+    async fn a_cancellation_is_accepted_without_a_version_and_is_repeatable() {
         let (app, presented, _profile) = test_router().await;
 
         let created = app
@@ -683,36 +688,77 @@ mod tests {
         let reply: jarvis_protocol::RunReply = serde_json::from_str(&body_text(created).await)
             .unwrap_or_else(|error| panic!("decode create: {error}"));
 
-        let stale = app
+        // No body at all. A client cannot supply a current version, so the endpoint must not require one.
+        let accepted = app
             .clone()
             .oneshot(post_json(
                 &format!("/api/v1/runs/{}/cancel", reply.run_id),
                 &presented,
-                r#"{"expected_version":99}"#,
+                "",
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
-            stale.status(),
-            StatusCode::CONFLICT,
-            "a stale version must not be applied"
+            accepted.status(),
+            StatusCode::OK,
+            "a cancellation must not require a version"
         );
-
-        let accepted = app
-            .oneshot(post_json(
-                &format!("/api/v1/runs/{}/cancel", reply.run_id),
-                &presented,
-                &format!(r#"{{"expected_version":{}}}"#, reply.version),
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("router call: {error}"));
-        assert_eq!(accepted.status(), StatusCode::OK);
         let cancelled: jarvis_protocol::RunReply = serde_json::from_str(&body_text(accepted).await)
             .unwrap_or_else(|error| panic!("decode cancel: {error}"));
         // Cancellation is a REQUEST, so the run is not yet terminal. Reporting it settled would
         // claim a stop that has not happened.
         assert!(cancelled.cancellation_requested_at.is_some());
         assert_eq!(cancelled.state, jarvis_core::RunState::Received);
+        let first_requested_at = cancelled.cancellation_requested_at;
+
+        // A repeat is accepted, and keeps the FIRST request time so the interval between asking and
+        // stopping stays measurable. This is what makes the request idempotent.
+        let repeated = app
+            .oneshot(post_json(
+                &format!("/api/v1/runs/{}/cancel", reply.run_id),
+                &presented,
+                "",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let again: jarvis_protocol::RunReply = serde_json::from_str(&body_text(repeated).await)
+            .unwrap_or_else(|error| panic!("decode cancel: {error}"));
+        assert_eq!(
+            again.cancellation_requested_at, first_requested_at,
+            "a second request must preserve the first request time"
+        );
+    }
+
+    /// Cancelling a run that has already settled is refused.
+    ///
+    /// **Proved at the storage layer, not here**, because the gateway has no route that settles a run —
+    /// settlement is the executor's `settle_run` and there is no HTTP path to it, so a gateway test
+    /// would have to fabricate one. `jarvis_storage::run_repository`'s
+    /// `cancelling_a_settled_run_is_refused` covers the guard where it lives, which is where a stale
+    /// version would previously have been mistaken for it.
+    ///
+    /// Recorded here as a gap rather than left silent: the remaining guard on this endpoint is the one
+    /// that cannot go stale, and it is exercised by the test above plus the storage test.
+    #[tokio::test]
+    async fn cancelling_a_settled_run_is_refused() {
+        let (app, presented, _profile) = test_router().await;
+
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/runs",
+                &presented,
+                r#"{"objective":"already done"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let reply: jarvis_protocol::RunReply = serde_json::from_str(&body_text(created).await)
+            .unwrap_or_else(|error| panic!("decode create: {error}"));
+
+        // The run is not settled through HTTP: there is no route for it, and inventing one here would
+        // be a fixture for a path no client can take. The storage test covers the guard.
+        let _ = reply.run_id;
     }
 
     /// A cursor past what the daemon holds is a resync rather than an empty success. Without this

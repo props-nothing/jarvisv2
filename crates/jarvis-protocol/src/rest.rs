@@ -100,18 +100,6 @@ pub struct RunReply {
     pub cancellation_requested_at: Option<UtcTimestamp>,
 }
 
-/// Request body for `POST /api/v1/runs/{id}/cancel`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CancelRunRequest {
-    /// The row version the caller believes is current.
-    ///
-    /// Required, not optional. Cancellation is a state-dependent request, so supplying the
-    /// version is what stops a client from cancelling a run that already settled and
-    /// silently getting `already cancelled` for a different run's terminal state.
-    pub expected_version: i64,
-}
-
 /// One event stream item as a REST DTO.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunEventReply {
@@ -177,6 +165,7 @@ pub fn safe(message: &str) -> SafeMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jarvis_core::SystemClock;
 
     /// A fixed instant for fixtures.
     ///
@@ -239,14 +228,36 @@ mod tests {
         assert!(!encoded.contains("error_code"));
     }
 
-    /// A cancel request without a version must be refused: the version is what makes the
-    /// operation safe against a run that already settled.
+    /// A cancel request carries no body, so there is nothing to decode and nothing to refuse.
+    ///
+    /// This replaces a test that asserted `expected_version` was required. That field is gone, and the
+    /// reason is recorded in `jarvis_storage::request_run_cancellation`: a cancellation is operator
+    /// intent, and the run's own progress writes invalidate a client's version almost immediately, so
+    /// requiring one let the system refuse the user's request to stop because the run was running.
+    ///
+    /// The assertion that remains is that the type is **not** in the protocol at all, so a client
+    /// written against the old shape fails to compile rather than silently sending a body the daemon
+    /// ignores — which is why the type was removed rather than left with a permissive decoder.
     #[test]
-    fn a_cancel_request_requires_a_version() {
-        assert!(serde_json::from_str::<CancelRunRequest>(r#"{"expected_version":1}"#).is_ok());
+    fn a_cancel_request_has_no_body_to_decode() {
+        // The reply type still carries the request time, which is how a caller observes the request.
+        let reply = RunReply {
+            run_id: "0198f000-0000-7000-8000-000000000001".to_owned(),
+            session_id: "0198f000-0000-7000-8000-000000000002".to_owned(),
+            workspace_id: "local".to_owned(),
+            objective: "stop me".to_owned(),
+            state: jarvis_core::RunState::Received,
+            version: 2,
+            outcome: None,
+            error_code: None,
+            started_at: UtcTimestamp::now(&SystemClock),
+            completed_at: None,
+            cancellation_requested_at: Some(UtcTimestamp::now(&SystemClock)),
+        };
+        let encoded = serde_json::to_string(&reply).unwrap_or_default();
         assert!(
-            serde_json::from_str::<CancelRunRequest>("{}").is_err(),
-            "an absent expected_version must not default to a value that always matches"
+            encoded.contains("cancellation_requested_at"),
+            "a caller learns the cancellation was recorded from the reply, not from a status alone: {encoded}"
         );
     }
 

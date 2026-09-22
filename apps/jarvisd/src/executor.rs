@@ -1340,14 +1340,15 @@ mod tests {
             tokio::spawn(async move { execute_run(&executor_database, &slow, &run_id).await });
 
         // Request cancellation through the real path while the model call is parked.
+        //
+        // No version is read or supplied, and that is now the point rather than an omission: the
+        // executor advances the run's version as it walks the state machine, so a version read here and
+        // written 80ms later raced those writes and failed intermittently with a conflict — a request
+        // that failed only because the run was running. See `request_run_cancellation`.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let observed = find_run(&database, run.id())
-            .await
-            .unwrap_or_else(|error| panic!("read: {error}"));
         jarvis_storage::request_run_cancellation(
             &database,
             run.id(),
-            observed.expectation(),
             UtcTimestamp::now(&SystemClock),
         )
         .await
