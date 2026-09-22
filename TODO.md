@@ -183,6 +183,13 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       each step to `run_events`, which is what makes a run reach a terminal state and therefore what
       `A03`/`A04` need. That is the next round, and it also unblocks `jarvis chat` and the `jarvis ask`
       stall guard's replacement (a settled run).
+      **Its storage prerequisite is done:** `jarvis_storage::settle_run` writes a terminal transition and
+      its settlement event in one transaction. The two existing primitives are individually correct but
+      had **no valid order** — transitioning first makes the event append fail
+      (`RunEventAfterSettlement`), and appending first records a settlement for a run that has not
+      settled. Four tests, including one that writes out the two-call form and asserts it is refused, so
+      the reason the primitive exists is falsifiable. `RunState::terminal_event_kind` is the one place
+      the state-to-event mapping lives.
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
 
 ## P3: Tools, Policy, Approvals, And MCP
