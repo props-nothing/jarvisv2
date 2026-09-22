@@ -41,6 +41,7 @@ mod identity;
 mod port;
 mod request;
 mod response;
+mod scripted;
 mod stream;
 mod usage;
 
@@ -54,5 +55,6 @@ pub use request::{
     ChatMessage, ChatRequest, ContentPart, MAX_MESSAGE_BYTES, MAX_MESSAGES, MessageContent, Role,
 };
 pub use response::{ChatResponse, FinishReason, OutputContent, ToolCall};
+pub use scripted::{SCRIPTED_PROVIDER, ScriptedCancellation, ScriptedModel, Turn, scripted};
 pub use stream::{StreamEnvelope, StreamEvent, StreamEventError, StreamSummary, StreamValidator};
 pub use usage::TokenUsage;

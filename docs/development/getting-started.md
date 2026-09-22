@@ -13,6 +13,7 @@ Phase 1 (`P1-001` through `P1-012`) has delivered a runnable local foundation:
 - local control protocol v1 over a Unix domain socket or a Windows named pipe, authenticated with a profile-bound credential
 - structured logs: one JSON object per line, bounded and secret-redacted, plus human console output from the same event
 - `jarvis status`, `jarvis health`, `jarvis logs`, `jarvis doctor`, and `jarvis service` with human and `--json` output
+- `jarvis ask`, which starts a run through the daemon's loopback HTTP API and renders its event stream
 - offline `doctor` diagnosis with stable finding codes, safe evidence, specific remediation, and verified repair
 - portable foreground mode where one explicit root holds every managed file
 - per-user service planning and drift detection (no service is installed yet)

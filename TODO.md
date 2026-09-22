@@ -167,7 +167,22 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `chat` is carried by `P2-009` rather than reported as done.
 - [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
       Also carries the `jarvis chat` loop from `P2-008`: a multi-turn chat needs a model that answers
-      and a session read model, both of which this slice supplies.
+      and a session read model, both of which this slice must supply.
+      **In progress — the adapter is done, the executor is not.** `crates/jarvis-models/src/scripted.rs`
+      implements the **same** `ModelGateway` port as the real provider adapter, so a consumer cannot
+      tell a scripted run from a live one except by what it was told to do: `Turn` scripts answer,
+      fragment, fail with a normalized error, or delay so a cancellation can race them. Ten tests
+      assert the sequence contract (`0..n`, contiguous, terminal last), that a dropped event is
+      reported as a gap by `StreamValidator`, that the last turn repeats so an over-call is a visible
+      call count rather than an error, that a cancellation arriving *during* a turn reports `Cancelled`
+      and not a timeout, and that the port works through a trait object.
+      It is deliberately **not** `#[cfg(test)]` and not a mock: the daemon must be able to run it for
+      the first end-to-end run, and a mock-only path is what `definition-of-done.md` forbids calling
+      complete. It is not reachable from configuration, so it cannot be selected by accident.
+      **Remaining for this slice:** the executor that drives a run through `jarvis-models` and writes
+      each step to `run_events`, which is what makes a run reach a terminal state and therefore what
+      `A03`/`A04` need. That is the next round, and it also unblocks `jarvis chat` and the `jarvis ask`
+      stall guard's replacement (a settled run).
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
 
 ## P3: Tools, Policy, Approvals, And MCP
