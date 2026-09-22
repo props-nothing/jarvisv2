@@ -257,7 +257,11 @@ pub enum AdapterError {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// Returns a stable identifier for diagnostics.
-    fn adapter_id(&self) -> &str;
+    ///
+    /// `&'static str` rather than an elided `&str`: an adapter's name is a compile-time literal, not
+    /// a value borrowed from the request, and saying so removes a lint that fires on every
+    /// implementation that returns a literal.
+    fn adapter_id(&self) -> &'static str;
 
     /// Runs one call.
     ///

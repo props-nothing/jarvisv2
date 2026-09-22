@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+cap-std.workspace = true
 getrandom.workspace = true
 jarvis-core.workspace = true
 jsonschema.workspace = true

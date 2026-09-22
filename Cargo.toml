@@ -30,6 +30,18 @@ async-trait = "0.1.92"
 # needs. See docs/research/integrations/rust-http-server-and-sse.md.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
 bytes = "1.12.0"
+# Capability-based filesystem access, for the read-only filesystem tool (`P3-006`).
+#
+# The workspace forbids `unsafe_code`, so a hand-written `openat`/`NtCreateFile` wrapper is not an
+# option: confinement has to come from a crate that already exposes a safe handle-based API.
+# `cap-std` is that crate -- it wraps `rustix` (and `openat2` with `RESOLVE_BENEATH`) on unix and a
+# safe `windows-sys` wrapper on Windows, and it does not expose `unsafe` itself.
+#
+# It replaces the obvious "canonicalize the joined path, then prefix-check it" scheme, which has a
+# TOCTOU window: the path is resolved and then opened, so a component swapped for a symlink in between
+# escapes. A `Dir` resolves each component beneath its own handle, so an escape cannot be expressed as
+# a path at all. See docs/research/integrations/cap-std-filesystem-confinement.md.
+cap-std = "4.0.3"
 etcetera = "0.11.0"
 futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

@@ -406,14 +406,55 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       one named after the illegal `requested -> submitted` edge, which was added **because** a test
       author wrote it and the domain correctly refused. ADR-0019.
       Deliberately not a placeholder, and deliberately not a working tool: this is the lifecycle and the
-      port. **No adapter implements `ToolExecutor`** (the only implementation is a test
-      `ScriptedExecutor`), **no caller admits a tool call**, no run reaches any outcome, and
+      port. **No adapter implements `ToolExecutor` until `P3-006`** (the only implementation here is a
+      test `ScriptedExecutor`), **no caller admits a tool call**, no run reaches any outcome, and
       `apps/jarvisd` has no tool pipeline — no schema validation, no policy evaluation call, no approval
       request, no execution. Nothing is written to `run_events` for a tool call either, so a call is a
       stored document rather than an entry in the durable event log. The audit receipt is stored as a
-      document produced upstream; nothing here generates one. `P3-006` is the first real adapter and the
-      first consumer; `P3-012` is where the Phase 3 gate proves the whole path.
-- [ ] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
+      document produced upstream; nothing here generates one. **`P3-006` added the first real adapter and
+      the first consumer of this lifecycle, but still with no composition root**: no caller admits a
+      call, so the lifecycle remains driven by tests. `P3-012` is where the Phase 3 gate proves the whole
+      path.
+- [x] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
+      Two modules in `jarvis-tools`. `workspace.rs` is the security boundary: `WorkspaceRoots` opens one
+      `cap_std::fs::Dir` handle per granted root and **resolves through the handle** rather than
+      validating a path. The obvious join-canonicalize-prefix-check scheme is rejected because it has a
+      two-syscall window — the path is resolved and then opened, so a component swapped for a link in
+      between escapes — which is the "race" the requirement names. A handle resolves each component
+      beneath itself, so an escape is an error rather than a file. `cap-std` was required because
+      `unsafe_code = "forbid"` rules out a hand-written `openat`/`NtCreateFile` wrapper, and `rustix`'s
+      `openat2` + `RESOLVE_BENEATH` is unix-only, so Windows would need its own implementation.
+      `Dir::open_ambient_dir` — the grant, which has no confinement of its own — appears exactly once,
+      in `WorkspaceRoots::new`. An unusable grant is refused rather than narrowed: empty, relative,
+      duplicate, missing, or not-a-directory are all errors, because a skipped missing root makes an
+      unmounted disk read as an empty workspace.
+      `files.rs` is the first real `ToolExecutor` adapter: `jarvis.files.read` and `jarvis.files.list`,
+      both `read_only`, risk 0, `Auto` approval, idempotency `Required`. A refused path is a **`Failed`
+      outcome, not `RefusedBeforeReaching`** — the resolution reached the filesystem and failed, so
+      "nothing happened at all" would be false; the refusal vocabulary is reserved for a malformed
+      argument or a lapsed deadline, where nothing was touched. Output is read through a limited reader
+      that takes one byte past the bound, so a 4 GB file is truncated rather than allocated. 179
+      `jarvis-tools` tests. ADR-0020; `docs/research/integrations/cap-std-filesystem-confinement.md`.
+      **Two defects were found by running the tests, not by review.** (a) A binary file was reported as
+      `Confirmed` with **no content**, because `String::from_utf8` reports the valid prefix and a file
+      invalid from its first byte has a valid prefix of zero — which decodes to an empty `String`, which
+      *is* valid UTF-8. (b) **The truncation flag was discarded, so a cut read was recorded as
+      complete**: the reader bounded at the source (correct) and then handed already-limited text to
+      `BoundedOutput::truncating`, which infers truncation **by length** and reads a value of exactly
+      the limit as "fits". Fixed by adding `BoundedOutput::from_bounded(content, truncated)`, because a
+      source-bounded reader holds a fact the type cannot infer. The general lesson: when a type infers a
+      property from a value's shape, a caller that knows the property directly must be able to state it,
+      or the inference silently overrules the knowledge.
+      Deliberately not a placeholder, and deliberately not wired up: **no entry point drives the tool**.
+      Nothing in `apps/jarvisd` registers the two definitions, evaluates policy, requests an approval, or
+      calls `execute`, so no model can read a file yet. `definitions()` returns the canonical pair but
+      nothing inserts them into a `ToolRegistry` in production code — the composition step joining the
+      registry, the policy engine, the approval repository, and this adapter is unwritten. The deadline
+      is checked, not enforced: a read that begins in time and then blocks on a slow mount is not
+      interrupted, because that needs cancellation (`P3-011`), which also owns the resource limits that
+      belong under this blocking I/O. No write, move, delete, or trash/undo — the read half was chosen
+      first because its failure mode is disclosure, which confinement prevents, rather than destruction,
+      which needs an undo design. `P3-012` is where the gate proves the path end to end.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.

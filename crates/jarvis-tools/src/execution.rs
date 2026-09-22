@@ -174,6 +174,34 @@ impl BoundedOutput {
         }
     }
 
+    /// Records content the caller already bounded, carrying the caller's truncation decision.
+    ///
+    /// # Why this exists beside [`Self::truncating`]
+    ///
+    /// A file reader bounds **at the source** — it reads one byte past its limit and stops — and that
+    /// is the only way to avoid allocating a 4 GB file in order to discover it is too large. But the
+    /// content it then holds is already at the limit, so `truncating` cannot infer what happened: it
+    /// decides by length, and a reader that stopped at the limit hands it a value of exactly the limit.
+    /// The result was that a truncated read was recorded as complete — a silent lie about a file the
+    /// model would then treat as whole.
+    ///
+    /// `truncated` is therefore a **claim by the caller**, and this constructor is for a caller that
+    /// has evidence for it. [`Self::truncating`] stays for a caller that does not.
+    ///
+    /// The content is still bounded here rather than trusted, so a caller that supplies more than the
+    /// limit gets it cut and the flag set — this cannot be used to smuggle oversized output past the
+    /// bound. It only cannot be used to *clear* a flag the caller has already established.
+    #[must_use]
+    pub fn from_bounded(content: impl Into<String>, truncated: bool) -> Self {
+        let content = content.into();
+        if content.len() > MAX_TOOL_OUTPUT_BYTES {
+            let mut bounded = Self::truncating(content);
+            bounded.truncated = true;
+            return bounded;
+        }
+        Self { content, truncated }
+    }
+
     /// Returns the bounded content.
     #[must_use]
     pub fn content(&self) -> &str {
@@ -665,6 +693,36 @@ mod tests {
                 .contains("truncated"),
             "the content must not gain text"
         );
+    }
+
+    /// **Content already bounded at the source keeps the caller's truncation claim.**
+    ///
+    /// The defect this constructor exists for: a file reader reads one byte past its own limit and
+    /// stops, so the value it holds is exactly the limit — and `truncating` infers "not truncated"
+    /// from that length, because it cannot tell a file of exactly the bound from one that was cut at
+    /// it. A truncated read was therefore recorded as complete. `from_bounded` carries the caller's
+    /// finding instead of guessing.
+    #[test]
+    fn content_bounded_at_the_source_keeps_the_callers_truncation_claim() {
+        let at_the_limit = "x".repeat(MAX_TOOL_OUTPUT_BYTES);
+
+        // The same content, two different truths, which is why the flag cannot be inferred.
+        let complete = BoundedOutput::from_bounded(at_the_limit.clone(), false);
+        assert!(!complete.is_truncated());
+        assert_eq!(complete.byte_len(), MAX_TOOL_OUTPUT_BYTES);
+
+        let cut = BoundedOutput::from_bounded(at_the_limit, true);
+        assert!(
+            cut.is_truncated(),
+            "a reader that stopped at the bound must be believed"
+        );
+        assert_eq!(cut.byte_len(), MAX_TOOL_OUTPUT_BYTES);
+
+        // The claim cannot be used to smuggle oversized output past the bound: the content is still
+        // bounded here, so a caller that supplies too much gets cut AND marked, whatever it claimed.
+        let lied = BoundedOutput::from_bounded("y".repeat(MAX_TOOL_OUTPUT_BYTES + 10), false);
+        assert!(lied.is_truncated());
+        assert_eq!(lied.byte_len(), MAX_TOOL_OUTPUT_BYTES);
     }
 
     /// A strict output refuses rather than truncating.

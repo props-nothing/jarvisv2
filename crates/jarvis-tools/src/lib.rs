@@ -45,12 +45,14 @@ mod effect;
 mod evaluation;
 mod execution;
 mod executor;
+mod files;
 mod identifier;
 mod policy;
 mod registry;
 mod risk;
 mod schema;
 mod scope;
+mod workspace;
 
 pub use definition::{
     MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_TITLE_CHARS, ToolDefinition, ToolDefinitionError,
@@ -76,6 +78,10 @@ pub use executor::{
     AdapterError, ExecutionRequestError, ToolExecutionRequest, ToolExecutionRequestParts,
     ToolExecutor,
 };
+pub use files::{
+    FilesystemReadTool, FilesystemToolError, LIST_TOOL, MAX_LISTED_ENTRIES,
+    MAX_PATH_ARGUMENT_CHARS, READ_TOOL,
+};
 pub use identifier::{
     MAX_TOOL_ID_CHARS, MAX_TOOL_ID_SEGMENT_CHARS, MAX_TOOL_VERSION_CHARS, ToolId, ToolIdError,
 };
@@ -99,3 +105,4 @@ pub use schema::{
 pub use scope::{
     MAX_SCOPE_CHARS, MAX_SCOPE_SEGMENT_CHARS, Scope, ScopeError, ScopeSet, WILDCARD_ACTION,
 };
+pub use workspace::{RootError, WorkspaceRoots};
