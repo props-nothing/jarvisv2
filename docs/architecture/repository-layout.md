@@ -4,7 +4,7 @@
 
 Create this tree incrementally. Phase 1 begins with only the six members named in `P1-001`; later crates appear when their behavior is implemented.
 
-Implemented so far beyond the initial six: `crates/jarvis-observability` (structured logging, redaction, and the readers behind `jarvis logs`), `crates/jarvis-diagnostics` (offline `doctor` checks, stable findings, and verified repair), `crates/jarvis-models` (provider-neutral model contracts plus one OpenAI-compatible adapter), `crates/jarvis-mcp` (MCP server identity, canonical tool naming, and schema conformance), and `tests/e2e` (the process-level Phase 1 acceptance gate).
+Implemented so far beyond the initial six: `crates/jarvis-observability` (structured logging, redaction, and the readers behind `jarvis logs`), `crates/jarvis-diagnostics` (offline `doctor` checks, stable findings, and verified repair), `crates/jarvis-models` (provider-neutral model contracts plus one OpenAI-compatible adapter), `crates/jarvis-mcp` (MCP server identity, canonical tool naming, and schema conformance), `crates/jarvis-mcp-transport` (the MCP SDK dependency, `server/discover` negotiation, and stdio/Streamable-HTTP transports), and `tests/e2e` (the process-level Phase 1 acceptance gate).
 
 ```text
 jarvis/
@@ -28,6 +28,7 @@ jarvis/
 |   |-- jarvis-storage/          SQLite/Postgres repositories and migrations
 |   |-- jarvis-models/           model gateway and provider adapters
 |   |-- jarvis-mcp/              MCP identity, canonical tool naming, schema conformance
+|   |-- jarvis-mcp-transport/    MCP SDK adapter: discovery negotiation and wire transports
 |   |-- jarvis-runtimes/         runtime router, supervisor, adapters
 |   |-- jarvis-tools/            registry, policy pipeline, MCP, sandbox ports
 |   |-- jarvis-connectors/       first-party service connectors and OAuth
@@ -156,6 +157,15 @@ It does not own business decisions. Generate TypeScript clients from its publish
   would make the reachable tool set depend on an ordering nobody declared meaningful; for the same reason
   it refuses two listings for one server and records a changed server self-description as an
   `IdentityDrift` instead of treating it as an error.
+- `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
+  `server/discover` negotiation, and the stdio/Streamable-HTTP transports (`P3-008e`). Separate from
+  `jarvis-mcp` because that crate's value is that it is pure: the authority rules are verified as
+  functions of their arguments, with no SDK type in scope and no peer standing. Adopting `rmcp` beside
+  them would make a security reviewer read the rules through a third-party data model, and would make
+  the rules untestable without it. The split also keeps the SDK replaceable: if the transport is
+  reimplemented against the wire, no naming, posture, or conformance rule moves. No provider SDK type
+  appears in this crate's public surface either — `AGENTS.md` forbids SDK types crossing a JARVIS
+  boundary, and an error type is a boundary.
 - `jarvis-connectors`: OAuth/account lifecycle and provider-specific mail/calendar/etc. operations.
 - `jarvis-memory`: memory admission, scoring, embeddings, retrieval explanations, entity resolution.
 - `jarvis-workflows`: event inbox/outbox, scheduler, durable worker and step executors.

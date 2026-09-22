@@ -6,6 +6,7 @@ members = [
     "crates/jarvis-core",
     "crates/jarvis-diagnostics",
     "crates/jarvis-mcp",
+    "crates/jarvis-mcp-transport",
     "crates/jarvis-models",
     "crates/jarvis-observability",
     "crates/jarvis-protocol",
@@ -51,6 +52,7 @@ jarvis-application = { path = "crates/jarvis-application", version = "0.1.0" }
 jarvis-core = { path = "crates/jarvis-core", version = "0.1.0" }
 jarvis-diagnostics = { path = "crates/jarvis-diagnostics", version = "0.1.0" }
 jarvis-mcp = { path = "crates/jarvis-mcp", version = "0.1.0" }
+jarvis-mcp-transport = { path = "crates/jarvis-mcp-transport", version = "0.1.0" }
 jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
 jarvis-observability = { path = "crates/jarvis-observability", version = "0.1.0" }
 jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
@@ -66,6 +68,29 @@ jarvis-tools = { path = "crates/jarvis-tools", version = "0.1.0" }
 jsonschema = { version = "=0.57.0", default-features = false }
 libsqlite3-sys = { version = "=0.37.0", features = ["bundled"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["http2", "json", "rustls", "stream"] }
+# The official MCP Rust SDK, selected in `docs/research/integrations/mcp.md` (P3-007) and adopted
+# here (P3-008e). Apache-2.0.
+#
+# Pinned exactly, like `axum` and `jsonschema`, because the protocol revision this SDK targets is a
+# *source* fact rather than a compatibility range: `3.4.0` is the release whose `ProtocolVersion`
+# carries `V_2026_07_28`, and the SDK's own `LATEST` constant is NOT that revision. A floating
+# requirement could resolve to a release that changes which revisions are known, which would change
+# what "modern" means without any local code changing.
+#
+# Feature set is deliberately the narrowest that serves the client side of `P3-008`:
+#   - `client`     -- the `Peer` request surface (`list_tools`, `call_tool`) this adapter needs.
+#   - `transport-child-process` -- stdio via a spawned child, the standard local MCP shape.
+#   - `transport-streamable-http-client-reqwest` -- the current HTTP transport, on the `reqwest`
+#     already in this graph rather than a second HTTP stack.
+# `server` is OFF: the daemon is a client and host until `P3-009`. `auth` is OFF: JARVIS
+# authorization is not MCP authorization, and the OAuth machinery would be a second, unowned
+# token lifecycle. `macros` is OFF because the `#[tool]`/`#[tool_router]` macros generate a *server*.
+# See docs/research/integrations/mcp.md for the measured evidence behind this set.
+rmcp = { version = "=3.4.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The canonical intent hash of an approval decision. Already in the locked graph as a

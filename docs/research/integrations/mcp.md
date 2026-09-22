@@ -320,9 +320,15 @@ Ordered cheapest-first. A test only counts if it can fail.
    `initialize`?** The SDK exposes it and tests it, but the interaction between an overridden handler
    and a narrowed `supported_protocol_versions` is subtle enough that `P3-009` must test it rather than
    infer it.
-5. **Exact crate feature set for our build** — in particular whether `transport-streamable-http-server`
-   pulls a transitive dependency that the licence or ban gate refuses. Impact: `P3-008` may need to
-   enable features incrementally. Not yet measured; `cargo deny` will answer it on first add.
+5. **RESOLVED (2026-09-22, `P3-008e`): the feature set is measured and admits.** `cargo deny check`
+   reports advisories, bans, licenses, and sources **all ok** with `rmcp = 3.4.0` in the graph, using
+   `default-features = false` plus `client`, `transport-child-process`, and
+   `transport-streamable-http-client-reqwest`. The graph gained no duplicate of anything the
+   workspace pins: `tokio` 1.53.1, `reqwest` 0.13.5, `serde` 1.0.229, `serde_json` 1.0.151, and
+   `tracing` 0.1.44 all resolve to the versions already locked, and `process-wrap` 10.0.0
+   (`Apache-2.0 OR MIT`) is genuinely new. `request-state` (which would pull `hmac` and `sha2` 0.11
+   against our pinned `sha2` 0.10.9) is not enabled, which is why no duplicate arises — that is a
+   consequence to re-check on any bump, not a property to assume.
 6. **Whether `rmcp`'s `auth` feature is usable for our authorization model.** JARVIS authorization is
    not MCP authorization, so the question is only whether the SDK's OAuth machinery can be confined to
    the adapter. Unresolved pending `P3-008`.
@@ -364,3 +370,4 @@ about the protocol, not decisions of ours.
 | --- | --- | --- | --- |
 | 2026-09-20 | spec/docs 2026-07-28, Rust SDK `main` | Initial architecture verification; exact release selection deferred. **Superseded below.** | GitHub Copilot |
 | 2026-09-22 | spec 2026-07-28 (`llms.txt`, changelog, versioning, streamable-http); `rmcp` 3.4.0 metadata; SDK `main` source | **Substantive change since the previous entry.** `2026-07-28` is a stateless rewrite: `initialize` removed, per-request `_meta`, mandatory `server/discover`, sessions and SSE resumability removed, `subscriptions/listen` replaces the GET stream and `resources/subscribe`, MRTR replaces server-initiated requests, required `resultType`, error codes renumbered (`UnsupportedProtocolVersion` → `-32022`, resource-not-found → `-32602`), Roots/Sampling/Logging deprecated, Tasks moved to an extension. Rust SDK is now **Tier 1**; selected **`rmcp` 3.4.0** (2026-09-15, Apache-2.0, MSRV 1.88, edition 2024). Found that `ProtocolVersion::LATEST = V_2025_11_25` — the SDK default is *not* the current revision. | GitHub Copilot |
+| 2026-09-22 | `rmcp` 3.4.0 vendored source (`service/client.rs`, `model.rs`, `transport/async_rw.rs`), crates.io API, `cargo tree`/`cargo deny` with the SDK admitted | **Re-verified during `P3-008e`, from source rather than metadata.** Confirmed `LATEST = V_2025_11_25` at `model.rs` (`pub const LATEST: Self = Self::V_2025_11_25;`), which **contradicts the SDK's own README** — the README calls `LATEST` "newest stable version this SDK defaults to" while the same file states the SDK implements `2026-07-28`. The source is the contract; the README is not. **New finding:** `DEFAULT_AUTO_DISCOVER_TIMEOUT` (10s) is applied **only** in the `ClientLifecycleMode::Auto` arm of `serve_client_with_lifecycle` — `Discover` has **no deadline**, so a client using `Discover` against a silent peer waits indefinitely. This is a real gap for a daemon starting against a dead or legacy server, and it is why `jarvis-mcp-transport` wraps the negotiation in its own timeout. Also verified: stdio framing is newline-delimited JSON-RPC (`read_until(b'\n', ..)` / `put_u8(b'\n')` in `transport/async_rw.rs`), `(R, W)` pairs are valid transports, and `ServerPeerInfo.server_info` is `Option<Implementation>` because "discovery responses are not required to provide it" — so a conforming modern server may report **no identity**. Deny gate measured: all four categories ok. | GitHub Copilot |

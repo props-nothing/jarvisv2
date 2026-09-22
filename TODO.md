@@ -806,6 +806,79 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       responsibility, so it was split into `admit_configuration`, `observe_identity`, and `finalize` — each one
       now states a single decision, and `admit_configuration` is where the three "refuse before translating"
       checks can be read together.
+- [x] `P3-008e` Adopt the MCP SDK and carry a real negotiation: `server/discover`, not the handshake.
+      **The first slice where JARVIS speaks the MCP wire**, and the first time `rmcp` is a dependency.
+      New crate `crates/jarvis-mcp-transport` (depends on `jarvis-mcp` + `rmcp` + `tokio`). **19 crate
+      tests; 783 workspace tests.**
+      **Split into two crates deliberately.** `jarvis-mcp` stays pure, offline, and free of the SDK, so
+      the authority rules a security reviewer must read are still testable without a peer standing and
+      without any third-party type in scope — and so the transport can be reimplemented against the
+      wire without any naming, posture, or conformance rule moving. `AGENTS.md`'s "provider SDK types
+      must not cross JARVIS domain boundaries" is what forces this: a *transport* is where an SDK
+      belongs, and an authority decision is where it does not.
+      **The SDK's own README contradicts its own source, and the source is the contract.** Its README
+      says `ProtocolVersion::LATEST` is "newest stable version this SDK defaults to" and that the SDK
+      "implements the stable `2026-07-28` specification"; `LATEST` is **`V_2025_11_25`**, the *legacy*
+      era, and the removal of `initialize` is precisely what makes `2026-07-28` modern. So the trap
+      `P3-007` recorded is now an **executable fact**: `revision.rs` asserts `LATEST` is *not* the
+      modern revision, and every connection names `V_2026_07_28` explicitly. An SDK bump that changes
+      this produces a failing test and a decision, not a silent change of era.
+      **`Discover`, never `Auto`.** `Auto` falls back to the legacy handshake when the peer does not
+      answer `server/discover` within ten seconds (its constant is `DEFAULT_AUTO_DISCOVER_TIMEOUT`),
+      which would negotiate a different era while looking healthy — and nothing in this crate
+      implements the legacy era. `Discover` has no fallback path, verified by reading the SDK's
+      `serve_client_with_lifecycle`: the timeout is passed in the `Auto` arm **only**.
+      **That reading found a real defect in our own first version.** The same verification showed
+      `Discover` has *no deadline at all*, so a peer that never replies left the client waiting
+      forever — a daemon starting against a dead or legacy server would hang at startup rather than
+      report. Found by a test that asserted a refusal and instead **hung**, which is why that test now
+      asserts a bounded `DiscoveryTimedOut` naming the deadline and pointing at the protocol era as
+      the likely cause.
+      **A server's `annotations` are structurally unreachable.** `Tool` carries `readOnlyHint`,
+      `destructiveHint`, and `idempotentHint`, and a test sends a tool that declares itself read-only
+      and idempotent — exactly what a server would assert to get an effect auto-approved. The hints are
+      dropped **by construction**: `McpToolListing` has five fields and none is an annotation, so the
+      translation cannot consult them even by accident. A comment saying "do not read these" is a
+      convention; a type with nowhere to put them is a guarantee.
+      **The tests are driven against the wire, not against the SDK's server.** `tests/support` is a
+      hand-written scripted peer that reads and writes newline-delimited JSON-RPC itself — the framing
+      `rmcp` uses, verified in its `transport/async_rw.rs` (`read_until(b'\n', ..)` and
+      `put_u8(b'\n')`). Using the SDK's own server would have been less code and worthless as
+      evidence: a client and server from the same library share their assumptions, so a disagreement
+      with the *specification* would pass. The peer also **refuses to answer a method it was not
+      scripted for**, so a client calling the wrong method cannot appear to negotiate.
+      What the tests prove, each aimed at a way the code could be wrong: `server/discover` is sent and
+      `initialize`/`notifications/initialized` **never** are; a silent peer yields a bounded refusal
+      rather than a connection or a hang; a server offering only `2025-11-25` is refused by name; a
+      tool list arrives over the wire and translates (with a missing title/description staying absent
+      rather than invented); a server claiming its tool is safe gets no say; the operator's name and
+      the server's reported identity stay separate; a modern server that reports **no identity** still
+      connects (the SDK's own source notes `server/discover` responses are "not required to provide
+      it"), which matters because `P3-008d` must be able to see a server that *stops* naming itself; a
+      discovery request actually carries its per-request metadata, which is the stateless contract's
+      core requirement; and a JSON-RPC error on `tools/list` is a `PeerError` rather than
+      `Unavailable`, because the two have different remedies.
+      **Measured, not assumed: the SDK is admissible.** `cargo deny check` reports advisories, bans,
+      licenses, and sources **all ok** with `rmcp` in the graph, which answers unresolved question 5 in
+      `docs/research/integrations/mcp.md` (recorded there as "not yet measured"). The feature set is
+      the narrowest that serves a client — `client`, `transport-child-process`,
+      `transport-streamable-http-client-reqwest` — and the graph gained **no duplicate** of any crate
+      the workspace already pins (`tokio`, `reqwest`, `serde`, `serde_json`, `tracing` all resolve to
+      the same version, and `process-wrap` is genuinely new). `server` is off because the daemon is a
+      client until `P3-009`; `auth` is off because JARVIS authorization is not MCP authorization and
+      the OAuth machinery would be a second, unowned token lifecycle.
+      **Honest limits.** **Still nothing exercised against a real MCP server.** A scripted peer proves
+      the client agrees with the documented framing; it cannot prove a third-party server behaves.
+      `connect_stdio` and `connect_http` are **unexercised** — every test drives `connect_over` over an
+      in-process duplex pair, so the child-process spawn and the HTTP transport have no test at all,
+      and `StdioCommand` being spawned is the one path where a real OS error could appear. **No
+      `tools/call`**: this slice lists tools and stops, so the transport cannot yet run anything, and
+      the MRTR round-driving the SDK offers is unused. **No connection is pooled or reused**, and
+      nothing reconnects — `P3-009` owns the daemon that would. **Nothing calls any of this**: there is
+      still no configuration surface for MCP servers, so the crate is a capability a caller can use and
+      not one an operator can reach — the same limit `P3-008a`..`P3-008d` each recorded. The
+      `resources` and `prompts` capabilities are not modelled because nothing consumes them, and the
+      SDK's automatic response caching is left at its default rather than deliberately configured.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
