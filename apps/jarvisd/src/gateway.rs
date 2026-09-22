@@ -46,6 +46,7 @@ use axum::{
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
 use jarvis_protocol::{MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe};
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
+use serde::{Deserialize, Serialize};
 
 pub use crate::run_service::RunService;
 
@@ -67,6 +68,12 @@ pub struct GatewayState {
     /// shipped. Holding it here rather than reaching for a global keeps the executor's existence a
     /// property of the running daemon's configuration.
     executor: Option<Arc<crate::executor::Executor>>,
+    /// The composed tool pipeline, when workspace roots were granted.
+    ///
+    /// `None` means no tool is registered at all, so there is nothing to call — which is deliberately
+    /// different from a pipeline with no roots, because the latter would offer a tool that fails every
+    /// call (`docs/adr/0020-filesystem-confinement-is-a-handle.md`).
+    tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
 }
 
 impl GatewayState {
@@ -81,6 +88,7 @@ impl GatewayState {
             database,
             credential,
             executor: None,
+            tools: None,
         }
     }
 
@@ -89,6 +97,19 @@ impl GatewayState {
     pub fn with_executor(mut self, executor: Arc<crate::executor::Executor>) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    /// Attaches the composed tool pipeline.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<crate::tool_pipeline::ToolPipeline>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Returns the tool pipeline, when one is configured.
+    #[must_use]
+    pub fn tools(&self) -> Option<&Arc<crate::tool_pipeline::ToolPipeline>> {
+        self.tools.as_ref()
     }
 
     /// Returns the database the gateway reads through.
@@ -109,7 +130,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}", get(read_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
-        .route("/runs/{id}/stream", get(crate::sse::stream_events));
+        .route("/runs/{id}/stream", get(crate::sse::stream_events))
+        .route("/tools/{tool}/calls", post(call_tool));
 
     Router::new()
         .route("/health/live", get(health_live))
@@ -216,6 +238,127 @@ async fn start_run(
         }
         Err(error) => error.into_response(),
     }
+}
+
+/// Request body for `POST /api/v1/tools/{tool}/calls`.
+///
+/// Only two fields, and both are the caller's to choose: **which stored run** the call is attributed
+/// to, and what to pass the tool. The workspace, the actor's scopes, and the authentication strength
+/// are **not** here, because a client that could name its own workspace or grant could widen its own
+/// authority — `docs/architecture/identity-and-workspaces.md` requires access to follow from
+/// authentication rather than from a client-supplied identifier.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallRequest {
+    /// The stored run the call belongs to, which is also where the workspace comes from.
+    pub run_id: String,
+    /// The arguments to pass, which the tool's own input schema validates.
+    pub arguments: serde_json::Value,
+}
+
+/// `POST /api/v1/tools/{tool}/calls`
+///
+/// The first path from a client to a tool adapter. It exists so the composition the pipeline performs
+/// is **reachable** rather than only constructible: without a route, the pipeline could be composed and
+/// never exercised, which is the state `P3-001`..`P3-006` were in for six slices.
+///
+/// # The actor is derived, not accepted
+///
+/// The workspace and run come from the profile's seeded local identity and the stored run, and the
+/// scope is one the daemon grants rather than one the request names. A caller-supplied workspace or
+/// scope would let a client widen its own authority, which
+/// `docs/architecture/identity-and-workspaces.md` forbids. The tool name and the arguments are the
+/// only parts of the request this handler reads.
+async fn call_tool(
+    State(state): State<GatewayState>,
+    Path(tool): Path<String>,
+    Json(request): Json<ToolCallRequest>,
+) -> Response {
+    let Some(tools) = state.tools() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no tool is registered: grant `daemon.tool_workspace_roots` to enable the filesystem tool",
+        );
+    };
+
+    // The run the call is attributed to. A tool call belongs to a run, and the caller names it rather
+    // than the daemon inventing one — but the *workspace* comes from the run's stored row, so a caller
+    // cannot attribute a call to a workspace the run is not in.
+    let run = match state.runs.read(&request.run_id).await {
+        Ok(run) => run,
+        Err(error) => return error.into_response(),
+    };
+
+    let actor = crate::tool_actor::ToolActor::workspace_reader(
+        run.workspace_id.clone(),
+        run.run_id.clone(),
+        jarvis_core::SessionChannel::Cli,
+        // The loopback credential over local IPC is a verified credential, which is what an
+        // HTTP client on this transport has actually established.
+        jarvis_tools::AuthenticationStrength::Credential,
+        "policy-1",
+    );
+
+    match tools
+        .call_tool(
+            &tool,
+            request.arguments,
+            &actor,
+            jarvis_core::CorrelationId::new(),
+        )
+        .await
+    {
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::Executed(result)) => {
+            (StatusCode::OK, Json(tool_call_reply(&result))).into_response()
+        }
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::AwaitingApproval {
+            call_id,
+            required_strength,
+            reason_code,
+        }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "call_id": call_id,
+                "state": "awaiting_approval",
+                "required_strength": required_strength.as_str(),
+                "reason_code": reason_code,
+            })),
+        )
+            .into_response(),
+        // A refusal is a correct answer to a request, so it is `403` with the reason code rather than
+        // a `5xx`: the request was understood and declined, and a client should not retry it.
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::Refused { reason_code }) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "state": "refused",
+                "reason_code": reason_code,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(
+            StatusCode::CONFLICT,
+            ErrorCode::Validation,
+            &format!("the tool call could not be completed: {error}"),
+        ),
+    }
+}
+
+/// Renders an executed call's result as JSON.
+///
+/// The outcome, the evidence, and the output are **separate fields**, which is the whole point of
+/// `P3-005`: a caller must be able to tell a `confirmed` outcome from a `failed` one and must receive
+/// the provider evidence separately from the content, so a success-sounding sentence cannot be mistaken
+/// for proof.
+fn tool_call_reply(result: &jarvis_tools::ToolCallResult) -> serde_json::Value {
+    serde_json::json!({
+        "state": result.outcome().as_str(),
+        "terminal": result.outcome().is_terminal(),
+        "evidence": result.evidence().map(jarvis_tools::ProviderEvidence::as_str),
+        "reason": result.record().reason(),
+        "output": result.output().map(jarvis_tools::BoundedOutput::content),
+        "truncated": result.output().is_some_and(jarvis_tools::BoundedOutput::is_truncated),
+    })
 }
 
 /// `GET /api/v1/runs/{id}`
@@ -934,5 +1077,236 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Builds a router with a composed tool pipeline over one granted root, plus the id of a stored
+    /// run to attribute tool calls to.
+    ///
+    /// A **real** `ToolPipeline` over a real temporary directory, not a stand-in: the claims under
+    /// test are about what the route does with a request — which workspace it uses and which fields
+    /// it accepts — and a double would decide those itself, which is the thing to be checked.
+    async fn tool_router() -> (Router, String, TempProfile, String) {
+        let profile = TempProfile::new();
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create workspace: {error}"));
+        std::fs::write(root.join("secret.txt"), "workspace contents")
+            .unwrap_or_else(|error| panic!("write fixture file: {error}"));
+
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate()
+            .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
+        let presented = credential.expose().to_owned();
+
+        let roots = jarvis_tools::WorkspaceRoots::new([root.as_path()])
+            .unwrap_or_else(|error| panic!("grant the workspace root: {error}"));
+        let pipeline = crate::tool_pipeline::ToolPipeline::new(
+            Arc::clone(&database),
+            roots,
+            jarvis_tools::WorkspacePolicy::default(),
+        )
+        .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
+
+        let app = router(GatewayState::new(database, credential).with_tools(Arc::new(pipeline)));
+
+        // A run is the attribution target: the handler reads its **stored** row for the workspace, so
+        // the run has to exist for any of this to be exercised.
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/runs",
+                &presented,
+                r#"{"objective":"read a file"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let reply: jarvis_protocol::RunReply = serde_json::from_str(&body_text(created).await)
+            .unwrap_or_else(|error| panic!("decode create: {error}"));
+
+        (app, presented, profile, reply.run_id)
+    }
+
+    /// Posts a tool call the way the route expects it.
+    fn tool_call_request(
+        presented: &str,
+        tool: &str,
+        run_id: &str,
+        arguments: &serde_json::Value,
+    ) -> Request<Body> {
+        post_json(
+            &format!("/api/v1/tools/{tool}/calls"),
+            presented,
+            &serde_json::json!({ "run_id": run_id, "arguments": arguments }).to_string(),
+        )
+    }
+
+    /// **The falsification test for the tool route's authority derivation.**
+    ///
+    /// The claim in `docs/adr/0023-tool-pipeline-composition-root.md` is that the workspace comes from
+    /// the stored run and the scope from the daemon, so that a client cannot widen its own authority.
+    /// A guard on a request field is only worth something if the **absence** of the field is what makes
+    /// the call succeed, so the positive control is asserted first: with the same request the adapter
+    /// really does reach the file. Without that, the refusals below would pass on a route that never
+    /// worked at all.
+    #[tokio::test]
+    async fn a_tool_call_cannot_name_its_own_workspace() {
+        let (app, presented, _profile, run_id) = tool_router().await;
+
+        let allowed = app
+            .clone()
+            .oneshot(tool_call_request(
+                &presented,
+                jarvis_tools::READ_TOOL,
+                &run_id,
+                &serde_json::json!({ "path": "secret.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            allowed.status(),
+            StatusCode::OK,
+            "the granted root must be readable, or the refusals below prove nothing"
+        );
+        let body = body_text(allowed).await;
+        assert!(
+            body.contains("workspace contents"),
+            "the call must reach the granted file: {body}"
+        );
+        assert!(
+            body.contains("\"state\":\"confirmed\""),
+            "the reply must report the adapter's outcome separately from the content: {body}"
+        );
+
+        // Widening attempt one: name a workspace of the caller's choosing. `deny_unknown_fields` means
+        // this is refused by the decoder rather than silently ignored — an ignored field reads as an
+        // accepted one, which is how a client comes to believe it set something.
+        let named = Request::builder()
+            .uri(format!("/api/v1/tools/{}/calls", jarvis_tools::READ_TOOL))
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {presented}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "run_id": run_id,
+                    "arguments": { "path": "secret.txt" },
+                    "workspace_id": "0198f000-0000-7000-8000-0000000000ff"
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|error| panic!("fixture request: {error}"));
+        let response = app
+            .clone()
+            .oneshot(named)
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a request that names a workspace must be refused, not accepted with the field ignored"
+        );
+
+        // Widening attempt two: attribute the call to a run that does not exist. The workspace comes
+        // from the run's stored row, so there is nothing to read from and the call cannot proceed.
+        let absent = app
+            .clone()
+            .oneshot(tool_call_request(
+                &presented,
+                jarvis_tools::READ_TOOL,
+                "0198f000-0000-7000-8000-0000000000fe",
+                &serde_json::json!({ "path": "secret.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            absent.status(),
+            StatusCode::NOT_FOUND,
+            "a call attributed to an unknown run has no workspace to be decided against"
+        );
+
+        // Widening attempt three: escape the granted root. The status is `200`, because a `Failed`
+        // outcome is a **correct answer** to a request that was understood — ADR-0020's fifth rule puts
+        // a refused path in the outcome rather than in a transport error. So the assertion is on the
+        // outcome and on the absence of content, NOT on the status: asserting "not 2xx" here would pass
+        // for a route that returned a body, which is the confusion `P3-005` exists to remove.
+        let escaped = app
+            .oneshot(tool_call_request(
+                &presented,
+                jarvis_tools::READ_TOOL,
+                &run_id,
+                &serde_json::json!({ "path": "../outside.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(escaped).await;
+        let reply: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(
+            reply["state"], "failed",
+            "a traversal must be a failed outcome, not a confirmation: {body}"
+        );
+        assert!(
+            reply["output"].is_null(),
+            "a refused path must return no content at all: {body}"
+        );
+        assert!(
+            reply["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("outside")),
+            "the outcome must say the path left the root rather than only that something failed: {body}"
+        );
+    }
+
+    /// An unknown tool is refused by the adapter's registry rather than by the route, so the route
+    /// cannot become the place a tool name is validated and then drift from the registry's rules.
+    #[tokio::test]
+    async fn a_tool_that_is_not_registered_is_refused() {
+        let (app, presented, _profile, run_id) = tool_router().await;
+
+        let response = app
+            .oneshot(tool_call_request(
+                &presented,
+                "jarvis.files.delete",
+                &run_id,
+                &serde_json::json!({ "path": "secret.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "an unregistered tool must not be resolved to something else"
+        );
+    }
+
+    /// **With no roots granted there is no tool route at all**, which is deliberately different from a
+    /// pipeline over zero roots.
+    ///
+    /// A pipeline registered over no roots would advertise the tool and then fail every call, which a
+    /// caller reads as a broken tool rather than as an absent capability. The refusal must also name
+    /// the configuration key, because "no tool is registered" without the remedy sends an operator to
+    /// read the source.
+    #[tokio::test]
+    async fn a_tool_call_without_a_composed_pipeline_is_not_found() {
+        let (app, presented, _profile) = test_router().await;
+
+        let response = app
+            .oneshot(tool_call_request(
+                &presented,
+                jarvis_tools::READ_TOOL,
+                "0198f000-0000-7000-8000-0000000000fe",
+                &serde_json::json!({ "path": "secret.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_text(response).await;
+        assert!(
+            body.contains("daemon.tool_workspace_roots"),
+            "the refusal must name the key that would enable the tool: {body}"
+        );
     }
 }

@@ -8,6 +8,8 @@ mod health;
 mod run_service;
 mod singleton;
 mod sse;
+mod tool_actor;
+mod tool_pipeline;
 
 use std::{env, future::Future, io, path::Path, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -74,6 +76,18 @@ enum DaemonError {
         /// Why the name was refused.
         #[source]
         source: executor::ExecutorBuildError,
+    },
+    #[error("a tool workspace root could not be granted")]
+    ToolWorkspaceRoots {
+        /// Why the grant was refused, which names the root and the reason.
+        #[source]
+        source: jarvis_tools::RootError,
+    },
+    #[error("the tool pipeline could not be composed")]
+    ToolPipeline {
+        /// Why composition failed, which names the rejected definition or root.
+        #[source]
+        source: crate::tool_pipeline::ToolPipelineError,
     },
 }
 
@@ -166,6 +180,9 @@ struct Running {
     /// The configured executor model, resolved at start so an unimplemented name fails the
     /// daemon rather than being discovered when a run is started.
     executor: Option<Arc<executor::Executor>>,
+    /// The composed tool pipeline, resolved at start for the same reason: an unusable workspace
+    /// grant must fail the daemon rather than the first tool call.
+    tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
     daemon_id: DaemonRunId,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
@@ -249,7 +266,10 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
     let lock_path = paths.runtime().join(DAEMON_LOCK_FILE_NAME);
     let singleton = SingletonGuard::acquire(&lock_path, build)?;
 
-    let database = SqliteDatabase::open_default(&paths).await?;
+    // Wrapped in a shared handle immediately, because both the daemon's lifetime state and the tool
+    // pipeline need the same connection pool. Two handles to one SQLite file would be two pools over
+    // one WAL, which is a correctness hazard rather than a convenience.
+    let database = Arc::new(SqliteDatabase::open_default(&paths).await?);
     let daemon_id = DaemonRunId::new();
     let started_at = UtcTimestamp::now(&SystemClock);
     let instance = DaemonInstanceStart::new(
@@ -319,18 +339,56 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         None => None,
     };
 
+    // The tool pipeline is composed HERE, for the same reason the executor is: an unusable workspace
+    // grant must stop the daemon at startup rather than be discovered by the first tool call.
+    let tools = compose_tool_pipeline(loaded_config.config(), Arc::clone(&database))?;
+
     Ok(Running {
         health,
         paths,
         logging,
         singleton,
-        database: Arc::new(database),
+        database,
         credential,
         http_port,
         executor,
+        tools,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
+}
+
+/// Composes the tool pipeline from the configured workspace roots, or `None` when none are granted.
+///
+/// Runs at startup rather than lazily for the same reason the executor model is resolved there: an
+/// unusable workspace grant is a configuration fault, and a root that cannot be opened must stop the
+/// daemon rather than surface as a workspace whose files appear to be simply absent. ADR-0020 forbids
+/// narrowing a grant silently, so the failure is loud and early.
+///
+/// **No roots means no pipeline**, not an empty one. Registering the adapter over zero roots would let
+/// the daemon advertise a tool that fails every call, which reads to a caller as a broken tool rather
+/// than an absent capability.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::ToolWorkspaceRoots`] when a configured root cannot be used as a root, and
+/// [`DaemonError::ToolPipeline`] when the adapter's own definitions or the registry are rejected.
+fn compose_tool_pipeline(
+    config: &jarvis_storage::Config,
+    database: Arc<SqliteDatabase>,
+) -> Result<Option<Arc<crate::tool_pipeline::ToolPipeline>>, DaemonError> {
+    let roots = match config.daemon().tool_workspace_roots() {
+        [] => return Ok(None),
+        roots => jarvis_tools::WorkspaceRoots::new(roots.iter())
+            .map_err(|source| DaemonError::ToolWorkspaceRoots { source })?,
+    };
+    let pipeline = crate::tool_pipeline::ToolPipeline::new(
+        database,
+        roots,
+        jarvis_tools::WorkspacePolicy::default(),
+    )
+    .map_err(|source| DaemonError::ToolPipeline { source })?;
+    Ok(Some(Arc::new(pipeline)))
 }
 
 /// A bound and served loopback HTTP transport.
@@ -358,6 +416,7 @@ impl HttpTransport {
         database: Arc<SqliteDatabase>,
         credential: jarvis_core::ClientCredential,
         executor: Option<Arc<executor::Executor>>,
+        tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
@@ -369,6 +428,9 @@ impl HttpTransport {
         let mut state = gateway::GatewayState::new(database, credential);
         if let Some(executor) = executor {
             state = state.with_executor(executor);
+        }
+        if let Some(tools) = tools {
+            state = state.with_tools(tools);
         }
         let app = gateway::router(state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -478,6 +540,7 @@ where
         credential,
         http_port,
         executor,
+        tools,
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
@@ -502,9 +565,14 @@ where
     // is reported here rather than becoming a listener nobody notices is dead.
     let (http, http_stop) = match http_port {
         Some(port) => {
-            let (transport, stop) =
-                HttpTransport::bind(port, Arc::clone(&database), credential.clone(), executor)
-                    .await?;
+            let (transport, stop) = HttpTransport::bind(
+                port,
+                Arc::clone(&database),
+                credential.clone(),
+                executor,
+                tools,
+            )
+            .await?;
             (Some(transport), Some(stop))
         }
         None => (None, None),

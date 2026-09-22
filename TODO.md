@@ -507,6 +507,44 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       re-examined against the same reasoning. No `jarvis cancel` CLI verb exists, so the endpoint is
       exercised only by the gateway test and the e2e gate. Whether a cancellation *request* should emit a
       `run_events` row is not answered here.
+- [x] `P3-006d` Compose the tool pipeline in the daemon and make it reachable over HTTP.
+      **The first production caller of the whole tool path.** `P3-001`..`P3-006c` each built one layer and
+      **nothing composed them**, so no route reached a tool adapter and every seam was unverified — and the
+      three preceding slices found a real defect in every seam they examined. This closes that: route →
+      handler → registry → schema → policy → receipt → admit → authorize → submit → adapter → recorded
+      outcome. Composed in `apps/jarvisd`, because `repository-layout.md` forbids an arrow from
+      core/application into an adapter. ADR-0023.
+      The pipeline registers the **adapter's own** `definitions()` rather than restating schemas and risk
+      levels, because policy deciding about a declared copy would be policy deciding about a tool other than
+      the one being run — the `P3-006a` defect class one level up. The route accepts only `run_id` and
+      `arguments`: the **workspace comes from the stored run's row** and the scope from the daemon's actor
+      constructor, never from the request, because `identity-and-workspaces.md` requires access to follow
+      from authentication rather than from a client-supplied identifier. No roots means **no pipeline**, not
+      an empty one, which would advertise a tool that fails every call. An unusable grant fails **startup**,
+      per ADR-0020's rule that a grant is refused rather than narrowed.
+      `call_tool` at 117 lines was split into `validate`, `authorize_and_admit`, and `execute_and_record`,
+      with `authorize_and_admit` returning `Option<PreparedCall>` so that "held" is a value rather than a
+      hidden early return, and `PreparedCall` grouping the values that must agree.
+      Four route-level tests, two of them **falsification** tests: a tool call cannot name its own
+      workspace (positive control first — the granted root really is read — then `422` for a named
+      workspace, `404` for an unknown run, and a traversal asserted to produce `state: "failed"` with
+      `output: null`), and a call with no composed pipeline is `404` naming the config key. **One assertion
+      was wrong and the error was instructive**: it asserted "a traversal must not be 2xx" and got `200`,
+      because ADR-0020 puts a refused path in the *outcome* rather than in a transport error. The assertion
+      was conflating HTTP success with "the read happened" — exactly the confusion `P3-005` exists to
+      remove — so it now asserts on the outcome and on the absence of content.
+      **Honest limits.** **There is no approval round-trip**: a held decision returns `202` with `call_id`
+      and `required_strength` and then nothing happens — no `ApprovalRequest` is persisted, no route lets a
+      human decide, and nothing resumes the call, so the row stays truthfully `requested` forever. That is
+      a gap, not a design. **No `run_events` row is written for a tool call** (`P3-012` owns it), so a call
+      is absent from any stream a client is watching. **`policy_version` is a label, not a verifiable
+      version** — the handler passes the literal `"policy-1"` and nothing checks it, so a receipt citing it
+      proves which string was supplied rather than which rules were applied. **The authentication strength
+      is asserted, not proven**: `Credential` is passed because a loopback credential was presented, with
+      no per-call verification at the call site. The route takes its workspace from the run but **does not
+      check that the run is the caller's**, because this transport has one local identity; that becomes a
+      real question when a second identity exists. No CLI verb drives the route, so it is exercised by the
+      gateway tests and no end-to-end process gate yet.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.

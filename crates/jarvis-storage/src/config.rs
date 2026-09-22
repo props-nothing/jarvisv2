@@ -103,6 +103,22 @@ pub struct DaemonConfig {
     /// typo cannot silently leave every run unexecuted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executor_model: Option<String>,
+    /// The absolute directories the read-only filesystem tool is confined to.
+    ///
+    /// # Why this is configuration and not derived
+    ///
+    /// `docs/architecture/tools-and-connectors.md` requires "explicit granted roots" for the
+    /// filesystem adapter, and `docs/adr/0020-filesystem-confinement-is-a-handle.md` makes an empty or
+    /// unusable grant a hard error rather than an empty workspace. A grant must therefore come from an
+    /// operator decision, never from the daemon's working directory or a default like the profile root
+    /// — a default would grant read access to a directory nobody chose, and one that the daemon's own
+    /// state lives in.
+    ///
+    /// Empty means **no filesystem tool is registered at all**. That is deliberately not "a tool that
+    /// reads nothing": a registered tool with no roots would be offered to a model and then fail every
+    /// call, whereas an absent tool is simply not something the model can ask for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_workspace_roots: Vec<PathBuf>,
 }
 
 fn default_http_port() -> u16 {
@@ -133,6 +149,12 @@ impl DaemonConfig {
     pub fn executor_model(&self) -> Option<&str> {
         self.executor_model.as_deref()
     }
+
+    /// Returns the absolute directories the read-only filesystem tool is confined to.
+    #[must_use]
+    pub fn tool_workspace_roots(&self) -> &[PathBuf] {
+        &self.tool_workspace_roots
+    }
 }
 
 impl Default for DaemonConfig {
@@ -144,6 +166,8 @@ impl Default for DaemonConfig {
             // Off by default: a daemon that executes runs without being asked to would spend a
             // model budget nobody enabled.
             executor_model: None,
+            // Empty: no filesystem tool is registered until an operator grants roots.
+            tool_workspace_roots: Vec::new(),
         }
     }
 }
@@ -582,6 +606,7 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "http_enabled",
                 "http_port",
                 "executor_model",
+                "tool_workspace_roots",
             ],
             &mut unknown,
         );

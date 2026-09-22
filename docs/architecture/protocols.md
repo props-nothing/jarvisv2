@@ -39,8 +39,8 @@ The first local slice is implemented and verified end to end on Windows:
 ADR-0011 makes the HTTP API a first-class, **separately enabled** peer transport. What exists:
 
 - Routes: `POST /api/v1/runs`, `GET /api/v1/runs/{id}`, `POST /api/v1/runs/{id}/cancel`,
-  `GET /api/v1/runs/{id}/events`, `GET /api/v1/runs/{id}/stream`, plus `/health/live` and
-  `/health/ready`.
+  `GET /api/v1/runs/{id}/events`, `GET /api/v1/runs/{id}/stream`,
+  `POST /api/v1/tools/{tool}/calls`, plus `/health/live` and `/health/ready`.
 - Authentication is the **same** profile credential, verified through the same
   `ClientCredential::matches`, presented only in the `Authorization: Bearer` header. There is no
   second authentication implementation and no third-party auth middleware, so the two transports
@@ -58,7 +58,30 @@ ADR-0011 makes the HTTP API a first-class, **separately enabled** peer transport
   `daemon.http_port`, `JARVIS_HTTP_PORT`, default `8765`). Reaching a non-loopback interface is
   remote mode, owned by `P10-004` as an explicit TLS-terminated configuration.
 
-Still unbuilt from the surface below: `sessions`, `tools`, `approvals`, `memories`,
+### The Tool Call Route (`P3-012` partial)
+
+`POST /api/v1/tools/{tool}/calls` is the first path from a client to a tool adapter. ADR-0023 records
+why it is composed in the daemon and what it may read.
+
+- The body is exactly `run_id` and `arguments`, and it is decoded with `deny_unknown_fields`. The
+  **workspace comes from the stored run's row** and the scope from the daemon, never from the request.
+  A request that names a `workspace_id` is `422` rather than accepted-with-the-field-ignored, because an
+  ignored field reads as an accepted one. A test asserts both the positive control (a granted root
+  really is read) and that refusal.
+- A call is attributed to an existing run, so an unknown `run_id` is `404`: without the stored row there
+  is no workspace to decide against.
+- **A refusal and a failure are different shapes.** A policy denial is `403` with a `reason_code` — a
+  correct answer the client must not retry. An executed call is `200` **regardless of outcome**, with
+  the outcome, the provider evidence, the reason, the content, and the truncation flag as separate
+  fields, so a `failed` outcome cannot be mistaken for a success. A traversal is the second shape:
+  confinement refuses it inside the adapter, producing `state: "failed"` with `output: null`, not a
+  transport error (ADR-0020's fifth rule).
+- A held decision is `202` with the `call_id` and the `required_strength`. **Nothing lets a human
+  decide it yet**, so the call stays `requested` — see the limits in ADR-0023.
+- With no `daemon.tool_workspace_roots` there is **no pipeline at all**, and the route is `404` naming
+  that key, rather than a tool that fails every call.
+
+Still unbuilt from the surface below: `sessions`, `GET /api/v1/tools`, `approvals`, `memories`,
 `connectors`, `runtimes`, and `models`. A run is driven to a terminal state by the executor
 (`P2-009`), and a restart settles any run it interrupted (`P2-010`).
 

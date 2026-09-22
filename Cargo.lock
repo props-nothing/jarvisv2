@@ -1237,6 +1237,8 @@ dependencies = [
  "jarvis-observability",
  "jarvis-protocol",
  "jarvis-storage",
+ "jarvis-tools",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

@@ -40,3 +40,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0020](0020-filesystem-confinement-is-a-handle.md) | Filesystem confinement is a directory handle rather than a validated path | Accepted |
 | [0021](0021-an-authorization-receipt-derives-from-its-decision.md) | An authorization receipt is derived from its policy decision and cannot be built from a refusal | Accepted |
 | [0022](0022-cancellation-carries-no-version.md) | A cancellation request carries no version, because operator intent cannot be stale | Accepted |
+| [0023](0023-tool-pipeline-composition-root.md) | The tool pipeline is composed in the daemon over the adapter's own definitions | Accepted |
