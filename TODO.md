@@ -545,7 +545,51 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       check that the run is the caller's**, because this transport has one local identity; that becomes a
       real question when a second identity exists. No CLI verb drives the route, so it is exercised by the
       gateway tests and no end-to-end process gate yet.
-- [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
+- [x] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
+      **The research found the previous record was substantially WRONG about the current protocol**, so this
+      slice's value was mostly in what it corrected. `docs/research/integrations/mcp.md` (re-verified
+      `2026-09-22` against the live `llms.txt`, changelog, versioning page, Streamable HTTP page, and the
+      official Rust SDK source) replaces an architecture snapshot that assumed the `initialize` handshake.
+      **Revision `2026-07-28` is a stateless rewrite**: the `initialize`/`notifications/initialized`
+      handshake is **gone**, the `Mcp-Session-Id` session is **gone**, and every request now carries its
+      protocol version, capabilities, and identity in `_meta`
+      (`io.modelcontextprotocol/protocolVersion`, `.../clientCapabilities`, `.../clientInfo`). `server/discover`
+      is **mandatory for servers**. Also removed: the Streamable HTTP GET endpoint, SSE resumability
+      (`Last-Event-ID` + event ids), `ping`, `logging/setLevel`, `notifications/roots/list_changed`, and
+      `resources/subscribe`/`unsubscribe`. New: `subscriptions/listen` for change notifications, and
+      **multi round-trip requests** replace server-initiated JSON-RPC requests (a server returns
+      `InputRequiredResult` with `inputRequests`; the client retries the original request with
+      `inputResponses`). Every result now carries a required `resultType`. Error codes were renumbered
+      (`UnsupportedProtocolVersion` `-32004` → `-32022`; resource-not-found `-32002` → `-32602`) and the
+      server-error range was partitioned so `-32020`..`-32099` is spec-reserved.
+      **Selected: protocol `2026-07-28`, SDK `rmcp` 3.4.0** (published `2026-09-15`, `Apache-2.0`, MSRV
+      `1.88`, edition 2024 — this workspace is on `1.98.1`/edition 2024, and `Apache-2.0` is already in
+      `deny.toml`). The Rust SDK is now **Tier 1** (100% conformance pass rate, features before a spec
+      release, triage in two business days, relegation if any conformance test fails four weeks running),
+      which is a concrete commitment rather than an aspiration. **A trap worth recording: the SDK's
+      `ProtocolVersion::LATEST` is `V_2025_11_25`, NOT the current revision** — so relying on it would
+      silently negotiate the deprecated handshake while appearing to target the new spec. Both the client
+      and the server must name `V_2026_07_28` explicitly.
+      **Decisions, each with a reason recorded:** JARVIS is a **modern client** (`ClientLifecycleMode::Discover`,
+      not `serve()`, which is the legacy handshake) and a **dual-era server**, because the spec's own
+      compatibility matrix states a legacy client has **no fall-forward mechanism** — serving modern-only
+      would break older clients silently for no gain. `Auto` is the fallback for an unknown-era peer, and the
+      SDK treats only a **correlated, non-modern JSON-RPC error** as evidence of a legacy peer; a transport
+      error stays a hard error rather than a silent fallback. **Roots, Sampling, and Logging are deprecated**
+      (twelve-month removal window) and are deliberately **not adopted** — their spec-named migrations (pass
+      directories via parameters/configuration, call the provider directly, log to `stderr`/OpenTelemetry) are
+      already JARVIS's shape. Tasks moved out of core to an extension and is **not adopted**; long-running work
+      is a JARVIS run. `x-mcp-header` is recorded as an adapter-only wire hint that must never leak into a
+      `ToolDefinition`, and the spec's strict reachability rules (primitives only, `properties`-chain only, no
+      `$ref`/`items`/`oneOf`) mean an invalid annotation **excludes that one tool** from `tools/list` rather
+      than failing the list.
+      **Honest limits.** This slice produced **no code and no dependency** — `rmcp` is not in the workspace
+      yet, so nothing here is proven by a test; the verification plan names ten falsifying tests, none of which
+      are written. Six unresolved questions are recorded rather than answered, including whether the
+      dual-era server requirement conflicts with the daemon's single-transport shape (`P3-009`), whether the
+      full `transport-streamable-http-server` feature set pulls something `cargo deny` refuses (unmeasured),
+      and whether `rmcp`'s `auth` machinery can be confined to the adapter. **No `llms.txt` exists for the
+      docs separately** — one index covers both, which is recorded as `not found` rather than glossed.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

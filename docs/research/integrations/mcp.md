@@ -1,97 +1,335 @@
 ---
 integration: model-context-protocol
 status: researched
-last_verified: 2026-09-20
+last_verified: 2026-09-22
 owners: []
-selected_spec_version: 2026-07-28 candidate for implementation negotiation
-selected_sdk: modelcontextprotocol/rust-sdk rmcp, exact crate version undecided
+selected_spec_version: "2026-07-28"
+selected_sdk: "rmcp 3.4.0 (Apache-2.0, Tier 1)"
 ---
 
 # Model Context Protocol
 
 ## Scope
 
-Architecture research for JARVIS as MCP client/host/server, using local stdio and remote Streamable HTTP. Exact crate version and negotiated compatibility range will be selected in `P3-007`.
+Selecting the protocol revision and SDK version JARVIS will implement, and recording the contract
+facts that decide the adapter boundary. In scope: version negotiation, both standard transports
+(stdio, Streamable HTTP), authorization shape, tool-schema translation, and the limits a tool call
+must respect.
+
+Out of scope: implementing the adapter (`P3-008`), the server-facing exposure and per-client
+allowlists (`P3-009`), and the Inspector conformance suite (`P3-010`). Optional extensions (tasks,
+apps, skills) are **not** selected here.
 
 ## Official Sources
 
 | Source | URL/version | Accessed | Purpose |
 | --- | --- | --- | --- |
-| Documentation index | https://modelcontextprotocol.io/llms.txt | 2026-09-20 | current/versioned docs discovery |
-| Current specification | https://modelcontextprotocol.io/specification/2026-07-28/index.md | 2026-09-20 | protocol contract |
-| Versioning | https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning.md | 2026-09-20 | negotiation/compatibility |
-| Transports | https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/index.md | 2026-09-20 | stdio and Streamable HTTP |
-| Authorization | https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/index.md | 2026-09-20 | remote auth |
-| Security guidance | https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices.md | 2026-09-20 | threat controls |
-| Official Rust SDK | https://github.com/modelcontextprotocol/rust-sdk | 2026-09-20 | `rmcp` features and examples |
-| Inspector | https://modelcontextprotocol.io/docs/2026-07-28/tools/inspector.md | 2026-09-20 | conformance/debugging |
+| `llms.txt` index | https://modelcontextprotocol.io/llms.txt | 2026-09-22 | discovery; enumerates every spec revision + SEPs |
+| Current specification | https://modelcontextprotocol.io/specification/2026-07-28/index.md | 2026-09-22 | normative contract |
+| Key changes | https://modelcontextprotocol.io/specification/2026-07-28/changelog.md | 2026-09-22 | what changed vs 2025-11-25 |
+| Versioning & compatibility | https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning.md | 2026-09-22 | negotiation, modern/legacy/dual-era, compat matrix |
+| Streamable HTTP | https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http.md | 2026-09-22 | headers, validation, sessions, resumability, cancellation |
+| SDK list + tiers | https://modelcontextprotocol.io/docs/2026-07-28/sdk.md | 2026-09-22 | official SDK selection |
+| SDK tiering rules | https://modelcontextprotocol.io/community/sdk-tiers.md | 2026-09-22 | what Tier 1 commits a vendor to |
+| Rust SDK crate metadata | https://crates.io/api/v1/crates/rmcp | 2026-09-22 | exact version, license, MSRV, feature flags |
+| Rust SDK API docs | https://docs.rs/rmcp/latest/rmcp/ | 2026-09-22 | transports, features, lifecycle modes |
+| Rust SDK source | https://github.com/modelcontextprotocol/rust-sdk (`main`) | 2026-09-22 | negotiation behaviour, version constants |
+| Deprecated features | https://modelcontextprotocol.io/specification/2026-07-28/deprecated.md | 2026-09-22 | features new implementations must not adopt |
+| Separate docs `llms.txt` | `not found` — the single `llms.txt` above covers both docs and specification | 2026-09-22 | — |
 
 ## Verified Contract
 
-### Transport And Lifecycle
+### The 2026-07-28 revision is a stateless rewrite — this is the decisive fact
 
-- The current official docs/spec expose stdio and Streamable HTTP as standard transports.
-- The official Rust SDK has server-side stdio, client child-process stdio, Streamable HTTP client/server feature flags, protocol negotiation, and stateless-friendly HTTP behavior.
-- SDK examples show cross-language tests against the JavaScript SDK.
-- Protocol versions are negotiated; JARVIS must not serialize only one unversioned shape.
-- The current spec includes progress, cancellation, subscriptions, discovery, tools/resources/prompts, and extensions; support is capability-negotiated.
+Revision `2026-07-28` **removes the protocol-level session and the `initialize` handshake entirely**
+(SEP-2575, SEP-2567). Every request is self-describing:
+
+- The protocol version, client capabilities, and client identity travel **per request** in the
+  `_meta` object, under `io.modelcontextprotocol/protocolVersion`,
+  `io.modelcontextprotocol/clientCapabilities`, and `io.modelcontextprotocol/clientInfo`. Servers
+  identify themselves in each result's `_meta` as `io.modelcontextprotocol/serverInfo`.
+- **`server/discover` is mandatory for servers.** It advertises supported protocol versions,
+  capabilities, and identity. Clients MAY call it up front, or may simply invoke any RPC and handle
+  `UnsupportedProtocolVersionError`.
+- Version mismatch returns an `UnsupportedProtocolVersionError` listing the versions the server *does*
+  support, and the client retries with a mutually supported one. There is no handshake to negotiate in.
+- The specification names three eras: **Modern** (`2026-07-28`+), **Legacy** (`2025-11-25` and
+  earlier, handshake-based), and **Dual-era** (supports both). The compatibility matrix states plainly
+  that a modern client against a legacy server **fails**, and that a legacy client against a modern
+  server **fails** with no fall-forward mechanism.
+
+Other core changes that affect an adapter:
+
+| Change | Was | Now |
+| --- | --- | --- |
+| Session | `Mcp-Session-Id` header | **removed**; cross-call state uses server-minted handles passed as ordinary tool arguments |
+| `initialize` | handshake | **removed** |
+| List stability | per-connection | `tools/list`, `resources/list`, `prompts/list` no longer vary per connection |
+| Server-initiated requests | JSON-RPC requests on the SSE stream | **MRTR**: server returns `InputRequiredResult` (`resultType: "input_required"`) carrying `inputRequests`; the client retries the original request with `inputResponses` |
+| Result discriminator | absent | `resultType` is **required**: `"complete"` or `"input_required"`. Clients **MUST** treat an absent field from an older server as `"complete"` |
+| Change notifications | `HTTP GET` stream + `resources/subscribe` | `subscriptions/listen` (one long-lived POST-response SSE stream, opted in per notification type, tagged `io.modelcontextprotocol/subscriptionId`) |
+| `resources/subscribe` / `resources/unsubscribe` | present | **removed** |
+| `ping`, `logging/setLevel`, `notifications/roots/list_changed` | present | **removed**; log level is per-request via `io.modelcontextprotocol/logLevel`, and a server **MUST NOT** emit `notifications/message` for a request that omitted it |
+| SSE resumability | `Last-Event-ID` + event ids | **removed**. A broken response stream loses the in-flight request; the client **MUST** re-issue it as a **new** request with a **new** id |
+| Tasks | experimental core | moved to an extension, `io.modelcontextprotocol/tasks` (polling `tasks/get`, `tasks/update`; `tasks/list` and blocking `tasks/result` removed) |
+| Resource-not-found error | `-32002` | `-32602` (Invalid Params), to align with JSON-RPC |
+| Error-code allocation | ad hoc | `-32000`..`-32019` implementation-defined (existing SDK use grandfathered), `-32020`..`-32099` reserved for the specification |
+
+### Version negotiation, precisely
+
+- The spec text is explicit that **an `initialize` request selects legacy semantics whatever version
+  it names**, because the handshake does not exist in `2026-07-28`. The SDK's source repeats this in
+  `is_legacy_request`, with a comment saying the version in `initialize.params` "never routes it to the
+  stateless path".
+- `is_legacy_version(v)` is a **string comparison**: anything `< "2026-07-28"` is legacy. So the
+  boundary is lexical, not a list membership test.
+- A server answering `initialize` **must not agree to a version that dropped the handshake**. If a
+  server supports only modern versions, it returns `UnsupportedProtocolVersionError` for `initialize`
+  rather than echoing a modern version back.
+
+### Streamable HTTP: request contract
+
+- **One endpoint, POST only.** Each JSON-RPC message is its own POST. GET and DELETE to the endpoint
+  are `405 Method Not Allowed` in this revision.
+- **Required headers on every POST**: `MCP-Protocol-Version` (must equal the body's
+  `_meta.protocolVersion`), `Mcp-Method`, and `Mcp-Name` for `tools/call`, `resources/read`,
+  `prompts/get`.
+- **Header values must match the body**, and a mismatch is `400 Bad Request` + JSON-RPC error
+  `-32020 HeaderMismatch`. The specification's stated reason is a *security* one: a load balancer
+  routing on the header while the server executes the body value would let the two disagree. Servers
+  that process the body **MUST** validate this.
+- **`Origin` validation is a MUST** — if present and invalid, reply `403`. Servers **SHOULD** bind
+  `127.0.0.1` only when local. The stated threat is DNS rebinding against a local server from a
+  remote web page.
+- A JSON-RPC **notification** POST is `202 Accepted` with no body.
+- A JSON-RPC **request** POST returns either `application/json` or `text/event-stream`. Clients must
+  accept both. Notifications on that stream must relate to the originating request; the final response
+  SHOULD terminate the stream.
+- Servers SHOULD send `X-Accel-Buffering: no` when opening an SSE stream, and are encouraged to emit
+  SSE comment keep-alives (`:` lines) on long-lived streams. Clients must ignore comment lines.
+- **Closing the SSE response stream IS the cancellation signal.** On HTTP, `notifications/cancelled` is
+  not used at all — it remains a stdio-only mechanism.
+
+### `x-mcp-header`: mirroring tool parameters into headers
+
+Servers MAY annotate a tool parameter with `x-mcp-header` to mirror it into an `Mcp-Param-{Name}`
+header. Clients **MUST** support it (rejecting the tool if the annotation is invalid), and this is the
+part of the revision with the most sharp edges:
+
+- The annotated value MUST be a **primitive**: `integer`, `string`, or `boolean`. `number` is
+  **explicitly not permitted**, and integer values must sit inside the JavaScript safe range
+  (±2^53−1).
+- The property must be **statically reachable from the schema root through `properties` keys only** —
+  the chain MUST NOT pass through `items` or any array keyword, `oneOf`/`anyOf`/`allOf`/`not`,
+  `if`/`then`/`else`, or `$ref`. Nested object properties are fine as long as every step is a
+  `properties` key. An annotation anywhere else makes **the tool definition invalid**.
+- Names must be unique case-insensitively and must satisfy HTTP token syntax.
+- A client that finds an invalid annotation **MUST exclude that tool from `tools/list`** — not fail the
+  list. It SHOULD log the tool name and reason.
+- Values that cannot be a plain ASCII header value (non-ASCII, control characters, leading/trailing
+  whitespace) MUST use the Base64 sentinel `=?base64?{value}?=`, and a value that merely *looks* like
+  the sentinel must also be encoded. The same rule covers `Mcp-Name`.
 
 ### Authorization
 
-- Remote MCP authorization follows the current specification's OAuth-oriented discovery and security requirements.
-- The Rust SDK includes auth/client credential features, but exact feature completeness and crate version require re-check during implementation.
-- Stdio child process authorization relies on launch/configuration isolation and must not receive the daemon's whole environment.
+- Remote MCP authorization remains OAuth-oriented, and the spec now requires clients to key persisted
+  credentials **by issuer**, never reusing them with a different authorization server, and to
+  re-register when the authorization server changes.
+- Authorization servers SHOULD include `iss` (RFC 9207) and clients **MUST** validate it against the
+  recorded issuer before redeeming a code.
+- Clients must send an appropriate `application_type` during Dynamic Client Registration.
+- **OAuth 2.0 Dynamic Client Registration (RFC 7591) is deprecated** as a registration mechanism in
+  favour of Client ID Metadata Documents. It still works for compatibility, so an adapter must not
+  assume either mechanism.
+- Stdio carries no transport authorization at all. Its only control is launch isolation, which is why
+  the environment must be curated rather than inherited.
 
-### Volatility
+### Data And Compliance
 
-- The `llms.txt` index contains current, older, and draft specification versions plus extensions and SEPs.
-- The Rust SDK includes deprecation notes and a conformance assessment; current feature support must be checked rather than inferred from the latest spec.
-- Legacy SSE appears in older integrations while current server transport is Streamable HTTP. Keep legacy support adapter-specific.
+Nothing in the protocol requires telemetry. The relevant data concerns are JARVIS-side: whatever a tool
+returns enters the context pipeline and must carry a trust label and sensitivity ceiling, and the
+`_meta` trace-context keys (`traceparent`, `tracestate`, `baggage`) are optional OpenTelemetry
+conventions a server may propagate.
+
+### Versions And Deprecations
+
+**Deprecated — a new implementation must NOT adopt these:**
+
+- **Roots, Sampling, and Logging** (SEP-2577). The spec's own suggested migrations are: pass
+  directories via tool parameters, resource URIs, or server configuration instead of Roots; call LLM
+  provider APIs directly instead of Sampling; log to `stderr` (stdio) or use OpenTelemetry instead of
+  Logging. The minimum deprecation window is **twelve months**, governed by a new feature-lifecycle
+  policy.
+- The **HTTP+SSE transport** from `2024-11-05` (deprecated since `2025-03-26`) — migrate to Streamable
+  HTTP.
+- `includeContext` values `"thisServer"` / `"allServers"`; omit the field or use `"none"`.
+- **OAuth 2.0 DCR** (RFC 7591), per above.
+
+**SDK selection.** The Rust SDK `rmcp` is now **Tier 1** — 100% conformance-test pass rate, new
+features delivered before a spec release, issue triage within two business days, a stable release, and
+published documentation/roadmap. That is a materially strong commitment: a Tier 1 SDK is relegated to
+Tier 2 if *any* conformance test fails continuously for four weeks.
+
+Selected: **`rmcp` 3.4.0**, published `2026-09-15T15:44:08Z`.
+
+- License **Apache-2.0**. `Apache-2.0` is already in `deny.toml`'s allow list, so no licence entry
+  changes. (The crate's declared licence has varied across its history — the same crates.io response
+  shows `MIT/Apache-2.0` at 0.6.0 and `MIT` at 0.8.5 through 0.12.0 — so the *current* value is what
+  was verified here, and a version bump must re-check it rather than assume a stable identifier.)
+- `rust_version = 1.88`, `edition = "2024"`. This workspace is on `1.98.1` and edition 2024, so the
+  MSRV is satisfied with margin.
+- No `bin_names`, so enabling it adds a library only — no binary that a release has to account for.
+- Feature flags relevant to this work: `client`, `server`, `macros`, `schemars`, `auth`,
+  `elicitation`, `transport-io`, `transport-child-process`, `transport-streamable-http-client`,
+  `transport-streamable-http-client-reqwest`, `transport-streamable-http-server`. The crate declares
+  `default = ["base64", "macros", "server"]`.
+- **Transports are a pluggable `Transport` trait**, with two built-in pairs: stdio
+  (`TokioChildProcess` client / `transport-io` server) and Streamable HTTP
+  (`StreamableHttpClientTransport` / `StreamableHttpService`).
+- **Client lifecycle is explicit**: `serve()` is legacy `initialize`; `ClientLifecycleMode::Discover`
+  is the modern stateless startup; `ClientLifecycleMode::Auto` probes `server/discover` and falls back
+  to legacy, treating only a **correlated, non-modern JSON-RPC error** as evidence of a legacy peer —
+  a transport error becomes `Err` rather than a silent fallback. The auto-discovery timeout is
+  **10 seconds**.
+- TLS backends are opt-in and separate (`reqwest` = rustls; `reqwest-native-tls`;
+  `reqwest-tls-no-provider`). Our existing policy is rustls with no system OpenSSL, so the `reqwest`
+  variant is the one that matches.
 
 ## JARVIS Mapping
 
-- MCP tool schemas translate into canonical `ToolDefinition`; MCP is not the internal tool model.
-- Server identity/configuration, negotiated version, tool-list snapshot/hash, and health belong to the MCP host adapter.
-- Every call receives JARVIS actor/client/workspace grants, policy, approval, idempotency, output limits, and audit.
-- External MCP clients receive purpose-built scoped profiles; no inherited operator authority.
-- Local stdio servers run under the runtime/process supervisor with environment, path, resource, and output limits.
-- Remote URLs pass SSRF/TLS/redirect policy and use dedicated credentials.
+| MCP concept | JARVIS side |
+| --- | --- |
+| `tools/list` entry | **not** a `ToolDefinition`. It is adapter input. A canonical `ToolDefinition` is constructed with a JARVIS namespace (`mcp.<server>.<tool>`), an effect set, a risk level, and scopes that the server never supplies. |
+| `tools/call` | One `ToolExecutionRequest` through the existing pipeline: schema validation → policy → receipt → admit → execute → recorded outcome. |
+| `inputSchema` (2020-12) | `ToolSchema`, which is already 2020-12-only and offline. The revision's loosening to *any* 2020-12 keyword, plus its new `$ref`-resolution rules, means an incoming schema may reference documents; `jarvis-tools` refuses a remote `$ref`, so a server schema that needs one must be refused or inlined, not fetched. |
+| `outputSchema` / `structuredContent` | Bounded output only. The revision allows any JSON value in `structuredContent`, which is a size hazard: it is truncated and bounded exactly like text. |
+| `x-mcp-header` | Adapter concern, inside the transport. It must never leak into `ToolDefinition`: the annotation is a wire hint, not a JARVIS capability. |
+| Server-provided tool name | **Untrusted input.** It becomes part of a canonical identifier, so it must pass the same `<namespace>.<name>` charset rules as any other tool id and must not be able to smuggle a dot that re-parses as a different tool. |
+| `isError` / tool error | Maps onto the existing outcome vocabulary. A tool-level error is a `Failed` outcome; whether anything *reached* the server decides `Failed` vs `Unknown`, which is the same distinction `AdapterError::RefusedBeforeReaching` vs `AmbiguousAfterReaching` already draws. |
+| `notifications/progress` | Progress evidence, bounded, and never a substitute for an outcome. |
+| Cancellation (closing the SSE stream) | The run's cancellation must be able to close the stream. This is the hook `P3-011` needs. |
+| `subscriptions/listen` | A long-lived server→client stream; it is **not** the run event log and must not be confused with `run_events`. |
+| MRTR `inputRequests` | An approval-shaped interaction. It must route through the JARVIS approval path, never be answered by the adapter itself. |
+| Server identity / negotiated version | Adapter state, auditable, and never a source of authority. |
+
+`policy_version`, approvals, idempotency, and the audit record stay JARVIS-owned. MCP authorization is
+**not** JARVIS authorization, and a server being reachable is not a reason for a call to be permitted.
 
 ## Decisions
 
-1. Use the official Rust SDK if its selected release passes required conformance and security checks; hide it behind `jarvis-tools` adapters.
-2. Implement stdio and Streamable HTTP first.
-3. Negotiate compatible versions and test at least the selected current version plus one supported prior version if the SDK permits.
-4. Use the official Inspector and an independent SDK for interoperability.
-5. Do not make MCP authentication equivalent to JARVIS authorization.
+1. **Target protocol `2026-07-28`, implemented as a modern client and a dual-era server.**
+   Rationale: the client only ever talks to servers we choose, so it can be modern-only and simpler.
+   The server is exposed to clients we do not control, so refusing legacy clients outright would be an
+   unforced compatibility loss — and the compatibility matrix confirms legacy clients have no
+   fall-forward path, so a dual-era server is the only shape that serves both.
+2. **Select `rmcp` 3.4.0**, pinned, with the SDK hidden behind `jarvis-tools` adapters. Tier 1 plus
+   conformance testing is a concrete commitment rather than an aspiration, and the alternative is
+   hand-rolling JSON-RPC framing and negotiation for a protocol that is still changing.
+3. **Do not adopt Roots, Sampling, or Logging.** They are deprecated with a twelve-month removal
+   window, and each has a spec-suggested migration that is strictly better for us: Roots become tool
+   parameters or configuration (which is how workspace grants *should* be expressed anyway),
+   Sampling is replaced by calling the provider directly (which is the architecture we already have),
+   and Logging by `stderr`/OpenTelemetry (which is also already ours).
+4. **Modern client startup uses the `Discover` lifecycle**, not `serve()`. `serve()` is the legacy
+   `initialize` handshake and would land a modern server in a legacy session.
+5. **`Auto` is the fallback for a server whose era is unknown.** It probes `server/discover`, treats a
+   correlated non-modern JSON-RPC error as "legacy" and falls back, and — importantly — treats a
+   transport error or an uncorrelated response as a hard error rather than silently retrying legacy.
+6. **Treat the SDK's `ProtocolVersion::LATEST` as untrustworthy for our purposes.** It is
+   `V_2025_11_25`, not `V_2026_07_28`. Every server must narrow/declare its supported versions
+   explicitly and every client must name `V_2026_07_28` explicitly; relying on `LATEST` would
+   silently negotiate the legacy handshake.
+7. **Validate `Origin` and bind loopback for any locally hosted MCP server**, and validate
+   header↔body agreement. Both are MUSTs in the spec and both are cheap; the failure mode each
+   prevents is a security one.
+8. **Never fetch anything a server schema references.** `jarvis-tools` already refuses a remote `$ref`;
+   this revision makes schemas more expressive, so the refusal becomes *more* load-bearing, not less.
+9. **Ignore `Mcp-Session-Id`, `Last-Event-ID`, and GET on the endpoint** when acting as a modern
+   server, and **re-issue a lost request under a new id** instead of trying to resume. There is no
+   resume mechanism to implement.
+10. **Treat an absent `resultType` as `"complete"`**, as the spec requires, so a legacy peer is not
+    misread as malformed.
 
 ## Rejected Alternatives
 
-- MCP as the JARVIS runtime protocol: it does not by itself model the complete run/supervision lifecycle JARVIS needs.
-- Raw MCP tools exposed directly to models: bypasses canonical risk, policy, and naming.
-- Arbitrary local MCP commands with inherited environment: leaks credentials and host authority.
-- WebSocket as the primary MCP transport: not one of the standard transport pairs identified by the current SDK/spec.
+- **Implement `2026-07-28` as hand-written JSON-RPC over HTTP** rather than via the SDK. Rejected: the
+  header/body validation rules, the Base64 sentinel, the `x-mcp-header` reachability analysis, and the
+  version gating are all fiddly protocol detail with conformance tests available; reimplementing them is
+  the highest-risk, lowest-value code in the integration.
+- **Serve modern-only.** Rejected on the compatibility matrix: a legacy client has no fall-forward
+  mechanism, so this silently breaks every older client for no gain.
+- **Client as dual-era.** Rejected: an unnecessary second code path. We choose the servers our daemon
+  talks to, so `Discover` with `Auto` as a safety net covers every server we would actually configure.
+- **`ProtocolVersion::LATEST` as the target.** Rejected: it is `2025-11-25`, so this would implement the
+  deprecated handshake while believing it implemented the current revision.
+- **Adopt the Tasks extension now.** Rejected: it moved out of core precisely because it is unsettled
+  (`tasks/list` and blocking `tasks/result` were removed in the same revision). Long-running work is a
+  JARVIS run, not an MCP task.
+- **Adopt Sampling** so a server can use our model. Rejected: deprecated, and it would let a remote
+  server spend our model budget through a path outside the run/audit model.
+- **Use Roots to tell a server where our files are.** Rejected: deprecated, and it inverts the
+  workspace grant — the server would be told a directory rather than confined to one. The ADR-0020
+  handle is the boundary.
+- **Treat an MCP tool listing as a `ToolDefinition`.** Rejected: it would let a third party choose its
+  own risk level and effects.
+- **`rmcp` 3.3.0 or 3.2.0** to avoid the newest release. Rejected: no reason to prefer an older
+  release of the same minor line; the version and licence are the same shape and the newest has the
+  most conformance fixes.
 
 ## Verification Plan
 
-- Run official Inspector CLI/TUI recipes against the JARVIS server.
-- Cross-test Rust client with official JavaScript test server and Rust server with JavaScript client.
-- Test negotiation, unknown versions, capability changes, pagination, cancellation, progress, subscriptions, reconnect/sessionless behavior as selected.
-- Test OAuth discovery/invalid audience/scope/refresh and unauthenticated denial for remote mode.
-- Test stdio environment stripping, command identity, stderr bounds, crash, timeout, and cancellation.
-- Test malicious schemas, duplicate names, oversized outputs, prompt injection, and server URL SSRF.
+Ordered cheapest-first. A test only counts if it can fail.
 
-Cheapest discriminator: stand up the official SDK counter Streamable HTTP fixture and prove JARVIS can negotiate/list/call it while replacing its metadata with a canonical scoped tool definition.
+1. **Offline schema/fixture tests (the cheapest discriminator).** Capture real `server/discover`,
+   `tools/list`, and `tools/call` frames from a reference server, sanitise them, and assert the
+   translation into canonical `ToolDefinition` values. **This is the test that would disprove the
+   central assumption** — that a server-supplied tool can be mapped into a scoped canonical definition
+   without the server influencing its risk or effects.
+2. **Negotiation tests.** A modern peer, a legacy peer, and a dual-era peer; assert the modern client
+   never lands in a legacy session, that an unknown version produces the retry-then-succeed path, and
+   that `initialize` never agrees to a version that dropped the handshake.
+3. **`x-mcp-header` rejection tests.** A schema with the annotation inside `oneOf`, under `items`,
+   on a `number`, and with a duplicate name case-insensitively must each cause **that tool** to be
+   excluded from `tools/list` while the rest of the list survives.
+4. **Header/body mismatch tests.** Omit `Mcp-Method`; send a `Mcp-Name` that disagrees with the body;
+   send a Base64-sentinel value and a plain value matching the sentinel pattern. Assert `400` + `-32020`.
+5. **`Origin` tests.** Valid, absent, and hostile `Origin` values; assert `403` for the hostile one and
+   that a local server bound to loopback is unreachable off-host.
+6. **Cancellation tests.** Close the SSE stream mid-call and assert the work stops and the run records
+   a truthful terminal state (not a success).
+7. **Lost-stream tests.** Break a response stream and assert the request is **re-issued with a new
+   id**, and that a re-issue does not produce two effects (the idempotency ledger is what must make
+   this safe).
+8. **stdio isolation tests.** Assert the child does not inherit the daemon's environment, that stderr
+   is bounded, that a crash is detected, and that a timeout is enforced.
+9. **Oversized-output tests.** A `structuredContent` payload far over the bound must truncate with the
+   flag set, not be stored whole.
+10. **Opt-in live smoke test.** One handshake + `tools/list` + one read-only `tools/call` against a
+    sandboxed reference server, gated behind an explicit environment variable so CI does not need
+    network access.
 
 ## Unresolved Questions
 
-- Exact `rmcp` crate version/features and current SDK tier at implementation time.
-- Compatibility window JARVIS will promise to external clients.
-- Which optional current extensions (tasks, skills, subscriptions) belong in the first release.
-- Whether any required ElevenLabs account path still needs legacy SSE rather than Streamable HTTP.
+1. **Does the dual-era server requirement conflict with the daemon's current single-transport shape?**
+   Impact: `P3-009` may need a second listen path. Blocks: the server-exposure design, not the client.
+2. **Which optional extension is needed first, if any?** Tasks is the likeliest but was just revised.
+   Impact: none now. Blocks: nothing — deliberately deferred.
+3. **Does any target server still require the deprecated HTTP+SSE transport?** Impact: would need a
+   legacy transport path. Blocks: adapter scope, and can only be answered by naming actual servers.
+4. **Is `negotiate_initialize` on the server side reachable for a handler that overrides
+   `initialize`?** The SDK exposes it and tests it, but the interaction between an overridden handler
+   and a narrowed `supported_protocol_versions` is subtle enough that `P3-009` must test it rather than
+   infer it.
+5. **Exact crate feature set for our build** — in particular whether `transport-streamable-http-server`
+   pulls a transitive dependency that the licence or ban gate refuses. Impact: `P3-008` may need to
+   enable features incrementally. Not yet measured; `cargo deny` will answer it on first add.
+6. **Whether `rmcp`'s `auth` feature is usable for our authorization model.** JARVIS authorization is
+   not MCP authorization, so the question is only whether the SDK's OAuth machinery can be confined to
+   the adapter. Unresolved pending `P3-008`.
 
 ## Verification Log
 
 | Date | Versions checked | Relevant change or no-change evidence | Researcher |
 | --- | --- | --- | --- |
-| 2026-09-20 | spec/docs 2026-07-28, official Rust SDK main | Initial architecture verification; exact release selection deferred | GitHub Copilot |
+| 2026-09-20 | spec/docs 2026-07-28, Rust SDK `main` | Initial architecture verification; exact release selection deferred. **Superseded below.** | GitHub Copilot |
+| 2026-09-22 | spec 2026-07-28 (`llms.txt`, changelog, versioning, streamable-http); `rmcp` 3.4.0 metadata; SDK `main` source | **Substantive change since the previous entry.** `2026-07-28` is a stateless rewrite: `initialize` removed, per-request `_meta`, mandatory `server/discover`, sessions and SSE resumability removed, `subscriptions/listen` replaces the GET stream and `resources/subscribe`, MRTR replaces server-initiated requests, required `resultType`, error codes renumbered (`UnsupportedProtocolVersion` → `-32022`, resource-not-found → `-32602`), Roots/Sampling/Logging deprecated, Tasks moved to an extension. Rust SDK is now **Tier 1**; selected **`rmcp` 3.4.0** (2026-09-15, Apache-2.0, MSRV 1.88, edition 2024). Found that `ProtocolVersion::LATEST = V_2025_11_25` — the SDK default is *not* the current revision. | GitHub Copilot |

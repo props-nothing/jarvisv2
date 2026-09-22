@@ -96,7 +96,14 @@ Manage MCP server lifecycle, configuration, authentication, health, capability r
 
 Expose a deliberately selected subset of JARVIS capabilities to external agents. Each client has an identity, scopes, rate limits, workspace, and explicit tool allowlist. Authentication to `/mcp` never implies all-tools access.
 
-As of the 2026-09-20 research snapshot, the current MCP specification and official Rust SDK support stdio and Streamable HTTP, protocol negotiation, OAuth features, and stateless-friendly HTTP behavior. Implementation must re-check the live `llms.txt`, selected specification date, SDK feature matrix, deprecations, and conformance results.
+As of the `P3-007` research (`2026-09-22`), the selected protocol is **`2026-07-28`** and the selected SDK is **`rmcp` 3.4.0** (Apache-2.0, Tier 1). That revision is a **stateless rewrite**: the `initialize` handshake and the `Mcp-Session-Id` session are gone, every request carries its version and capabilities in `_meta`, `server/discover` is mandatory for servers, and Streamable HTTP GET, SSE resumability, `ping`, `logging/setLevel`, and `resources/subscribe` are all removed. `subscriptions/listen` replaces the notification stream and multi round-trip requests replace server-initiated JSON-RPC requests.
+
+Two consequences that shape this design, both recorded in `docs/research/integrations/mcp.md`:
+
+- **JARVIS is a modern client and a dual-era server.** The client only talks to servers we configure, so modern-only is sufficient. The server is exposed to clients we do not control, and the specification's own compatibility matrix states that a legacy client has **no fall-forward mechanism** — so refusing legacy clients would break them silently.
+- **Roots, Sampling, and Logging are deprecated** with a twelve-month removal window, and a new implementation must not adopt them. The spec's named migrations (pass directories via parameters or configuration; call the provider directly; log to `stderr` or OpenTelemetry) are all the shape JARVIS already has, so this costs nothing.
+
+Implementation must re-check the live `llms.txt`, the selected specification date, the SDK feature matrix, deprecations, and conformance results. A spec revision or an SDK version bump is an external-contract change: it needs a fresh research record and a test that can fail, not an inference from this table.
 
 ## Connectors
 

@@ -30,6 +30,8 @@ Reviewed on **2026-09-20**:
 | Tailscale | https://github.com/tailscale/tailscale | Long-lived daemon plus CLI, local API, OS-specific services, state paths, update and integration tests |
 | Tauri | https://github.com/tauri-apps/tauri and https://v2.tauri.app/llms.txt | Native desktop packaging, Rust/webview boundaries, updater and platform bundles |
 | MCP | https://github.com/modelcontextprotocol/rust-sdk and https://modelcontextprotocol.io/llms.txt | Client/server separation, stdio, Streamable HTTP, protocol negotiation, OAuth, conformance |
+
+`P3-007` selected **`rmcp` 3.4.0** for MCP (`Apache-2.0`, Rust SDK Tier 1) against protocol revision **`2026-07-28`**. It is not yet a dependency; the licence and MSRV were verified against the live crate metadata on `2026-09-22`, and the feature set will be pinned when `P3-008` adds it. See `docs/research/integrations/mcp.md`.
 | OpenAI Agents SDK | https://github.com/openai/openai-agents-python and https://openai.github.io/openai-agents-python/llms.txt | Runner boundary, tool approvals, guardrails, sessions, tracing, realtime, deterministic testing |
 | LangGraph | https://github.com/langchain-ai/langgraph and https://docs.langchain.com/oss/python/langgraph/llms.txt | Checkpoints, interrupts, resume, durability modes, stateful/stateless subgraphs |
 | Home Assistant Core | https://github.com/home-assistant/core | Manifest-driven integrations, setup/config flows, diagnostics, quality gates, colocated integration tests |
