@@ -70,3 +70,7 @@ playwright-report/
 *.profdata
 *.log
 
+
+# Scratch output from local gate runs and probes (never commit these)
+/summary.txt
+/probe*.txt
