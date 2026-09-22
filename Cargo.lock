@@ -1155,6 +1155,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-mcp"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "jarvis-core",
+ "jarvis-tools",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "jarvis-models"
 version = "0.1.0"
 dependencies = [

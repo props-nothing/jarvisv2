@@ -1,0 +1,17 @@
+[package]
+name = "jarvis-mcp"
+description = "Model Context Protocol translation: server identity, canonical tool naming, and schema conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+getrandom.workspace = true
+jarvis-core.workspace = true
+jarvis-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+[lints]
+workspace = true

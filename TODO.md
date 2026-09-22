@@ -590,6 +590,62 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       full `transport-streamable-http-server` feature set pulls something `cargo deny` refuses (unmeasured),
       and whether `rmcp`'s `auth` machinery can be confined to the adapter. **No `llms.txt` exists for the
       docs separately** — one index covers both, which is recorded as `not found` rather than glossed.
+- [x] `P3-008a` Build the MCP translation layer: server identity, canonical tool naming, and schema conformance.
+      **Added out of ledger order, because `P3-008`'s first real decision is not a transport decision.** New
+      crate `crates/jarvis-mcp` (depends only on `jarvis-core` + `jarvis-tools`). ADR-0024. Three rules, each
+      about *authority* rather than bytes, so each is settled once for every MCP server that will ever be
+      configured. **33 tests; 725 workspace tests.**
+      **1. A server does not name itself.** `ServerName` is an **operator-chosen** local name, validated as
+      narrowly as a tool-name segment (lowercase ASCII, digits, `-`, `_`), with dots refused because
+      `mcp.a.b` would otherwise be ambiguous between "server `a.b`" and "server `a`". The server's own claim
+      is `ReportedIdentity` — bounded, kept as **evidence**, never an identifier — because the specification
+      says the server name "is not guaranteed to be unique across servers and **SHOULD NOT** be relied upon
+      for disambiguation". It is a self-assertion by the party being identified, and the **namespace prefix
+      is load-bearing**: `mcp.` is what classifies a definition `ToolSource::Mcp`, i.e. third-party, so
+      letting a server choose it would let a hostile server claim `jarvis.files` and be classified native.
+      **2. Two MCP tool names never become one identifier.** MCP names may legally contain a **dot** and
+      uppercase; JARVIS names are lowercase-only and forbid a dot in the name half. Every lossy fix merges
+      two tools, and the dangerous direction is that a call for one tool would then run the other *with the
+      other's declared risk, effects, and scopes*. So: use the name unchanged when a segment can hold it
+      **exactly**, otherwise **hash the whole name** (SHA-256, `h` + 8 hex, length-prefixed input) — never
+      truncate, because a shortened name *is* a different name and can collide with a real one, whereas a
+      digest is obviously not a name. `Prefixed` (`mcp.github.list_issues`), `Bare` (`mcp.list_issues`, which
+      collides across servers by design), and `Hashed` differ in **namespace**, not by mangling the tool
+      name. `CanonicalToolName` keeps the **server's** name alongside the canonical id, because `tools/call`
+      must send the server its own name back — sending the canonical id would be the translation applied
+      twice, invisible until a real server rejects a call.
+      **3. A server-supplied schema is untrusted input.** `$ref` is refused wherever it appears (this
+      revision loosened schemas to any 2020-12 keyword, so that refusal is **more** load-bearing, not less —
+      resolving one means fetching a URL a server chose). All four `x-mcp-header` constraints are enforced:
+      primitives only (**`number` explicitly forbidden**; an integer bound must sit inside the JS-safe range
+      ±2^53−1, and an *exclusive* bound of 2^53 is accepted because a bound is what must fit), reachable only
+      through `properties` keys (not `items`/`oneOf`/`anyOf`/`allOf`/`if`/`then`/`else`/`$ref`/wildcards),
+      unique case-insensitively, and a valid HTTP field name. The **reachability rule is the interesting one**
+      and is not arbitrary: the spec defines extraction as reading the value at "the exact property path",
+      which has a single answer only when the path is unique — under `oneOf` there are two answers and under
+      `items` the path needs an array index a header cannot carry. A failing tool is **excluded by itself**,
+      per the spec's explicit requirement that one malformed definition not remove the others.
+      **THE DESIGN BUG MY OWN TESTS FOUND.** `NameAssignments` first keyed the collision check on the tool
+      name alone, so it **refused a legitimate `tools/list` refresh** while **silently permitting two
+      different servers to share one identifier** — a collision check that failed in both directions. The
+      keys must be `(server, tool)`: same server + same name = refresh (accept); different server + same name
+      = the collision `Bare` causes (refuse). Two of the four failing tests were that bug, and the other two
+      were my own wrong expectations about the identifier shape (I had assumed the prefix belonged in the
+      *name* half, which would give that half a dot and is not even expressible).
+      **Honest limits.** **Nothing has been exercised against a real MCP server** — these are pure functions
+      tested as pure functions, and "the translation is correct" and "a real server's tool list translates"
+      are different claims; only the first is proven, and the field names used (`serverInfo`,
+      `x-mcp-header`, `inputSchema`) come from the recorded specification rather than from bytes. **`rmcp` is
+      not a dependency yet**, deliberately (these rules are about JARVIS identifiers), so nothing is checked
+      against a real payload. **The hash is a disambiguator, not a security boundary** — 8 hex characters,
+      and an attacker who can grind a colliding digest can forge one; the authority is the stored canonical
+      id, not the hash. **No operator surface for the naming strategy exists**, so `Bare` cannot currently be
+      selected — and when it can be, a collision refuses the *second* server's tool at translation time
+      rather than at configuration time, which is later than an operator would want to learn it.
+      `ReportedIdentity::agrees_with` has a test and **no caller**, because the host adapter that would use
+      it is `P3-008`. The conformance module checks the *annotation* rules, not the schema's validity — a
+      schema with no annotation gets no structural opinion at all, which is correct for this layer and worth
+      not mistaking for validation.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

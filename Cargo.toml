@@ -5,6 +5,7 @@ members = [
     "crates/jarvis-application",
     "crates/jarvis-core",
     "crates/jarvis-diagnostics",
+    "crates/jarvis-mcp",
     "crates/jarvis-models",
     "crates/jarvis-observability",
     "crates/jarvis-protocol",
@@ -49,6 +50,7 @@ getrandom = "0.4.3"
 jarvis-application = { path = "crates/jarvis-application", version = "0.1.0" }
 jarvis-core = { path = "crates/jarvis-core", version = "0.1.0" }
 jarvis-diagnostics = { path = "crates/jarvis-diagnostics", version = "0.1.0" }
+jarvis-mcp = { path = "crates/jarvis-mcp", version = "0.1.0" }
 jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
 jarvis-observability = { path = "crates/jarvis-observability", version = "0.1.0" }
 jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
