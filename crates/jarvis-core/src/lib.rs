@@ -17,6 +17,15 @@ mod timestamp;
 #[cfg(any(unix, windows))]
 mod transport;
 
+mod approval;
+mod secretbytes;
+
+pub use approval::{
+    ApprovalChannel, ApprovalDecision, ApprovalDecisionOutcome, ApprovalRequest,
+    ApprovalRequestParts, ApprovalState, AuthenticationStrength, CanonicalIntentHash,
+    DecisionNonce, IntentError, InvalidApprovalField, MAX_APPROVAL_LIFETIME_SECONDS,
+    MAX_APPROVAL_PREVIEW_CHARS, MAX_CANONICAL_INTENT_CHARS, NonceError,
+};
 pub use context::{
     ContextBudget, ContextError, ContextItem, ContextManifest, ContextPriority, ContextSource,
     ContextSourceKind, ContextTrust, ExcludedContext, ExclusionReason, InclusionReason,
@@ -29,8 +38,8 @@ pub use endpoint::{
 };
 pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessageReason};
 pub use id::{
-    ClientId, CorrelationId, DaemonRunId, IdGenerator, InvalidId, InvalidIdReason, ProfileId,
-    RequestId, RunId, SessionId, SystemIdGenerator,
+    ApprovalId, ClientId, CorrelationId, DaemonRunId, IdGenerator, InvalidId, InvalidIdReason,
+    ProfileId, RequestId, RunId, SessionId, SystemIdGenerator, WorkspaceId,
 };
 pub use loglevel::LogLevel;
 pub use loopback::{InvalidLoopbackHost, LOOPBACK_ADDRESS, LoopbackHost};

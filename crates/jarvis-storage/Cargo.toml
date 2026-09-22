@@ -12,12 +12,14 @@ etcetera.workspace = true
 jarvis-core.workspace = true
 libsqlite3-sys.workspace = true
 serde.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
 jarvis-protocol.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 
 [lints]

@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -357,6 +357,50 @@ pub enum DatabaseError {
     /// against a policy nobody chose.
     #[error("the stored session has an invalid {field}")]
     StoredSessionInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// An approval request failed the domain's own validation.
+    ///
+    /// Delegated from [`jarvis_core::ApprovalRequest::new`] rather than re-checked here, so the
+    /// bounds live in one place. The field name is stable and the offending value is never echoed:
+    /// the preview is user-visible text and the intent hash is a digest, and neither belongs in an
+    /// error that could reach a log.
+    #[error("the approval {field} is invalid")]
+    InvalidApprovalRequest {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// No approval exists for the requested identifier.
+    #[error("no approval exists for the requested identifier")]
+    ApprovalNotFound,
+    /// An approval's state or intent no longer matches what the caller expected.
+    ///
+    /// A guarded write matched nothing. Two causes, and both are real: the approval was decided by
+    /// someone else in the meantime, or it lapsed. The caller must re-read rather than conclude the
+    /// row is gone, which is why this is a conflict and not a not-found.
+    #[error("the approval state changed before this decision could be recorded")]
+    ApprovalConflict,
+    /// A decision was presented against an approval that already has one.
+    ///
+    /// A **replay**, not a conflict: the nonce is one-time, so a second presentation of a recorded
+    /// decision is either a retried request or an attempt to replace a denial. Both must be refused,
+    /// and distinguishing it from [`Self::ApprovalConflict`] lets the caller report which happened.
+    #[error("this approval already has a recorded decision")]
+    ApprovalAlreadyDecided,
+    /// A decision's nonce did not match the stored digest.
+    ///
+    /// The forgery case. The presented value is never echoed, because an error that carried it would
+    /// put a candidate secret into a log.
+    #[error("the presented decision nonce does not match this approval")]
+    ApprovalNonceMismatch,
+    /// A stored approval row contradicted the domain's own closed sets.
+    ///
+    /// A storage-integrity finding: the row was written by another build, restored from a backup, or
+    /// edited outside JARVIS. Reported rather than defaulted, because a defaulted decision channel
+    /// would attribute a decision to a person through a channel they never used.
+    #[error("the stored approval has an invalid {field}")]
+    StoredApprovalInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
     },

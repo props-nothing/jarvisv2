@@ -53,6 +53,12 @@ libsqlite3-sys = { version = "=0.37.0", features = ["bundled"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The canonical intent hash of an approval decision. Already in the locked graph as a
+# `sqlx` transitive dependency, so declaring it adds no new package. Used with no
+# features: the default set is `std` plus `asm`, and this project needs neither the
+# assembly optimizations nor `oid`, `zeroize`, or `sha2-asm`.
+# See docs/research/integrations/sha2-intent-hashing.md.
+sha2 = { version = "=0.10.9", default-features = false }
 sqlx = { version = "=0.9.0", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite-bundled"] }
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["serde", "serde-well-known"] }

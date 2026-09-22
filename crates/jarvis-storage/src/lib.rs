@@ -11,6 +11,11 @@ mod run_event_repository;
 mod run_repository;
 mod session_repository;
 
+mod approval_repository;
+
+pub use approval_repository::{
+    create_approval, find_approval, read_pending_approvals, read_run_approvals, record_decision,
+};
 pub use config::{
     CURRENT_CONFIG_VERSION, Config, ConfigError, ConfigMigration, ConfigStore, DaemonConfig,
     LoadedConfig, LoggingConfig, ProfileConfig,

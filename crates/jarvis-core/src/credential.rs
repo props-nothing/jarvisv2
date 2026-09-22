@@ -1,13 +1,13 @@
-use std::{fmt, str};
+use std::fmt;
 
 use thiserror::Error;
+
+use crate::secretbytes::{constant_time_eq, encode_hex};
 
 /// Entropy bytes in a generated client credential.
 pub const CREDENTIAL_BYTES: usize = 32;
 /// Encoded credential length in ASCII hexadecimal characters.
 pub const CREDENTIAL_CHARS: usize = CREDENTIAL_BYTES * 2;
-
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// Explains why a client credential was rejected.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -107,27 +107,6 @@ impl Drop for ClientCredential {
     fn drop(&mut self) {
         self.encoded.fill(0);
     }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(CREDENTIAL_CHARS);
-    for byte in bytes {
-        text.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-    }
-    text
-}
-
-/// Compares two byte strings without an early exit that reveals the first mismatch.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    let width = left.len().max(right.len());
-    for index in 0..width {
-        let left_byte = left.get(index).copied().unwrap_or_default();
-        let right_byte = right.get(index).copied().unwrap_or_default();
-        difference |= usize::from(left_byte ^ right_byte);
-    }
-    difference == 0
 }
 
 #[cfg(test)]

@@ -360,12 +360,28 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       adapter direction.
       Deliberately not a placeholder: nothing calls this yet and nothing is persisted. Recording an
       approval obligation (nonce, expiry, resume) is `P3-004`; the execution receipt is `P3-005`.
-- [ ] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
-      `P3-003` supplies what it must store and enforce: a `RequireApproval` decision always carries
-      `required_strength()`, so the approval a request must obtain is already stated, and
-      `DenyReason::is_refusal()` separates a hold from a refusal. What is NOT yet supplied: nothing
-      persists a decision, and no caller exists, so an approval cannot be requested or answered.
+- [x] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
+      `jarvis_core::approval` (the domain) + `jarvis_storage::approval_repository` + migration
+      `0006_approvals.sql` (schema v6). An approval binds to a **canonical intent digest** computed
+      from the tool, its version, and a sorted-key rendering of the arguments, domain-separated so
+      two parts cannot bleed into each other. The one-time decision nonce is stored only as a
+      SHA-256 **digest** and rotated on use, so a leaked row proves a decision happened without
+      yielding the ability to make one. A storage-loaded request **cannot verify a nonce** and says
+      so, because it holds only the digest; the store verifies and then calls the domain's verified
+      path, which enforces the strength floor, the expiry, and the self-approval refusal. Expiry is
+      evaluated in Rust from `unix_nanos` and is a **read-side** fact, never a stored state and never
+      a SQL comparison. One approval per intent per run (unique index), and a second decision is
+      refused, so a denial cannot be overwritten. 113 core tests plus 19 in-crate storage tests, with
+      one named after each category `security.md` requires (forgery, replay, expiry, mutation, stale
+      state). ADR-0018; `docs/research/integrations/sha2-intent-hashing.md`.
+      Deliberately not a placeholder: nothing requests or answers an approval yet, and no run parks in
+      `awaiting_approval`. A caller that creates and decides one exists in tests only. `P3-005` owns
+      the execution receipt that consumes an approved intent.
 - [ ] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).
+      `P3-004` supplies the receipt's first half: an `Approved` approval whose `intent()` is the digest
+      a resuming execution revalidates against, and `authorizes_at(now)` which goes false at the
+      expiry. `P3-001` supplies the outcome vocabulary. What is NOT yet supplied: nothing calls a tool,
+      so there is no lifecycle to record.
 - [ ] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.

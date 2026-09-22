@@ -127,6 +127,64 @@ mod tests {
         );
     }
 
+    /// **The stored form does NOT sort lexicographically, so this text must not be compared in SQL.**
+    ///
+    /// Found while designing a table with an `expires_at < now` predicate, by printing real values
+    /// rather than assuming. `Rfc3339` **omits** the fractional part when it is zero, so:
+    ///
+    /// ```text
+    /// 2026-09-21T08:00:00Z   <  2026-09-21T08:00:00.5Z   (string order)
+    /// ```
+    ///
+    /// `'0'` (0x30) is less than `'Z'` (0x5A), so the whole-second value sorts **last** among values
+    /// in its own second. A predicate like `expires_at < ?1` would therefore treat an expired row as
+    /// unexpired. This is a live defect class: `inspect.rs` orders `daemon_instances` by `started_at`,
+    /// and `run_events_recorded_idx` is a `recorded_at DESC` index, so a row written at a whole
+    /// second sorts after rows written later in the same second.
+    ///
+    /// The test pins the behaviour rather than fixing it, because changing the stored format is a
+    /// migration across every timestamp column in the schema — and a schema-version bump is a
+    /// decision, not a drive-by. What it prevents is the assumption being made again silently.
+    ///
+    /// **Until the format is fixed, an expiry check must compare `unix_nanos()` in Rust**, or store a
+    /// separate integer column. A string comparison in SQL will be wrong.
+    #[test]
+    fn the_stored_form_is_not_lexicographically_sortable() {
+        // The same instant with a zero fraction is the case that breaks ordering.
+        let base: i128 = 1_700_000_000_000_000_000;
+        let whole = UtcTimestamp::from_unix_nanos(base)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .to_string();
+        let fraction = UtcTimestamp::from_unix_nanos(base + 500_000_000)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .to_string();
+
+        assert!(!whole.contains('.'), "a whole second omits the fraction");
+        assert!(
+            fraction.contains('.'),
+            "a fraction is emitted when non-zero"
+        );
+        assert!(
+            fraction.as_str() < whole.as_str(),
+            "the LATER instant sorts EARLIER as text, which is the defect"
+        );
+
+        // Time order and string order disagree, stated as one assertion.
+        let mut time_ordered = vec![whole.clone(), fraction.clone()];
+        time_ordered.sort_by_key(|value| {
+            value
+                .parse::<UtcTimestamp>()
+                .map(UtcTimestamp::unix_nanos)
+                .unwrap_or_default()
+        });
+        let mut string_ordered = vec![whole, fraction];
+        string_ordered.sort();
+        assert_ne!(
+            time_ordered, string_ordered,
+            "if these ever agree, the stored format changed and SQL comparisons became safe"
+        );
+    }
+
     #[test]
     fn parsed_offsets_are_normalized_to_utc() {
         let timestamp: UtcTimestamp = "2026-09-20T14:30:00.123456789+02:00"

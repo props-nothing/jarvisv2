@@ -192,6 +192,14 @@ typed_id!(
     /// Identifies one agent run within a session.
     RunId
 );
+typed_id!(
+    /// Identifies one workspace, the unit that scopes data and authority.
+    WorkspaceId
+);
+typed_id!(
+    /// Identifies one durable approval request.
+    ApprovalId
+);
 
 #[cfg(test)]
 mod tests {
