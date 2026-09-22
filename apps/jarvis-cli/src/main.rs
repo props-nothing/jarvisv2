@@ -43,6 +43,7 @@ async fn main() -> ExitCode {
         Some("status") => run(Command::Status, &arguments).await,
         Some("health") => run(Command::Health, &arguments).await,
         Some("ask") => ask(&arguments).await,
+        Some("chat") => chat(&arguments).await,
         Some("logs") => logs(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
@@ -60,7 +61,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|logs|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]"
+    "usage: jarvis <status|health|ask|chat|logs|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]"
 }
 
 fn json_requested(arguments: &[String]) -> bool {
@@ -397,14 +398,45 @@ async fn ask(arguments: &[String]) -> ExitStatus {
         return ExitStatus::Usage;
     };
 
-    let paths = match resolve_paths(&root) {
-        Ok(paths) => paths,
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    chat::drive(&client, &objective).await
+}
+
+/// Runs an interactive conversation against the daemon's API.
+///
+/// A conversation is an operator-driven sequence of runs in one session, so this command differs
+/// from `ask` only in that it reads turns from standard input and remembers the session. It contains
+/// no orchestration for the same reason `ask` does not: what history a model sees is the daemon's
+/// context assembly, and its result is the manifest the daemon records.
+async fn chat(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
         Err(status) => return status,
     };
 
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    chat::converse(&client).await
+}
+
+/// Builds an authenticated client for this profile's daemon.
+///
+/// Shared by `ask` and `chat`, because both need the same four facts: the configured port, the
+/// profile credential, the loopback-only endpoint type, and whether HTTP is enabled at all. Duplicated
+/// per command, one of them would eventually read a different configuration and target a port the
+/// daemon is not listening on.
+fn run_client(root: &[String]) -> Result<api_client::ApiClient, ExitStatus> {
+    let paths = resolve_paths(root)?;
+
     let loaded = match ConfigStore::from_paths(&paths).load() {
         Ok(loaded) => loaded,
-        Err(error) => return fail("configuration", &error),
+        Err(error) => return Err(fail("configuration", &error)),
     };
     let daemon = loaded.config().daemon();
     if !daemon.http_enabled() {
@@ -417,28 +449,22 @@ async fn ask(arguments: &[String]) -> ExitStatus {
         eprintln!(
             "jarvis: set daemon.http_enabled = true in config.toml (or JARVIS_HTTP_ENABLED=1) and restart jarvisd"
         );
-        return ExitStatus::Unavailable;
+        return Err(ExitStatus::Unavailable);
     }
 
-    let credential = match load_credential(&paths) {
-        Ok(credential) => credential,
-        Err(status) => return status,
-    };
+    let credential = load_credential(&paths)?;
     // Port 0 is refused by configuration validation, so this can only fail if a stored config was
     // edited outside the validated path. It is still handled rather than unwrapped.
     let host = match LoopbackHost::new(daemon.http_port()) {
         Ok(host) => host,
         Err(error) => {
             eprintln!("jarvis: the configured HTTP port cannot be used: {error}");
-            return ExitStatus::Unavailable;
+            return Err(ExitStatus::Unavailable);
         }
     };
 
-    let client = match api_client::ApiClient::new(host, credential.expose().to_owned()) {
-        Ok(client) => client,
-        Err(error) => return fail("client", &error),
-    };
-    chat::drive(&client, &objective).await
+    api_client::ApiClient::new(host, credential.expose().to_owned())
+        .map_err(|error| fail("client", &error))
 }
 
 /// Splits `ask` arguments into an objective and an optional `--root` directory.

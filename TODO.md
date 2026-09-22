@@ -161,10 +161,12 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `reqwest` timeout, which bounds the whole response body, so every SSE stream was killed at the
       deadline while every non-streaming call worked. The timeout is now applied per non-streaming
       request, and only `read_timeout` bounds a stream.
-      **`chat` is deliberately NOT built.** It needs a session that persists across turns and a model
-      that answers; neither exists until `P2-009`, so a chat loop now could only print a `received`
-      run per turn — a conversation that records nothing. This item therefore stays unchecked, and
-      `chat` is carried by `P2-009` rather than reported as done.
+      **`chat` was deliberately NOT built here.** It needs a session that persists across turns and a
+      model that answers; neither existed until `P2-009`, so a chat loop at that point could only print
+      a `received` run per turn — a conversation that records nothing. This item therefore shipped
+      `ask` alone and `chat` was carried by `P2-009`, which is where it was built as `P2-009b`. This
+      entry is checked because `ask` is delivered and `chat` is no longer outstanding, not because
+      `chat` was part of this change.
 - [x] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
       **Conversation persistence is done, which closes the A03 half that needed no model:** the
       `messages` table existed since `P2-004` but had **no production writer** — only test fixtures
@@ -223,11 +225,49 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       run to a terminal state, and conversation persistence means an accepted user message and the
       answer that resulted are both recorded, with the answer read back from the run's own
       `output_completed` event rather than held in memory.
-      **Still not built, and recorded as such: `jarvis chat`.** It needs a multi-turn session read model
-      (reading a session's prior `messages` and replaying them as `ChatMessage`s), which is a real slice
-      rather than a client change: the tables have a writer now, but nothing reads a conversation back.
-      `P2-008` deferred it for the same reason and it stays deferred here rather than being reported as
-      done; it is the next slice in this area.
+      **The `jarvis chat` loop it carried is built**, in the slice below.
+- [x] `P2-009b` Build the multi-turn `jarvis chat` loop, carrying the `chat` half of `P2-008`.
+      **Delivered:** a conversation is a sequence of **runs sharing one session**. `jarvis chat` reads
+      a turn per line, starts a run in the session the daemon issued on the first turn, and prints it,
+      so the earlier turns are replayed by the daemon rather than by the client. New pieces:
+      - `jarvis_storage::SessionTarget` (`New` | `Existing`) and `StartRunInput::continuing`, so
+        "start a conversation" and "continue one" are distinguishable rather than both being an
+        optional identifier. The session predicate — `workspace_id`, `user_id`, `status = 'active'` —
+        is folded into the `UPDATE` that attaches the run, not checked afterwards, because a session
+        identifier is guessable and a caller must not be able to append to a conversation it was never
+        granted. A refusal is resolved on the failure path into `SessionNotFound` (absent, or another
+        identity's — reported as absent so its existence is not confirmed) or `SessionNotWritable`
+        (archived, which means "start a new conversation" rather than "the identifier was wrong").
+      - `jarvis_storage::{read_recent_messages, count_messages}`. The history window is selected from
+        the **end** of the transcript, because a follow-up depends on the turns closest to it: reading
+        the first N and reversing them returns the *oldest* turns, which is the obvious mistake here
+        and the one the test names.
+      - `StartRunRequest.session_id` (optional; absent means a new conversation) and
+        `ApiClient::start_run_in_session`.
+      - The executor loads the session's history, offers it to **the context assembler** rather than
+        adding it to the request directly, and builds the request from the resulting manifest.
+      - `ScriptedModel::seen_messages()` records every request served, because a conversation is a
+        property of the *request*: a daemon that sent only the latest question would satisfy every
+        assertion about the answer.
+      **Running the new test found a real defect the design had wrong.** `messages_from_manifest`
+      walked the manifest and produced `policy, current question, earlier question, earlier answer`,
+      because the assembler orders by **budget tier** — required content first — and the objective is
+      required while history is optional. That order is right for budgeting and wrong for a
+      conversation: a model reading the earlier exchange *after* the current question sees it as a
+      continuation of the prompt rather than as context for it. Fixed by separating the two questions:
+      the manifest decides **what may be sent** (so an excluded turn is absent by construction) and
+      the conversation decides **in what order** (policy, then replayed turns oldest-first, then the
+      question).
+      **Verified live:** two turns against a real daemon produced two runs in one session
+      (`run …4cee-772d… session …d915c4c7…`, then `run …4f05-70f6… session …d915c4c7…`), both
+      `completed`, with the second turn replayed from the first.
+      **Honest limits:** the session's history is replayed as text, so a tool result is skipped rather
+      than replayed (a tool message needs the call it answers, and nothing writes one yet); the
+      twelve-turn window is bounded because a transcript grows without limit and a model's context
+      does not, and a turn the budget cannot hold is excluded **with a recorded reason**; and
+      `jarvis chat` has no resume-by-identifier, so a conversation continues within one process —
+      `P4-008` adds the inspect and export surface that would make a stored conversation reachable
+      again.
 - [x] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
       **Delivered:** restart truthfulness, and the Phase 2 process gate that proves it against the real
       binaries.

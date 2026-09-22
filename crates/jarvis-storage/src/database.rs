@@ -338,6 +338,17 @@ pub enum DatabaseError {
     /// No session exists for the requested identifier.
     #[error("no session exists for the requested identifier")]
     SessionNotFound,
+    /// The session exists but no new run may be attached to it.
+    ///
+    /// Distinct from [`Self::SessionNotFound`] because the two call for different actions: an
+    /// archived session means "start a new conversation", while a session this identity may not
+    /// write into means "this is not yours", and reporting the first for the second would confirm
+    /// that somebody else's session exists.
+    #[error("the session {field} does not accept new work")]
+    SessionNotWritable {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
     /// A stored session row contradicted the domain's own closed sets.
     ///
     /// A storage-integrity finding rather than a caller mistake: the row was written by

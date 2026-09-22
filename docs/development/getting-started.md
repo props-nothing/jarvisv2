@@ -14,12 +14,14 @@ Phase 1 (`P1-001` through `P1-012`) has delivered a runnable local foundation:
 - structured logs: one JSON object per line, bounded and secret-redacted, plus human console output from the same event
 - `jarvis status`, `jarvis health`, `jarvis logs`, `jarvis doctor`, and `jarvis service` with human and `--json` output
 - `jarvis ask`, which starts a run through the daemon's loopback HTTP API and renders its event stream
+- `jarvis chat`, which holds a multi-turn conversation: one run per turn, replaying the session's transcript
 - offline `doctor` diagnosis with stable finding codes, safe evidence, specific remediation, and verified repair
 - portable foreground mode where one explicit root holds every managed file
 - per-user service planning and drift detection (no service is installed yet)
 - an automated process-level acceptance gate in `tests/e2e`, run on Windows, macOS, and Linux CI
 
-Not implemented yet: service installation, log rotation, model provider adapters, tools, memory, workflows, and voice.
+Not implemented yet: service installation, log rotation, live model provider adapters, tools, memory,
+workflows, and voice.
 
 The next implementation task is the first unchecked item in [TODO.md](../../TODO.md).
 
@@ -37,6 +39,7 @@ In another:
 cargo run -p jarvis-cli -- status
 cargo run -p jarvis-cli -- health --json
 cargo run -p jarvis-cli -- ask "summarise my inbox"
+cargo run -p jarvis-cli -- chat
 cargo run -p jarvis-cli -- logs --lines 20
 cargo run -p jarvis-cli -- doctor
 cargo run -p jarvis-cli -- service
@@ -92,6 +95,35 @@ replays from its position rather than re-reading the whole answer.
 The executor lives in `apps/jarvisd` rather than `jarvis-application`, because
 `docs/architecture/repository-layout.md` allows the application layer to depend only on `jarvis-core`
 and has no arrow from it into an adapter crate.
+
+### Chatting (multi-turn)
+
+`jarvis chat` needs the same configuration as `ask`:
+
+```powershell
+jarvis chat
+jarvis> what is on my calendar
+jarvis> and the second one
+jarvis> :quit
+```
+
+Each line starts a **new run in the same session**, so a conversation is a sequence of runs, not one
+long-lived run. A run settles once and a settled run emits no further events, so a conversation cannot
+be a single run; ADR-0014 records the decision.
+
+The **daemon** replays the session's transcript into each model call, and the session identifier is
+printed on the first turn. It is a value the daemon issued — the client never invents one, because a
+session identifier is guessable and the daemon refuses a session belonging to another workspace as
+`404` rather than confirming that somebody else's conversation exists.
+
+Two limits are worth knowing:
+
+- **History is bounded to the newest turns.** A transcript grows without limit and a model's context
+  does not, so the window is chosen from the end and a turn the budget cannot hold is excluded with a
+  recorded reason. Summarisation of long conversations is `P4-007`.
+- **A conversation cannot yet be resumed from a new process.** The identifier is printed so it can be
+  found later, but the inspect and export surface that would reopen one is `P4-008`. Continuing works
+  within a single `chat` session.
 
 ### What a run stores
 

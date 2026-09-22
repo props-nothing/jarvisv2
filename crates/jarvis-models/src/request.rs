@@ -176,6 +176,17 @@ impl ChatMessage {
         &self.content
     }
 
+    /// Returns the message's text, whatever shape its content is in.
+    ///
+    /// A convenience for callers that only carry text — a conversation replay, a diagnostic, a test —
+    /// so they do not each walk the `MessageContent` variants. Owned rather than borrowed because a
+    /// multipart message has to be concatenated, and returning a reference would mean either
+    /// refusing parts or fabricating a string with nowhere to live.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.content.text()
+    }
+
     /// Returns the tool call this message answers, when it is a tool result.
     #[must_use]
     pub fn tool_call_id(&self) -> Option<&str> {

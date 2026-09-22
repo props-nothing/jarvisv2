@@ -31,7 +31,7 @@ use jarvis_core::{
 };
 use jarvis_protocol::{RunReply, StartRunRequest, rest_error, safe};
 use jarvis_storage::{
-    API_SESSION_CHANNEL, DatabaseError, SqliteDatabase, StartRunInput, find_run,
+    API_SESSION_CHANNEL, DatabaseError, SessionTarget, SqliteDatabase, StartRunInput, find_run,
     load_local_identity, request_run_cancellation, start_run,
 };
 
@@ -89,6 +89,10 @@ impl RunService {
     ) -> impl std::future::Future<Output = Result<RunReply, RunServiceError>> + '_ {
         let objective = request.objective.trim().to_owned();
         let idempotency_key = request.idempotency_key.clone();
+        // Bound before the `async move` so the future owns its input rather than borrowing the
+        // request. The returned future's lifetime is already tied to `&self`, and adding a borrow of
+        // the request to it as well would make the two outlive each other incorrectly.
+        let requested_session = request.session_id.clone();
         async move {
             if objective.is_empty() {
                 return Err(RunServiceError::new(
@@ -117,11 +121,20 @@ impl RunService {
             let now = UtcTimestamp::now(&SystemClock);
             let correlation_id = CorrelationId::new();
 
+            // The requested conversation, or a new one. The target is built from the request rather
+            // than decided later, so "continue this session" and "start a conversation" stay
+            // distinguishable all the way to the transaction that enforces it.
+            let (target, session_id) = match requested_session {
+                Some(existing) => (SessionTarget::Existing(existing.clone()), existing),
+                None => (SessionTarget::New, SessionId::new().to_string()),
+            };
+
             // The identifiers are generated before the write so a failure can be correlated against
             // the identifiers the client will be told about, rather than discovered only after the
             // transaction commits.
-            let input = StartRunInput::new(
-                SessionId::new().to_string(),
+            let input = StartRunInput::continuing(
+                target,
+                session_id,
                 RunId::new().to_string(),
                 jarvis_core::RequestId::new().to_string(),
                 identity.workspace_id(),
@@ -246,10 +259,25 @@ fn map_identity_error(error: &DatabaseError) -> RunServiceError {
 /// well-formed and simply absent, so blaming the caller's content would be wrong.
 fn map_database_error(error: &DatabaseError) -> RunServiceError {
     match error {
-        DatabaseError::RunNotFound | DatabaseError::SessionNotFound => RunServiceError::new(
+        DatabaseError::RunNotFound => RunServiceError::new(
             StatusCode::NOT_FOUND,
             ErrorCode::Validation,
             "no run exists for the requested identifier",
+        ),
+        // A continuation that named a session this identity may not write into is reported exactly
+        // as one that does not exist, because a caller must not learn that somebody else's session
+        // is there.
+        DatabaseError::SessionNotFound => RunServiceError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no session exists for the requested identifier",
+        ),
+        // An archived session is a state conflict, not a missing one: the conversation exists and
+        // is closed to new work, which is what the caller needs to know to start another.
+        DatabaseError::SessionNotWritable { .. } => RunServiceError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the session does not accept new work; start a new conversation",
         ),
         DatabaseError::RunConflict
         | DatabaseError::RunEventConflict

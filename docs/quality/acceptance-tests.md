@@ -79,6 +79,22 @@ and `jarvis` binaries against a portable profile and proves:
 - **no duplicated final output** — `P2-008`'s client rendered `output_delta` and `output_completed`
   identically and printed the answer twice, because the completed event repeats every fragment. The
   two are distinct readings now, with a test asserting they differ.
+- **a durable conversation, not just a durable run** — `P2-009b` makes a conversation a sequence of
+  runs sharing a session (ADR-0014). `apps/jarvisd/src/executor.rs` asserts against the **request the
+  adapter received** — `ScriptedModel::seen_messages()`, which exists for this — that a continuation
+  replays the session's earlier turns and that a first turn replays nothing, because an adapter that
+  returned the same answer either way would satisfy every answer-shaped assertion. One conversation's
+  turns are asserted not to reach another, which is what catches a history read scoped by workspace
+  rather than by session.
+
+**A real defect was found by that last property, and the design had it wrong.** The first
+implementation built the request by walking the assembled manifest, which orders by **budget tier** —
+required content first — so it produced *policy, current question, earlier question, earlier answer*.
+Correct for budgeting, wrong for a conversation: a model reading the earlier exchange *after* the
+current question reads it as a continuation of the prompt rather than as context for it. The fix
+separates the two questions: the manifest decides **what may be sent** and the replay decides **in
+what order**. No unit test of the manifest alone could see this, because the manifest was right — the
+error was in translating it into a request.
 
 **What this does not claim.** Recovery is truthfulness, not resumption: a run interrupted mid-call is
 reported as interrupted, and the partial answer is not replayed, because the executor holds the model
@@ -86,7 +102,8 @@ stream in memory and the daemon cannot know whether the provider accepted the in
 scenario's "or" ("resumes… **or** marks the run with a truthful terminal/recoverable state") is
 therefore met by the second branch, deliberately. Cancellation in flight is proven at the crate level
 (`apps/jarvisd/src/executor.rs`), because a scripted model answers too quickly for the process gate to
-reliably race; `A04` records the same limit.
+reliably race; `A04` records the same limit. And a stored conversation cannot yet be reopened from a
+new process: the identifier is printed, but reading a conversation back by identifier is `P4-008`.
 
 ## A04: Cancellation
 

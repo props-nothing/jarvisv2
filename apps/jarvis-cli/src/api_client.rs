@@ -175,15 +175,29 @@ impl ApiClient {
         self.host
     }
 
-    /// Starts a run.
+    /// Starts a run, continuing an existing conversation when one is named.
+    ///
+    /// A second turn is a **new run in the same session**, not a mutation of the first: the daemon
+    /// replays the session's transcript into the model call, so a run is the unit of work and the
+    /// session is the unit of continuity. That is why this takes a session identifier rather than
+    /// a run identifier.
+    ///
+    /// `session_id` of `None` begins a new conversation, which is the ordinary single-turn case. There
+    /// is deliberately no separate "start a fresh run" method: a second wrapper would be one more
+    /// place for the session argument to be dropped by accident.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] when the objective is not storable, the daemon refuses the request, or
-    /// the transport fails.
-    pub async fn start_run(&self, objective: &str) -> Result<RunReply, ApiError> {
+    /// Returns [`ApiError`] when the objective is not storable, the named session is absent or
+    /// closed to new work, the daemon refuses the request, or the transport fails.
+    pub async fn start_run_in_session(
+        &self,
+        objective: &str,
+        session_id: Option<&str>,
+    ) -> Result<RunReply, ApiError> {
         let body = StartRunRequest {
             objective: objective.to_owned(),
+            session_id: session_id.map(ToOwned::to_owned),
             // Omitted rather than sent as null. The daemon refuses a present idempotency key
             // because no deduplication ledger exists, and sending one would be claiming a
             // guarantee this build does not provide.

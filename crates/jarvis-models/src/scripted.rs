@@ -32,7 +32,7 @@ use crate::capability::{ModelCapabilities, Placement, Support};
 use crate::error::{ModelError, ModelErrorKind};
 use crate::identity::{ModelId, ProviderId};
 use crate::port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
-use crate::request::ChatRequest;
+use crate::request::{ChatMessage, ChatRequest};
 use crate::response::{ChatResponse, FinishReason, OutputContent};
 use crate::stream::{StreamEnvelope, StreamEvent};
 use crate::usage::TokenUsage;
@@ -157,6 +157,13 @@ pub struct ScriptedModel {
     cursor: Mutex<usize>,
     cancellation: Option<std::sync::Arc<ScriptedCancellation>>,
     capabilities: ModelCapabilities,
+    /// The messages of every request served, in call order.
+    ///
+    /// Recorded because the *request* is what a multi-turn conversation is: an adapter that only
+    /// returns turns cannot show whether history reached the model, so a test of "the earlier turns
+    /// were replayed" would have nothing to assert against and would pass for a daemon that sent
+    /// only the latest question. Recording the request is what makes that assertable.
+    seen: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl ScriptedModel {
@@ -189,6 +196,7 @@ impl ScriptedModel {
             turns,
             cursor: Mutex::new(0),
             cancellation: None,
+            seen: Mutex::new(Vec::new()),
             // A scripted model declares what it is: local, streaming, and usage-reporting. The
             // placement is `Local` because nothing leaves the process, which makes a
             // `Sensitivity::Internal` destination able to receive any content — the point of a
@@ -213,6 +221,25 @@ impl ScriptedModel {
     pub const fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Returns the messages of every request this adapter has served, in call order.
+    ///
+    /// A conversation is a property of the *request*, not of the answer, so this is what makes
+    /// "the earlier turns were replayed" a testable claim. Without it a daemon that sent only the
+    /// latest question would satisfy every assertion about the answer.
+    #[must_use]
+    pub fn seen_messages(&self) -> Vec<Vec<ChatMessage>> {
+        self.seen
+            .lock()
+            .map_or_else(|_| Vec::new(), |seen| seen.clone())
+    }
+
+    /// Records one request's messages.
+    fn record(&self, request: &ChatRequest) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(request.messages().to_vec());
+        }
     }
 
     /// Returns how many turns have been served.
@@ -337,6 +364,7 @@ impl ModelGateway for ScriptedModel {
 
     async fn complete(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.check_cancelled()?;
+        self.record(&request);
         let turn = self.next_turn()?;
         let (fragments, reason, usage) = self.resolve(&turn).await?;
 
@@ -350,8 +378,9 @@ impl ModelGateway for ScriptedModel {
         .with_usage(usage))
     }
 
-    async fn stream(&self, _request: ChatRequest) -> Result<ModelStream, ModelError> {
+    async fn stream(&self, request: ChatRequest) -> Result<ModelStream, ModelError> {
         self.check_cancelled()?;
+        self.record(&request);
         let turn = self.next_turn()?;
         let (fragments, reason, usage) = self.resolve(&turn).await?;
         let events = Self::events(&fragments, reason, usage);

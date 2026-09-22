@@ -25,7 +25,8 @@ pub use identity_repository::{
 };
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
 pub use message_repository::{
-    MAX_MESSAGE_PAGE, StoredMessage, append_message, find_message, read_messages,
+    MAX_MESSAGE_PAGE, StoredMessage, append_message, count_messages, find_message, read_messages,
+    read_recent_messages,
 };
 pub use paths::{
     AppPaths, PathError, PathKind, PathMode, RuntimePathSource, portable_layout,
@@ -40,6 +41,6 @@ pub use run_repository::{
     find_run, recover_interrupted_runs, request_run_cancellation, settle_run, transition_run,
 };
 pub use session_repository::{
-    API_SESSION_CHANNEL, NewSession, StartRunInput, StartedRun, StoredSession, find_session,
-    start_run,
+    API_SESSION_CHANNEL, NewSession, SessionTarget, StartRunInput, StartedRun, StoredSession,
+    find_session, start_run,
 };

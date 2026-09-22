@@ -45,6 +45,18 @@ pub const MAX_STREAM_PAGE: u32 = 1000;
 pub struct StartRunRequest {
     /// The objective the run must achieve. Bounded by the storage schema.
     pub objective: String,
+    /// The conversation to continue, or absent to begin a new one.
+    ///
+    /// A multi-turn conversation is a sequence of runs that share one session: the second turn is a
+    /// run that replays the first turn's transcript, not a mutation of the first run. That is why
+    /// this identifies a session rather than a run.
+    ///
+    /// Absent rather than required, because single-turn use is the common case and requiring a
+    /// session identifier would make every caller create one first. The daemon **verifies** any
+    /// value supplied: a session identifier is guessable, so accepting one without checking its
+    /// workspace would let a caller append to a conversation it was never granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Optional client-supplied idempotency key.
     ///
     /// Absent by default. When present, a repeated request with the same key must not
@@ -202,6 +214,7 @@ mod tests {
     fn optional_fields_are_omitted_when_absent() {
         let request = StartRunRequest {
             objective: "summarise".to_owned(),
+            session_id: None,
             idempotency_key: None,
         };
         let encoded = serde_json::to_string(&request).unwrap_or_default();

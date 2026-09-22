@@ -59,8 +59,8 @@ ADR-0011 makes the HTTP API a first-class, **separately enabled** peer transport
   remote mode, owned by `P10-004` as an explicit TLS-terminated configuration.
 
 Still unbuilt from the surface below: `sessions`, `tools`, `approvals`, `memories`,
-`connectors`, `runtimes`, and `models`. **Nothing invokes a model yet**, so a run reaches
-`received` and stays there; the run executor is `P2-009`.
+`connectors`, `runtimes`, and `models`. A run is driven to a terminal state by the executor
+(`P2-009`), and a restart settles any run it interrupted (`P2-010`).
 
 ### The CLI Over This Transport (`P2-008`)
 
@@ -83,6 +83,32 @@ preferred transport for the CLI.
   response body, so on a client that also serves an open-ended SSE stream it kills every healthy stream
   at the deadline. Non-streaming calls set a per-request timeout; only `read_timeout` bounds a stream.
   This was found by running the client, not by a test.
+
+### Multi-Turn Conversations (`P2-009b`)
+
+A conversation is **runs sharing one session**, and ADR-0014 records why: a run settles once and a
+settled run emits no further events, so a conversation cannot be one long-lived run, and keeping the
+history in the client would make the server unable to enforce policy over it or audit it.
+
+`jarvis chat` reads a turn per line and starts a run per turn:
+
+- `POST /api/v1/runs` accepts an optional `session_id`. Present means "continue this conversation";
+  absent means a new one, which is the ordinary single-turn case.
+- The **daemon** replays the session's transcript into the model call, so history is not a client
+  artefact and a second client sees the same conversation. The selection is the context assembler's,
+  and its result is the manifest the daemon records.
+- The **session identifier is a trust boundary, not a capability.** Attaching a run to a session is one
+  statement whose predicate includes the workspace, the user, and `status = 'active'`. A session of
+  another workspace or user is refused as `404`, deliberately, so the refusal does not confirm that
+  somebody else's conversation exists. An archived session is `409`, because that one is actionable:
+  the caller starts a new conversation rather than retrying.
+- The client never invents a session identifier. `chat` prints the one the daemon issued and sends that
+  back, so it cannot end up addressing a session that does not exist.
+- The replay window is the **newest** turns, bounded, because a transcript grows without limit and a
+  model's context does not. A turn the budget cannot hold is excluded with a recorded reason rather
+  than silently dropped.
+- A failed **turn** does not end the conversation; a refused **session** does, because every later turn
+  would fail the same way.
 
 ## HTTP API
 

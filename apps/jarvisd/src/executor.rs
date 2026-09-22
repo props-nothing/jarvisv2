@@ -59,9 +59,9 @@ const MAX_OBJECTIVE_REFERENCE_CHARS: usize = 120;
 
 /// Token budget for a run's context.
 ///
-/// `P2-009` sends policy text and the objective and nothing else, because memory retrieval is
-/// `P4-004`. The budget is still explicit rather than unlimited so the reserved tiers are exercised
-/// and a later retrieval step draws on a measured remainder instead of on everything.
+/// `P2-009` sends policy text, the conversation so far, and the objective, because memory retrieval
+/// is `P4-004`. The budget is explicit rather than unlimited so the reserved tiers are exercised and
+/// a later retrieval step draws on a measured remainder instead of on everything.
 const TOTAL_CONTEXT_TOKENS: u32 = 8_192;
 
 /// Tokens reserved for immutable policy text.
@@ -72,6 +72,19 @@ const RESERVED_USER_INTENT_TOKENS: u32 = 1_024;
 
 /// Maximum tokens any single source kind may contribute.
 const PER_SOURCE_CAP_TOKENS: u32 = 4_096;
+
+/// Conversation turns replayed into a model call.
+///
+/// The window is chosen from the **end** of the transcript, because a follow-up question depends on
+/// the turns closest to it. A bound is required rather than optional: a session grows without limit
+/// and a model's context does not, so an unbounded replay is a request that eventually fails for a
+/// reason nothing in the run explains.
+///
+/// Twelve rather than a larger number because each turn costs its full text, and the budget below is
+/// what actually constrains the request. When the budget cannot hold all twelve the assembler
+/// excludes the rest **with a recorded reason**, which is what makes a truncated history visible
+/// rather than silent.
+const MAX_HISTORY_TURNS: u32 = 12;
 
 /// Model calls allowed for one run before it is failed rather than looped.
 ///
@@ -192,6 +205,9 @@ pub async fn execute_run(
     let mut calls = 0_u32;
     let mut current = run;
     let correlation_id = CorrelationId::new();
+    // The request the model will be sent, produced by the context assembly step. Held here so the
+    // manifest and the request describe the same selection.
+    let mut request_messages: Vec<ChatMessage> = Vec::new();
 
     loop {
         // A settlement ends the loop. Without this guard, a run that `fail`, `complete`, or
@@ -218,23 +234,17 @@ pub async fn execute_run(
                 current
             }
             RunState::ContextBuilding => {
-                current = assemble_and_record(database, model, &current, &model_id, correlation_id)
-                    .await?;
+                // The assembled request is held across the loop rather than rebuilt in `generate`,
+                // because the manifest is the record of what was selected for **this** call.
+                let (advanced, messages) =
+                    assemble_and_record(database, model, &current, &model_id, correlation_id)
+                        .await?;
+                request_messages = messages;
+                current = advanced;
                 current
             }
             RunState::Planning => {
-                // One planned step: call the model. Recorded as a transition rather than skipped so
-                // the stream explains the sequence the run actually took.
-                current = advance(
-                    database,
-                    &current,
-                    RunState::Executing,
-                    RunEventKind::StateChanged,
-                    Some("calling the model"),
-                    r#"{"state":"executing"}"#,
-                    correlation_id,
-                )
-                .await?;
+                current = enter_execution(database, &current, correlation_id).await?;
                 current
             }
             RunState::Executing => {
@@ -253,20 +263,19 @@ pub async fn execute_run(
                     )
                     .await;
                 }
-                current = generate(database, model, &current, &model_id, correlation_id).await?;
-                current
-            }
-            RunState::Observing => {
-                current = advance(
+                current = generate(
                     database,
+                    model,
                     &current,
-                    RunState::Responding,
-                    RunEventKind::StateChanged,
-                    Some("producing the answer"),
-                    r#"{"state":"responding"}"#,
+                    &model_id,
+                    &request_messages,
                     correlation_id,
                 )
                 .await?;
+                current
+            }
+            RunState::Observing => {
+                current = enter_responding(database, &current, correlation_id).await?;
                 current
             }
             RunState::Responding => {
@@ -294,6 +303,45 @@ pub async fn execute_run(
 
         current = check_cancellation(database, &current, correlation_id).await?;
     }
+}
+
+/// Records the move from interpreting the result to producing the answer.
+async fn enter_responding(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    advance(
+        database,
+        run,
+        RunState::Responding,
+        RunEventKind::StateChanged,
+        Some("producing the answer"),
+        r#"{"state":"responding"}"#,
+        correlation_id,
+    )
+    .await
+}
+
+/// Records the planned step as a transition into `executing`.
+///
+/// One planned step — call the model — and it is recorded rather than skipped so the stream explains
+/// the sequence the run actually took instead of jumping from planning to an answer.
+async fn enter_execution(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    advance(
+        database,
+        run,
+        RunState::Executing,
+        RunEventKind::StateChanged,
+        Some("calling the model"),
+        r#"{"state":"executing"}"#,
+        correlation_id,
+    )
+    .await
 }
 
 /// Re-reads the run and settles it `cancelled` when a cancellation was requested.
@@ -335,7 +383,7 @@ async fn assemble_and_record(
     run: &StoredRun,
     model_id: &ModelId,
     correlation_id: CorrelationId,
-) -> Result<StoredRun, DatabaseError> {
+) -> Result<(StoredRun, Vec<ChatMessage>), DatabaseError> {
     let budget = ContextBudget::new(
         TOTAL_CONTEXT_TOKENS,
         RESERVED_POLICY_TOKENS,
@@ -373,21 +421,50 @@ async fn assemble_and_record(
     )
     .map_err(|_| DatabaseError::InvalidRunRequest { field: "objective" })?;
 
+    // The conversation so far, offered to the **assembler** rather than added to the request
+    // directly. Adding it directly would let the manifest — the audit record of what the model was
+    // given — disagree with the request, which is the same class of defect the ceiling below
+    // guards against.
+    let history = load_history(database, run).await?;
+    let mut offered = vec![policy, objective];
+    for turn in &history {
+        offered.push(
+            ContextItem::new(
+                ContextSource::new(
+                    ContextSourceKind::RecentConversation,
+                    turn.reference.as_str(),
+                )
+                .map_err(|_| DatabaseError::InvalidRunRequest { field: "history" })?,
+                turn.trust,
+                Sensitivity::Internal,
+                // Optional rather than required, so a conversation longer than the budget drops its
+                // oldest turns instead of failing the run. `RequiredExceedsBudget` is an error by
+                // design, and "your conversation is too long" is not a reason to refuse a question.
+                ContextPriority::Optional,
+                turn.tokens,
+                InclusionReason::RetrievedMatch,
+                false,
+            )
+            .map_err(|_| DatabaseError::InvalidRunRequest { field: "history" })?,
+        );
+    }
+
     // The destination ceiling is the model's **placement**, which is a privacy input rather than a
     // label, read from the adapter instead of assumed. A local model never leaves the machine, so
     // it may receive anything; a remote or unprobed model may not receive Confidential content.
     let ceiling = destination_ceiling(model, model_id).await;
 
-    let manifest = assemble_context(vec![policy, objective], budget, ceiling)
+    let manifest = assemble_context(offered, budget, ceiling)
         .map_err(|_| DatabaseError::InvalidRunRequest { field: "context" })?;
 
     let payload = format!(
-        r#"{{"included":{},"excluded":{},"used_tokens":{},"instruction_tokens":{},"untrusted_tokens":{}}}"#,
+        r#"{{"included":{},"excluded":{},"used_tokens":{},"instruction_tokens":{},"untrusted_tokens":{},"history_offered":{}}}"#,
         manifest.included().len(),
         manifest.excluded().len(),
         manifest.used_tokens(),
         manifest.instruction_tokens(),
         manifest.untrusted_tokens(),
+        history.len(),
     );
 
     append(
@@ -403,7 +480,7 @@ async fn assemble_and_record(
     // The manifest is recorded, then the run advances. The transition is separate so its own event
     // carries the state change, keeping "what was assembled" and "what state the run is in"
     // distinguishable in the stream rather than fused into one payload.
-    advance(
+    let advanced = advance(
         database,
         run,
         RunState::Planning,
@@ -412,7 +489,167 @@ async fn assemble_and_record(
         r#"{"state":"planning"}"#,
         correlation_id,
     )
-    .await
+    .await?;
+
+    // The request is built from the **manifest**, not from the offered list. That is what keeps
+    // "what the audit record says was included" and "what the model was sent" the same set: a turn
+    // the assembler excluded for budget must not appear in the request, or the manifest is a record
+    // of a decision that was not honoured.
+    Ok((
+        advanced,
+        messages_from_manifest(&manifest, &history, run.objective()),
+    ))
+}
+
+/// One conversation turn offered to the assembler.
+struct HistoryTurn {
+    /// The bounded source reference, which is also how the inclusion is recognised afterwards.
+    reference: String,
+    /// The role this turn is replayed as.
+    role: HistoryRole,
+    /// The turn's text.
+    content: String,
+    /// The trust class this turn carries.
+    trust: ContextTrust,
+    /// The turn's token estimate.
+    tokens: u32,
+}
+
+/// How a stored message is replayed to a model.
+///
+/// `MessageSource` records *where content came from* and `MessageRole` records *who spoke*; a model
+/// call needs the latter. The mapping is explicit rather than a `From` impl because a `tool` message
+/// cannot be replayed without its call identifier, and a silent conversion would be the place that
+/// detail got lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRole {
+    User,
+    Assistant,
+    System,
+}
+
+/// Loads the conversation turns preceding this run.
+///
+/// The run's **own** objective is excluded: it is the current turn, and it is already offered under
+/// `CurrentInput`. Including it twice would show the model the same question as both history and the
+/// live request, which reads to a model as a repeated question rather than a continuation.
+///
+/// A turn with no answer yet is included as history anyway, because the transcript is the record of
+/// what was said. An unanswered question is a real event in a conversation.
+async fn load_history(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+) -> Result<Vec<HistoryTurn>, DatabaseError> {
+    let messages =
+        jarvis_storage::read_recent_messages(database, run.session_id(), MAX_HISTORY_TURNS).await?;
+
+    let mut turns = Vec::with_capacity(messages.len());
+    for message in &messages {
+        // The current run's question is the live input, not history. Identified by its run
+        // identifier rather than by matching text, because a user may legitimately ask the same
+        // question twice in one conversation and text matching would drop the earlier one.
+        if message.run_id() == Some(run.id()) && message.role() == jarvis_core::MessageRole::User {
+            continue;
+        }
+        let Some(role) = history_role(message.role()) else {
+            // A tool message cannot be replayed without the call it answers, and no stored message
+            // this build writes is a tool result yet. Skipping it is honest: a fabricated tool
+            // result would be a claim the transcript does not support.
+            continue;
+        };
+        turns.push(HistoryTurn {
+            reference: history_reference(message.id(), message.sequence()),
+            role,
+            content: message.content().to_owned(),
+            // A stored assistant message is JARVIS's own output, so it is `Derived`. User text is
+            // the user speaking. The contract allows both for `RecentConversation`, and labelling an
+            // assistant turn as user input would let the model treat its own past words as a
+            // request.
+            trust: match role {
+                HistoryRole::User => ContextTrust::User,
+                HistoryRole::Assistant | HistoryRole::System => ContextTrust::Derived,
+            },
+            tokens: estimate_tokens(message.content()),
+        });
+    }
+    Ok(turns)
+}
+
+/// Maps a stored role onto the role it is replayed as.
+fn history_role(role: jarvis_core::MessageRole) -> Option<HistoryRole> {
+    match role {
+        jarvis_core::MessageRole::User => Some(HistoryRole::User),
+        jarvis_core::MessageRole::Assistant => Some(HistoryRole::Assistant),
+        jarvis_core::MessageRole::System => Some(HistoryRole::System),
+        // A tool result carries a call identifier the model must see, and replaying it without one
+        // would be a malformed request. `None` rather than a guess.
+        jarvis_core::MessageRole::Tool => None,
+    }
+}
+
+/// Builds the bounded source reference for one stored message.
+fn history_reference(message_id: &str, sequence: i64) -> String {
+    format!("message:{sequence}:{message_id}")
+}
+
+/// Builds the model request from the assembled manifest.
+///
+/// # Membership comes from the manifest; order comes from the conversation
+///
+/// These are two different questions and the first implementation conflated them, which running the
+/// test found: it walked the manifest and produced `policy, current question, earlier question,
+/// earlier answer`, because the assembler orders by **budget tier** — required content first — and
+/// the objective is required while history is optional. That order is correct for budgeting and
+/// wrong for a conversation: a model reading the earlier exchange *after* the current question sees
+/// history as a continuation of the prompt rather than as context for it.
+///
+/// So the manifest decides *what* may be sent, which is what makes an excluded turn absent by
+/// construction, and the conversation decides *in what order*: policy first, then the replayed turns
+/// oldest-to-newest, then the current question. The result is the transcript as it happened, ending
+/// with the question being asked.
+///
+/// A context item carries a bounded **reference** rather than content — an opaque pointer is all the
+/// manifest stores, by design — so the text is looked up from the turns that were offered. `objective`
+/// is passed for the same reason: it is the run's own validated text.
+fn messages_from_manifest(
+    manifest: &jarvis_core::ContextManifest,
+    history: &[HistoryTurn],
+    objective: &str,
+) -> Vec<ChatMessage> {
+    let included = |kind: ContextSourceKind| {
+        manifest
+            .included()
+            .iter()
+            .any(|item| item.source().kind() == kind)
+    };
+
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    if included(ContextSourceKind::IdentityPolicy) {
+        messages.push(ChatMessage::system(SYSTEM_POLICY));
+    }
+
+    // The turns are walked in the order they were loaded, which `read_recent_messages` returns
+    // oldest-first, so the replayed conversation reads chronologically. Each turn is sent only if
+    // the manifest recorded its reference as included.
+    for turn in history {
+        if !manifest
+            .included()
+            .iter()
+            .any(|item| item.source().reference() == turn.reference)
+        {
+            continue;
+        }
+        messages.push(match turn.role {
+            HistoryRole::User => ChatMessage::user(turn.content.clone()),
+            HistoryRole::Assistant => ChatMessage::assistant(turn.content.clone()),
+            HistoryRole::System => ChatMessage::system(turn.content.clone()),
+        });
+    }
+
+    if included(ContextSourceKind::CurrentInput) {
+        messages.push(ChatMessage::user(objective));
+    }
+    messages
 }
 
 /// Returns the most sensitive content the configured model may receive.
@@ -517,16 +754,10 @@ async fn generate(
     model: &dyn ModelGateway,
     run: &StoredRun,
     model_id: &ModelId,
+    messages: &[ChatMessage],
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
-    let request = ChatRequest::new(
-        model_id.clone(),
-        vec![
-            ChatMessage::system(SYSTEM_POLICY),
-            ChatMessage::user(run.objective()),
-        ],
-        correlation_id,
-    );
+    let request = ChatRequest::new(model_id.clone(), messages.to_vec(), correlation_id);
 
     let stream = match model.stream(request).await {
         Ok(stream) => stream,
@@ -966,6 +1197,36 @@ mod tests {
             .unwrap_or_else(|error| panic!("scripted model: {error}"))
     }
 
+    /// Starts a run as a continuation of an existing session, through the real start path.
+    async fn continue_session(
+        database: &Arc<SqliteDatabase>,
+        session_id: &str,
+        objective: &str,
+    ) -> StoredRun {
+        let identity = jarvis_storage::load_local_identity(database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must have a seeded identity: {error}"));
+        let input = StartRunInput::continuing(
+            jarvis_storage::SessionTarget::Existing(session_id.to_owned()),
+            session_id.to_owned(),
+            jarvis_core::RunId::new().to_string(),
+            jarvis_core::RequestId::new().to_string(),
+            identity.workspace_id(),
+            identity.user_id(),
+            objective,
+            API_SESSION_CHANNEL,
+            CorrelationId::new(),
+            UtcTimestamp::now(&SystemClock),
+        )
+        .unwrap_or_else(|error| panic!("continue input: {error}"));
+        let started = start_run(database, &input)
+            .await
+            .unwrap_or_else(|error| panic!("continue the session: {error}"));
+        find_run(database, started.run_id())
+            .await
+            .unwrap_or_else(|error| panic!("read the continued run: {error}"))
+    }
+
     async fn events(database: &Arc<SqliteDatabase>, run_id: &str) -> Vec<RunEventKind> {
         jarvis_storage::read_run_events(
             database,
@@ -1245,5 +1506,156 @@ mod tests {
             "three characters plus the ellipsis"
         );
         assert!(truncated.starts_with("ééé"));
+    }
+
+    /// **The multi-turn property: a continuation replays the session's earlier turns.**
+    ///
+    /// This is what makes a conversation a conversation rather than a series of unrelated questions.
+    /// It is asserted against the **request** the adapter received, not against the answer: an
+    /// adapter that returned the same answer either way would satisfy every answer-shaped assertion,
+    /// so the answer cannot be the evidence.
+    #[tokio::test]
+    async fn a_continuation_sends_the_earlier_turns_to_the_model() {
+        let (_profile, database) = database().await;
+        let first = start(&database, "what is on my calendar").await;
+        let first_model = model(vec![Turn::answer("Three meetings.")]);
+        execute_run(&database, &first_model, first.id())
+            .await
+            .unwrap_or_else(|error| panic!("first run: {error}"));
+
+        let second = continue_session(&database, first.session_id(), "and the second one").await;
+        let second_model = model(vec![Turn::answer("At ten.")]);
+        execute_run(&database, &second_model, second.id())
+            .await
+            .unwrap_or_else(|error| panic!("second run: {error}"));
+
+        let requests = second_model.seen_messages();
+        assert_eq!(requests.len(), 1, "the second turn makes one model call");
+        let sent = &requests[0];
+
+        let texts: Vec<String> = sent.iter().map(ChatMessage::text).collect();
+        assert!(
+            texts.iter().any(|text| text == "what is on my calendar"),
+            "the first turn's question must be replayed: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Three meetings."),
+            "the first turn's answer must be replayed, or the model cannot resolve 'the second one': {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "and the second one"),
+            "the current turn must be present: {texts:?}"
+        );
+
+        // The order is what makes the replay a conversation: history precedes the current question.
+        let current = texts
+            .iter()
+            .position(|text| *text == "and the second one")
+            .unwrap_or_else(|| panic!("the current question must be present: {texts:?}"));
+        let earlier = texts
+            .iter()
+            .position(|text| *text == "Three meetings.")
+            .unwrap_or_else(|| panic!("the earlier answer must be present: {texts:?}"));
+        assert!(
+            earlier < current,
+            "the earlier answer must precede the current question: {texts:?}"
+        );
+        database.close().await;
+    }
+
+    /// A first turn must not replay anything, because there is nothing to replay.
+    ///
+    /// The counterpart to the test above: a daemon that read *some* transcript unconditionally would
+    /// pass that test and still put another conversation's turns into a fresh question.
+    #[tokio::test]
+    async fn a_first_turn_sends_only_policy_and_the_question() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "a brand new question").await;
+        let model = model(vec![Turn::answer("A brand new answer.")]);
+        execute_run(&database, &model, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        let requests = model.seen_messages();
+        let texts: Vec<String> = requests[0].iter().map(ChatMessage::text).collect();
+        assert_eq!(
+            texts,
+            vec![SYSTEM_POLICY.to_owned(), "a brand new question".to_owned()],
+            "a first turn is policy plus the question, with no history"
+        );
+        database.close().await;
+    }
+
+    /// A second conversation must not inherit the first one's turns.
+    ///
+    /// The transcript is scoped by session, and this is the assertion that catches a history read
+    /// that filtered by workspace or by nothing at all: both would look correct in a single-session
+    /// test.
+    #[tokio::test]
+    async fn a_different_session_does_not_inherit_the_first_conversation() {
+        let (_profile, database) = database().await;
+        let first = start(&database, "the first conversation").await;
+        let first_model = model(vec![Turn::answer(
+            "An answer about the first conversation.",
+        )]);
+        execute_run(&database, &first_model, first.id())
+            .await
+            .unwrap_or_else(|error| panic!("first run: {error}"));
+
+        // A separate session, through the ordinary new-session path.
+        let second = start(&database, "an unrelated question").await;
+        assert_ne!(
+            first.session_id(),
+            second.session_id(),
+            "the fixture must have produced two conversations"
+        );
+        let second_model = model(vec![Turn::answer("An unrelated answer.")]);
+        execute_run(&database, &second_model, second.id())
+            .await
+            .unwrap_or_else(|error| panic!("second run: {error}"));
+
+        let requests = second_model.seen_messages();
+        let texts: Vec<String> = requests[0].iter().map(ChatMessage::text).collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("the first conversation")),
+            "one conversation's turns must not reach another: {texts:?}"
+        );
+        database.close().await;
+    }
+
+    /// The answer recorded for a continuation is the assistant message a later turn will replay.
+    ///
+    /// Proves the transcript is closed on both sides, so the third turn has a complete second turn to
+    /// read. A daemon that stored only the question would replay a conversation of unanswered
+    /// questions.
+    #[tokio::test]
+    async fn a_completed_turn_stores_both_sides_of_the_exchange() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "a question worth answering").await;
+        let model = model(vec![Turn::answer("An answer worth storing.")]);
+        execute_run(&database, &model, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        let transcript = jarvis_storage::read_messages(&database, run.session_id(), 10)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        let contents: Vec<&str> = transcript
+            .iter()
+            .map(jarvis_storage::StoredMessage::content)
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["a question worth answering", "An answer worth storing."],
+            "a settled turn must leave both the question and the answer"
+        );
+        assert_eq!(
+            transcript[1].role(),
+            jarvis_core::MessageRole::Assistant,
+            "the answer must be stored as the assistant's turn"
+        );
+        database.close().await;
     }
 }

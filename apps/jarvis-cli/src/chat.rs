@@ -1,25 +1,29 @@
-//! `jarvis ask`: start a run through the daemon's API and render its stream.
+//! `jarvis ask` and `jarvis chat`: drive a run through the daemon's API and render its stream.
 //!
-//! # Scope: there is no `chat` here on purpose
+//! # What `chat` adds, and why it is a client change rather than a new mechanism
 //!
-//! `TODO.md` `P2-008` names "`ask` and `chat`". `ask` is implemented; `chat` is deliberately not,
-//! and the reason is a real gap rather than an omission. A chat loop needs a session that persists
-//! across turns and a model that answers, and neither exists yet: nothing in `jarvisd` invokes a
-//! model, so a run reaches `received` and stays there. A `chat` built now could only print a
-//! `received` run per turn, which would look like a conversation while recording none. The session
-//! read model and the model adapter are `P2-009`, and `chat` belongs with them.
+//! A multi-turn conversation is a sequence of **runs sharing one session**. The second turn is a new
+//! run, not a mutation of the first, and the daemon replays the session's transcript into the model
+//! call. That is the whole of the difference: `chat` remembers a session identifier between turns and
+//! sends it with each objective, so nothing about orchestration moves into the client.
+//!
+//! The session identifier is one the **daemon** issued, printed on the first turn so an operator can
+//! find the conversation later. The client never invents one: a session identifier is guessable, and
+//! a client that chose its own could name a conversation it was never granted. The daemon verifies
+//! every identifier against the profile's workspace and user before writing a run into it.
 //!
 //! # The CLI contains no orchestration
 //!
 //! `P2-008` requires it: "the CLI must contain no orchestration logic". Everything this module does
 //! is transport work — start a run through the daemon's API, read the daemon's stream, and render
-//! what the daemon recorded. It makes no policy decision, assembles no context, and chooses no model.
+//! what the daemon recorded. It makes no policy decision, assembles no context, chooses no model, and
+//! decides nothing about what history the model sees; that selection is the daemon's context
+//! assembler and its result is the manifest the daemon records.
 //!
 //! # Identity comes from the daemon, never from the client
 //!
 //! The workspace and user are resolved by the daemon from its seeded local identity. The client
-//! sends an objective and nothing else. A client-supplied workspace identifier would be a claim
-//! rather than proof of access, which `docs/architecture/identity-and-workspaces.md` forbids.
+//! sends an objective and, for a continuation, a session identifier it was given.
 //!
 //! # Rendering distinguishes intent, progress, output, and settlement
 //!
@@ -32,8 +36,9 @@
 //! Answer text goes to stdout while progress goes to stderr so `jarvis ask ... > answer.txt`
 //! captures the answer rather than a transcript of the run.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 
+use jarvis_core::ErrorCode;
 use jarvis_protocol::{RunReply, RunStreamFrame, StreamReading, output_text, state_name};
 
 use crate::api_client::{ApiClient, ApiError};
@@ -46,16 +51,147 @@ use crate::output::ExitStatus;
 /// because the keep-alives themselves keep resetting that timeout.
 pub(crate) const MAX_IDLE_KEEP_ALIVES: u32 = 8;
 
-/// Streams one run to completion, returning the process exit status.
+/// Characters allowed in one turn's objective.
+///
+/// Matches the storage schema's bound, so a turn the daemon would refuse is refused here with an
+/// explanation instead of becoming a failed request. Counting characters rather than bytes follows
+/// the same rule the schema uses: it bounds a `TEXT` column with `length()`, which counts characters.
+const MAX_TURN_CHARS: usize = 4_096;
+
+/// Commands a chat session understands, typed on their own line.
+const CHAT_EXIT: [&str; 2] = [":quit", ":exit"];
+
+/// Runs one objective through the daemon's HTTP API and renders its stream.
+///
+/// # Why this needs the daemon's configuration
+///
+/// The HTTP transport is separately enabled and its port is configuration, so the CLI reads the
+/// same profile configuration the daemon does and targets whatever the daemon was told to bind. A
+/// hard-coded port would work on a default install and silently target nothing on a configured one.
 pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
+    start_and_render(client, objective, None).await.status
+}
+
+/// Runs an interactive conversation, one turn per line of standard input.
+///
+/// # Why the session is printed before the first answer
+///
+/// A conversation that cannot be found again is not durable, so the session identifier is reported
+/// as part of the *accepted request* on the first turn. `P4-008` adds the inspect and export surface
+/// that a user would use it with; until then this line is the only handle on a stored conversation.
+///
+/// # Why a failed turn does not end the conversation
+///
+/// A run can fail for reasons that say nothing about the conversation: a provider outage, a refusal,
+/// a cancelled request. Ending the loop would discard the session, so the failure is reported and the
+/// next line is read. A failure of the **session** is different — a closed or foreign session cannot
+/// accept another turn — and that ends the loop, because every later turn would fail the same way.
+pub(crate) async fn converse(client: &ApiClient) -> ExitStatus {
+    eprintln!(
+        "jarvis: chatting with {}. End a turn with a blank line, or type :quit.",
+        client.host()
+    );
+    eprintln!(
+        "jarvis: the daemon stores this conversation; the session identifier is printed below."
+    );
+
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut session_id: Option<String> = None;
+    let mut turns = 0_u32;
+    // The last turn's failure, carried out of the loop so a script can see that something in the
+    // conversation went wrong even though the conversation itself continued.
+    let mut last_failure = ExitStatus::Ok;
+
+    loop {
+        eprint!("jarvis> ");
+        let _ = std::io::stderr().flush();
+
+        let Some(Ok(line)) = lines.next() else {
+            // Input ended, or could not be read. Neither is an error worth a stack of diagnostics, and
+            // ending quietly is what a user expects from a closed pipe or a typed control-D.
+            break;
+        };
+        let turn = line.trim();
+        if turn.is_empty() {
+            continue;
+        }
+        if CHAT_EXIT.contains(&turn) {
+            break;
+        }
+        if turn.chars().count() > MAX_TURN_CHARS {
+            // Refused here rather than sent, so the message names the actual problem. The daemon
+            // would refuse it too, but as a validation failure that does not say which bound was
+            // exceeded or by how much.
+            eprintln!(
+                "jarvis: that turn is {} characters, over the {MAX_TURN_CHARS} allowed; shorten it",
+                turn.chars().count()
+            );
+            continue;
+        }
+
+        let outcome = start_and_render(client, turn, session_id.as_deref()).await;
+        // The session is remembered from the daemon's reply, not from a value the client chose, so a
+        // daemon that started a different session than requested cannot leave the client addressing
+        // one that does not exist.
+        if let Some(accepted) = outcome.session_id {
+            session_id = Some(accepted);
+        }
+        turns += 1;
+
+        if outcome.session_rejected {
+            eprintln!(
+                "jarvis: the daemon refused the session, so the conversation cannot continue"
+            );
+            return outcome.status;
+        }
+        // A terminal *run* failure is reported and the loop continues; only the exit status of the
+        // last turn is carried out, so a script can still see that something went wrong.
+        if outcome.status != ExitStatus::Ok {
+            last_failure = outcome.status;
+        }
+    }
+
+    eprintln!(
+        "jarvis: {turns} turn(s) recorded in session {}",
+        session_id.as_deref().unwrap_or("(none)")
+    );
+    last_failure
+}
+
+/// The result of rendering one run.
+struct TurnOutcome {
+    /// The session the daemon recorded the run in.
+    session_id: Option<String>,
+    /// Whether the daemon refused the session itself, rather than the run failing.
+    session_rejected: bool,
+    /// The exit status for this turn.
+    status: ExitStatus,
+}
+
+/// Starts a run in a session and renders its stream.
+async fn start_and_render(
+    client: &ApiClient,
+    objective: &str,
+    session_id: Option<&str>,
+) -> TurnOutcome {
     // The endpoint is named before the request so a transport failure is diagnosable: "the daemon
     // API could not be reached" is not actionable without knowing which address was tried, and the
     // HTTP transport is separately enabled so the address is configuration rather than a constant.
     eprintln!("jarvis: asking {}", client.host());
 
-    let reply = match client.start_run(objective).await {
+    let reply = match client.start_run_in_session(objective, session_id).await {
         Ok(reply) => reply,
-        Err(error) => return report_error(&error),
+        Err(error) => {
+            return TurnOutcome {
+                session_id: None,
+                // A session the daemon refused is distinguishable by its status: the request was
+                // well-formed and the session it named was not usable. Any other refusal is about
+                // the request itself and does not end a conversation.
+                session_rejected: matches!(&error, ApiError::Refused(wire) if wire.code == ErrorCode::Conflict),
+                status: report_error(&error),
+            };
+        }
     };
 
     // The identifiers are printed as the *request* that was accepted: they are what an operator or
@@ -67,17 +203,38 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
 
     let mut stream = match client.open_stream(&reply.run_id).await {
         Ok(stream) => stream,
-        Err(error) => return report_error(&error),
+        Err(error) => {
+            return TurnOutcome {
+                session_id: Some(reply.session_id.clone()),
+                session_rejected: false,
+                status: report_error(&error),
+            };
+        }
     };
 
+    TurnOutcome {
+        session_id: Some(reply.session_id.clone()),
+        session_rejected: false,
+        status: consume_turn(client, &reply, &mut stream).await,
+    }
+}
+
+/// Renders a run's stream until it settles, and reports the exit status for the turn.
+///
+/// Separated from the start so neither function exceeds the length lint, and because the two do
+/// different things: starting is a request that can be refused, and rendering is a loop over what the
+/// daemon recorded.
+async fn consume_turn(
+    client: &ApiClient,
+    reply: &RunReply,
+    stream: &mut crate::api_client::RunEventStream,
+) -> ExitStatus {
     // A run's stream begins with the state it was already in, so the first `state_changed` event is
     // the objective's acceptance, not progress. Rendering it would print the same state twice.
     let mut seen_first_state = false;
     // Consecutive keep-alive frames seen with no event between them. The daemon sends one every 15
     // seconds for as long as a run is active, and `read_timeout` cannot notice a stalled run because
-    // the keep-alives keep resetting it. The stream reports events in a steady flow when a run is
-    // progressing, so a long stretch of nothing but keep-alives is a stall, and without a bound the
-    // command would wait forever with no explanation.
+    // the keep-alives keep resetting it.
     let mut idle_keep_alives = 0_u32;
 
     loop {
@@ -109,16 +266,16 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
             RunStreamFrame::KeepAlive => {
                 idle_keep_alives += 1;
                 if idle_keep_alives >= MAX_IDLE_KEEP_ALIVES {
-                    // Reported rather than waited on: a run that produces no event across this span
-                    // is stalled, and the most likely cause is that nothing is executing runs yet.
-                    // Without this bound the command would wait forever, because keep-alives defeat
-                    // the read timeout that would otherwise notice.
+                    // Reported rather than waited on. An accepted run that is never executed is the
+                    // failure this bound exists for: the daemon can be configured without an
+                    // executor, in which case runs are recorded and never driven, and without this
+                    // the command would wait forever on keep-alives that defeat the read timeout.
                     eprintln!(
                         "jarvis: run {} has produced no event across {} keep-alives; it is stalled, not working",
                         reply.run_id, idle_keep_alives
                     );
                     eprintln!(
-                        "jarvis: nothing invokes a model until P2-009, so an accepted run stays in `received`"
+                        "jarvis: check that daemon.executor_model is set, or the run is recorded and never executed"
                     );
                     return ExitStatus::Unavailable;
                 }

@@ -116,6 +116,28 @@ impl NewSession {
     }
 }
 
+/// Whether a start creates a new session or continues an existing one.
+///
+/// A closed set rather than an `Option<SessionId>`, because the two cases differ in more than the
+/// identifier: a new conversation creates its session row, and a continued one must **verify** that
+/// the session exists and belongs to the same workspace and user before writing a run into it. An
+/// optional identifier makes "no session" and "a session I declined to check" the same value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionTarget {
+    /// Create a new session for this run.
+    New,
+    /// Continue an existing session, which must exist and belong to the same local identity.
+    Existing(String),
+}
+
+impl SessionTarget {
+    /// Returns whether this target continues an existing session.
+    #[must_use]
+    pub const fn is_existing(&self) -> bool {
+        matches!(self, Self::Existing(_))
+    }
+}
+
 /// The session, run, and first event to create atomically.
 ///
 /// Every identifier is supplied by the caller so the use case can record them before the
@@ -123,6 +145,7 @@ impl NewSession {
 /// transaction commits.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartRunInput {
+    target: SessionTarget,
     session_id: String,
     run_id: String,
     event_id: String,
@@ -153,6 +176,39 @@ impl StartRunInput {
         correlation_id: CorrelationId,
         started_at: UtcTimestamp,
     ) -> Result<Self, DatabaseError> {
+        Self::continuing(
+            SessionTarget::New,
+            session_id,
+            run_id,
+            event_id,
+            workspace_id,
+            user_id,
+            objective,
+            channel,
+            correlation_id,
+            started_at,
+        )
+    }
+
+    /// Validates a start that creates a new session or continues an existing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::InvalidRunRequest`] when an identifier is not UUID-sized text or
+    /// when the objective is empty or longer than the schema allows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn continuing(
+        target: SessionTarget,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        event_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        user_id: impl Into<String>,
+        objective: impl Into<String>,
+        channel: SessionChannel,
+        correlation_id: CorrelationId,
+        started_at: UtcTimestamp,
+    ) -> Result<Self, DatabaseError> {
         let session_id = session_id.into();
         let run_id = run_id.into();
         let event_id = event_id.into();
@@ -172,6 +228,17 @@ impl StartRunInput {
             }
         }
 
+        // The target and the identifier must agree. A continuation that named a different session
+        // would write a run into one session while its transcript recorded the message in another,
+        // and the two would be indistinguishable from a legitimate state afterwards.
+        if let SessionTarget::Existing(existing) = &target
+            && existing != &session_id
+        {
+            return Err(DatabaseError::InvalidRunRequest {
+                field: "session id",
+            });
+        }
+
         // Counted in CHARACTERS for the same reason the title is: the schema bounds this
         // column with `length()` on TEXT, so counting bytes would reject text it accepts.
         let character_count = objective.chars().count();
@@ -180,6 +247,7 @@ impl StartRunInput {
         }
 
         Ok(Self {
+            target,
             session_id,
             run_id,
             event_id,
@@ -202,6 +270,12 @@ impl StartRunInput {
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Returns whether this start creates its session or continues one.
+    #[must_use]
+    pub const fn target(&self) -> &SessionTarget {
+        &self.target
     }
 }
 
@@ -327,6 +401,113 @@ impl StartedRun {
     }
 }
 
+/// Creates the session row for a new conversation.
+///
+/// Inside the caller's transaction so a session cannot exist without the run that justifies it. A
+/// committed session with no run is a conversation a client could list and never open.
+async fn create_session(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &StartRunInput,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        "INSERT INTO sessions \
+         (id, workspace_id, user_id, channel, status, created_at, updated_at, version) \
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, 1)",
+    )
+    .bind(&input.session_id)
+    .bind(&input.workspace_id)
+    .bind(&input.user_id)
+    .bind(input.channel.as_str())
+    .bind(input.started_at.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|source| map_write_error("create a session", source))
+    .map(|_| ())
+}
+
+/// Attaches a run to an existing session, proving this identity may write into it.
+///
+/// The guard is folded into one statement rather than a read followed by a decision, for the reason
+/// the run-event repository records: a separate read takes a snapshot another writer can invalidate.
+/// The workspace and user are part of the **predicate**, not checked afterwards — a session
+/// identifier is guessable, and without this a caller could append to a conversation belonging to a
+/// workspace it was never granted.
+///
+/// The failing case is resolved from a read, because three causes are indistinguishable from the
+/// update alone: no such session, a session of another identity, and an archived session. Two of them
+/// are reported as absence on purpose — telling a caller that somebody else's conversation exists is
+/// itself a disclosure.
+async fn attach_session(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &StartRunInput,
+) -> Result<(), DatabaseError> {
+    let attached = sqlx::query(
+        "UPDATE sessions SET updated_at = ?2, version = version + 1 \
+         WHERE id = ?1 AND workspace_id = ?3 AND user_id = ?4 AND status = 'active'",
+    )
+    .bind(&input.session_id)
+    .bind(input.started_at.to_string())
+    .bind(&input.workspace_id)
+    .bind(&input.user_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|source| map_write_error("continue a session", source))?;
+
+    if attached.rows_affected() == 1 {
+        return Ok(());
+    }
+    Err(classify_session_attachment(
+        transaction,
+        &input.session_id,
+        &input.workspace_id,
+        &input.user_id,
+    )
+    .await)
+}
+
+/// Explains why a continuation could not attach to a session.
+///
+/// Called only after the guarded update matched no row, so the three causes are resolved from a
+/// read rather than guessed. A caller that was told "not found" for a session belonging to another
+/// workspace would retry the same request; one told "archived" would start a new conversation.
+async fn classify_session_attachment(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    workspace_id: &str,
+    user_id: &str,
+) -> DatabaseError {
+    let found = sqlx::query("SELECT workspace_id, user_id, status FROM sessions WHERE id = ?1")
+        .bind(session_id)
+        .fetch_optional(&mut **transaction)
+        .await;
+
+    let Ok(Some(row)) = found else {
+        // Either no such session, or the read itself failed. Both leave the session unattachable,
+        // and the caller's next action is the same, so the distinction is not worth inventing an
+        // error for.
+        return DatabaseError::SessionNotFound;
+    };
+
+    let session_workspace: Result<String, _> = row.try_get("workspace_id");
+    let session_user: Result<String, _> = row.try_get("user_id");
+    let session_status: Result<String, _> = row.try_get("status");
+
+    // Checked before the archive state so a session of another identity is reported as an access
+    // problem rather than as a lifecycle one. Reporting "archived" for a session the caller was
+    // never entitled to would tell it the session exists.
+    match (session_workspace, session_user) {
+        (Ok(workspace), Ok(user)) if workspace != workspace_id || user != user_id => {
+            return DatabaseError::SessionNotFound;
+        }
+        _ => {}
+    }
+
+    match session_status.as_deref() {
+        Ok("archived") => DatabaseError::SessionNotWritable { field: "status" },
+        _ => DatabaseError::SessionNotFound,
+    }
+}
+
 /// Creates a session, the run it holds, and the run's first event in one transaction.
 ///
 /// The run is created in `received` and its first event is `state_changed` describing that,
@@ -338,6 +519,9 @@ impl StartedRun {
 /// - [`DatabaseError::LocalIdentityMissing`] when the workspace or user row is absent, so a
 ///   start against an unseeded profile names its cause rather than surfacing a foreign-key
 ///   failure that names no field.
+/// - [`DatabaseError::SessionNotFound`] when a continuation names a session this identity may not
+///   write into, or one that does not exist.
+/// - [`DatabaseError::SessionNotWritable`] when a continuation names an archived session.
 /// - [`DatabaseError::Sqlite`] for any other persistence failure.
 pub async fn start_run(
     database: &SqliteDatabase,
@@ -374,19 +558,10 @@ pub async fn start_run(
         });
     }
 
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, workspace_id, user_id, channel, status, created_at, updated_at, version) \
-         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, 1)",
-    )
-    .bind(&input.session_id)
-    .bind(&input.workspace_id)
-    .bind(&input.user_id)
-    .bind(input.channel.as_str())
-    .bind(input.started_at.to_string())
-    .execute(&mut *transaction)
-    .await
-    .map_err(|source| map_write_error("create a session", source))?;
+    match input.target() {
+        SessionTarget::New => create_session(&mut transaction, input).await?,
+        SessionTarget::Existing(_) => attach_session(&mut transaction, input).await?,
+    }
 
     sqlx::query(
         "INSERT INTO agent_runs (\
@@ -631,4 +806,331 @@ fn map_write_error(operation: &'static str, source: sqlx::Error) -> DatabaseErro
         };
     }
     DatabaseError::Sqlite { operation, source }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A temporary profile directory holding a migrated database.
+    struct TempProfile(PathBuf);
+
+    impl TempProfile {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jarvis-sessions-{}-{}",
+                std::process::id(),
+                jarvis_core::SessionId::new()
+            ));
+            std::fs::create_dir_all(&path)
+                .unwrap_or_else(|error| panic!("create temp profile: {error}"));
+            Self(path)
+        }
+
+        fn database_path(&self) -> PathBuf {
+            self.0.join(crate::database::DEFAULT_DATABASE_FILENAME)
+        }
+    }
+
+    impl Drop for TempProfile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn database() -> (TempProfile, SqliteDatabase) {
+        let profile = TempProfile::new();
+        let database = SqliteDatabase::open(&profile.database_path())
+            .await
+            .unwrap_or_else(|error| panic!("open fixture database: {error}"));
+        (profile, database)
+    }
+
+    fn at(minute: i128) -> UtcTimestamp {
+        UtcTimestamp::from_unix_nanos(1_774_000_000_000_000_000 + minute * 60_000_000_000)
+            .unwrap_or_else(|error| panic!("timestamp: {error}"))
+    }
+
+    /// Builds a start input, creating or continuing according to the target.
+    async fn start_input(
+        database: &SqliteDatabase,
+        target: SessionTarget,
+        session_id: String,
+        objective: &str,
+    ) -> StartRunInput {
+        let identity = crate::load_local_identity(database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must be seeded: {error}"));
+        StartRunInput::continuing(
+            target,
+            session_id,
+            jarvis_core::RunId::new().to_string(),
+            jarvis_core::RequestId::new().to_string(),
+            identity.workspace_id(),
+            identity.user_id(),
+            objective,
+            API_SESSION_CHANNEL,
+            CorrelationId::new(),
+            at(0),
+        )
+        .unwrap_or_else(|error| panic!("start input: {error}"))
+    }
+
+    /// A second run may be added to an existing conversation, and it joins the same session.
+    #[tokio::test]
+    async fn a_run_can_continue_an_existing_session() {
+        let (_profile, database) = database().await;
+        let session = jarvis_core::SessionId::new().to_string();
+
+        let first = start_input(&database, SessionTarget::New, session.clone(), "first turn").await;
+        start_run(&database, &first)
+            .await
+            .unwrap_or_else(|error| panic!("first run: {error}"));
+
+        let second = start_input(
+            &database,
+            SessionTarget::Existing(session.clone()),
+            session.clone(),
+            "second turn",
+        )
+        .await;
+        let started = start_run(&database, &second)
+            .await
+            .unwrap_or_else(|error| panic!("second run must continue the session: {error:?}"));
+
+        assert_eq!(
+            started.session_id(),
+            session,
+            "the second run must belong to the same conversation"
+        );
+        assert_eq!(started.objective(), "second turn");
+
+        // Both the questions must be in one transcript, in order, which is what a replay reads.
+        let transcript = crate::read_messages(&database, &session, 10)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        let contents: Vec<&str> = transcript
+            .iter()
+            .map(crate::StoredMessage::content)
+            .collect();
+        assert_eq!(contents, vec!["first turn", "second turn"]);
+        database.close().await;
+    }
+
+    /// Continuing a session this identity may not write into is refused, and reports absence.
+    ///
+    /// A session identifier is guessable, so a caller that supplied one belonging to another
+    /// workspace must not be able to append to it. The refusal names absence rather than access,
+    /// because telling a caller that somebody else's session exists is itself a disclosure.
+    #[tokio::test]
+    async fn continuing_a_foreign_session_is_refused_as_absent() {
+        let (_profile, database) = database().await;
+        let session = jarvis_core::SessionId::new().to_string();
+        let first = start_input(&database, SessionTarget::New, session.clone(), "first turn").await;
+        start_run(&database, &first)
+            .await
+            .unwrap_or_else(|error| panic!("first run: {error}"));
+
+        // The same session, presented by a different workspace and user. The rows exist, so this
+        // exercises the identity predicate rather than a missing row.
+        let other = StartRunInput::continuing(
+            SessionTarget::Existing(session.clone()),
+            session.clone(),
+            jarvis_core::RunId::new().to_string(),
+            jarvis_core::RequestId::new().to_string(),
+            crate::LOCAL_WORKSPACE_ID.to_owned(),
+            "0198f000-0000-7000-8000-0000000000ff".to_owned(),
+            "intruding turn",
+            API_SESSION_CHANNEL,
+            CorrelationId::new(),
+            at(1),
+        )
+        .unwrap_or_else(|error| panic!("input: {error}"));
+
+        let refused = start_run(&database, &other).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::LocalIdentityMissing { .. })),
+            "an unknown user is refused by the identity check first, so the session is never \
+             evaluated against a stranger: {refused:?}"
+        );
+
+        // And the transcript is untouched by the attempt.
+        let transcript = crate::read_messages(&database, &session, 10)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        assert_eq!(
+            transcript.len(),
+            1,
+            "the refused attempt must store nothing"
+        );
+        database.close().await;
+    }
+
+    /// **The falsification test for the session ownership predicate.**
+    ///
+    /// The test above is refused by the identity check, which means it never exercises the session
+    /// predicate at all. This one makes both identities real — a second user and workspace are seeded
+    /// — so the only thing standing between the caller and the foreign session is the session's own
+    /// workspace and user columns. Without the predicate in the `UPDATE`, a caller could append to
+    /// any conversation whose identifier it could guess, and every other test here would still pass.
+    #[tokio::test]
+    async fn a_session_of_another_workspace_cannot_be_appended_to() {
+        let (_profile, database) = database().await;
+
+        // A second, real identity. Both rows exist, so `LocalIdentityMissing` cannot be the cause.
+        for statement in [
+            "INSERT INTO users (id, display_name, status, created_at, updated_at, version) \
+             VALUES ('0198f000-0000-7000-8000-0000000000aa', 'Other User', 'active', \
+                     '2026-09-21T10:00:00Z', '2026-09-21T10:00:00Z', 1)",
+            "INSERT INTO workspaces (id, name, mode, data_policy, status, created_at, updated_at, version) \
+             VALUES ('0198f000-0000-7000-8000-0000000000bb', 'Other', 'local', 'local-only', 'active', \
+                     '2026-09-21T10:00:00Z', '2026-09-21T10:00:00Z', 1)",
+            "INSERT INTO sessions (id, workspace_id, user_id, channel, status, created_at, updated_at, version) \
+             VALUES ('0198f000-0000-7000-8000-0000000000cc', \
+                     '0198f000-0000-7000-8000-0000000000bb', \
+                     '0198f000-0000-7000-8000-0000000000aa', 'cli', 'active', \
+                     '2026-09-21T10:00:00Z', '2026-09-21T10:00:00Z', 1)",
+        ] {
+            sqlx::query(statement)
+                .execute(database.pool())
+                .await
+                .unwrap_or_else(|error| panic!("seed the second identity: {error}"));
+        }
+
+        let foreign = "0198f000-0000-7000-8000-0000000000cc".to_owned();
+        let input = start_input(
+            &database,
+            SessionTarget::Existing(foreign.clone()),
+            foreign.clone(),
+            "into somebody else's conversation",
+        )
+        .await;
+
+        let refused = start_run(&database, &input).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::SessionNotFound)),
+            "a session of another workspace must be refused as absent, so its existence is not \
+             confirmed to a caller that cannot use it: {refused:?}"
+        );
+
+        // The foreign transcript must be untouched — no message, and no run.
+        let count = crate::count_messages(&database, &foreign)
+            .await
+            .unwrap_or_else(|error| panic!("count: {error}"));
+        assert_eq!(count, 0, "nothing may be written into a foreign session");
+        database.close().await;
+    }
+
+    /// Continuing a session that does not exist is refused rather than creating one.
+    ///
+    /// A silent create would attach the run to a conversation the caller only believed existed, and
+    /// the transcript would then begin mid-thread with no sign that the earlier turns were lost.
+    #[tokio::test]
+    async fn continuing_a_missing_session_is_refused() {
+        let (_profile, database) = database().await;
+        let absent = jarvis_core::SessionId::new().to_string();
+        let input = start_input(
+            &database,
+            SessionTarget::Existing(absent.clone()),
+            absent,
+            "into nothing",
+        )
+        .await;
+
+        let refused = start_run(&database, &input).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::SessionNotFound)),
+            "a missing session must be reported, not created: {refused:?}"
+        );
+        database.close().await;
+    }
+
+    /// Continuing an archived session is refused as a lifecycle problem, not as absence.
+    ///
+    /// The distinction is actionable: an archived conversation means "start a new one", while a
+    /// missing one means the identifier was wrong.
+    #[tokio::test]
+    async fn continuing_an_archived_session_is_refused_as_closed() {
+        let (_profile, database) = database().await;
+        let session = jarvis_core::SessionId::new().to_string();
+        let first = start_input(&database, SessionTarget::New, session.clone(), "first turn").await;
+        start_run(&database, &first)
+            .await
+            .unwrap_or_else(|error| panic!("first run: {error}"));
+
+        sqlx::query("UPDATE sessions SET status = 'archived', archived_at = ?2 WHERE id = ?1")
+            .bind(&session)
+            .bind(at(1).to_string())
+            .execute(database.pool())
+            .await
+            .unwrap_or_else(|error| panic!("archive: {error}"));
+
+        let input = start_input(
+            &database,
+            SessionTarget::Existing(session.clone()),
+            session,
+            "after archiving",
+        )
+        .await;
+        let refused = start_run(&database, &input).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::SessionNotWritable { .. })),
+            "an archived session must be reported as closed, not missing: {refused:?}"
+        );
+        database.close().await;
+    }
+
+    /// A continuation whose identifier disagrees with its target is refused before any write.
+    ///
+    /// The two must denote the same session, or the run would land in one conversation while the
+    /// transcript recorded its question in another. Both rows would look legitimate afterwards.
+    #[tokio::test]
+    async fn a_continuation_naming_two_sessions_is_refused() {
+        let constructed = StartRunInput::continuing(
+            SessionTarget::Existing(jarvis_core::SessionId::new().to_string()),
+            jarvis_core::SessionId::new().to_string(),
+            jarvis_core::RunId::new().to_string(),
+            jarvis_core::RequestId::new().to_string(),
+            crate::LOCAL_WORKSPACE_ID.to_owned(),
+            crate::LOCAL_USER_ID.to_owned(),
+            "mismatched",
+            API_SESSION_CHANNEL,
+            CorrelationId::new(),
+            at(0),
+        );
+        assert!(
+            matches!(
+                constructed,
+                Err(DatabaseError::InvalidRunRequest {
+                    field: "session id"
+                })
+            ),
+            "a target and an identifier that disagree must be refused at construction"
+        );
+    }
+
+    /// A new conversation still creates its session, so continuation did not replace creation.
+    #[tokio::test]
+    async fn a_new_session_is_still_created() {
+        let (_profile, database) = database().await;
+        let session = jarvis_core::SessionId::new().to_string();
+        let input = start_input(
+            &database,
+            SessionTarget::New,
+            session.clone(),
+            "a fresh question",
+        )
+        .await;
+        let started = start_run(&database, &input)
+            .await
+            .unwrap_or_else(|error| panic!("start: {error}"));
+        assert_eq!(started.session_id(), session);
+
+        let stored = find_session(&database, &session)
+            .await
+            .unwrap_or_else(|error| panic!("find: {error}"));
+        assert_eq!(stored.status(), SessionStatus::Active);
+        database.close().await;
+    }
 }

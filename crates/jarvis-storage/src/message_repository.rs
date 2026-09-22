@@ -203,6 +203,68 @@ pub async fn read_messages(
 /// Maximum messages one read may return.
 pub const MAX_MESSAGE_PAGE: u32 = 512;
 
+/// Reads the **most recent** messages of a session, oldest-first among those returned.
+///
+/// # Why this is not `read_messages(..).rev()`
+///
+/// A conversation grows without bound while the context that can be replayed into a model call does
+/// not. Selecting "the first N" and then taking the last of them would read the *oldest* N and
+/// discard the turns closest to the current one, which are the ones a follow-up question depends on.
+/// The window therefore has to be chosen by the query, from the end, and then ordered forwards so the
+/// transcript replays in the order it happened.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::InvalidMessageRequest`] when `limit` is zero or above the maximum page,
+/// and [`DatabaseError::Sqlite`] when the read fails.
+pub async fn read_recent_messages(
+    database: &SqliteDatabase,
+    session_id: &str,
+    limit: u32,
+) -> Result<Vec<StoredMessage>, DatabaseError> {
+    if limit == 0 || limit > MAX_MESSAGE_PAGE {
+        return Err(DatabaseError::InvalidMessageRequest { field: "limit" });
+    }
+    let rows = sqlx::query(
+        "SELECT id, session_id, sequence, role, source, content, run_id, created_at \
+         FROM (SELECT * FROM messages WHERE session_id = ?1 ORDER BY sequence DESC LIMIT ?2) \
+         ORDER BY sequence ASC",
+    )
+    .bind(session_id)
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read a session's recent transcript",
+        source,
+    })?;
+
+    rows.iter().map(decode_message).collect()
+}
+
+/// Counts a session's messages without reading them.
+///
+/// A caller that windows a transcript needs to know whether older turns exist outside its window.
+/// Deriving that from a page length compares against the page bound, which is wrong the moment the
+/// bound changes — a count answers the question directly.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the read fails.
+pub async fn count_messages(
+    database: &SqliteDatabase,
+    session_id: &str,
+) -> Result<i64, DatabaseError> {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE session_id = ?1")
+        .bind(session_id)
+        .fetch_one(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "count a session transcript",
+            source,
+        })
+}
+
 fn decode_message(row: &sqlx::sqlite::SqliteRow) -> Result<StoredMessage, DatabaseError> {
     let role = text_field(row, "role")?
         .parse::<MessageRole>()
@@ -492,6 +554,115 @@ mod tests {
             read_messages(&database, &session, MAX_MESSAGE_PAGE + 1).await,
             Err(DatabaseError::InvalidMessageRequest { field: "limit" })
         ));
+        assert!(matches!(
+            read_recent_messages(&database, &session, 0).await,
+            Err(DatabaseError::InvalidMessageRequest { field: "limit" })
+        ));
+        database.close().await;
+    }
+
+    /// A bounded history read selects the **newest** turns and returns them oldest-first.
+    ///
+    /// This is the property a follow-up question depends on, and the one an obvious implementation
+    /// gets wrong: reading the first N and reversing them returns the *oldest* turns, so the turns
+    /// closest to the question in hand are the ones dropped.
+    #[tokio::test]
+    async fn a_bounded_history_read_keeps_the_newest_turns_in_order() {
+        let (_profile, database) = database().await;
+        let session = session(&database).await;
+
+        for index in 0..9 {
+            let message = NewMessage::user(format!("turn {index}"))
+                .unwrap_or_else(|error| panic!("valid message: {error}"));
+            append_message(
+                &database,
+                &session,
+                None,
+                &message,
+                CorrelationId::new(),
+                at(1),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("append: {error:?}"));
+        }
+
+        // Ten messages exist: the objective plus nine turns. A window of four must select the last
+        // four, and present them in the order they happened.
+        let window = read_recent_messages(&database, &session, 4)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        let contents: Vec<&str> = window.iter().map(StoredMessage::content).collect();
+        assert_eq!(
+            contents,
+            vec!["turn 5", "turn 6", "turn 7", "turn 8"],
+            "the window must hold the newest turns, oldest-first among themselves"
+        );
+
+        let sequences: Vec<i64> = window.iter().map(StoredMessage::sequence).collect();
+        assert!(
+            sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "the returned window must be in ascending sequence order: {sequences:?}"
+        );
+
+        // The count is what tells a caller whether turns exist outside the window, which a page
+        // length cannot: it is compared against the bound, so it is wrong the moment the bound moves.
+        assert_eq!(
+            count_messages(&database, &session)
+                .await
+                .unwrap_or_else(|error| panic!("count: {error}")),
+            10
+        );
+        database.close().await;
+    }
+
+    /// A window larger than the transcript returns the whole transcript rather than failing.
+    ///
+    /// A conversation must not break because a caller asked for more turns than exist. The bound is a
+    /// ceiling, not a requirement.
+    #[tokio::test]
+    async fn a_window_larger_than_the_transcript_returns_all_of_it() {
+        let (_profile, database) = database().await;
+        let session = session(&database).await;
+        let window = read_recent_messages(&database, &session, MAX_MESSAGE_PAGE)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        assert_eq!(window.len(), 1, "only the objective has been stored");
+        assert_eq!(window[0].content(), "store the transcript");
+        database.close().await;
+    }
+
+    /// The count is per session, so one conversation cannot report another's size.
+    #[tokio::test]
+    async fn the_count_is_scoped_to_its_session() {
+        let (_profile, database) = database().await;
+        let first = session(&database).await;
+        let second = session(&database).await;
+
+        let message = NewMessage::user("only in the second")
+            .unwrap_or_else(|error| panic!("valid message: {error}"));
+        append_message(
+            &database,
+            &second,
+            None,
+            &message,
+            CorrelationId::new(),
+            at(1),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("append: {error:?}"));
+
+        assert_eq!(
+            count_messages(&database, &first)
+                .await
+                .unwrap_or_else(|error| panic!("count: {error}")),
+            1
+        );
+        assert_eq!(
+            count_messages(&database, &second)
+                .await
+                .unwrap_or_else(|error| panic!("count: {error}")),
+            2
+        );
         database.close().await;
     }
 }
