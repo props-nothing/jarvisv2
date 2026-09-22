@@ -308,8 +308,26 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 
 ## P3: Tools, Policy, Approvals, And MCP
 
-- [ ] `P3-001` Define canonical tool identifiers, JSON Schema 2020-12 input/output, effects, risk, scopes, source, version, timeout, retry, and idempotency metadata.
+- [x] `P3-001` Define canonical tool identifiers, JSON Schema 2020-12 input/output, effects, risk, scopes, source, version, timeout, retry, and idempotency metadata.
+      Implemented as the `jarvis-tools` crate: `ToolId` (`namespace.name`, split on the last dot,
+      source derived from the namespace), `ToolSchema` (2020-12 only, compiled once, refusing any
+      non-local `$ref`), `EffectSet`, `Risk` (typed 0..=3, refused below the effect floor),
+      `ScopeSet` (`resource.action`, JARVIS capabilities rather than provider OAuth scopes),
+      `ApprovalPolicy`, `RetryPolicy`/`RetryDeclaration`, `Idempotency`, `Availability`,
+      `ToolSensitivity`, `ToolOutcome`/`ToolOutcomeRecord`, and the aggregate `ToolDefinition`.
+      Three cross-field rules are enforced at construction, including through a parsed manifest:
+      risk ≥ the effect floor, no blind retry of an ambiguous effect, and a declared source that
+      must agree with the identifier. 96 in-crate tests. ADR-0015 records the durable decisions;
+      `docs/research/integrations/json-schema-validation.md` records the `jsonschema` 0.57.0
+      selection and why its default features (HTTP/file `$ref` resolution) are disabled.
+      Deliberately not a placeholder: this slice declares and validates metadata and decides nothing.
+      Policy evaluation is `P3-003`; registration is `P3-002`; execution is `P3-005`. No adapter is
+      wired to it yet, so no tool can actually be called.
 - [ ] `P3-002` Implement the capability registry with collision detection, namespacing, dynamic availability, and compact model-facing discovery.
+      `P3-001` supplies the pieces it needs: `ToolId` is comparable and hashable for collision
+      detection, `Availability` is declarable, and `ToolDefinitionParts` parses a manifest before it
+      is validated. It must also supply the document set the validator is given, since a `$ref`
+      cannot currently resolve outside its own document.
 - [ ] `P3-003` Implement deterministic policy evaluation with deny-overrides, workspace grants, actor identity, channel constraints, and reason codes.
 - [ ] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
 - [ ] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).

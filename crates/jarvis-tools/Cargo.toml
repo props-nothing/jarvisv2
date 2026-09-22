@@ -1,0 +1,17 @@
+[package]
+name = "jarvis-tools"
+description = "Canonical tool contracts: identifiers, schemas, effects, risk, scopes, and outcomes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

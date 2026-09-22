@@ -9,6 +9,7 @@ members = [
     "crates/jarvis-observability",
     "crates/jarvis-protocol",
     "crates/jarvis-storage",
+    "crates/jarvis-tools",
     "tests/e2e",
 ]
 resolver = "3"
@@ -40,6 +41,14 @@ jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
 jarvis-observability = { path = "crates/jarvis-observability", version = "0.1.0" }
 jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
 jarvis-storage = { path = "crates/jarvis-storage", version = "0.1.0" }
+# Pinned exactly, and with NO features enabled. The default feature set is
+# `resolve-http` + `resolve-file` + a TLS provider + `idna`, which makes a `$ref` a
+# network fetch. A tool schema is authored by JARVIS or a connector manifest, so a
+# reference must resolve within the document set JARVIS supplies -- fetching a URL
+# inside the tool path is the SSRF surface `docs/architecture/security.md` lists.
+# Disabling the defaults also removes `reqwest`, `rustls`, and `idna` from this graph.
+# See docs/research/integrations/json-schema-validation.md.
+jsonschema = { version = "=0.57.0", default-features = false }
 libsqlite3-sys = { version = "=0.37.0", features = ["bundled"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
