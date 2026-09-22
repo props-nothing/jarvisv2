@@ -32,8 +32,8 @@ pub use run_event_repository::{
     read_run_events,
 };
 pub use run_repository::{
-    MAX_OBJECTIVE_CHARS, NewRun, StoredRun, create_run, find_run, request_run_cancellation,
-    transition_run,
+    MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition, create_run, find_run,
+    request_run_cancellation, settle_run, transition_run,
 };
 pub use session_repository::{
     API_SESSION_CHANNEL, NewSession, StartRunInput, StartedRun, StoredSession, find_session,

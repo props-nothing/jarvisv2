@@ -29,12 +29,13 @@
 //! paths (`P2-007`), so they are deliberately absent rather than stubbed.
 
 use jarvis_core::{
-    CorrelationId, ExpectedRunState, RunErrorCode, RunOutcome, RunState, RunTransition,
-    UtcTimestamp,
+    CorrelationId, EventSummary, ExpectedRunState, RunErrorCode, RunEventPayload, RunOutcome,
+    RunState, RunTransition, UtcTimestamp,
 };
 use sqlx::Row;
 
 use crate::database::{DatabaseError, SqliteDatabase, require_run_transition};
+use crate::run_event_repository::NewRunEvent;
 
 /// Maximum objective length, matching the migration's `CHECK`.
 pub const MAX_OBJECTIVE_CHARS: usize = 4096;
@@ -333,6 +334,195 @@ pub async fn transition_run(
     find_run(database, id).await
 }
 
+/// One terminal transition together with the settlement event that must accompany it.
+///
+/// Both halves are required together because they describe one settlement, and splitting them
+/// across two calls is what makes the ordering defect below possible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalTransition {
+    id: String,
+    run_id: String,
+    expected: ExpectedRunState,
+    transition: RunTransition,
+    summary: Option<EventSummary>,
+    payload: RunEventPayload,
+    correlation_id: CorrelationId,
+    occurred_at: UtcTimestamp,
+}
+
+impl TerminalTransition {
+    /// Validates a terminal transition and its event.
+    ///
+    /// The event fields are taken as a [`NewRunEvent`] so the settlement uses the same validated
+    /// event shape as an ordinary append. Building them separately here would create a second
+    /// constructor for the same row, and the two would drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::RunTransitionRefused`] when the transition's target is not
+    /// terminal, because this function exists to settle a run and a non-terminal write here would
+    /// leave the run open beside an event that claims it settled. Returns
+    /// [`DatabaseError::InvalidRunEventRequest`] when the event's kind does not match the target
+    /// state, so a run cannot settle with an event that describes a different outcome.
+    pub fn new(
+        expected: ExpectedRunState,
+        transition: RunTransition,
+        event: &NewRunEvent,
+    ) -> Result<Self, DatabaseError> {
+        if !transition.to().is_terminal() {
+            return Err(DatabaseError::RunTransitionRefused {
+                // The reported state is the one the caller believed they were moving from, which is
+                // the only state the evidence actually contains.
+                source: jarvis_core::RunTransitionError::TerminalStateImmutable {
+                    from: expected.state(),
+                },
+            });
+        }
+        // The kind must match the target state, so a `Completed` transition cannot be recorded as
+        // a `RunCancelled` event. `settle_run` derives the stored kind from the target state as
+        // well; this check catches the mistake at construction, where the diagnosis is clearest.
+        let Some(expected_kind) = transition.to().terminal_event_kind() else {
+            return Err(DatabaseError::InvalidRunEventRequest { field: "kind" });
+        };
+        if event.kind() != expected_kind {
+            return Err(DatabaseError::InvalidRunEventRequest { field: "kind" });
+        }
+        Ok(Self {
+            id: event.id().to_owned(),
+            run_id: event.run_id().to_owned(),
+            expected,
+            transition,
+            summary: event.summary().cloned(),
+            payload: event.payload().clone(),
+            correlation_id: event.correlation_id(),
+            occurred_at: event.occurred_at(),
+        })
+    }
+}
+
+/// Settles a run and appends its terminal event in ONE transaction.
+///
+/// # Why the ordering matters, and why two calls cannot express it
+///
+/// [`append_run_event`] refuses to write to a run that is already terminal, because a settled
+/// run emits nothing more. `transition_run` writes the terminal state. So the two calls are
+/// **inherently ordered**: transitioning first makes the event append fail with
+/// `RunEventAfterSettlement`, and appending first writes a settlement event for a run that has
+/// not settled.
+///
+/// Neither order can be fixed by the caller, because the guard and the transition are correct
+/// individually — only their combination is impossible. The event therefore has to be written
+/// inside the transaction that performs the transition, and that is what this function does
+/// rather than what its documentation asks a caller to remember.
+///
+/// # Errors
+///
+/// - [`DatabaseError::RunTransitionRefused`] when the domain rejects the edge, which includes
+///   every request made against an already-settled run.
+/// - [`DatabaseError::RunConflict`] when the stored state or version no longer matches the
+///   caller's expectation. Nothing is written in that case, so the losing writer leaves no event.
+/// - [`DatabaseError::RunNotFound`] when no run has that identifier.
+/// - [`DatabaseError::Sqlite`] for any other persistence failure.
+pub async fn settle_run(
+    database: &SqliteDatabase,
+    settlement: &TerminalTransition,
+) -> Result<StoredRun, DatabaseError> {
+    // Consulted before the transaction so an illegal edge is reported precisely, matching
+    // `transition_run`. The `WHERE` clause still decides, because this check cannot see a
+    // concurrent writer.
+    settlement
+        .transition
+        .apply(settlement.expected)
+        .map_err(|source| DatabaseError::RunTransitionRefused { source })?;
+
+    let target = settlement.transition.to();
+    // The kind is derived from the target state rather than passed in, so the event cannot
+    // describe a different state than the row now holds.
+    let kind = target
+        .terminal_event_kind()
+        .ok_or(DatabaseError::InvalidRunEventRequest { field: "kind" })?;
+
+    let mut transaction =
+        database
+            .pool()
+            .begin()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "begin a run settlement",
+                source,
+            })?;
+
+    let outcome = settlement.transition.outcome().map(RunOutcome::as_str);
+    let error_code = settlement.transition.error_code().map(RunErrorCode::as_str);
+    let at = settlement.occurred_at.to_string();
+
+    let result = sqlx::query(
+        "UPDATE agent_runs \
+         SET state = ?3, \
+             terminal_outcome = ?4, \
+             error_code = ?5, \
+             completed_at = ?6, \
+             cancellation_requested_at = COALESCE(cancellation_requested_at, ?7), \
+             updated_at = ?6, \
+             version = version + 1 \
+         WHERE id = ?1 AND state = ?2 AND version = ?8 \
+           AND state NOT IN ('completed', 'cancelled', 'failed')",
+    )
+    .bind(&settlement.run_id)
+    .bind(settlement.expected.state().as_str())
+    .bind(target.as_str())
+    .bind(outcome)
+    .bind(error_code)
+    .bind(&at)
+    .bind((target == RunState::Cancelled).then_some(at.as_str()))
+    .bind(settlement.expected.version())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "settle an agent run",
+        source,
+    })?;
+
+    if result.rows_affected() != 1 {
+        // The transaction is dropped rather than committed, so a lost race leaves nothing
+        // behind. The reason is resolved by the caller's follow-up read, which knows identity.
+        return Err(DatabaseError::RunConflict);
+    }
+
+    sqlx::query(
+        "INSERT INTO run_events (\
+            id, run_id, sequence, kind, summary, payload, \
+            correlation_id, occurred_at, recorded_at\
+         ) \
+         SELECT ?1, ?2, \
+            (SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events WHERE run_id = ?2), \
+            ?3, ?4, ?5, ?6, ?7, ?7",
+    )
+    .bind(&settlement.id)
+    .bind(&settlement.run_id)
+    .bind(kind.as_str())
+    .bind(settlement.summary.as_ref().map(EventSummary::as_str))
+    .bind(settlement.payload.as_str())
+    .bind(settlement.correlation_id.to_string())
+    .bind(&at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "append a settlement run event",
+        source,
+    })?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "commit a run settlement",
+            source,
+        })?;
+
+    find_run(database, &settlement.run_id).await
+}
+
 /// Records that a client requested cancellation without settling the run yet.
 ///
 /// This is deliberately not a transition. Cancellation is a *request*; the run settles as
@@ -614,6 +804,25 @@ mod tests {
 
     fn code(value: &str) -> RunErrorCode {
         must(RunErrorCode::new(value))
+    }
+
+    /// Builds a settlement event for the tests below, so each call site states only what it varies.
+    fn settlement_event(
+        id: &str,
+        run_id: &str,
+        kind: jarvis_core::RunEventKind,
+        payload: &str,
+        minute: i128,
+    ) -> crate::NewRunEvent {
+        must(crate::NewRunEvent::new(
+            id,
+            run_id,
+            kind,
+            None,
+            must(jarvis_core::RunEventPayload::new(payload)),
+            CorrelationId::new(),
+            at(minute),
+        ))
     }
 
     async fn one_run(database: &SqliteDatabase, id: &str) -> StoredRun {
@@ -1227,5 +1436,200 @@ mod tests {
             Err(DatabaseError::RunConflict)
         ));
         reopened.close().await;
+    }
+
+    /// The defect this primitive exists to prevent, asserted against the two-call form.
+    ///
+    /// A caller that settles a run and then appends its terminal event finds the append
+    /// **refused**, because a settled run emits nothing more. The transition and the guard are
+    /// each right; only their combination is impossible. This test writes out the two-call form
+    /// so the reason `settle_run` exists is falsifiable rather than a claim in a comment.
+    #[tokio::test]
+    async fn two_calls_cannot_settle_a_run_and_record_its_event() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+
+        // Call one: transition to the terminal state.
+        let settled = must(
+            transition_run(
+                &database,
+                run.id(),
+                run.expectation(),
+                &transition(RunState::Completed),
+                at(2),
+            )
+            .await,
+        );
+        assert!(settled.state().is_terminal());
+
+        // Call two: append the settlement event. This is what a caller would naturally do next,
+        // and it cannot succeed.
+        let event = settlement_event(
+            "0198f000-0000-7000-8000-0000000000e1",
+            run.id(),
+            jarvis_core::RunEventKind::RunCompleted,
+            r#"{"outcome":"succeeded"}"#,
+            2,
+        );
+        assert!(
+            matches!(
+                crate::append_run_event(&database, &event).await,
+                Err(DatabaseError::RunEventAfterSettlement)
+            ),
+            "a settled run must refuse a later event, which is why the event is written with the transition"
+        );
+        database.close().await;
+    }
+
+    /// A settlement event whose kind disagrees with the target state is refused, so a run cannot
+    /// settle as `completed` while its stream records that it was cancelled.
+    #[test]
+    fn a_settlement_event_that_disagrees_with_the_target_state_is_refused() {
+        let expected = ExpectedRunState::new(RunState::Responding, 5);
+        let mismatched = settlement_event(
+            "0198f000-0000-7000-8000-0000000000e6",
+            RUN_A,
+            jarvis_core::RunEventKind::RunCancelled,
+            r#"{"outcome":"cancelled"}"#,
+            2,
+        );
+        assert!(
+            TerminalTransition::new(expected, transition(RunState::Completed), &mismatched)
+                .is_err(),
+            "a completed settlement must not record a cancellation event"
+        );
+    }
+
+    /// The primitive writes both rows, and the event describes the state the row now holds.
+    #[tokio::test]
+    async fn settling_writes_the_terminal_state_and_its_event_together() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+
+        let settlement = must(TerminalTransition::new(
+            run.expectation(),
+            transition(RunState::Completed),
+            &settlement_event(
+                "0198f000-0000-7000-8000-0000000000e2",
+                run.id(),
+                jarvis_core::RunEventKind::RunCompleted,
+                r#"{"outcome":"succeeded"}"#,
+                2,
+            ),
+        ));
+        let settled = must(settle_run(&database, &settlement).await);
+
+        assert_eq!(settled.state(), RunState::Completed);
+        assert_eq!(settled.terminal_outcome(), Some(RunOutcome::Succeeded));
+
+        // The event exists, is last, and its kind matches the settled state. A kind derived
+        // from anywhere but the target state is how a run settles with an event describing a
+        // different state.
+        let events = must(
+            crate::read_run_events(
+                &database,
+                run.id(),
+                must(jarvis_core::ReplayRequest::new(
+                    jarvis_core::RunEventSequence::first(),
+                    100,
+                )),
+            )
+            .await,
+        );
+        let last = events
+            .last()
+            .unwrap_or_else(|| panic!("the settlement event must exist"));
+        assert_eq!(last.kind(), jarvis_core::RunEventKind::RunCompleted);
+        assert!(last.kind().is_terminal());
+        database.close().await;
+    }
+
+    /// A settlement that loses a race must leave NO event behind, because the event is written
+    /// inside the transaction that the losing writer never commits.
+    ///
+    /// This is the property that makes writing both rows in one transaction necessary rather
+    /// than merely tidy: a committed event for a transition that did not happen would be a
+    /// stream describing a settlement the run does not have.
+    #[tokio::test]
+    async fn a_lost_settlement_race_leaves_no_event_behind() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+        let stale = ExpectedRunState::new(run.state(), run.version());
+
+        // Another writer settles first.
+        let settlement = must(TerminalTransition::new(
+            stale,
+            transition(RunState::Completed),
+            &settlement_event(
+                "0198f000-0000-7000-8000-0000000000e3",
+                run.id(),
+                jarvis_core::RunEventKind::RunCompleted,
+                r#"{"outcome":"succeeded"}"#,
+                2,
+            ),
+        ));
+        must(settle_run(&database, &settlement).await);
+
+        // A second writer holds the same expectation, so only its version guard separates them.
+        // Its edge is legal from the state it believes is stored, so the domain refuses nothing
+        // and the SQL guard is what decides.
+        let loser = must(TerminalTransition::new(
+            stale,
+            transition(RunState::Cancelled),
+            &settlement_event(
+                "0198f000-0000-7000-8000-0000000000e4",
+                run.id(),
+                jarvis_core::RunEventKind::RunCancelled,
+                r#"{"outcome":"cancelled"}"#,
+                3,
+            ),
+        ));
+        assert!(matches!(
+            settle_run(&database, &loser).await,
+            Err(DatabaseError::RunConflict)
+        ));
+
+        let events = must(
+            crate::read_run_events(
+                &database,
+                run.id(),
+                must(jarvis_core::ReplayRequest::new(
+                    jarvis_core::RunEventSequence::first(),
+                    100,
+                )),
+            )
+            .await,
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind().is_terminal())
+                .count(),
+            1,
+            "a settlement that lost its race must not have written an event"
+        );
+        database.close().await;
+    }
+
+    /// `settle_run` refuses a non-terminal target, so the settlement path cannot be used to
+    /// write an ordinary transition and leave the run open beside an event that says otherwise.
+    #[test]
+    fn a_non_terminal_settlement_is_refused() {
+        let expected = ExpectedRunState::new(RunState::Planning, 3);
+        assert!(
+            TerminalTransition::new(
+                expected,
+                transition(RunState::Executing),
+                &settlement_event(
+                    "0198f000-0000-7000-8000-0000000000e5",
+                    RUN_A,
+                    jarvis_core::RunEventKind::StateChanged,
+                    r#"{"state":"executing"}"#,
+                    2,
+                ),
+            )
+            .is_err(),
+            "a non-terminal target must not be accepted by the settlement path"
+        );
     }
 }

@@ -158,6 +158,48 @@ impl NewRunEvent {
             occurred_at,
         })
     }
+
+    /// Returns the event identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the run this event belongs to.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Returns the event kind.
+    #[must_use]
+    pub const fn kind(&self) -> RunEventKind {
+        self.kind
+    }
+
+    /// Returns the bounded operational summary, when present.
+    #[must_use]
+    pub const fn summary(&self) -> Option<&EventSummary> {
+        self.summary.as_ref()
+    }
+
+    /// Returns the validated JSON payload.
+    #[must_use]
+    pub const fn payload(&self) -> &RunEventPayload {
+        &self.payload
+    }
+
+    /// Returns the correlation identity shared with the originating request.
+    #[must_use]
+    pub const fn correlation_id(&self) -> CorrelationId {
+        self.correlation_id
+    }
+
+    /// Returns when the event occurred.
+    #[must_use]
+    pub const fn occurred_at(&self) -> UtcTimestamp {
+        self.occurred_at
+    }
 }
 
 /// Appends one event to its run's stream, allocating the next sequence.

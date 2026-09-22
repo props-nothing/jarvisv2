@@ -43,6 +43,8 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
+use crate::run_event::RunEventKind;
+
 /// Explains why a run state or outcome spelling was rejected.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum InvalidRunState {
@@ -151,6 +153,27 @@ pub enum RunState {
 }
 
 impl RunState {
+    /// Returns the event kind that must accompany a transition into this state.
+    ///
+    /// This is the ONE place the state-to-event mapping lives, because two writers depend on
+    /// it agreeing with itself: the terminal write that appends a settlement event in the same
+    /// transaction as the transition (ADR-0011), and any future transition that records an
+    /// event. Two spellings of this table is how a run settles with an event that describes a
+    /// different state.
+    ///
+    /// Only terminal states have a *required* event kind. A non-terminal transition records a
+    /// `state_changed` event when a caller wants one, but nothing about a run's correctness
+    /// depends on it, so it is not forced here.
+    #[must_use]
+    pub const fn terminal_event_kind(self) -> Option<RunEventKind> {
+        match self {
+            Self::Completed => Some(RunEventKind::RunCompleted),
+            Self::Cancelled => Some(RunEventKind::RunCancelled),
+            Self::Failed => Some(RunEventKind::RunFailed),
+            _ => None,
+        }
+    }
+
     /// Returns the stable snake-case wire/storage code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
