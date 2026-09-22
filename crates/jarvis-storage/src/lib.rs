@@ -5,6 +5,7 @@ mod credential;
 mod database;
 mod identity_repository;
 mod inspect;
+mod message_repository;
 mod paths;
 mod run_event_repository;
 mod run_repository;
@@ -23,6 +24,9 @@ pub use identity_repository::{
     LOCAL_USER_ID, LOCAL_WORKSPACE_ID, LocalIdentity, load_local_identity,
 };
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
+pub use message_repository::{
+    MAX_MESSAGE_PAGE, StoredMessage, append_message, find_message, read_messages,
+};
 pub use paths::{
     AppPaths, PathError, PathKind, PathMode, RuntimePathSource, portable_layout,
     secure_private_file,

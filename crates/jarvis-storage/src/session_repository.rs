@@ -28,8 +28,8 @@
 //! [`crate::run_event_repository`] records for its append.
 
 use jarvis_core::{
-    CorrelationId, RunEventKind, RunEventPayload, RunEventSequence, RunState, SessionChannel,
-    SessionStatus, UtcTimestamp,
+    CorrelationId, NewMessage, RunEventKind, RunEventPayload, RunEventSequence, RunState,
+    SessionChannel, SessionStatus, UtcTimestamp,
 };
 use sqlx::Row;
 
@@ -429,6 +429,10 @@ pub async fn start_run(
     .await
     .map_err(|source| map_write_error("append the first run event", source))?;
 
+    // The user's own message is stored in the SAME transaction as the run it triggers. See
+    // `store_user_message` for why the two writes cannot be separate calls.
+    store_user_message(&mut transaction, input).await?;
+
     transaction
         .commit()
         .await
@@ -438,6 +442,51 @@ pub async fn start_run(
         })?;
 
     read_started_run(database, &input.run_id).await
+}
+
+/// Stores the accepted user message inside the transaction that creates its run.
+///
+/// This is what `docs/quality/acceptance-tests.md` A03 requires: an accepted user message must never
+/// be lost. As a second call after the commit, a crash in between would leave a run that answered a
+/// question the transcript does not contain — and the transcript is what a later turn replays, so
+/// the model would lose the question while the event log kept the answer.
+///
+/// The content is the objective. `P2-009` has one input per run, so the two are the same text; a
+/// separate message body would be a second source of truth for what the run was asked.
+async fn store_user_message(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &StartRunInput,
+) -> Result<(), DatabaseError> {
+    let message = NewMessage::user(input.objective.clone())
+        .map_err(|_| DatabaseError::InvalidMessageRequest { field: "content" })?;
+
+    sqlx::query(
+        "INSERT INTO messages (\
+            id, session_id, sequence, author_kind, role, content, content_bytes, \
+            sensitivity, source, run_id, created_at\
+         ) \
+         SELECT ?1, ?2, \
+            (SELECT COALESCE(MAX(sequence) + 1, 0) FROM messages WHERE session_id = ?2), \
+            ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
+         FROM sessions WHERE id = ?2",
+    )
+    .bind(jarvis_core::SessionId::new().to_string())
+    .bind(&input.session_id)
+    // `author_kind` and `role` hold the same value: the schema keeps "who spoke" and "where the
+    // content came from" as separate columns whose value sets coincide for every message this build
+    // writes. Both are bound from one validated value rather than two literals that could drift.
+    .bind(message.role().as_str())
+    .bind(message.role().as_str())
+    .bind(message.content())
+    .bind(message.content_bytes())
+    .bind(message.sensitivity().as_str())
+    .bind(message.source().as_str())
+    .bind(&input.run_id)
+    .bind(input.started_at.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|source| map_write_error("store the user message", source))?;
+    Ok(())
 }
 
 /// Reads one session by identifier.

@@ -38,8 +38,9 @@ use std::sync::Arc;
 
 use jarvis_core::{
     ContextBudget, ContextItem, ContextPriority, ContextSource, ContextSourceKind, ContextTrust,
-    CorrelationId, EventSummary, InclusionReason, RunErrorCode, RunEventKind, RunEventPayload,
-    RunState, RunTransition, Sensitivity, SystemClock, UtcTimestamp, assemble_context,
+    CorrelationId, EventSummary, InclusionReason, NewMessage, RunErrorCode, RunEventKind,
+    RunEventPayload, RunState, RunTransition, Sensitivity, SystemClock, UtcTimestamp,
+    assemble_context,
 };
 use jarvis_models::{
     ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, StreamEvent,
@@ -77,6 +78,12 @@ const PER_SOURCE_CAP_TOKENS: u32 = 4_096;
 /// One, because `P2-009` does not plan or use tools: a second call would mean the loop is retrying
 /// blindly, and a bounded retry policy belongs with the step planner rather than here.
 const MAX_MODEL_CALLS: u32 = 1;
+
+/// Events read back when locating a run's completed answer.
+///
+/// Well above any answer this slice produces, and bounded rather than unbounded so the read cannot
+/// grow with a runaway run. A run that exceeded it would be one this executor did not produce.
+const MAX_EVENTS_READ: u32 = 1_000;
 
 /// The system prompt for a native run.
 ///
@@ -616,11 +623,30 @@ async fn generate(
 }
 
 /// Settles a responding run as completed.
+///
+/// The answer is stored as a transcript message **before** the settlement, so a completed
+/// conversation is one whose transcript holds both sides. Stored after the settle it could be lost
+/// to a crash between the two writes, leaving a run that answered a question the transcript does not
+/// contain.
 async fn complete(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
+    if let Some(answer) = last_answer(database, run).await? {
+        let message = NewMessage::assistant(answer, Sensitivity::Internal)
+            .map_err(|_| DatabaseError::InvalidMessageRequest { field: "content" })?;
+        jarvis_storage::append_message(
+            database,
+            run.session_id(),
+            Some(run.id()),
+            &message,
+            correlation_id,
+            UtcTimestamp::now(&SystemClock),
+        )
+        .await?;
+    }
+
     settle(
         database,
         run,
@@ -631,6 +657,36 @@ async fn complete(
         correlation_id,
     )
     .await
+}
+
+/// Reads the run's completed answer from its own event stream.
+///
+/// Read back rather than threaded through the loop, so the stored transcript and the stored events
+/// cannot disagree: the message is built from the event that a client already receives, not from a
+/// second copy of the text held in memory.
+async fn last_answer(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+) -> Result<Option<String>, DatabaseError> {
+    let events = jarvis_storage::read_run_events(
+        database,
+        run.id(),
+        jarvis_core::ReplayRequest::new(jarvis_core::RunEventSequence::first(), MAX_EVENTS_READ)
+            .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "replay" })?,
+    )
+    .await?;
+
+    for event in events.iter().rev() {
+        if event.kind() != RunEventKind::OutputCompleted {
+            continue;
+        }
+        let payload: serde_json::Value = serde_json::from_str(event.payload())
+            .map_err(|_| DatabaseError::StoredRunEventInvalid { field: "payload" })?;
+        if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+            return Ok(Some(text.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// Settles a run as failed with a bounded reason.
@@ -1076,6 +1132,68 @@ mod tests {
             before,
             "a settled run must emit nothing more"
         );
+        database.close().await;
+    }
+
+    /// A completed run stores BOTH sides of the conversation, so A03's "never loses an accepted user
+    /// message" is met by a transcript that actually exists rather than by a table nobody writes.
+    ///
+    /// Three assertions, because each can fail independently: the user's question is present, the
+    /// model's answer is present, and they are in order.
+    #[tokio::test]
+    async fn a_completed_run_stores_the_question_and_the_answer() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "what is in my inbox").await;
+
+        execute_run(
+            &database,
+            &model(vec![Turn::answer("Three unread.")]),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("execute: {error}"));
+
+        let transcript = jarvis_storage::read_messages(&database, run.session_id(), 50)
+            .await
+            .unwrap_or_else(|error| panic!("read transcript: {error}"));
+
+        assert_eq!(
+            transcript.len(),
+            2,
+            "a completed conversation has a question and an answer"
+        );
+        assert_eq!(transcript[0].content(), "what is in my inbox");
+        assert_eq!(transcript[0].role(), jarvis_core::MessageRole::User);
+        assert_eq!(transcript[0].sequence(), 0);
+        assert_eq!(transcript[1].content(), "Three unread.");
+        assert_eq!(transcript[1].role(), jarvis_core::MessageRole::Assistant);
+        assert_eq!(
+            transcript[1].run_id(),
+            Some(run.id()),
+            "the answer names the run that produced it"
+        );
+        database.close().await;
+    }
+
+    /// A failed run stores the question but no answer, because there is no answer to store.
+    #[tokio::test]
+    async fn a_failed_run_does_not_store_an_answer() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "anything").await;
+
+        execute_run(&database, &model(vec![Turn::refusal()]), run.id())
+            .await
+            .unwrap_or_else(|error| panic!("execute: {error}"));
+
+        let transcript = jarvis_storage::read_messages(&database, run.session_id(), 50)
+            .await
+            .unwrap_or_else(|error| panic!("read transcript: {error}"));
+        assert_eq!(
+            transcript.len(),
+            1,
+            "a failed run must not record an answer it did not produce"
+        );
+        assert_eq!(transcript[0].role(), jarvis_core::MessageRole::User);
         database.close().await;
     }
 

@@ -93,6 +93,20 @@ The executor lives in `apps/jarvisd` rather than `jarvis-application`, because
 `docs/architecture/repository-layout.md` allows the application layer to depend only on `jarvis-core`
 and has no arrow from it into an adapter crate.
 
+### What a run stores
+
+A run is durable in three places, and they answer different questions:
+
+- `agent_runs` is the state machine: where the run is, and how it settled.
+- `run_events` is the stream a client replays, ordered per run with `UNIQUE (run_id, sequence)`.
+- `messages` is the conversation: the user's question and, when the run completes, the answer.
+
+The user's message is written **in the same transaction** that creates the run, so an accepted message
+cannot be lost — it exists before the run does. The assistant's answer is read back from the run's own
+`output_completed` event rather than kept in memory, so the transcript and the event stream cannot
+disagree about what was said. A failed run records the question and no answer, because there is no answer
+to record.
+
 ### Portable Mode
 
 Pass an absolute root to keep everything inside one directory:

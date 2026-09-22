@@ -166,6 +166,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       run per turn — a conversation that records nothing. This item therefore stays unchecked, and
       `chat` is carried by `P2-009` rather than reported as done.
 - [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
+      **Conversation persistence is done, which closes the A03 half that needed no model:** the
+      `messages` table existed since `P2-004` but had **no production writer** — only test fixtures
+      inserted rows, so an accepted user message was not recorded at all. `jarvis_core::message` now
+      defines the stored vocabulary and `jarvis_storage::message_repository` is the writer, with the
+      sequence allocated by the inserting statement because `UNIQUE (session_id, sequence)` makes a
+      read-then-insert collide (a test races eight appends and asserts eight contiguous positions).
+      The user's message is written **in the same transaction as the run it triggers**, and the
+      assistant's answer is read back from the run's own `output_completed` event rather than held in
+      memory, so the transcript and the event stream cannot disagree.
       Also carries the `jarvis chat` loop from `P2-008`: a multi-turn chat needs a model that answers
       and a session read model, both of which this slice must supply.
       **In progress — the adapter is done, the executor is not.** `crates/jarvis-models/src/scripted.rs`

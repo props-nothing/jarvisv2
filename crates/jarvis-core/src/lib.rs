@@ -7,6 +7,7 @@ mod error;
 mod id;
 mod loglevel;
 mod loopback;
+mod message;
 mod run;
 mod run_event;
 mod secret;
@@ -33,6 +34,9 @@ pub use id::{
 };
 pub use loglevel::LogLevel;
 pub use loopback::{InvalidLoopbackHost, LOOPBACK_ADDRESS, LoopbackHost};
+pub use message::{
+    InvalidMessage, MAX_MESSAGE_CONTENT_BYTES, MessageRole, MessageSource, NewMessage,
+};
 pub use run::{
     ExpectedRunState, InvalidRunErrorCode, InvalidRunState, MAX_RUN_ERROR_CODE_CHARS, RunErrorCode,
     RunOutcome, RunState, RunTransition, RunTransitionError,

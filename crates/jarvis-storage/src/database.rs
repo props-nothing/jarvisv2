@@ -246,6 +246,24 @@ pub enum DatabaseError {
     /// No run exists for the requested identifier.
     #[error("no agent run exists for the requested identifier")]
     RunNotFound,
+    /// No message exists for the requested identifier.
+    #[error("no message exists for the requested identifier")]
+    MessageNotFound,
+    /// Fields required to store a message failed bounded validation.
+    #[error("the message {field} is invalid")]
+    InvalidMessageRequest {
+        /// Stable field name without the rejected value.
+        field: &'static str,
+    },
+    /// A stored message row contradicted the schema's invariants.
+    ///
+    /// A storage-integrity finding rather than a caller mistake: the row came from another build,
+    /// a restored backup, or an edit outside JARVIS. Reported as data so the caller can decide.
+    #[error("the stored message {field} is not internally consistent")]
+    StoredMessageInvalid {
+        /// Stable field name without the stored value.
+        field: &'static str,
+    },
     /// A run write lost an optimistic-concurrency race or hit a duplicate identifier.
     ///
     /// The stored run was **not** changed. The caller must re-read it and decide from the
