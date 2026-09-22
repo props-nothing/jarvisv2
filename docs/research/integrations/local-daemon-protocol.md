@@ -24,7 +24,7 @@ The same-machine transport and versioned control protocol between local clients 
 | Rust `PermissionsExt` | https://doc.rust-lang.org/std/os/unix/fs/trait.PermissionsExt.html | 2026-09-21 | socket and credential modes |
 | Microsoft named pipes | https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes | 2026-09-21 | pipe security and semantics |
 | Microsoft `CreateNamedPipe` | https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea | 2026-09-21 | `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS` |
-| `getrandom` 0.4.3 | https://docs.rs/getrandom/0.4.3/getrandom/ | 2026-09-21 | credential entropy |
+| `getrandom` 0.4.3 | https://docs.rs/getrandom/0.4.3/getrandom/ | 2026-09-21 | credential entropy; also `P3-005`'s idempotency key entropy |
 | changelog/release notes | not applicable; pinned versions verified through `Cargo.lock` | 2026-09-21 | compatibility |
 
 Where no `llms.txt` exists, the normative contract is the language/OS specification, and implementation details were read from the pinned crate source in the local cargo registry.

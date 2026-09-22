@@ -28,7 +28,6 @@ use thiserror::Error;
 
 use crate::effect::EffectSet;
 use crate::identifier::ToolId;
-use crate::outcome::{ToolOutcome, ToolOutcomeError, ToolOutcomeRecord};
 use crate::policy::{
     ApprovalPolicy, Availability, Idempotency, MAX_TOOL_TIMEOUT_SECONDS, RetryDeclaration,
     RetryPolicy, ToolSensitivity, ToolSource,
@@ -36,6 +35,7 @@ use crate::policy::{
 use crate::risk::{Risk, RiskError};
 use crate::schema::ToolSchema;
 use crate::scope::ScopeSet;
+use crate::{ToolOutcome, ToolOutcomeError, ToolOutcomeRecord};
 
 /// Maximum characters in a tool title.
 ///

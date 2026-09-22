@@ -43,8 +43,9 @@ mod definition;
 mod documents;
 mod effect;
 mod evaluation;
+mod execution;
+mod executor;
 mod identifier;
-mod outcome;
 mod policy;
 mod registry;
 mod risk;
@@ -55,6 +56,9 @@ pub use definition::{
     MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_TITLE_CHARS, ToolDefinition, ToolDefinitionError,
     ToolDefinitionParts,
 };
+// The outcome vocabulary lives in `jarvis-core` and is re-exported here, so `crate::ToolOutcome`
+// resolves for every caller in this crate while the storage adapter -- which cannot depend on this
+// crate -- reads the same definition from core. One definition, two readers, no second home.
 pub use documents::{DocumentError, DocumentSet, MAX_SUPPLIED_DOCUMENTS};
 pub use effect::{EffectSet, ToolEffect};
 pub use evaluation::{
@@ -62,10 +66,22 @@ pub use evaluation::{
     PolicyDecision, PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, channel_ceiling,
     effective_risk, evaluate,
 };
+pub use execution::{
+    ApprovalCitation, AuthorizationReceipt, AuthorizationReceiptParts, BoundedOutput,
+    EvidenceError, IdempotencyKey, IdempotencyKeyError, MAX_POLICY_VERSION_CHARS,
+    MAX_PROVIDER_EVIDENCE_CHARS, MAX_TOOL_OUTPUT_BYTES, OutputError, ProviderEvidence,
+    ReceiptError, ToolCallResult,
+};
+pub use executor::{
+    AdapterError, ExecutionRequestError, ToolExecutionRequest, ToolExecutionRequestParts,
+    ToolExecutor,
+};
 pub use identifier::{
     MAX_TOOL_ID_CHARS, MAX_TOOL_ID_SEGMENT_CHARS, MAX_TOOL_VERSION_CHARS, ToolId, ToolIdError,
 };
-pub use outcome::{MAX_OUTCOME_DETAIL_CHARS, ToolOutcome, ToolOutcomeError, ToolOutcomeRecord};
+pub use jarvis_core::{
+    InvalidToolOutcome, MAX_OUTCOME_DETAIL_CHARS, ToolOutcome, ToolOutcomeError, ToolOutcomeRecord,
+};
 pub use policy::{
     ApprovalPolicy, Availability, Idempotency, MAX_AVAILABILITY_REASON_CHARS,
     MAX_TOOL_BACKOFF_SECONDS, MAX_TOOL_RETRY_ATTEMPTS, MAX_TOOL_TIMEOUT_SECONDS, RetryDeclaration,

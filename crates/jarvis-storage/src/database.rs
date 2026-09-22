@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -401,6 +401,51 @@ pub enum DatabaseError {
     /// would attribute a decision to a person through a channel they never used.
     #[error("the stored approval has an invalid {field}")]
     StoredApprovalInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// A tool call request failed the domain's own validation.
+    #[error("the tool call {field} is invalid")]
+    InvalidToolCallRequest {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// No tool call exists for the requested identifier.
+    #[error("no tool call exists for the requested identifier")]
+    ToolCallNotFound,
+    /// A tool call record is already stored under this run's idempotency key.
+    ///
+    /// **This is the duplicate-detection result, not an error condition.** The key is generated once
+    /// when a call is admitted, so a re-driven pipeline that reaches this point has found the existing
+    /// call and must read it rather than create a second one. Reported as its own variant because the
+    /// caller's response is to *use* the returned identifier, and a generic conflict would push it
+    /// into a retry loop.
+    #[error("a tool call is already recorded for this run and idempotency key")]
+    ToolCallDuplicate {
+        /// The identifier of the call already recorded.
+        existing_call_id: String,
+    },
+    /// A tool call outcome write lost a race for the record's version.
+    ///
+    /// Nothing was recorded on the losing side. The caller must re-read rather than assume the row is
+    /// gone, because the two causes — another writer advanced the version, or the call does not exist
+    /// — need different responses.
+    #[error("the tool call version changed before this outcome could be recorded")]
+    ToolCallConflict,
+    /// A call's outcome may already be recorded, so this one is refused.
+    ///
+    /// Distinct from [`Self::ToolCallConflict`] because the cause is different and so is the remedy: a
+    /// conflict means re-read and retry, while this means the outcome is already known. Refused for a
+    /// **terminal** existing outcome, since an effect that is proven or disproven cannot be re-reported
+    /// — and reporting it again is how an `Unknown` gets quietly replaced by a `Failed`.
+    #[error("this tool call already has a reported outcome of {existing}")]
+    ToolCallAlreadyResolved {
+        /// The outcome already recorded.
+        existing: String,
+    },
+    /// A stored tool call row contradicted the domain's own closed sets or honesty rules.
+    #[error("the stored tool call has an invalid {field}")]
+    StoredToolCallInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
     },

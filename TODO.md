@@ -375,13 +375,44 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       one named after each category `security.md` requires (forgery, replay, expiry, mutation, stale
       state). ADR-0018; `docs/research/integrations/sha2-intent-hashing.md`.
       Deliberately not a placeholder: nothing requests or answers an approval yet, and no run parks in
-      `awaiting_approval`. A caller that creates and decides one exists in tests only. `P3-005` owns
-      the execution receipt that consumes an approved intent.
-- [ ] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).
-      `P3-004` supplies the receipt's first half: an `Approved` approval whose `intent()` is the digest
-      a resuming execution revalidates against, and `authorizes_at(now)` which goes false at the
-      expiry. `P3-001` supplies the outcome vocabulary. What is NOT yet supplied: nothing calls a tool,
-      so there is no lifecycle to record.
+      `awaiting_approval`. A caller that creates and decides one exists in tests only. `P3-005` now
+      stores an approval identifier on a call row, but **does not consume an approved intent**: the
+      revalidation-on-resume path that re-reads an `Approved` approval and compares its `intent()`
+      digest is still unbuilt.
+- [x] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).
+      Split across three crates along the dependency direction. `jarvis_core::tool_outcome` holds the
+      honest vocabulary — `ToolOutcome` with `may_have_had_an_effect`, `is_safe_to_repeat_from_outcome`,
+      `is_reported`, and the strict `can_advance_to` table that refuses `requested -> submitted` — plus
+      `ToolOutcomeRecord`, which cannot be built as `confirmed` without evidence or as `failed` without
+      a reason, and reports "no evidence supplied" and "evidence too long" as different errors.
+      `jarvis_tools::execution` holds the bounded invocation: `BoundedOutput` (32 KiB, `strict()` refuses
+      and `truncating()` cuts on a char boundary), `ProviderEvidence` (256 chars) kept **separate from**
+      the output column so a success-sounding sentence cannot become proof, `IdempotencyKey` (32
+      lowercase hex), and `AuthorizationReceipt` whose four approval fields move together from one
+      citation and whose validity is compared in Rust from `unix_nanos`. `jarvis_tools::executor` is the
+      async `ToolExecutor` port, whose `AdapterError` distinguishes `RefusedBeforeReaching` from
+      `AmbiguousAfterReaching` because that is what maps onto `failed` versus `unknown`.
+      `jarvis_storage::tool_call_repository` + migration `0007_tool_calls.sql` (schema v7) make a call
+      durable. **The idempotency ledger is the `UNIQUE (run_id, idempotency_key)` index, not a second
+      table**: admission is one `INSERT ... ON CONFLICT DO NOTHING` and a suppressed insert returns the
+      **existing** call id so the caller adopts it. The key is generated at admission, not derived from
+      the intent, because the digest must be deterministic (an approval binds to it) while the key must
+      be unique per logical call — two calls with an identical intent hash and different keys are
+      asserted to be two calls. **A terminal outcome cannot be replaced** and a repeat of the same
+      outcome is a no-op, which is what stops an `Unknown` becoming a `Failed` and one sent message
+      becoming two. The 32 KiB bound is enforced twice (the type and the migration's `CHECK`), and the
+      `CHECK` also refuses a `confirmed` row with no evidence.
+      170 `jarvis-tools` tests, 125 `jarvis-core` tests, 143 in-crate `jarvis-storage` tests — including
+      one named after the illegal `requested -> submitted` edge, which was added **because** a test
+      author wrote it and the domain correctly refused. ADR-0019.
+      Deliberately not a placeholder, and deliberately not a working tool: this is the lifecycle and the
+      port. **No adapter implements `ToolExecutor`** (the only implementation is a test
+      `ScriptedExecutor`), **no caller admits a tool call**, no run reaches any outcome, and
+      `apps/jarvisd` has no tool pipeline — no schema validation, no policy evaluation call, no approval
+      request, no execution. Nothing is written to `run_events` for a tool call either, so a call is a
+      stored document rather than an entry in the durable event log. The audit receipt is stored as a
+      document produced upstream; nothing here generates one. `P3-006` is the first real adapter and the
+      first consumer; `P3-012` is where the Phase 3 gate proves the whole path.
 - [ ] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.

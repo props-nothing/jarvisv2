@@ -19,6 +19,7 @@ mod transport;
 
 mod approval;
 mod secretbytes;
+mod tool_outcome;
 
 pub use approval::{
     ApprovalChannel, ApprovalDecision, ApprovalDecisionOutcome, ApprovalRequest,
@@ -58,5 +59,8 @@ pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};
 pub use session::{InvalidSessionField, MAX_SESSION_TITLE_CHARS, SessionChannel, SessionStatus};
 pub use timestamp::{Clock, InvalidTimestamp, SystemClock, UtcTimestamp};
+pub use tool_outcome::{
+    InvalidToolOutcome, MAX_OUTCOME_DETAIL_CHARS, ToolOutcome, ToolOutcomeError, ToolOutcomeRecord,
+};
 #[cfg(any(unix, windows))]
 pub use transport::{LocalListener, LocalStream, TransportError, connect};

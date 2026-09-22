@@ -12,6 +12,7 @@ mod run_repository;
 mod session_repository;
 
 mod approval_repository;
+mod tool_call_repository;
 
 pub use approval_repository::{
     create_approval, find_approval, read_pending_approvals, read_run_approvals, record_decision,
@@ -48,4 +49,9 @@ pub use run_repository::{
 pub use session_repository::{
     API_SESSION_CHANNEL, NewSession, SessionTarget, StartRunInput, StartedRun, StoredSession,
     find_session, start_run,
+};
+pub use tool_call_repository::{
+    CallBinding, CallOrigin, CallTarget, NewToolCall, StoredToolCall, admit_tool_call,
+    advance_tool_call, find_tool_call, read_run_tool_calls, read_unrepeatable_calls,
+    record_tool_outcome,
 };
