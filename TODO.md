@@ -342,12 +342,29 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Deliberately not a placeholder: this slice holds and lists capabilities and decides nothing.
       Policy evaluation is `P3-003`; execution is `P3-005`. The registry is populated from code, not
       persisted, and no adapter is wired to it, so no tool can actually be called.
-- [ ] `P3-003` Implement deterministic policy evaluation with deny-overrides, workspace grants, actor identity, channel constraints, and reason codes.
-      `P3-002` supplies the registry it reads: `get` returns a `ToolDefinition` whose declared
-      effects, risk, scopes, and approval are already consistent with each other (ADR-0015), and
-      `is_callable` is the availability half of the decision. `ScopeSet::is_satisfied_by` is the pure
-      scope check. What is NOT yet supplied: nothing consumes the registry, so policy has no caller.
+- [x] `P3-003` Implement deterministic policy evaluation with deny-overrides, workspace grants, actor identity, channel constraints, and reason codes.
+      `crates/jarvis-tools/src/evaluation.rs`: `evaluate` is a pure function over a **borrowed**
+      `ToolDefinition` (no clock, no I/O, no repository), returning `Allow` / `RequireApproval` /
+      `Deny` plus an `effective_risk`, a `DenyReason` code, the strength an approval would need, and
+      the escalation signals that raised the risk. Deny overrides is a control-flow property: the
+      checks are ordered and the first refusal ends the evaluation, so no permissive finding can
+      mask a later refusal. The denials precede the approval steps, so a call that is denied *and*
+      would need approval reports the denial rather than sending an operator to approve something
+      that cannot run. A channel **caps** the authentication an actor may claim (`channel_ceiling`),
+      which is what produces the documented voice rule: a voice-originated risk-3 call is *held* for
+      a desktop/CLI approval, not refused, so the resume path stays reachable. Workspace policy can
+      only narrow what a tool declares. 150 in-crate tests. ADR-0017 records the ownership tension:
+      `repository-layout.md` gives core "policy decisions and reason codes" while `jarvis-tools` is
+      named for the policy pipeline, and the decision must read a definition holding compiled JSON
+      Schema validators — so core cannot own it without either gaining a vendor SDK or inverting the
+      adapter direction.
+      Deliberately not a placeholder: nothing calls this yet and nothing is persisted. Recording an
+      approval obligation (nonce, expiry, resume) is `P3-004`; the execution receipt is `P3-005`.
 - [ ] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
+      `P3-003` supplies what it must store and enforce: a `RequireApproval` decision always carries
+      `required_strength()`, so the approval a request must obtain is already stated, and
+      `DenyReason::is_refusal()` separates a hold from a refusal. What is NOT yet supplied: nothing
+      persists a decision, and no caller exists, so an approval cannot be requested or answered.
 - [ ] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).
 - [ ] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.

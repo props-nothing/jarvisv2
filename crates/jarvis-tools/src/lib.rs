@@ -42,6 +42,7 @@
 mod definition;
 mod documents;
 mod effect;
+mod evaluation;
 mod identifier;
 mod outcome;
 mod policy;
@@ -56,6 +57,11 @@ pub use definition::{
 };
 pub use documents::{DocumentError, DocumentSet, MAX_SUPPLIED_DOCUMENTS};
 pub use effect::{EffectSet, ToolEffect};
+pub use evaluation::{
+    ActorAuthority, ActorStatus, AuthenticationStrength, Decision, DenyReason, EscalationSignal,
+    PolicyDecision, PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, channel_ceiling,
+    effective_risk, evaluate,
+};
 pub use identifier::{
     MAX_TOOL_ID_CHARS, MAX_TOOL_ID_SEGMENT_CHARS, MAX_TOOL_VERSION_CHARS, ToolId, ToolIdError,
 };

@@ -34,3 +34,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0014](0014-conversations-are-runs-in-a-session.md) | A conversation is runs sharing a session, and the session is a trust boundary | Accepted |
 | [0015](0015-tool-contract-consistency-and-offline-schemas.md) | Tool contracts derive their source, refuse remote schema references, and validate cross-field consistency at construction | Accepted |
 | [0016](0016-supplied-schema-documents-and-registry-boundaries.md) | A schema composes only against JARVIS-supplied documents; external manifests are self-contained | Accepted |
+| [0017](0017-policy-evaluation-outcomes-and-ownership.md) | Policy evaluation is a pure adapter-crate function with three outcomes, deny overrides, and channel-capped authentication | Accepted |
