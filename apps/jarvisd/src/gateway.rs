@@ -63,17 +63,34 @@ pub struct GatewayState {
     database: Arc<SqliteDatabase>,
     credential: ClientCredential,
     runs: RunService,
+    /// The native executor, when one is configured.
+    ///
+    /// `None` means runs are accepted and recorded but never driven, which is what `P2-007`
+    /// shipped. Holding it here rather than reaching for a global keeps the executor's existence a
+    /// property of the running daemon's configuration.
+    executor: Option<Arc<crate::executor::Executor>>,
 }
 
 impl GatewayState {
-    /// Builds gateway state from the daemon's live resources.
+    /// Builds gateway state from the daemon's live resources, with no executor.
+    ///
+    /// Used by tests that exercise the transport, so a route test cannot accidentally start
+    /// spending a model budget.
     #[must_use]
     pub fn new(database: Arc<SqliteDatabase>, credential: ClientCredential) -> Self {
         Self {
             runs: RunService::new(Arc::clone(&database)),
             database,
             credential,
+            executor: None,
         }
+    }
+
+    /// Attaches the native executor, so a started run is driven to a terminal state.
+    #[must_use]
+    pub fn with_executor(mut self, executor: Arc<crate::executor::Executor>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     /// Returns the database the gateway reads through.
@@ -172,7 +189,33 @@ async fn start_run(
     Json(request): Json<StartRunRequest>,
 ) -> Response {
     match state.runs.start(&request).await {
-        Ok(reply) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Ok(reply) => {
+            // The run is driven on its own task so the response is not held open for the whole
+            // model call. The client learns the run identifier immediately and follows the stream,
+            // which is what makes the API usable for a long answer.
+            //
+            // The task is deliberately not awaited here and its failure is logged rather than
+            // returned: the run is already durably recorded, so a task that fails leaves a run
+            // that is visibly unfinished rather than a response that claims a start it did not
+            // make.
+            if let Some(executor) = &state.executor {
+                let database = Arc::clone(&state.database);
+                let executor = Arc::clone(executor);
+                let run_id = reply.run_id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::executor::execute_run(&database, executor.model(), &run_id).await
+                    {
+                        tracing::error!(
+                            run_id,
+                            error = %error,
+                            "the run executor could not persist its progress"
+                        );
+                    }
+                });
+            }
+            (StatusCode::CREATED, Json(reply)).into_response()
+        }
         Err(error) => error.into_response(),
     }
 }

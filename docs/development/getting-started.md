@@ -71,9 +71,27 @@ The CLI still contains no orchestration: it sends an objective and no identity, 
 the workspace and user from its own seeded rows. A client-supplied workspace identifier would be a claim
 rather than proof of access.
 
-**Runs do not settle yet.** No slice invokes a model until `P2-009`, so an accepted run reaches
-`received` and stays there, and `jarvis ask` waits on a stream that has nothing further to send. That is
-the honest current behavior rather than a bug, and `P2-009` is what changes it.
+**Runs now execute.** Set `daemon.executor_model` and the daemon drives a run to a terminal state:
+
+```toml
+[daemon]
+http_enabled = true
+http_port = 8765
+executor_model = "scripted"
+```
+
+The only value this build implements is `scripted`, a **deterministic local model** that needs no
+network and no credential. It says in its own answer that no language model is configured, so a
+misconfigured daemon cannot look like a working one. A name the build does not implement stops the
+daemon at startup with an actionable error rather than being discovered when the first run is started.
+
+With the executor enabled, `jarvis ask` completes in about a second: answer text on stdout, progress on
+stderr, and exit `0` for a completed run. The run's events are durable, so a client that reconnects
+replays from its position rather than re-reading the whole answer.
+
+The executor lives in `apps/jarvisd` rather than `jarvis-application`, because
+`docs/architecture/repository-layout.md` allows the application layer to depend only on `jarvis-core`
+and has no arrow from it into an adapter crate.
 
 ### Portable Mode
 

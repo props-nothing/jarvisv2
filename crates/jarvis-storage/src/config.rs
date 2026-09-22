@@ -70,7 +70,10 @@ impl LoggingConfig {
 pub const DEFAULT_HTTP_PORT: u16 = 8765;
 
 /// Daemon lifecycle configuration.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// Not `Copy`, because `executor_model` holds a name and a `String` cannot be copied. `Clone`
+/// remains, so a caller that needs an owned copy still gets one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     shutdown_timeout_seconds: u16,
@@ -84,6 +87,22 @@ pub struct DaemonConfig {
     /// The loopback port the HTTP transport binds when enabled.
     #[serde(default = "default_http_port")]
     http_port: u16,
+    /// Which model the native run executor drives, or `None` for no executor.
+    ///
+    /// # Why this is a name and not a URL plus a key
+    ///
+    /// A provider endpoint carries a credential in its path or query, so putting it here would
+    /// store a secret in a plaintext configuration file and make it a substring of every log line
+    /// that mentions the endpoint. This field names a **built-in** model implementation; provider
+    /// coordinates belong in the credential store when an adapter can reach one (`P2-003`
+    /// deliberately shipped no live path). Until then the only selectable value is `scripted`,
+    /// which is a deterministic local model and makes no claim to be a language model.
+    ///
+    /// `None` means runs are accepted and recorded but not executed, which is exactly what
+    /// `P2-007` shipped. The daemon refuses an unrecognized value rather than ignoring it, so a
+    /// typo cannot silently leave every run unexecuted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_model: Option<String>,
 }
 
 fn default_http_port() -> u16 {
@@ -108,6 +127,12 @@ impl DaemonConfig {
     pub const fn http_port(&self) -> u16 {
         self.http_port
     }
+
+    /// Returns the configured executor model name, when one is set.
+    #[must_use]
+    pub fn executor_model(&self) -> Option<&str> {
+        self.executor_model.as_deref()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -116,6 +141,9 @@ impl Default for DaemonConfig {
             shutdown_timeout_seconds: 15,
             http_enabled: false,
             http_port: DEFAULT_HTTP_PORT,
+            // Off by default: a daemon that executes runs without being asked to would spend a
+            // model budget nobody enabled.
+            executor_model: None,
         }
     }
 }
@@ -549,7 +577,12 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
         collect_nested_unknown(
             table,
             "daemon",
-            &["shutdown_timeout_seconds", "http_enabled", "http_port"],
+            &[
+                "shutdown_timeout_seconds",
+                "http_enabled",
+                "http_port",
+                "executor_model",
+            ],
             &mut unknown,
         );
     }
@@ -637,6 +670,17 @@ where
                     .map_err(|_| ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_HTTP_PORT",
                     })?;
+            }
+            "JARVIS_EXECUTOR_MODEL" => {
+                let name = environment_text(&value, "JARVIS_EXECUTOR_MODEL")?;
+                // An empty value is refused rather than treated as unset: `JARVIS_EXECUTOR_MODEL=`
+                // reads as "enable the executor" and would otherwise silently disable it.
+                if name.trim().is_empty() {
+                    return Err(ConfigError::InvalidEnvironmentValue {
+                        key: "JARVIS_EXECUTOR_MODEL",
+                    });
+                }
+                config.daemon.executor_model = Some(name.to_owned());
             }
             _ => {
                 return Err(ConfigError::UnknownEnvironmentKey {

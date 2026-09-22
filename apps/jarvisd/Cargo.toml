@@ -13,6 +13,11 @@ publish.workspace = true
 axum = { workspace = true }
 jarvis-application.workspace = true
 jarvis-core.workspace = true
+# The run executor is an adapter consumer, so it belongs in this composition root:
+# `repository-layout.md` allows `jarvis-application` to depend only on `jarvis-core` and has no
+# arrow from application into an adapter, so the provider port is reached here where the
+# routing already lives.
+jarvis-models.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
 jarvis-storage.workspace = true

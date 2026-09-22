@@ -314,8 +314,15 @@ pub enum StreamReading {
     Cancelled,
     /// A state change, which carries no terminal meaning on its own.
     StateChanged,
-    /// Answer text.
-    Output,
+    /// One **incremental** piece of answer text, to be rendered as it arrives.
+    OutputDelta,
+    /// The **whole** answer, sent once generation finished.
+    ///
+    /// Distinct from [`Self::OutputDelta`] and not interchangeable with it. A client that renders
+    /// both prints the answer twice, because the completed event repeats every fragment it already
+    /// received. That is not hypothetical: it is what the first end-to-end run of this stream did,
+    /// and the two kinds carried the same classification until the duplication was seen on screen.
+    OutputCompleted,
     /// Anything else worth showing as an operational line.
     Activity,
 }
@@ -329,7 +336,8 @@ impl StreamReading {
             RunEventKind::RunFailed => Self::Failed,
             RunEventKind::RunCancelled => Self::Cancelled,
             RunEventKind::StateChanged => Self::StateChanged,
-            RunEventKind::OutputDelta | RunEventKind::OutputCompleted => Self::Output,
+            RunEventKind::OutputDelta => Self::OutputDelta,
+            RunEventKind::OutputCompleted => Self::OutputCompleted,
             _ => Self::Activity,
         }
     }
@@ -430,7 +438,23 @@ mod tests {
         assert_eq!(first.kind, RunEventKind::StateChanged);
         assert_eq!(second.kind, RunEventKind::OutputDelta);
         assert_eq!(output_text(&second.payload), Some("hi"));
-        assert_eq!(StreamReading::of(second.kind), StreamReading::Output);
+        assert_eq!(StreamReading::of(second.kind), StreamReading::OutputDelta);
+    }
+
+    /// A fragment and the completed answer are DIFFERENT readings, because rendering both prints the
+    /// answer twice. Asserted as a difference rather than as two equal values, which is the whole
+    /// point of the distinction.
+    #[test]
+    fn a_delta_and_a_completed_answer_are_different_readings() {
+        assert_ne!(
+            StreamReading::of(RunEventKind::OutputDelta),
+            StreamReading::of(RunEventKind::OutputCompleted),
+            "a client that treats these alike repeats the whole answer"
+        );
+        assert_eq!(
+            StreamReading::of(RunEventKind::OutputCompleted),
+            StreamReading::OutputCompleted
+        );
     }
 
     /// A frame split across two reads must still decode, because a chunk boundary is arbitrary.

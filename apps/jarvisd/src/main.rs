@@ -2,6 +2,7 @@
 
 mod build_info;
 mod control;
+mod executor;
 mod gateway;
 mod health;
 mod run_service;
@@ -65,6 +66,14 @@ enum DaemonError {
         /// The underlying operating-system error.
         #[source]
         source: io::Error,
+    },
+    #[error("daemon.executor_model names a model this build does not implement: {name}")]
+    ExecutorModel {
+        /// The configured name, echoed so the fix is one edit.
+        name: String,
+        /// Why the name was refused.
+        #[source]
+        source: executor::ExecutorBuildError,
     },
 }
 
@@ -154,6 +163,9 @@ struct Running {
     database: Arc<SqliteDatabase>,
     credential: jarvis_core::ClientCredential,
     http_port: Option<u16>,
+    /// The configured executor model, resolved at start so an unimplemented name fails the
+    /// daemon rather than being discovered when a run is started.
+    executor: Option<Arc<executor::Executor>>,
     daemon_id: DaemonRunId,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
@@ -236,6 +248,19 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         .http_enabled()
         .then(|| loaded_config.config().daemon().http_port());
 
+    // The executor model is resolved HERE, so an unimplemented name stops the daemon at startup
+    // with an actionable error rather than being discovered when the first run is started and
+    // leaving a run that is accepted but never driven.
+    let executor = match loaded_config.config().daemon().executor_model() {
+        Some(name) => Some(Arc::new(executor::Executor::build(name).map_err(
+            |error| DaemonError::ExecutorModel {
+                name: name.to_owned(),
+                source: error,
+            },
+        )?)),
+        None => None,
+    };
+
     Ok(Running {
         health,
         paths,
@@ -244,6 +269,7 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         database: Arc::new(database),
         credential,
         http_port,
+        executor,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
@@ -273,6 +299,7 @@ impl HttpTransport {
         port: u16,
         database: Arc<SqliteDatabase>,
         credential: jarvis_core::ClientCredential,
+        executor: Option<Arc<executor::Executor>>,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
@@ -281,7 +308,11 @@ impl HttpTransport {
             .await
             .map_err(|source| DaemonError::HttpBind { port, source })?;
 
-        let app = gateway::router(gateway::GatewayState::new(database, credential));
+        let mut state = gateway::GatewayState::new(database, credential);
+        if let Some(executor) = executor {
+            state = state.with_executor(executor);
+        }
+        let app = gateway::router(state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (stopped_tx, stopped) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -388,6 +419,7 @@ where
         database,
         credential,
         http_port,
+        executor,
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
@@ -413,7 +445,8 @@ where
     let (http, http_stop) = match http_port {
         Some(port) => {
             let (transport, stop) =
-                HttpTransport::bind(port, Arc::clone(&database), credential.clone()).await?;
+                HttpTransport::bind(port, Arc::clone(&database), credential.clone(), executor)
+                    .await?;
             (Some(transport), Some(stop))
         }
         None => (None, None),

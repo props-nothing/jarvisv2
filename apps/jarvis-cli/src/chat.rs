@@ -128,10 +128,23 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
         idle_keep_alives = 0;
 
         match StreamReading::of(event.kind) {
-            StreamReading::Output => {
+            StreamReading::OutputDelta => {
                 if let Some(text) = output_text(&event.payload) {
                     print!("{text}");
                     let _ = std::io::stdout().flush();
+                }
+            }
+            // The completed event repeats the WHOLE answer, so nothing is printed for it. Printing
+            // its text would duplicate every fragment this loop already rendered, which is exactly
+            // what happened before the two kinds were told apart. It is still a useful signal, so
+            // its character count goes to stderr where progress belongs.
+            StreamReading::OutputCompleted => {
+                if let Some(chars) = event
+                    .payload
+                    .get("chars")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    eprintln!("jarvis: answer complete ({chars} characters)");
                 }
             }
             StreamReading::StateChanged => {

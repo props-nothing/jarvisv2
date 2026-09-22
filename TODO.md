@@ -190,6 +190,26 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       settled. Four tests, including one that writes out the two-call form and asserts it is refused, so
       the reason the primitive exists is falsifiable. `RunState::terminal_event_kind` is the one place
       the state-to-event mapping lives.
+      **The executor is done:** `apps/jarvisd/src/executor.rs` drives a run from `received` to a terminal
+      state, and it lives in that composition root because `repository-layout.md` allows
+      `jarvis-application` to depend only on `jarvis-core` with no arrow into an adapter. It assembles
+      context (recording the manifest as audit evidence), calls the model through the `ModelGateway`
+      port, appends one event per answer fragment, records usage, and settles. Selected by the new
+      `daemon.executor_model` / `JARVIS_EXECUTOR_MODEL`, resolved **at startup** so an unimplemented name
+      stops the daemon rather than being found when the first run starts.
+      **Verified live, and running it found three real defects plus one in `P2-008`:**
+      1. the loop re-settled an already-settled run, which the domain refused as
+         `TerminalStateImmutable { from: Failed }` — anything but an error about settlement ordering;
+      2. `assemble_context` was called with a ceiling that **excluded** the objective, and the objective
+         was then sent to the model anyway. The ceiling is now derived from the model's declared
+         placement, so the assembled context and the request agree;
+      3. a cancellation requested during a model call bumps `version` without changing `state`, so the
+         executor's next guarded write failed with a spurious `RunConflict`. Writes now re-read first;
+      4. **`P2-008`'s client printed the answer twice**, because it rendered `output_delta` and
+         `output_completed` identically and the completed event repeats every fragment. The two kinds
+         are now distinct readings, with a test asserting they differ.
+      A live run now completes in about a second with the answer on stdout and progress on stderr, and a
+      bad model name fails closed with an actionable message.
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
 
 ## P3: Tools, Policy, Approvals, And MCP

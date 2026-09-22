@@ -538,6 +538,20 @@ impl RunTransition {
         }
     }
 
+    /// Builds a transition that settles a run as cancelled.
+    ///
+    /// Present beside [`Self::completed`] and [`Self::failed`] so all three terminal settlements
+    /// have one constructor each. Without it a caller would build the arm by hand and could pair
+    /// the state with the wrong outcome, which the constructor refuses.
+    #[must_use]
+    pub const fn cancelled() -> Self {
+        Self {
+            to: RunState::Cancelled,
+            outcome: Some(RunOutcome::Cancelled),
+            error_code: None,
+        }
+    }
+
     /// Builds a transition that settles a run as failed with a bounded reason.
     #[must_use]
     pub const fn failed(error_code: RunErrorCode) -> Self {

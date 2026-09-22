@@ -1037,6 +1037,7 @@ dependencies = [
  "futures-util",
  "jarvis-application",
  "jarvis-core",
+ "jarvis-models",
  "jarvis-observability",
  "jarvis-protocol",
  "jarvis-storage",
