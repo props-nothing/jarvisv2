@@ -296,13 +296,90 @@ impl fmt::Debug for dyn ToolExecutor {
 mod tests {
     use super::*;
     use crate::execution::{AuthorizationReceiptParts, ProviderEvidence, ToolCallResult};
-    use crate::risk::Risk;
     use crate::{ToolOutcome, ToolOutcomeRecord};
     use serde_json::json;
 
     fn at(offset_seconds: i128) -> UtcTimestamp {
         UtcTimestamp::from_unix_nanos(1_774_000_000_000_000_000 + offset_seconds * 1_000_000_000)
             .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The digest of a tool, version, and the argument set the request fixtures use.
+    ///
+    /// Computed rather than a placeholder string, because `AuthorizationReceipt::new` now verifies the
+    /// digest against the arguments it is given. A fixture has to satisfy the check it exists for.
+    fn digest(tool: &str, version: &str) -> jarvis_core::CanonicalIntentHash {
+        jarvis_core::CanonicalIntentHash::compute(tool, version, &arguments())
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The arguments the receipt fixtures cover, so digest and request agree.
+    fn arguments() -> Value {
+        json!({"to": "a@example.invalid"})
+    }
+
+    /// An allowing decision, produced by `evaluate` rather than fabricated.
+    ///
+    /// `PolicyDecision` has a private constructor precisely so a decision must come from an
+    /// evaluation; a fixture that could build one directly could fabricate authority.
+    fn allowing() -> crate::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use crate::policy::{ApprovalPolicy, Availability, Idempotency, RetryDeclaration};
+        use crate::risk::Risk;
+        use crate::scope::ScopeSet;
+        use crate::{EffectSet, ToolEffect, ToolSource};
+        use jarvis_core::SessionChannel;
+
+        let definition = crate::ToolDefinition::new(crate::ToolDefinitionParts {
+            id: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
+            version: "1.0.0".to_owned(),
+            title: "Send mail".to_owned(),
+            description: "Sends one message.".to_owned(),
+            input_schema: crate::ToolSchema::from_value(json!({
+                "$schema": crate::TOOL_SCHEMA_DIALECT,
+                "type": "object"
+            }))
+            .unwrap_or_else(|error| panic!("{error}")),
+            output_schema: crate::ToolSchema::from_value(json!({
+                "$schema": crate::TOOL_SCHEMA_DIALECT,
+                "type": "object"
+            }))
+            .unwrap_or_else(|error| panic!("{error}")),
+            effects: EffectSet::single(ToolEffect::ReadOnly),
+            risk: 0,
+            required_scopes: ScopeSet::none(),
+            approval: ApprovalPolicy::Auto,
+            timeout_seconds: 30,
+            retry: RetryDeclaration::none(),
+            idempotency: Idempotency::Required,
+            source: ToolSource::Native,
+            availability: Availability::Available,
+            sensitivity: crate::ToolSensitivity::new(
+                jarvis_core::Sensitivity::Internal,
+                jarvis_core::Sensitivity::Internal,
+            ),
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let _ = Risk::Minimal;
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::none()),
+            workspace: &WorkspacePolicy::default(),
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_allowed(),
+            "the fixture needs an allowing decision, got {:?}",
+            decision.reason_code()
+        );
+        decision
     }
 
     fn receipt(expires_at: Option<UtcTimestamp>) -> AuthorizationReceipt {
@@ -316,9 +393,10 @@ mod tests {
             receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
             tool: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
             tool_version: "1.0.0".to_owned(),
-            intent_hash: "a".repeat(64),
+            arguments: arguments(),
+            intent_hash: digest("jarvis.mail.send", "1.0.0"),
             policy_version: "policy-3".to_owned(),
-            risk_level: Risk::Moderate,
+            decision: allowing(),
             approval,
             correlation_id: CorrelationId::new(),
             issued_at: at(0),
@@ -388,9 +466,10 @@ mod tests {
                 receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
                 tool: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
                 tool_version: "1.0.0".to_owned(),
-                intent_hash: "a".repeat(64),
+                arguments: arguments(),
+                intent_hash: digest("jarvis.mail.send", "1.0.0"),
                 policy_version: "policy-3".to_owned(),
-                risk_level: Risk::Moderate,
+                decision: allowing(),
                 approval: Some(crate::execution::ApprovalCitation {
                     approval_id: "0198f000-0000-7000-8000-0000000000e2".to_owned(),
                     approver_id: "user-2".to_owned(),
@@ -413,9 +492,10 @@ mod tests {
             receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
             tool: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
             tool_version: "1.0.0".to_owned(),
-            intent_hash: "a".repeat(64),
+            arguments: arguments(),
+            intent_hash: digest("jarvis.mail.send", "1.0.0"),
             policy_version: "policy-3".to_owned(),
-            risk_level: Risk::Moderate,
+            decision: allowing(),
             approval: Some(crate::execution::ApprovalCitation {
                 approval_id: "0198f000-0000-7000-8000-0000000000e2".to_owned(),
                 approver_id: "user-2".to_owned(),

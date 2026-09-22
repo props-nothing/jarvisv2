@@ -38,3 +38,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0018](0018-approvals-bind-to-a-digest-and-store-no-bearer-token.md) | An approval binds to an intent digest and stores a nonce digest rather than a bearer token | Accepted |
 | [0019](0019-tool-calls-are-a-durable-lifecycle.md) | A tool call is a durable lifecycle row; the idempotency ledger is a unique index and a terminal outcome is final | Accepted |
 | [0020](0020-filesystem-confinement-is-a-handle.md) | Filesystem confinement is a directory handle rather than a validated path | Accepted |
+| [0021](0021-an-authorization-receipt-derives-from-its-decision.md) | An authorization receipt is derived from its policy decision and cannot be built from a refusal | Accepted |

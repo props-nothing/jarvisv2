@@ -618,15 +618,99 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// An allowing decision for one of this adapter's tools, produced by `evaluate`.
+    ///
+    /// Through the policy engine rather than fabricated, because that is the whole point of the seam
+    /// this fixture exercises: an adapter's authority must come from a decision, and the receipt type
+    /// now refuses to be built from anything else.
+    fn allowing(tool: &str) -> crate::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use crate::scope::ScopeSet;
+        use jarvis_core::SessionChannel;
+
+        let definition =
+            FilesystemReadTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::new([
+                Scope::new("files.read").unwrap_or_else(|error| panic!("{error}"))
+            ])),
+            workspace: &WorkspacePolicy::default(),
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_allowed(),
+            "the adapter's read tools must be allowed by the default workspace, got {:?}",
+            decision.reason_code()
+        );
+        decision
+    }
+
+    /// A **denying** decision, for the test that an unknown tool is refused before anything runs.
+    ///
+    /// An unknown tool has no definition to evaluate, so the decision cannot come from policy over
+    /// that tool. It is built as a denial of a *real* read definition instead, which is what a caller
+    /// holding a mismatched decision would produce.
+    ///
+    /// Not currently called: the request fixture now always evaluates against a known tool, because an
+    /// unknown tool has no definition. Kept because it is the fixture a future test of the
+    /// mismatch path wants, and removing it would make that test re-derive the same construction.
+    #[expect(dead_code, reason = "the fixture for a future mismatch test")]
+    fn denying(tool: &str) -> crate::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use crate::scope::ScopeSet;
+        use jarvis_core::SessionChannel;
+
+        // A workspace that denies this tool outright.
+        let definition =
+            FilesystemReadTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
+        let workspace = WorkspacePolicy::default().denying(definition.id().clone());
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::none()),
+            workspace: &workspace,
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_denied(),
+            "the fixture needs a denying decision, got {:?}",
+            decision.reason_code()
+        );
+        decision
+    }
+
     fn request(tool: &str, arguments: Value, deadline: UtcTimestamp) -> ToolExecutionRequest {
         let tool_id = ToolId::new(tool).unwrap_or_else(|error| panic!("{error}"));
+        // The digest is computed from the arguments the request will carry, and the decision comes
+        // from a real evaluation: `AuthorizationReceipt::new` verifies both, so a fixture cannot
+        // stand in a placeholder digest or invent authority.
+        //
+        // The decision is evaluated against a **known** tool's definition even when `tool` is not one
+        // this adapter provides, because the test for an unknown tool needs a receipt that is validly
+        // built and names a tool the adapter cannot run. That is precisely the registry mistake the
+        // test reproduces: the authority is real, and the tool is missing.
+        let intent_hash = jarvis_core::CanonicalIntentHash::compute(tool, "1.0.0", &arguments)
+            .unwrap_or_else(|error| panic!("{error}"));
         let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
             receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
             tool: tool_id.clone(),
             tool_version: "1.0.0".to_owned(),
-            intent_hash: "a".repeat(64),
+            arguments: arguments.clone(),
+            intent_hash,
             policy_version: "policy-3".to_owned(),
-            risk_level: Risk::Minimal,
+            decision: allowing(READ_TOOL),
             approval: None,
             correlation_id: CorrelationId::new(),
             issued_at: at(0),

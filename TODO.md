@@ -416,7 +416,6 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       call, so the lifecycle remains driven by tests. `P3-012` is where the Phase 3 gate proves the whole
       path.
 - [x] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
-      Two modules in `jarvis-tools`. `workspace.rs` is the security boundary: `WorkspaceRoots` opens one
       `cap_std::fs::Dir` handle per granted root and **resolves through the handle** rather than
       validating a path. The obvious join-canonicalize-prefix-check scheme is rejected because it has a
       two-syscall window — the path is resolved and then opened, so a component swapped for a link in
@@ -455,6 +454,29 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       belong under this blocking I/O. No write, move, delete, or trash/undo — the read half was chosen
       first because its failure mode is disclosure, which confinement prevents, rather than destruction,
       which needs an undo design. `P3-012` is where the gate proves the path end to end.
+- [x] `P3-006a` Close the authorization seam: make an authorization receipt derive from the policy decision it came from.
+      **Added out of ledger order, because composing the pieces found a security defect.** `P3-001`..`P3-006`
+      each built one part and **nothing composed them**: the only `AuthorizationReceipt` constructions in the
+      workspace were six test fixtures, so no adapter had ever been handed a receipt from a real decision.
+      Closing that gap to write the first seam test showed it was a security gap, not only an integration one.
+      `AuthorizationReceiptParts` took the risk as a **value**, so a composer could evaluate a decision at
+      `High` and then build a receipt declaring `Risk::Minimal` — and nothing would refuse it, because nothing
+      held the decision and the receipt at once. The receipt is what an adapter treats as permission, so the
+      declaration an adapter acted on could understate the risk the decision was taken at. The digest had the
+      same shape of problem: `intent_hash: String` cannot express "this is the digest an approval binds to".
+      Fixed by making both **derived rather than stated**: the parts now carry the `PolicyDecision` and the
+      `arguments`, and `AuthorizationReceipt::new` reads `effective_risk()` from the decision and
+      **recomputes** `CanonicalIntentHash::compute` to refuse a mismatch. Two new refusals make the remaining
+      ways back in unrepresentable: `DecisionNotAuthorizing` (a `Deny`, or a `RequireApproval` citing no
+      approval, can never produce a receipt) and `IntentMismatch`. The digest stays pre-computed at the call
+      site because `jarvis-tools` does not depend on `sha2` and a second implementation of the canonical form
+      would get the `\u{1f}` separator wrong — so it is verified at the boundary instead. 182 `jarvis-tools`
+      tests; the seam has a named test with controls proving each refusal is about the intended cause. ADR-0021.
+      **No production code builds a receipt**, so this is a library fix, not a pipeline: there is still no
+      composition root (no registry lookup, no `evaluate` call, no approval round-trip, no admission, no
+      adapter call) and the seam is correct and tested but **not driven**. `P3-012` owns that. Also recorded:
+      the digest covers tool, version, and arguments but **not the actor or workspace**, so two actors with the
+      same tool and arguments currently produce the same digest — a question `P3-012` should answer.
 - [ ] `P3-007` Research the current MCP specification and selected Rust SDK; record negotiated versions and features.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.

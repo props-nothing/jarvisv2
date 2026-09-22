@@ -47,7 +47,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::identifier::ToolId;
-use crate::risk::Risk;
 use crate::{ToolOutcome, ToolOutcomeRecord};
 
 /// Bytes of tool output that may be retained.
@@ -117,6 +116,19 @@ pub enum ReceiptError {
     /// The receipt declared an approver but no approval.
     #[error("a receipt naming an approver must cite an approval")]
     ApproverWithoutApproval,
+    /// The decision the receipt was built from did not authorize the call.
+    ///
+    /// Raised for a `Deny`, and for a `RequireApproval` with no approval cited. A receipt is what an
+    /// adapter treats as permission, so building one from a decision that refused the call would turn
+    /// a refusal into an authority.
+    #[error("a receipt cannot be built from a decision that did not authorize the call")]
+    DecisionNotAuthorizing,
+    /// The supplied digest was not the digest of the supplied tool, version, and arguments.
+    ///
+    /// The receipt records the digest an approval binds to, so accepting a digest for a different
+    /// intent would carry an authorization to an action that is not the one running.
+    #[error("the intent digest does not match the tool, version, and arguments it must describe")]
+    IntentMismatch,
 }
 
 /// Tool output, bounded and honestly marked when it was cut.
@@ -373,6 +385,22 @@ pub struct AuthorizationReceipt {
 }
 
 /// The declared fields of an authorization receipt.
+///
+/// # `decision` and `intent_hash` are not optional, and that is the point
+///
+/// Both are **derived from what they must agree with** rather than taken as values, because a
+/// caller-supplied copy is a copy that can disagree. This was a real gap, not a hypothetical one:
+/// before this type took a [`PolicyDecision`], a composer could build a receipt declaring
+/// `Risk::Minimal` for a call that policy had decided at `High`, and
+/// [`crate::PolicyDecision::effective_risk`] would say one thing while the receipt an adapter acted on
+/// said another. Nothing would have refused it, because nothing held both values.
+///
+/// The intent digest has the same shape of problem and the same reason to be derived: the hash an
+/// approval binds to (`jarvis_core::CanonicalIntentHash`) and the hash in the receipt must be the same
+/// digest, and a `String` field cannot express that. It arrives **already computed**, because this
+/// crate does not depend on `sha2` and computing it here would mean a second implementation of the
+/// canonical form. [`AuthorizationReceipt::new`] compares it against the arguments it was given, so a
+/// digest for a different intent is refused rather than recorded.
 #[derive(Clone, Debug)]
 pub struct AuthorizationReceiptParts {
     /// The receipt's own identifier, for the audit record.
@@ -381,12 +409,18 @@ pub struct AuthorizationReceiptParts {
     pub tool: ToolId,
     /// The tool version the intent was built against.
     pub tool_version: String,
-    /// The canonical intent digest the authority covers.
-    pub intent_hash: String,
+    /// The validated arguments the receipt covers.
+    ///
+    /// Carried so the digest can be **checked** against reality rather than trusted, and so the intent
+    /// it hashes is the one that will actually run. An adapter never sees this field.
+    pub arguments: serde_json::Value,
+    /// The canonical intent digest, computed by `jarvis_core::CanonicalIntentHash`.
+    pub intent_hash: jarvis_core::CanonicalIntentHash,
     /// The policy version that produced the decision.
     pub policy_version: String,
-    /// The risk the decision was taken at.
-    pub risk_level: Risk,
+    /// The decision the authority comes from. Its `effective_risk` becomes the receipt's risk, so the
+    /// two cannot disagree.
+    pub decision: crate::evaluation::PolicyDecision,
     /// The approval the authorization came from, when one was required.
     pub approval: Option<ApprovalCitation>,
     /// The correlation identity shared with the originating request.
@@ -409,19 +443,35 @@ pub struct ApprovalCitation {
 }
 
 impl AuthorizationReceipt {
-    /// Builds and validates a receipt.
+    /// Builds and validates a receipt from the decision and intent it must agree with.
     ///
     /// # Errors
     ///
-    /// Returns [`ReceiptError::PolicyVersion`] for an empty or oversized policy version.
+    /// - [`ReceiptError::PolicyVersion`] for an empty or oversized policy version.
+    /// - [`ReceiptError::DecisionNotAuthorizing`] when the decision is a `Deny`, or a
+    ///   `RequireApproval` with no approval cited. **A receipt must never be buildable from a decision
+    ///   that did not authorize the call**, because the receipt is what an adapter treats as
+    ///   permission; the check is here rather than at the call site because a call site can forget.
+    /// - [`ReceiptError::IntentMismatch`] when the supplied digest is not the digest of the supplied
+    ///   arguments and tool. The receipt records the digest an approval binds to, so a digest for a
+    ///   different intent would carry an authorization to something that is not running.
+    /// - [`ReceiptError::ApprovalIncomplete`] when an approval cites no approver.
+    ///
+    /// # Why the risk is derived and not passed
+    ///
+    /// The receipt's risk comes from [`crate::PolicyDecision::effective_risk`], so the decision record
+    /// and the authority an adapter acts on cannot disagree. The previous shape took a `risk_level`
+    /// value, which meant a composer could declare `Minimal` for a call policy had decided at `High`
+    /// and nothing would refuse it — a gap between two values nothing held at once.
     pub fn new(parts: AuthorizationReceiptParts) -> Result<Self, ReceiptError> {
         let AuthorizationReceiptParts {
             receipt_id,
             tool,
             tool_version,
+            arguments,
             intent_hash,
             policy_version,
-            risk_level,
+            decision,
             approval,
             correlation_id,
             issued_at,
@@ -430,6 +480,24 @@ impl AuthorizationReceipt {
         let policy_version = policy_version.trim().to_owned();
         if policy_version.is_empty() || policy_version.chars().count() > MAX_POLICY_VERSION_CHARS {
             return Err(ReceiptError::PolicyVersion);
+        }
+
+        // The decision must actually authorize. A `Deny` can never produce a receipt, and a held call
+        // needs the approval it was held for.
+        if decision.is_denied() {
+            return Err(ReceiptError::DecisionNotAuthorizing);
+        }
+        if decision.is_held() && approval.is_none() {
+            return Err(ReceiptError::DecisionNotAuthorizing);
+        }
+
+        // The digest must be the digest of THIS intent. Recomputed through the same canonical form the
+        // approval binds to, so the two cannot describe different actions.
+        let expected =
+            jarvis_core::CanonicalIntentHash::compute(&tool.to_string(), &tool_version, &arguments)
+                .map_err(|_| ReceiptError::IntentMismatch)?;
+        if expected != intent_hash {
+            return Err(ReceiptError::IntentMismatch);
         }
 
         // The four approval fields move together. Constructing them from one `Option` is what makes a
@@ -453,9 +521,11 @@ impl AuthorizationReceipt {
             receipt_id,
             tool: tool.to_string(),
             tool_version,
-            intent_hash,
+            // Stored as the digest's own canonical hex, so the receipt and an approval's `intent()`
+            // are the same string by construction rather than by convention.
+            intent_hash: intent_hash.to_hex(),
             policy_version,
-            risk_level: risk_level.level(),
+            risk_level: decision.effective_risk().level(),
             approval_id,
             approver_id,
             approved_at,
@@ -640,7 +710,9 @@ impl ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::risk::Risk;
+    use crate::definition::{ToolDefinition, ToolDefinitionParts};
+    use crate::policy::ToolSensitivity;
+    use crate::scope::ScopeSet;
 
     /// A bounded output keeps small content, unmarked.
     #[test]
@@ -807,14 +879,62 @@ mod tests {
         assert_eq!(decoded, key);
     }
 
-    fn receipt_parts(approval: Option<ApprovalCitation>) -> AuthorizationReceiptParts {
+    /// The arguments the receipt's digest must describe.
+    ///
+    /// A real object rather than a placeholder string, because [`AuthorizationReceipt::new`] now
+    /// verifies the digest against these. The fixture must satisfy the check it is a fixture for.
+    fn arguments() -> serde_json::Value {
+        serde_json::json!({"receipt_id": "0198f000-0000-7000-8000-0000000000e1"})
+    }
+
+    /// The digest of the fixture's tool, version, and arguments.
+    fn intent_hash() -> jarvis_core::CanonicalIntentHash {
+        jarvis_core::CanonicalIntentHash::compute("jarvis.mail.send", "1.0.0", &arguments())
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// An **allowing** decision, since a receipt can only be built from one.
+    ///
+    /// Built through `evaluate` rather than by constructing a `PolicyDecision` directly, and that is
+    /// deliberate: the constructor is private to the policy engine precisely so a decision must come
+    /// from an evaluation. A fixture that could fabricate one would be able to fabricate authority.
+    fn allow_decision() -> crate::evaluation::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use jarvis_core::SessionChannel;
+
+        let definition = fixture_definition(crate::Risk::Minimal);
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::none()),
+            workspace: &WorkspacePolicy::default(),
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_allowed(),
+            "the fixture needs an allowing decision, got {:?}",
+            decision.reason_code()
+        );
+        decision
+    }
+
+    fn receipt_parts(
+        approval: Option<ApprovalCitation>,
+        decision: crate::evaluation::PolicyDecision,
+    ) -> AuthorizationReceiptParts {
         AuthorizationReceiptParts {
             receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
             tool: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
             tool_version: "1.0.0".to_owned(),
-            intent_hash: "a".repeat(64),
+            arguments: arguments(),
+            intent_hash: intent_hash(),
             policy_version: "policy-3".to_owned(),
-            risk_level: Risk::Moderate,
+            decision,
             approval,
             correlation_id: CorrelationId::new(),
             issued_at: UtcTimestamp::from_unix_nanos(1_774_000_000_000_000_000)
@@ -833,15 +953,205 @@ mod tests {
         }
     }
 
+    /// **The seam this slice exists for: the receipt cannot disagree with the decision that authorized it.**
+    ///
+    /// `P3-001` through `P3-005` each built a piece and nothing composed them, so nothing held the
+    /// `PolicyDecision` and the `AuthorizationReceipt` at once. That gap was a **security** gap, not
+    /// only an integration one: `AuthorizationReceiptParts` took a `risk_level` **value**, so a
+    /// composer could declare `Minimal` for a call policy had decided at `High`. The receipt is what an
+    /// adapter treats as permission, so the declaration an adapter acts on could understate the risk
+    /// the decision was taken at, and no code anywhere would have refused it.
+    ///
+    /// Three properties now hold, and each is the falsification of one way the gap could reopen:
+    ///
+    /// 1. the receipt's risk **is** the decision's effective risk, so the two cannot drift;
+    /// 2. a **denied** decision cannot produce a receipt at all;
+    /// 3. a **digest for a different intent** is refused, so an authorization cannot be carried to an
+    ///    action it does not cover.
+    #[test]
+    fn a_receipt_cannot_disagree_with_the_decision_that_authorized_it() {
+        // (1) The risk is derived. A decision at a raised risk produces a receipt at that risk, and
+        // there is no field through which a caller could state otherwise.
+        let decision = allow_decision();
+        let receipt = AuthorizationReceipt::new(receipt_parts(None, decision.clone()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            receipt.risk_level(),
+            decision.effective_risk().level(),
+            "the receipt's risk must be the decision's effective risk"
+        );
+        assert_eq!(
+            receipt.risk_level(),
+            crate::Risk::Minimal.level(),
+            "a risk-0 decision makes a risk-0 receipt"
+        );
+
+        // (2) A denial cannot become authority. Built from a real evaluation that denies.
+        let denied = deny_decision();
+        assert_eq!(
+            AuthorizationReceipt::new(receipt_parts(None, denied)),
+            Err(ReceiptError::DecisionNotAuthorizing),
+            "a denial must never produce a receipt"
+        );
+
+        // (3) The digest must describe THIS intent. A digest for other arguments is refused, so an
+        // approval for one action cannot be carried to another.
+        let mut parts = receipt_parts(None, allow_decision());
+        parts.intent_hash =
+            jarvis_core::CanonicalIntentHash::compute("jarvis.mail.send", "1.0.0", &arguments())
+                .unwrap_or_else(|error| panic!("{error}"));
+        // Same digest, so accepted: the control that the check is about content, not about rejecting.
+        assert!(AuthorizationReceipt::new(parts.clone()).is_ok());
+
+        parts.intent_hash = jarvis_core::CanonicalIntentHash::compute(
+            "jarvis.mail.send",
+            "1.0.0",
+            &serde_json::json!({"receipt_id": "a-different-receipt"}),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            AuthorizationReceipt::new(parts),
+            Err(ReceiptError::IntentMismatch),
+            "a digest for a different intent must be refused"
+        );
+    }
+
+    /// A `RequireApproval` with no approval cannot produce a receipt.
+    ///
+    /// The second half of "the decision must authorize": a held call is authorized only by an
+    /// approval, so a receipt built from a hold with nothing cited would be an authority nobody gave.
+    #[test]
+    fn a_held_decision_without_an_approval_cannot_produce_a_receipt() {
+        let held = held_decision();
+        assert!(
+            held.is_held(),
+            "the fixture needs a held decision, got {:?}",
+            held.reason_code()
+        );
+        assert_eq!(
+            AuthorizationReceipt::new(receipt_parts(None, held.clone())),
+            Err(ReceiptError::DecisionNotAuthorizing),
+            "a hold with no approval is not an authority"
+        );
+
+        // The control: the same hold WITH an approval does produce a receipt, so the refusal above is
+        // about the missing approval rather than about held decisions being unusable.
+        let receipt = AuthorizationReceipt::new(receipt_parts(Some(citation()), held))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            receipt.approval_id(),
+            Some("0198f000-0000-7000-8000-0000000000e2")
+        );
+    }
+
+    /// A decision that denies, produced by a real evaluation.
+    fn deny_decision() -> crate::evaluation::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use jarvis_core::SessionChannel;
+
+        let definition = fixture_definition(crate::Risk::Minimal);
+        let workspace = WorkspacePolicy::default().denying(definition.id().clone());
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::none()),
+            workspace: &workspace,
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_denied(),
+            "the fixture needs a denying decision, got {:?}",
+            decision.reason_code()
+        );
+        decision
+    }
+
+    /// A decision that holds the call for approval, produced by a real evaluation.
+    ///
+    /// A risk-2 tool in the default workspace, which requires approval from risk 2 up.
+    fn held_decision() -> crate::evaluation::PolicyDecision {
+        use crate::evaluation::{
+            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
+            WorkspacePolicy, evaluate,
+        };
+        use jarvis_core::SessionChannel;
+
+        let definition = fixture_definition(crate::Risk::Moderate);
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: ActorAuthority::active(ScopeSet::none()),
+            workspace: &WorkspacePolicy::default(),
+            channel: SessionChannel::Cli,
+            claimed_strength: AuthenticationStrength::Present,
+            available: true,
+            target: TargetAssessment::none(),
+        });
+        assert!(
+            decision.is_held(),
+            "the fixture needs a held decision, got {:?}",
+            decision.reason_code()
+        );
+        decision
+    }
+
+    /// A definition with the given risk, for building decisions of different kinds.
+    fn fixture_definition(risk: crate::Risk) -> ToolDefinition {
+        use crate::policy::ApprovalPolicy;
+        use crate::schema::ToolSchema;
+        use crate::{
+            Availability, EffectSet, Idempotency, RetryDeclaration, ToolEffect, ToolSource,
+        };
+
+        ToolDefinition::new(ToolDefinitionParts {
+            id: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
+            version: "1.0.0".to_owned(),
+            title: "Send mail".to_owned(),
+            description: "Sends one message.".to_owned(),
+            input_schema: ToolSchema::from_value(serde_json::json!({
+                "$schema": crate::TOOL_SCHEMA_DIALECT,
+                "type": "object"
+            }))
+            .unwrap_or_else(|error| panic!("{error}")),
+            output_schema: ToolSchema::from_value(serde_json::json!({
+                "$schema": crate::TOOL_SCHEMA_DIALECT,
+                "type": "object"
+            }))
+            .unwrap_or_else(|error| panic!("{error}")),
+            effects: EffectSet::single(ToolEffect::ReadOnly),
+            risk: risk.level(),
+            required_scopes: ScopeSet::none(),
+            approval: ApprovalPolicy::Auto,
+            timeout_seconds: 30,
+            retry: RetryDeclaration::none(),
+            idempotency: Idempotency::Required,
+            source: ToolSource::Native,
+            availability: Availability::Available,
+            sensitivity: ToolSensitivity::new(
+                jarvis_core::Sensitivity::Internal,
+                jarvis_core::Sensitivity::Internal,
+            ),
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// A receipt without an approval carries no approval fields at all.
     #[test]
     fn a_direct_authorization_carries_no_approval() {
-        let receipt = AuthorizationReceipt::new(receipt_parts(None))
+        let receipt = AuthorizationReceipt::new(receipt_parts(None, allow_decision()))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(receipt.tool(), "jarvis.mail.send");
         assert_eq!(receipt.tool_version(), "1.0.0");
         assert_eq!(receipt.policy_version(), "policy-3");
-        assert_eq!(receipt.risk_level(), 2);
+        assert_eq!(
+            receipt.risk_level(),
+            0,
+            "the risk comes from the decision, so a risk-0 decision makes a risk-0 receipt"
+        );
         assert_eq!(receipt.approval_id(), None);
         assert_eq!(receipt.approver_id(), None);
         assert_eq!(receipt.approved_at(), None);
@@ -858,7 +1168,7 @@ mod tests {
     /// **An approval citation fills all four fields, so a half-cited approval is unrepresentable.**
     #[test]
     fn an_approval_citation_fills_every_approval_field() {
-        let receipt = AuthorizationReceipt::new(receipt_parts(Some(citation())))
+        let receipt = AuthorizationReceipt::new(receipt_parts(Some(citation()), allow_decision()))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(
             receipt.approval_id(),
@@ -888,7 +1198,7 @@ mod tests {
         let mut broken = citation();
         broken.approver_id = "   ".to_owned();
         assert_eq!(
-            AuthorizationReceipt::new(receipt_parts(Some(broken))),
+            AuthorizationReceipt::new(receipt_parts(Some(broken), allow_decision())),
             Err(ReceiptError::ApprovalIncomplete)
         );
     }
@@ -897,7 +1207,7 @@ mod tests {
     #[test]
     fn an_unusable_policy_version_is_refused() {
         for version in ["", "   ", &"x".repeat(MAX_POLICY_VERSION_CHARS + 1)] {
-            let mut parts = receipt_parts(None);
+            let mut parts = receipt_parts(None, allow_decision());
             parts.policy_version = version.to_owned();
             assert_eq!(
                 AuthorizationReceipt::new(parts),
@@ -910,7 +1220,7 @@ mod tests {
     /// A receipt round-trips through serialization, which storage needs.
     #[test]
     fn a_receipt_round_trips() {
-        let receipt = AuthorizationReceipt::new(receipt_parts(Some(citation())))
+        let receipt = AuthorizationReceipt::new(receipt_parts(Some(citation()), allow_decision()))
             .unwrap_or_else(|error| panic!("{error}"));
         let encoded = serde_json::to_string(&receipt).unwrap_or_else(|error| panic!("{error}"));
         let decoded: AuthorizationReceipt =
