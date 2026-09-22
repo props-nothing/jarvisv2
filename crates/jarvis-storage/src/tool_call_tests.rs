@@ -72,9 +72,20 @@ async fn reach_submitted(database: &SqliteDatabase, id: &str, at: UtcTimestamp) 
     must(advance_tool_call(database, id, ToolOutcome::Authorized, at).await);
     must(advance_tool_call(database, id, ToolOutcome::Submitted, at).await)
 }
+/// A timestamp `minute` minutes from a **fixed, non-zero-fraction** base instant.
+///
+/// The base deliberately carries a sub-second part. `UtcTimestamp`'s `Rfc3339` rendering **omits** the
+/// fraction when it is zero, and the omitted form sorts *after* the fractional form within the same
+/// second (`'0'` is 0x30, `'Z'` is 0x5A). With a non-zero fraction every value this helper produces is
+/// the same width, so ordering is stable whether the code under test compares the values as text or as
+/// `unix_nanos`.
+///
+/// A base of exactly `.000000000` would put this helper one clock-tick away from mixing widths, and a
+/// test helper that is only usually correct is worse than one that is obviously wrong.
 fn at(minute: i128) -> UtcTimestamp {
+    const BASE: i128 = 1_774_000_000_500_000_000;
     must(UtcTimestamp::from_unix_nanos(
-        1_774_000_000_000_000_000 + minute * 60_000_000_000,
+        BASE + minute * 60_000_000_000,
     ))
 }
 
