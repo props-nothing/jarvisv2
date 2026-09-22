@@ -6,6 +6,7 @@ mod endpoint;
 mod error;
 mod id;
 mod loglevel;
+mod loopback;
 mod run;
 mod run_event;
 mod secret;
@@ -31,6 +32,7 @@ pub use id::{
     RequestId, RunId, SessionId, SystemIdGenerator,
 };
 pub use loglevel::LogLevel;
+pub use loopback::{InvalidLoopbackHost, LOOPBACK_ADDRESS, LoopbackHost};
 pub use run::{
     ExpectedRunState, InvalidRunErrorCode, InvalidRunState, MAX_RUN_ERROR_CODE_CHARS, RunErrorCode,
     RunOutcome, RunState, RunTransition, RunTransitionError,

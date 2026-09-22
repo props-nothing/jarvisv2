@@ -35,12 +35,44 @@ In another:
 ```powershell
 cargo run -p jarvis-cli -- status
 cargo run -p jarvis-cli -- health --json
+cargo run -p jarvis-cli -- ask "summarise my inbox"
 cargo run -p jarvis-cli -- logs --lines 20
 cargo run -p jarvis-cli -- doctor
 cargo run -p jarvis-cli -- service
 ```
 
 `jarvis status` and `jarvis health` connect to the same profile the daemon owns. `jarvis logs`, `jarvis doctor`, and `jarvis service` all work without the daemon, which is the point: they must diagnose a broken installation rather than depend on it.
+
+### Asking (HTTP transport)
+
+`jarvis ask` is the one command that needs the daemon's **HTTP** API, because runs are not on the local
+control protocol. ADR-0011 makes HTTP a peer transport (`P2-008`), and the CLI speaks it for runs while
+`status`/`health` stay on local IPC.
+
+The HTTP transport is off by default, so enable it before asking:
+
+```toml
+# <config>/config.toml
+[daemon]
+http_enabled = true
+http_port = 8765
+```
+
+or set `JARVIS_HTTP_ENABLED=1` and restart `jarvisd`. With it disabled, `jarvis ask` explains exactly
+that and exits `3` rather than reporting a connection failure.
+
+```powershell
+jarvis ask "summarise my inbox"            # answer text on stdout, progress on stderr
+jarvis ask "summarise my inbox" > answer.txt
+```
+
+The CLI still contains no orchestration: it sends an objective and no identity, and the daemon resolves
+the workspace and user from its own seeded rows. A client-supplied workspace identifier would be a claim
+rather than proof of access.
+
+**Runs do not settle yet.** No slice invokes a model until `P2-009`, so an accepted run reaches
+`received` and stays there, and `jarvis ask` waits on a stream that has nothing further to send. That is
+the honest current behavior rather than a bug, and `P2-009` is what changes it.
 
 ### Portable Mode
 
@@ -68,7 +100,7 @@ The daemon prints its readiness line at startup and transitions through `booting
 
 Logs are one JSON object per line at `<logs>/jarvisd.jsonl`. Every line passes through the redactor before it is written, so known secrets, credential-shaped key/value text, `Bearer` values, and URL userinfo passwords are masked even if a call site forgets a rule. Lines longer than 8 KiB are truncated on a UTF-8 boundary and report the omitted byte count.
 
-The CLI exits `0` on success, `2` for a usage error, `3` when the daemon is unreachable or not ready, `4` when authentication or authorization fails, and `5` for a rejected request.
+The CLI exits `0` on success, `2` for a usage error, `3` when the daemon is unreachable or not ready, `4` when authentication or authorization fails, `5` for a rejected request, `9` when a run was cancelled, and `10` when an accepted run failed. Cancellation and failure are distinct from `0` and from `5` on purpose: a script that treats "the run ran" as success would otherwise record a cancelled run as a completed task.
 
 The daemon issues a 32-byte credential for its profile on first run and stores it beside the profile configuration. Clients only ever read that value; if it is missing, `jarvis` reports that the daemon has not issued one and exits `3` rather than creating a value. Otherwise any local process could choose the secret the daemon trusts. Do not copy the credential between machines or profiles.
 

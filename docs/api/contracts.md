@@ -107,6 +107,46 @@ pub enum RunEvent {
 
 Events are persisted/ordered at application boundaries. Transports wrap them with stream protocol metadata.
 
+### Run Stream As Implemented (`P2-007`, `P2-008`)
+
+The sketch above is the eventual shape. What exists is `run_events`: one durable row per run event,
+scoped to its run with a monotonic per-run `sequence` and `UNIQUE (run_id, sequence)`, written in the
+same transaction as the state transition that produced it (ADR-0011). The wire form of one event as a
+client receives it:
+
+```json
+{
+  "event_id": "...",
+  "sequence": 1,
+  "kind": "state_changed",
+  "summary": "run accepted",
+  "payload": { "state": "received", "version": 1 },
+  "correlation_id": "...",
+  "occurred_at": "..."
+}
+```
+
+`kind` is a closed set (the twelve values of `jarvis_core::RunEventKind`), and it is the same code in the
+durable row, the REST page, and the SSE `event:` name — one naming scheme, so the streaming and
+historical views of one event cannot disagree.
+
+On the stream each event is an SSE frame whose `id:` is the **sequence**, not the event UUID, because
+the cursor a client must send back is a position in the stream:
+
+```text
+id: 1
+event: state_changed
+data: { ...the object above... }
+
+```
+
+A mid-stream failure is an `error` event carrying the shared `WireError` envelope, so one error shape
+spans the stream, the REST routes, and local IPC. Keep-alives are SSE **comment** frames (`:`), never
+`heartbeat` events: a heartbeat event would occupy a sequence number and enter the durable log, so a
+later replay would replay it as though the run had done something. A client resuming with `Last-Event-ID`
+asks for everything after a position it holds; a position beyond what the daemon holds is an explicit
+`409` resync rather than an empty success.
+
 ## Model Port
 
 ```rust

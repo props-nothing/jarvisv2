@@ -16,7 +16,12 @@ jarvis-diagnostics.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
 jarvis-storage.workspace = true
+# The daemon's run API is HTTP (ADR-0011). `reqwest` is already resolved in this
+# workspace through the model adapter, so this adds no new version. Its defaults are
+# overridden in `api_client.rs`: proxies and redirects off, verification on.
+reqwest.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

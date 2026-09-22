@@ -62,6 +62,28 @@ Still unbuilt from the surface below: `sessions`, `tools`, `approvals`, `memorie
 `connectors`, `runtimes`, and `models`. **Nothing invokes a model yet**, so a run reaches
 `received` and stays there; the run executor is `P2-009`.
 
+### The CLI Over This Transport (`P2-008`)
+
+`jarvis ask <objective...>` is the first client of the HTTP surface, and ADR-0012 records why it uses
+HTTP rather than local IPC: runs are defined only on `/api/v1`, so a client uses the transport that
+carries the operation it needs. `status` and `health` stay on local IPC, which ADR-0011 records as the
+preferred transport for the CLI.
+
+- The endpoint is `jarvis_core::LoopbackHost`, which holds **a port only**, so a client cannot be aimed
+  at a host the daemon does not serve. The port comes from the same configuration the daemon binds.
+- The credential is sent **only** as `Authorization: Bearer`, never in a query string.
+- A run identifier interpolated into a path is validated against a strict character set first, so a
+  value containing `/`, `?`, `#`, or a percent-escape is refused rather than changing the request's
+  target.
+- The CLI contains no orchestration: it sends an objective and no identity, and the daemon resolves the
+  workspace and user from its own seeded rows.
+- `jarvis ask` needs the HTTP transport enabled, and says so with the exact config keys when it is not,
+  rather than reporting a connection failure.
+- **The CLI does not set a client-level request timeout.** A `reqwest` total timeout bounds the whole
+  response body, so on a client that also serves an open-ended SSE stream it kills every healthy stream
+  at the deadline. Non-streaming calls set a per-request timeout; only `read_timeout` bounds a stream.
+  This was found by running the client, not by a test.
+
 ## HTTP API
 
 Initial versioned surface:
@@ -137,8 +159,9 @@ are tolerated; an unknown **kind** is refused at the writer.
 
 ### HTTP Is A Peer Transport, Not A Fallback
 
-The `/api/v1` surface is a first-class daemon transport alongside local IPC, not the
-platform-constraint fallback described below. It exists for clients that cannot speak a
+The `/api/v1` surface is a first-class daemon transport alongside local IPC, not a
+platform-constraint fallback required only where a pipe or socket is unavailable. It exists
+for clients that cannot speak a
 named pipe or a Unix socket: a browser, the Tauri web view, and provider callbacks such as
 an OpenAI-compatible voice brain. Local IPC stays the preferred transport for the CLI and
 desktop because it is OS-protected and needs no port.

@@ -942,7 +942,9 @@ dependencies = [
  "jarvis-observability",
  "jarvis-protocol",
  "jarvis-storage",
+ "reqwest",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 

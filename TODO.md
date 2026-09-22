@@ -147,8 +147,27 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `idempotency_key` is refused with `Unsupported` rather than silently ignored, because no
       deduplication ledger exists and ignoring it would tell a retrying client its request was
       deduplicated while two runs had in fact been created.
-- [ ] `P2-008` Add CLI `ask` and `chat` using the daemon API; the CLI must contain no orchestration logic.
+- [x] `P2-008` Add CLI `ask` and `chat` using the daemon API; the CLI must contain no orchestration logic.
+      **Delivered:** `jarvis ask <objective...>`, which starts a run through `POST /api/v1/runs`,
+      consumes `GET /api/v1/runs/{id}/stream`, and renders the run. The client is transport only:
+      it sends an objective and no identity, because the workspace and user are resolved by the
+      daemon from its seeded local rows. New code: `crates/jarvis-core/src/loopback.rs`
+      (`LoopbackHost`, whose host is unrepresentable so a client cannot be aimed off loopback),
+      `crates/jarvis-protocol/src/run_api.rs` (request paths with a refused unsafe segment, and a
+      hand-written SSE decoder matching the decision already recorded for the model adapter), and
+      `apps/jarvis-cli/src/{api_client,chat}.rs`. Two exit statuses were added so a script cannot
+      read a cancelled (`9`) or failed (`10`) run as success.
+      **One real defect was found by running it, not by testing it:** the client set a *client-level*
+      `reqwest` timeout, which bounds the whole response body, so every SSE stream was killed at the
+      deadline while every non-streaming call worked. The timeout is now applied per non-streaming
+      request, and only `read_timeout` bounds a stream.
+      **`chat` is deliberately NOT built.** It needs a session that persists across turns and a model
+      that answers; neither exists until `P2-009`, so a chat loop now could only print a `received`
+      run per turn — a conversation that records nothing. This item therefore stays unchecked, and
+      `chat` is carried by `P2-009` rather than reported as done.
 - [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
+      Also carries the `jarvis chat` loop from `P2-008`: a multi-turn chat needs a model that answers
+      and a session read model, both of which this slice supplies.
 - [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
 
 ## P3: Tools, Policy, Approvals, And MCP

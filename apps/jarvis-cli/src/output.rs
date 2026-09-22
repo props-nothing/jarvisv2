@@ -23,6 +23,17 @@ pub(crate) enum ExitStatus {
     DoctorFailed,
     /// A requested repair did not verify.
     RepairFailed,
+    /// A run was cancelled.
+    ///
+    /// Distinct from [`Self::Rejected`] and [`Self::Ok`]: a cancelled run is a settled run whose
+    /// outcome is neither success nor failure, and a script that treats "the run ran" as success
+    /// would record a cancellation as a completed task.
+    Cancelled,
+    /// A run failed while executing.
+    ///
+    /// Distinct from [`Self::Rejected`], which means the daemon refused the *request*. This means
+    /// the request was accepted and the work failed, which is a different thing to retry.
+    RunFailed,
     /// An unexpected internal failure occurred.
     Internal,
 }
@@ -58,6 +69,8 @@ impl From<ExitStatus> for ExitCode {
             ExitStatus::DoctorWarnings => Self::from(6),
             ExitStatus::DoctorFailed => Self::from(7),
             ExitStatus::RepairFailed => Self::from(8),
+            ExitStatus::Cancelled => Self::from(9),
+            ExitStatus::RunFailed => Self::from(10),
             ExitStatus::Internal => Self::from(1),
         }
     }
@@ -140,6 +153,9 @@ mod tests {
         );
         assert_eq!(ExitCode::from(ExitStatus::DoctorFailed), ExitCode::from(7));
         assert_eq!(ExitCode::from(ExitStatus::RepairFailed), ExitCode::from(8));
+        assert_eq!(ExitCode::from(ExitStatus::Cancelled), ExitCode::from(9));
+        assert_eq!(ExitCode::from(ExitStatus::RunFailed), ExitCode::from(10));
+        assert_eq!(ExitCode::from(ExitStatus::Internal), ExitCode::from(1));
     }
 
     #[test]

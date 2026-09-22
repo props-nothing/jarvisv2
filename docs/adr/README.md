@@ -29,3 +29,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0009](0009-clean-room-prototype-migration.md) | Migrate prototype behavior clean-room | Accepted |
 | [0010](0010-model-based-turn-detection.md) | Turn detection and interruption are model-based capabilities | Accepted |
 | [0011](0011-run-events-and-http-transport.md) | Run events are durable; HTTP is a first-class daemon transport | Accepted |
+| [0012](0012-cli-runs-over-http.md) | The CLI reaches runs over HTTP with a loopback-only endpoint type | Accepted |

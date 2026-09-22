@@ -9,11 +9,13 @@
 //! credential is an actionable daemon-not-started error, not something to fix by
 //! generating a value.
 
+mod api_client;
+mod chat;
 mod output;
 
 use std::{io, path::PathBuf, process::ExitCode};
 
-use jarvis_core::{ClientCredential, LocalEndpoint, connect};
+use jarvis_core::{ClientCredential, LocalEndpoint, LoopbackHost, connect};
 use jarvis_diagnostics::{ServiceKind, ServicePlan, detect_drift, drift_finding};
 use jarvis_observability::{DEFAULT_TAIL_LINES, read_tail};
 use jarvis_protocol::{
@@ -40,6 +42,7 @@ async fn main() -> ExitCode {
         }
         Some("status") => run(Command::Status, &arguments).await,
         Some("health") => run(Command::Health, &arguments).await,
+        Some("ask") => ask(&arguments).await,
         Some("logs") => logs(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
@@ -57,7 +60,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|logs|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]"
+    "usage: jarvis <status|health|ask|logs|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]"
 }
 
 fn json_requested(arguments: &[String]) -> bool {
@@ -379,6 +382,90 @@ fn load_credential(paths: &AppPaths) -> Result<ClientCredential, ExitStatus> {
             Err(ExitStatus::Denied)
         }
     }
+}
+
+/// Runs one objective through the daemon's HTTP API and renders its stream.
+///
+/// # Why this needs the daemon's configuration
+///
+/// The HTTP transport is separately enabled and its port is configuration, so the CLI reads the
+/// same profile configuration the daemon does and targets whatever the daemon was told to bind. A
+/// hard-coded port would work on a default install and silently target nothing on a configured one.
+async fn ask(arguments: &[String]) -> ExitStatus {
+    let Some((objective, root)) = split_ask_arguments(arguments) else {
+        eprintln!("jarvis: ask requires an objective, for example: jarvis ask summary of my inbox");
+        return ExitStatus::Usage;
+    };
+
+    let paths = match resolve_paths(&root) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
+
+    let loaded = match ConfigStore::from_paths(&paths).load() {
+        Ok(loaded) => loaded,
+        Err(error) => return fail("configuration", &error),
+    };
+    let daemon = loaded.config().daemon();
+    if !daemon.http_enabled() {
+        // Reported rather than worked around: the HTTP transport is off by default because a
+        // listening port is a larger surface than an OS-protected pipe, and turning it on is the
+        // operator's decision. The message names the exact keys so the fix is one edit.
+        eprintln!(
+            "jarvis: the daemon HTTP API is not enabled for this profile, so runs are unreachable"
+        );
+        eprintln!(
+            "jarvis: set daemon.http_enabled = true in config.toml (or JARVIS_HTTP_ENABLED=1) and restart jarvisd"
+        );
+        return ExitStatus::Unavailable;
+    }
+
+    let credential = match load_credential(&paths) {
+        Ok(credential) => credential,
+        Err(status) => return status,
+    };
+    // Port 0 is refused by configuration validation, so this can only fail if a stored config was
+    // edited outside the validated path. It is still handled rather than unwrapped.
+    let host = match LoopbackHost::new(daemon.http_port()) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("jarvis: the configured HTTP port cannot be used: {error}");
+            return ExitStatus::Unavailable;
+        }
+    };
+
+    let client = match api_client::ApiClient::new(host, credential.expose().to_owned()) {
+        Ok(client) => client,
+        Err(error) => return fail("client", &error),
+    };
+    chat::drive(&client, &objective).await
+}
+
+/// Splits `ask` arguments into an objective and an optional `--root` directory.
+///
+/// `--root` is extracted from anywhere in the arguments rather than required to come first, and the
+/// remaining words are joined so an unquoted objective works. Returns `None` for an empty objective,
+/// which is a usage error rather than a run with no objective.
+fn split_ask_arguments(arguments: &[String]) -> Option<(String, Vec<String>)> {
+    let mut objective_words: Vec<String> = Vec::new();
+    let mut root: Vec<String> = Vec::new();
+    let mut index = 1;
+    while index < arguments.len() {
+        if arguments[index] == "--root" {
+            let value = arguments.get(index + 1)?;
+            root.push("--root".to_owned());
+            root.push(value.clone());
+            index += 2;
+            continue;
+        }
+        objective_words.push(arguments[index].clone());
+        index += 1;
+    }
+    let objective = objective_words.join(" ");
+    if objective.trim().is_empty() {
+        return None;
+    }
+    Some((objective, root))
 }
 
 fn fail(operation: &str, error: &impl std::fmt::Display) -> ExitStatus {
