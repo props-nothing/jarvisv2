@@ -646,6 +646,61 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       it is `P3-008`. The conformance module checks the *annotation* rules, not the schema's validity — a
       schema with no annotation gets no structural opinion at all, which is correct for this layer and worth
       not mistaking for validation.
+- [x] `P3-008b` Translate a server's tool listing into canonical definitions, with the effects decided by an operator.
+      The second half of `P3-008a`: that slice settled what an MCP tool is *called*, this one settles **what it may
+      do and at what risk**. New module `crates/jarvis-mcp/src/definition.rs`. ADR-0025. **54 crate tests; 746
+      workspace tests.**
+      **Effects, risk, and approval come from an operator, never from the server.** An MCP server supplies
+      `name`/`title`/`description`/`inputSchema` and an optional `annotations` object — and that object carries
+      `readOnlyHint`/`destructiveHint`/`idempotentHint`, which are precisely the three facts policy needs. The
+      specification warns of it: clients "**MUST** consider tool annotations to be untrusted unless they come
+      from trusted servers". `McpToolListing` has **no field for annotations**, so the translation cannot consult
+      them even by accident, and a test asserts that smuggling them into the input schema changes nothing. **The
+      incentive is what makes this decisive**: `EffectSet::risk_floor` is a MAXIMUM, so a server that admits one
+      outward effect lands at risk 2 → `Ask` and can never be silently auto-approved, while a server that
+      under-reports has no such problem. The asymmetry runs opposite to the server's incentive.
+      **An unclassified server fails closed.** `ToolEffectPolicy::unclassified()` declares
+      `ExternalCommunication` + `Write` (floor 2) and then risk **3** with `ApprovalPolicy::Ask` — which
+      workspace policy cannot lower the way `Policy` could — plus no automatic retry and
+      `Idempotency::Unsupported`. A read-only server is mildly inconvenienced by a prompt; a mass-mail server
+      presumed harmless is not inconvenienced at all. `read_only()` is the one convenience constructor.
+      **Effects are an operator statement, not a schema inference.** "It takes a `query` string, so it reads" is
+      inference presented as knowledge, and this project does not persist unsupported inference as fact.
+      `ToolEffectPolicy::new` refuses a risk below the effects' floor and a retry that would repeat an
+      un-deduplicated outward effect — **at configuration time**, so a policy that would send a payment twice
+      cannot be *held*, let alone used.
+      **The dialect rule composes two documents that disagree.** MCP says a schema with no `$schema` "defaults
+      to 2020-12"; `jarvis-tools` **requires** the keyword and refuses to default it (because
+      `exclusiveMinimum` is a boolean in earlier drafts and a number in 2020-12, so defaulting silently
+      reinterprets an older-draft document). Both are right: a server's **omission** is supplied with 2020-12,
+      and a server's **declaration of a different dialect** is refused rather than reinterpreted. The refusal
+      names both dialects, or an operator cannot act on it.
+      **Server text is sanitised before it reaches a model.** Whitespace collapses, control characters are
+      dropped, and **bidirectional / zero-width characters are removed** — not typographic tidiness: a bidi
+      override changes how text *reads* without changing what it *is*, which in the field that decides whether
+      a tool gets called is a deception primitive. A missing description says the server supplied none rather
+      than inventing a plausible one.
+      `translate_listing` excludes per tool for names as well as schemas, and a collision is an **exclusion,
+      never a rename** — any rename is a mapping the operator did not choose. The derived `version` is
+      `schema-<8 hex>` over the **input schema** (not the whole listing), so a cosmetic description edit does
+      not invalidate a stored intent while a schema change does; it is a digest, not a counter, because a
+      version must survive a restart. Clippy's `too_many_arguments` (8/7) was **right, not noise**: `risk` and
+      `timeout_seconds` are two adjacent numbers a caller could transpose silently, so the inputs were grouped
+      into `ToolEffectPolicyParts` / `ToolPosture` / `ToolExecutionLimits` — the same reasoning `P3-005` applied
+      to its call parts.
+      **Honest limits.** **No configuration surface exists**, so `ToolEffectPolicy` cannot be built from
+      `config.toml` and in practice every MCP server would get `unclassified` — the safe direction, but it means
+      `read_only()` has **no caller outside tests** and the operator story is incomplete. Still **nothing
+      exercised against a real MCP server**. The scope vocabulary is **one coarse `mcp.call`** — an MCP server is
+      treated as one trust unit because no grant model can yet express more. A tool with no declared output
+      schema gets a **permissive** one, so an unvalidated result reaches the model and the protection is the
+      output-size bound, not schema validation. **The version excludes the tool name**, so two servers'
+      identically-schemaed tools share a version string. **`Idempotency` is never `Required`/`ProviderKey`**
+      because MCP cannot express provider-side dedup, so an outward MCP call can never retry automatically —
+      safe, but a transient network failure is always a failure. **`translate_listing` builds its own
+      `NameAssignments`**, so it cannot detect a collision between two different servers; that is the
+      aggregate's job, and the test drives the cross-server case directly rather than pretending one call sees
+      two servers.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

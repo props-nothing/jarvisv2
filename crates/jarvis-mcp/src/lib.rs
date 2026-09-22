@@ -44,11 +44,17 @@
 //! translates" are different claims. `P3-008` is where the second one is tested.
 
 mod conformance;
+mod definition;
 mod server;
 
 pub use conformance::{
     ConformanceError, ConformanceReport, HEADER_ANNOTATION, MAX_CONFORMANCE_PROBLEMS,
     check_tool_schema, describe_schema_source, to_tool_schema,
+};
+pub use definition::{
+    DEFAULT_MCP_SCOPE, DEFAULT_MCP_TIMEOUT_SECONDS, ExcludedTool, ListingOutcome, McpToolListing,
+    PolicyError, ToolEffectPolicy, TranslatedTool, TranslationError, sanitize, tool_version,
+    translate_listing, translate_tool,
 };
 pub use server::{
     CanonicalToolName, MAX_REPORTED_TEXT_CHARS, MAX_SERVER_NAME_CHARS, NameAssignments,

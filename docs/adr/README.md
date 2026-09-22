@@ -42,3 +42,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0022](0022-cancellation-carries-no-version.md) | A cancellation request carries no version, because operator intent cannot be stale | Accepted |
 | [0023](0023-tool-pipeline-composition-root.md) | The tool pipeline is composed in the daemon over the adapter's own definitions | Accepted |
 | [0024](0024-a-server-does-not-name-itself.md) | A server does not name itself, and two MCP tool names never become one identifier | Accepted |
+| [0025](0025-mcp-effects-come-from-an-operator.md) | An MCP server's effects and risk come from an operator, never from the server | Accepted |

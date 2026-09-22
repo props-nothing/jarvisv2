@@ -326,6 +326,37 @@ Ordered cheapest-first. A test only counts if it can fail.
 6. **Whether `rmcp`'s `auth` feature is usable for our authorization model.** JARVIS authorization is
    not MCP authorization, so the question is only whether the SDK's OAuth machinery can be confined to
    the adapter. Unresolved pending `P3-008`.
+7. **A server may declare a JSON Schema dialect JARVIS does not implement, and the specification's own
+   examples invite it.** The `Tools` page states `inputSchema` "Defaults to 2020-12 if no `$schema` field
+   is present" and shows a **`draft-07` example** as a supported form. `jarvis-tools` implements 2020-12
+   only and refuses another declared dialect rather than reinterpreting it, so such a tool is excluded.
+   Impact: a server following the spec's own draft-07 example is unreachable through MCP. Blocks:
+   nothing yet — no target server has been named — but it needs either a documented operator-facing
+   refusal or a draft-07 path, and `P3-008`/`P3-009` should decide which.
+
+## Contract Facts Established During Implementation
+
+These were resolved while building `P3-008a`/`P3-008b` and are recorded here because they are facts
+about the protocol, not decisions of ours.
+
+- **A tool name and a JARVIS identifier do not have the same alphabet.** MCP names `SHOULD` be 1–128
+  characters of `A-Za-z0-9_.-` and are **case-sensitive**; JARVIS names are lowercase-only, cap a
+  segment at 48 characters, and forbid a dot in the name half. The two sets are not reconcilable by
+  rewriting, which is why `P3-008a` refuses or digests instead (ADR-0024).
+- **`tools/list` may legally contain duplicates and is required to be deterministic.** The
+  specification requires the set not to vary per-connection and `SHOULD` return a deterministic order,
+  but it does not forbid the same tool name twice. A repeat of one name from one server is therefore
+  treated as a refresh rather than a collision.
+- **`annotations` is explicitly untrusted.** The `Tools` page carries a warning that clients "**MUST**
+  consider tool annotations to be untrusted unless they come from trusted servers", and the annotations
+  that exist (`readOnlyHint`, `destructiveHint`, `idempotentHint`) are exactly the facts a policy engine
+  needs. ADR-0025 is the consequence: the posture comes from an operator.
+- **`outputSchema` is optional and `structuredContent` may be any JSON value.** A tool with no declared
+  output schema therefore has no schema to validate against, which is the truthful encoding of "the
+  server made no claim" — the protection for such a result is the output-size bound, not validation.
+- **The specification requires per-tool exclusion, not list failure.** An invalid tool definition must
+  be excluded from `tools/list` with a warning naming it, so that "a single malformed tool definition
+  does not prevent other valid tools from being used". Both `P3-008a` and `P3-008b` follow this.
 
 ## Verification Log
 
