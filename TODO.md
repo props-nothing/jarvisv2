@@ -507,6 +507,19 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       re-examined against the same reasoning. No `jarvis cancel` CLI verb exists, so the endpoint is
       exercised only by the gateway test and the e2e gate. Whether a cancellation *request* should emit a
       `run_events` row is not answered here.
+      **CORRECTION (2026-09-22): the `expected_version` half of that limit was FALSE.** Neither case exists
+      — `ApprovalDecision` has no version field and never did, and starting a run creates a row so there is
+      no prior version to expect. A grep for `expected_version` across the workspace now finds only ADR-0022,
+      a doc quotation of it, and the message of the test that replaced the removed cancel field. Three
+      documents asserted the field as live (`ADR-0022`, `docs/api/contracts.md`, and this entry) while **no
+      code, test, or protocol type ever had it** — a plausible-sounding claim written as a *deferral*, which
+      made it read as a live risk and survive three slices of review. Corrected in all three, with the ADR
+      struck rather than quietly edited. The general rule the ADR established generalises and is now recorded
+      there: **where a durable identity already names the subject of a decision — a stable `id` plus a state
+      machine that refuses a second decision — a version expectation adds no safety and can only add a
+      refusal.** Still true: no `jarvis cancel` verb (the verbs are `status`, `health`, `ask`, `chat`,
+      `logs`, `doctor`), and whether a cancellation *request* should emit a `run_events` row remains
+      unanswered.
 - [x] `P3-006d` Compose the tool pipeline in the daemon and make it reachable over HTTP.
       **The first production caller of the whole tool path.** `P3-001`..`P3-006c` each built one layer and
       **nothing composed them**, so no route reached a tool adapter and every seam was unverified — and the

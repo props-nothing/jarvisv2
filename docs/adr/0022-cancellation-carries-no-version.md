@@ -96,18 +96,37 @@ settled refusal where it lives. The daemon test no longer reads or supplies a ve
 
 ## Honest limits at the time of this decision
 
-- **`expected_version` remains on run *start* and on approval decisions.** This decision is scoped to
-  cancellation. Starting a run creates rather than mutates, and an approval decision genuinely races the
-  approval's own expiry and state, so neither has this problem — but neither has been re-examined against
-  the same reasoning, and that is worth doing rather than assuming.
+- ~~**`expected_version` remains on run *start* and on approval decisions.**~~ **CORRECTION (2026-09-22):
+  this claim was FALSE and is struck rather than quietly edited.** Neither case exists in this codebase.
+  `ApprovalDecision` holds `outcome`, `channel`, `strength`, and `decided_at` — there is no version field,
+  and there never was. Starting a run creates a row, so there is no prior version to expect. `grep` for
+  `expected_version` across the workspace now finds only this ADR, a doc quotation, and the message of the
+  test that replaced the removed cancel field.
+
+  The claim is worth recording as a **defect of this ADR, not of the code**: it was written as a
+  deferral, so it read as "the same problem may exist elsewhere". It did not — the opposite is true. **An
+  approval is inherently *not* an optimistic-concurrency case, and for a reason the cancellation did
+  share.** An approval is addressed by a stable `ApprovalId` and its own transition rule refuses a second
+  decision, so the *identity plus the state machine* already exclude a lost update. No version token is
+  needed to protect a decision whose subject cannot be raced. That is the general form of the rule this
+  ADR applied to cancellation only in its narrow instance: **where a durable identity already names the
+  subject of the decision, a version expectation adds no safety — it can only add a refusal.** The
+  cancellation had an `id` too; what it lacked was a settled-guard that could express "there is work left
+  to stop" without a version, which is what the state predicate supplied.
+
+  The lesson is about how a limit gets written: "neither has been re-examined" invited a future reader to
+  treat an unverified claim as a live risk. Stating it as a question ("does an approval need a version
+  guard?") would have been honest; asserting that one exists was not.
 - **This is not the composition work.** `apps/jarvisd` still has no tool pipeline: nothing reads a tool
   definition from a registry, calls `evaluate`, admits a tool call, or calls an adapter. `P3-012` owns
-  that.
+  that. *(Superseded: the pipeline was composed in `P3-006d` and the MCP translation in `P3-008a`/
+  `P3-008b`.)*
 - **The client's view is unchanged in one respect**: a cancel still returns the run in its current,
   non-terminal state, so a caller that wants to know when work actually stopped must watch the stream or
   re-read. That is `A04`'s semantics and is not altered here.
 - **No CLI verb was added.** `jarvis cancel` does not exist; the endpoint and the e2e gate exercise it,
   and adding a verb is a separate slice with its own exit-status mapping (`ExitStatus::Cancelled` is `9`).
+  *(Still true as of 2026-09-22: the verbs are `status`, `health`, `ask`, `chat`, `logs`, and `doctor`.)*
 - `run_events` is untouched by this change: settling still writes the terminal event, and the request
   does not write one. Whether a *request* should emit an event is a question this decision does not
   answer.

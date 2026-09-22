@@ -145,6 +145,15 @@ The process gate therefore asserts that an immediately-issued cancellation is *a
 model answers in about a second, so a process-level test cannot reliably race it. That race is what the
 crate test covers, deterministically.
 
+> **Also corrected (2026-09-22).** `ADR-0022`'s "honest limits" recorded that `expected_version`
+> "remains on run *start* and on approval decisions". **That was false in both cases** — `ApprovalDecision`
+> has no version field and never did, and starting a run creates a row rather than mutating one, so there
+> is no prior version to expect. The field exists nowhere in this codebase; only the three documents that
+> asserted it. The rule is worth stating generally, because it is what makes an approval safe without a
+> version token: **where a durable identity already names the subject of a decision — a stable `id` plus a
+> state machine that refuses a second decision — a version expectation adds no safety and can only add a
+> refusal.** See ADR-0022's corrected limit.
+
 ## A05: Tool Approval Cannot Be Forged
 
 **Phase:** 3

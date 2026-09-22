@@ -227,11 +227,18 @@ pub enum PolicyVerdict {
 pub struct ApprovalDecision {
     pub approval_id: ApprovalId,
     pub intent_hash: IntentHash,
-    pub expected_version: u64,
     pub decision: ApproveOrDeny,
     pub reason: Option<String>,
 }
 ```
+
+**There is no `expected_version` on a decision, and there must not be one.** An earlier revision of this
+document carried the field, and `docs/adr/0022-cancellation-carries-no-version.md` wrongly recorded it as
+implemented; neither was true. The rule the ADR established for cancellation generalises: **where a durable
+identity already names the subject of the decision — here a stable `ApprovalId` whose own transition rule
+refuses a second decision — a version expectation adds no safety, and can only add a refusal.** The identity
+plus the state machine already exclude a lost update, so a version token would be an additional way to
+reject a decision that is perfectly valid, which is exactly the defect `ADR-0022` removed from cancellation.
 
 Approval resolution receives `ActorContext`, checks eligibility/auth strength/expiry/nonce, and re-evaluates policy before issuing an authorization receipt.
 
