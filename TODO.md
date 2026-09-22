@@ -714,6 +714,46 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `NameAssignments`**, so it cannot detect a collision between two different servers; that is the
       aggregate's job, and the test drives the cross-server case directly rather than pretending one call sees
       two servers.
+- [x] `P3-008c` Aggregate several servers into one catalog, and refuse to serve an ambiguous one.
+      **Closes two limits recorded by `P3-008a`/`P3-008b` rather than deferring them again**: a per-listing
+      translation builds its own assignment set, so it *structurally* could not see a collision between two
+      servers — and `ReportedIdentity::agrees_with` had a test and no caller. New module
+      `crates/jarvis-mcp/src/catalog.rs`. **67 crate tests; 759 workspace tests.**
+      `McpCatalog` owns **one** `NameAssignments` across every server, so a collision is detected exactly
+      where the information exists. `McpCatalog::build` is the first function in this crate that can answer
+      "what happens when two servers offer the same name", and the answer is the interesting part:
+      **a cross-server collision is reported, not resolved.** Dropping one side would mean the set of tools a
+      model can call is a function of **configuration order** — the spec requires each server's own
+      `tools/list` to be deterministic but says nothing about the order a client iterates *servers*, and since
+      a collision is refused rather than renamed, the loser is **absent from discovery entirely**. A catalog
+      whose contents depend on an ordering nobody declared meaningful is worse than one that refuses, so
+      `has_cross_server_collision()` is the signal to **not serve**. A test drives both orderings and asserts
+      the collision is reported either way, which is what makes refusing the right answer rather than an
+      arbitrary winner.
+      **Collisions are their own list, not a flag derived from message text.** The first version asked
+      `exclusions.iter().any(|e| e.reason.contains("both translate to the identifier"))` — matching on a
+      `Display` string, so a reworded error would have **silently stopped the catalog refusing**. The category
+      is data (`collisions()`), not prose. Same family as the "two values that must agree" defects: a safety
+      property that depends on a string a message happens to contain is a safety property nobody is holding.
+      Other decisions: a **truncation is reported separately from an exclusion** (the causes and remedies
+      differ — an exclusion is about that tool, a truncation is about the *size* of the configuration, and an
+      operator fixing one tool would learn nothing); a server with no listing is **reported as an exclusion**
+      so its absence does not look like a server that was never configured; a server configured twice is
+      **refused**, because the second translation would look like an idempotent refresh, which is the case
+      `NameAssignments` deliberately accepts; entries are sorted by identifier so a catalog built twice is
+      equal; `MAX_MCP_SERVERS` is 16 so a config file cannot make startup unbounded; and the registry bound is
+      enforced **here** rather than discovered at registration, because a catalog that silently exceeded it
+      would fail later in a different component with an error naming the registry rather than the
+      configuration that caused it. `route()` returns `None` for an unknown identifier, so a lookup cannot
+      default to some other server.
+      **Honest limits.** Still **no configuration surface**: `McpCatalog::build` takes servers and listings as
+      arguments, so nothing constructs one from `config.toml` and `MAX_MCP_SERVERS`/the strategy cannot be
+      set by an operator. Still **nothing exercised against a real MCP server**. The catalog holds
+      **routing, not authority** — it carries definitions and server names, and a caller still passes them
+      through the pipeline. Listings are matched by server name rather than by position, but a **duplicate
+      entry in `listings`** is resolved by first-match rather than refused, which is a gap the config layer
+      will need to close since it is the layer that can see duplicate keys. `has_cross_server_collision` is a
+      method, and **nothing calls it yet** — the daemon that would refuse to serve is `P3-009`.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

@@ -143,12 +143,14 @@ It does not own business decisions. Generate TypeScript clients from its publish
 - `jarvis-models`: provider clients, capability discovery, streaming normalization, usage and errors.
 - `jarvis-runtimes`: runtime selection, process lifecycle, protocol sessions, health and adapter implementations.
 - `jarvis-tools`: canonical registry, schema checks, execution pipeline, sandbox adapters.
-- `jarvis-mcp`: MCP-specific translation — server identity, canonical tool naming, and schema
-  conformance (ADR-0024). Split out of `jarvis-tools` deliberately: `jarvis-tools` is the
-  **provider-neutral** canonical contract, and this crate is where one external protocol's rules are
+- `jarvis-mcp`: MCP-specific translation — server identity, canonical tool naming, tool posture, and
+  schema conformance (ADR-0024, ADR-0025). Split out of `jarvis-tools` deliberately: `jarvis-tools` is
+  the **provider-neutral** canonical contract, and this crate is where one external protocol's rules are
   reconciled with it. Keeping the reconciliation in its own crate means the canonical contract stays
   free of protocol quirks, and the MCP wire transport (`P3-008`) has a home that is neither the domain
-  contract nor the daemon. It depends only on `jarvis-core` and `jarvis-tools`.
+  contract nor the daemon. It depends only on `jarvis-core` and `jarvis-tools`, and holds **no
+  transport**: the JSON-RPC framing, stdio supervision, and HTTP header mirroring are `P3-008`, so the
+  authority rules are testable without a peer.
 - `jarvis-connectors`: OAuth/account lifecycle and provider-specific mail/calendar/etc. operations.
 - `jarvis-memory`: memory admission, scoring, embeddings, retrieval explanations, entity resolution.
 - `jarvis-workflows`: event inbox/outbox, scheduler, durable worker and step executors.
