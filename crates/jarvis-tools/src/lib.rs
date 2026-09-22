@@ -27,6 +27,11 @@
 //! | `availability` | whether it can run right now |
 //! | `sensitivity` | what classification its input and output carry |
 //!
+//! [`ToolRegistry`] holds these and answers two different questions with two different views:
+//! [`ToolRegistry::discover`] is model-facing and offers only what can run, while
+//! [`ToolRegistry::inventory`] is operator-facing and lists everything with its availability. They
+//! are separate methods rather than one with a flag, so an operator view cannot be handed to a model.
+//!
 //! # What this module deliberately does not do
 //!
 //! It does not decide anything. Effects, risk, and approval are **declared** here; whether a given
@@ -35,10 +40,12 @@
 //! contract rather than reconstructing intent from a description string.
 
 mod definition;
+mod documents;
 mod effect;
 mod identifier;
 mod outcome;
 mod policy;
+mod registry;
 mod risk;
 mod schema;
 mod scope;
@@ -47,6 +54,7 @@ pub use definition::{
     MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_TITLE_CHARS, ToolDefinition, ToolDefinitionError,
     ToolDefinitionParts,
 };
+pub use documents::{DocumentError, DocumentSet, MAX_SUPPLIED_DOCUMENTS};
 pub use effect::{EffectSet, ToolEffect};
 pub use identifier::{
     MAX_TOOL_ID_CHARS, MAX_TOOL_ID_SEGMENT_CHARS, MAX_TOOL_VERSION_CHARS, ToolId, ToolIdError,
@@ -56,6 +64,10 @@ pub use policy::{
     ApprovalPolicy, Availability, Idempotency, MAX_AVAILABILITY_REASON_CHARS,
     MAX_TOOL_BACKOFF_SECONDS, MAX_TOOL_RETRY_ATTEMPTS, MAX_TOOL_TIMEOUT_SECONDS, RetryDeclaration,
     RetryPolicy, RetryPolicyError, ToolSensitivity, ToolSource,
+};
+pub use registry::{
+    DiscoveryReport, MAX_DISCOVERY_TOOLS, MAX_REGISTERED_TOOLS, MAX_SUMMARY_DESCRIPTION_CHARS,
+    RegistrationError, RegistryError, ToolInventoryEntry, ToolRegistry, ToolSummary,
 };
 pub use risk::{MAX_RISK_LEVEL, Risk, RiskError};
 pub use schema::{

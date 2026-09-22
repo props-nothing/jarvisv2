@@ -38,6 +38,8 @@ use jsonschema::{Draft, Validator};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::documents::DocumentSet;
+
 /// The dialect every tool schema must declare.
 ///
 /// Fixed rather than detected. `docs/architecture/tools-and-connectors.md` names JSON Schema
@@ -143,12 +145,27 @@ impl ToolSchema {
     /// not declare [`TOOL_SCHEMA_DIALECT`], uses an unresolvable reference, or is not a valid
     /// 2020-12 schema.
     pub fn parse(document: &str) -> Result<Self, SchemaError> {
+        Self::parse_with(document, &DocumentSet::new())
+    }
+
+    /// Validates a schema document that may reference `documents` by `$id`.
+    ///
+    /// The path for a **JARVIS-authored** schema that composes against documents this project
+    /// supplied. External input (a connector manifest) cannot reach it: that arrives through this
+    /// type's `Deserialize`, which uses an empty set, so a manifest must be self-contained. The
+    /// asymmetry is deliberate and is explained in [`crate::documents`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError`] for the same reasons as [`Self::parse`], with a reference accepted when
+    /// it resolves against `documents` and refused when it does not.
+    pub fn parse_with(document: &str, documents: &DocumentSet) -> Result<Self, SchemaError> {
         if document.len() > MAX_TOOL_SCHEMA_BYTES {
             return Err(SchemaError::TooLarge);
         }
         let value: serde_json::Value =
             serde_json::from_str(document).map_err(|_| SchemaError::NotJson)?;
-        Self::from_value(value)
+        Self::from_value_with(value, documents)
     }
 
     /// Validates an already-parsed schema document.
@@ -156,7 +173,26 @@ impl ToolSchema {
     /// # Errors
     ///
     /// Returns [`SchemaError`] for the same reasons as [`Self::parse`].
+    ///
+    /// Uses an **empty** [`DocumentSet`], so every non-local reference is refused. This is the
+    /// constructor external input reaches, including a manifest's `Deserialize`, which is why an
+    /// external manifest cannot compose against a JARVIS document. See [`Self::from_value_with`] for
+    /// the JARVIS-authored path.
     pub fn from_value(value: serde_json::Value) -> Result<Self, SchemaError> {
+        Self::from_value_with(value, &DocumentSet::new())
+    }
+
+    /// Validates an already-parsed schema document that may reference `documents` by `$id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError`] for the same reasons as [`Self::parse`], including
+    /// [`SchemaError::ExternalReference`] when a reference resolves against neither the document
+    /// itself nor `documents`.
+    pub(crate) fn from_value_with(
+        value: serde_json::Value,
+        documents: &DocumentSet,
+    ) -> Result<Self, SchemaError> {
         let Some(object) = value.as_object() else {
             return Err(SchemaError::NotAnObject);
         };
@@ -177,16 +213,36 @@ impl ToolSchema {
             }
         }
 
-        reject_external_references(&value)?;
+        reject_unresolvable_references(&value, documents)?;
 
-        let validator = jsonschema::options()
+        let mut options = jsonschema::options();
+        options = options
             .with_draft(Draft::Draft202012)
             // Belt and braces against a `$ref` becoming a fetch. The walk above already refuses any
-            // non-local reference, so this can only fire if that walk is later relaxed — which is
-            // exactly when it matters. A retriever that refuses everything makes the network path
-            // unreachable rather than merely unused.
+            // reference that does not resolve locally or against the supplied set, so this can only
+            // fire if that walk is later relaxed — which is exactly when it matters. A retriever
+            // that refuses everything makes the network path unreachable rather than merely unused.
             .offline()
-            .should_validate_formats(false)
+            .should_validate_formats(false);
+
+        // The resolver is built only when there is something to resolve. A registry is not free, and
+        // an empty one would say "references may resolve" while resolving nothing.
+        let built = if documents.is_empty() {
+            None
+        } else {
+            Some(
+                documents
+                    .build_registry()
+                    .map_err(|detail| SchemaError::InvalidSchema {
+                        detail: bounded_detail(&detail),
+                    })?,
+            )
+        };
+        if let Some(registry) = &built {
+            options = options.with_registry(registry);
+        }
+
+        let validator = options
             .build(&value)
             .map_err(|error| SchemaError::InvalidSchema {
                 detail: bounded_detail(&error.to_string()),
@@ -288,13 +344,21 @@ impl ValidationReport {
     }
 }
 
-/// Rejects any `$ref` that is not a local pointer.
+/// Rejects any reference that cannot resolve within the document or the supplied set.
 ///
 /// Walked rather than configured, because the validator's behaviour for an unresolvable reference is
 /// to *fail the build* — which this module would report as an invalid schema, attributing a
 /// deliberate refusal to the author's syntax. Finding the reference first lets the error say what is
 /// actually wrong.
-fn reject_external_references(value: &serde_json::Value) -> Result<(), SchemaError> {
+///
+/// The rule is now exact rather than total: a reference resolves against the document itself (a
+/// local fragment) or against `documents` (a JARVIS-supplied `$id`). Anything else is refused,
+/// including a URL, a file path, and a URL that merely **looks** like a supplied identifier — the
+/// last case is why the check is membership in the set and not a URL-shaped test.
+fn reject_unresolvable_references(
+    value: &serde_json::Value,
+    documents: &DocumentSet,
+) -> Result<(), SchemaError> {
     match value {
         serde_json::Value::Object(object) => {
             for (key, child) in object {
@@ -308,19 +372,20 @@ fn reject_external_references(value: &serde_json::Value) -> Result<(), SchemaErr
                 if key == "$ref" || key == "$id" {
                     if let Some(reference) = child.as_str()
                         && !is_local_reference(reference)
+                        && !documents.resolves(reference)
                     {
                         return Err(SchemaError::ExternalReference {
                             reference: reference.to_owned(),
                         });
                     }
                 }
-                reject_external_references(child)?;
+                reject_unresolvable_references(child, documents)?;
             }
             Ok(())
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                reject_external_references(item)?;
+                reject_unresolvable_references(item, documents)?;
             }
             Ok(())
         }

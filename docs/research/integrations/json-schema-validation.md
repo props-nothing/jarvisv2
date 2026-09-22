@@ -135,14 +135,28 @@ Three details were wrong in the first implementation and were corrected by build
   evaluation; the crate advertises support but this record has not verified it against a live case.
   A test asserts the behaviour this project relies on (`additionalProperties` and `required`), and a
   tool schema needing `unevaluated*` is not yet written.
-- **Resolving a shared definition without fetching.** A connector that legitimately needs a shared
-  definition has no supported path today beyond inlining it. `P3-002` owns assembling a document set
-  the validator could be given through `with_registry`, which is the intended answer; until then the
-  restriction is enforced and its cost is stated rather than hidden.
-- **`resolve-file`-shaped local composition.** A sibling-file `$ref` is refused by the same walk that
-  refuses a URL, so a schema split across files does not work even though the fetch would be local.
-  Deliberate for now: the walk does not distinguish local from remote paths, and a path is a
-  filesystem primitive inside the tool path. Revisit with `with_registry` in `P3-002`.
+
+## Resolved In P3-002
+
+Both items this record previously left open are now decided and verified by a contract test
+(`crates/jarvis-tools/tests/supplied_documents.rs`):
+
+- **Resolving a shared definition without fetching.** Verified by running, not by reading: with the
+  resolver's default features disabled **and** `.offline()` set, a `$ref` to a document supplied
+  through `with_registry` resolves **and its constraints are enforced** (`minLength` and `maxLength`
+  from the supplied document both apply). The control case — the same reference with nothing supplied
+  — is refused. Both halves are asserted, because the permissive case alone would also pass on a build
+  that fetched the URL.
+- **A sibling-file `$ref`.** Still refused, now deliberately rather than by omission: the walk does not
+  distinguish a local path from a URL, and a path is a filesystem primitive inside the tool path. A
+  schema may compose only against a `DocumentSet` keyed by `$id`, never by path.
+
+Verified API details for this (0.57.0 / `referencing` 0.57.0, both read from the vendored source):
+`Registry::new()` returns a `RegistryBuilder`; add resources with
+`.add(uri, Resource::from_contents(value))` and finish with `.prepare()`. `Resource::from_contents`
+returns a `Resource` directly (no `Result`), and `options().with_registry(&registry)` on the
+`jsonschema` side copies what it needs — `Validator` carries no lifetime, so the registry does not
+have to outlive the validator.
 
 ## License Note
 

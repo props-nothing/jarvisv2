@@ -323,12 +323,30 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Deliberately not a placeholder: this slice declares and validates metadata and decides nothing.
       Policy evaluation is `P3-003`; registration is `P3-002`; execution is `P3-005`. No adapter is
       wired to it yet, so no tool can actually be called.
-- [ ] `P3-002` Implement the capability registry with collision detection, namespacing, dynamic availability, and compact model-facing discovery.
-      `P3-001` supplies the pieces it needs: `ToolId` is comparable and hashable for collision
-      detection, `Availability` is declarable, and `ToolDefinitionParts` parses a manifest before it
-      is validated. It must also supply the document set the validator is given, since a `$ref`
-      cannot currently resolve outside its own document.
+- [x] `P3-002` Implement the capability registry with collision detection, namespacing, dynamic availability, and compact model-facing discovery.
+      `ToolRegistry` in `crates/jarvis-tools/src/registry.rs`: `define` refuses a collision and
+      **leaves the first tool intact**; `define_all` loads a manifest atomically, with a collision
+      inside the batch refused rather than last-writer-wins; `replace` requires a version change, so
+      new behaviour cannot hide under an unchanged version. Availability has two sources — the
+      definition's declaration and an optional runtime state — and the restrictive one always wins,
+      so a health check cannot enable what the build declared impossible. `discover` is model-facing
+      and bounded (`MAX_DISCOVERY_TOOLS`), offering only callable tools and reporting omissions by
+      count; `inventory` is operator-facing and lists everything with its reason. `ToolSummary`
+      carries selection fields only, asserted by a serialized-field-list test.
+      Also closes `P3-001`'s deferred cost: `DocumentSet` supplies the documents a JARVIS-authored
+      schema may compose against, and a contract test proves a supplied `$ref` resolves **and its
+      constraints are enforced**, with the control that the same reference with nothing supplied is
+      refused. External manifests stay self-contained deliberately (ADR-0016) — a manifest cannot
+      influence which document is loaded, and `$id` shadowing is refused. 127 in-crate tests plus 7
+      contract tests. ADR-0016.
+      Deliberately not a placeholder: this slice holds and lists capabilities and decides nothing.
+      Policy evaluation is `P3-003`; execution is `P3-005`. The registry is populated from code, not
+      persisted, and no adapter is wired to it, so no tool can actually be called.
 - [ ] `P3-003` Implement deterministic policy evaluation with deny-overrides, workspace grants, actor identity, channel constraints, and reason codes.
+      `P3-002` supplies the registry it reads: `get` returns a `ToolDefinition` whose declared
+      effects, risk, scopes, and approval are already consistent with each other (ADR-0015), and
+      `is_callable` is the availability half of the decision. `ScopeSet::is_satisfied_by` is the pure
+      scope check. What is NOT yet supplied: nothing consumes the registry, so policy has no caller.
 - [ ] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
 - [ ] `P3-005` Implement tool execution lifecycle, bounded output, idempotency ledger, audit receipt, and honest outcome states (`requested`, `submitted`, `confirmed`, `failed`, `unknown`).
 - [ ] `P3-006` Add a read-only filesystem tool constrained to explicit workspace roots; test traversal, links, races, and oversized output.
