@@ -165,7 +165,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       that answers; neither exists until `P2-009`, so a chat loop now could only print a `received`
       run per turn — a conversation that records nothing. This item therefore stays unchecked, and
       `chat` is carried by `P2-009` rather than reported as done.
-- [ ] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
+- [x] `P2-009` Build a scripted model adapter for deterministic state, retry, stream, and cancellation tests.
       **Conversation persistence is done, which closes the A03 half that needed no model:** the
       `messages` table existed since `P2-004` but had **no production writer** — only test fixtures
       inserted rows, so an accepted user message was not recorded at all. `jarvis_core::message` now
@@ -219,7 +219,52 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
          are now distinct readings, with a test asserting they differ.
       A live run now completes in about a second with the answer on stdout and progress on stderr, and a
       bad model name fails closed with an actionable message.
-- [ ] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
+      **This slice is complete.** The two things it said it would carry are done: the executor drives a
+      run to a terminal state, and conversation persistence means an accepted user message and the
+      answer that resulted are both recorded, with the answer read back from the run's own
+      `output_completed` event rather than held in memory.
+      **Still not built, and recorded as such: `jarvis chat`.** It needs a multi-turn session read model
+      (reading a session's prior `messages` and replaying them as `ChatMessage`s), which is a real slice
+      rather than a client change: the tables have a writer now, but nothing reads a conversation back.
+      `P2-008` deferred it for the same reason and it stays deferred here rather than being reported as
+      done; it is the next slice in this area.
+- [x] `P2-010` Prove restart behavior at every persisted run boundary and pass the Phase 2 gate.
+      **Delivered:** restart truthfulness, and the Phase 2 process gate that proves it against the real
+      binaries.
+      `jarvis_storage::recover_interrupted_runs` settles every non-terminal run at startup: `cancelled`
+      when a cancellation had already been requested (the operator's intent outranks the interruption),
+      otherwise `failed` with `error_code = interrupted_by_restart`. Each settlement writes the terminal
+      state and its terminal event in **one transaction** through `settle_run`, so a client replaying
+      the stream sees it exactly once; it is the second place that primitive is required, which is the
+      evidence ADR-0011 wanted. Tests cover every non-terminal boundary in a loop rather than one
+      convenient state, a cancelled-before-restart run, idempotence of a second pass, and a clean profile
+      recovering nothing — 99 storage tests.
+      The daemon calls it **before the listener binds**, so no client can observe a run the daemon has
+      not accounted for, logs the identifiers it recovered rather than a bare count, and treats failure
+      as fatal: a daemon unable to explain its own interrupted work must not serve.
+      `tests/e2e/tests/phase2_gate.rs` is the Phase 2 exit gate as a process test. It runs the real
+      `jarvisd` and `jarvis`, starts runs through the public API, kills the daemon with two runs in
+      flight, and asserts the restarted daemon settled the abandoned run `failed` with
+      `interrupted_by_restart`, settled the cancelled one `cancelled`, that each gained exactly one
+      terminal event, that the recovery is in the log with its identifiers, that a fresh run streams to
+      `run_completed`, and that `jarvis ask` reaches the same API. It is wired into CI for all three
+      operating systems.
+      **Recovery is truthfulness, not resumption**, and ADR-0013 records why: the model stream and the
+      answer text live in the executor's memory and the daemon cannot know whether an in-flight provider
+      call was accepted, so a resume could present a second answer to a question already being answered.
+      `A03` offers that either/or and the second branch is taken deliberately.
+      **Three defects were found by running it, none by the unit suites:**
+      1. the gate could not write `config.toml` because its directory did not exist — it was relying on
+         the daemon to create the file the daemon reads;
+      2. `reqwest` panicked with "there is no reactor running" because the gate drove HTTP through
+         `Runtime::block_on` from a synchronous body. Neither `block_on` nor entering the runtime around
+         it gives the request builder a runtime context; making the gate genuinely `async` removes the
+         distinction instead of papering over it;
+      3. **the falsification run passed.** Disabling recovery and rerunning the gate reported success,
+         because `cargo test` does not rebuild the binary the test executes — it ran the previous
+         `jarvisd`. Rebuilding first made the gate fail exactly as it should ("a run interrupted by a
+         restart must be reported as failed", with the run still `received`), which is why CI rebuilds
+         the workspace before each gate.
 
 ## P3: Tools, Policy, Approvals, And MCP
 

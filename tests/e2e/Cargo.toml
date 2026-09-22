@@ -13,7 +13,13 @@ path = "src/lib.rs"
 
 [dependencies]
 jarvis-storage.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+
+[dev-dependencies]
+# The Phase 2 gate drives the run API as a client would, so it needs the same
+# HTTP client the CLI uses rather than a second hand-written one.
+reqwest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

@@ -170,6 +170,57 @@ struct Running {
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
 
+/// Settles every run a previous process left in flight, failing closed if it cannot.
+///
+/// A process that died mid-run leaves a run row in a non-terminal state with no task that will ever
+/// advance it. `FR-RUN-003` requires recovery at a documented boundary, and the boundary honoured
+/// here is **truthfulness**: the run is settled as failed with a code naming the restart, or as
+/// cancelled when a cancellation had already been requested, because the operator's intent outranks
+/// the interruption.
+///
+/// Recovery is deliberately not a resume. The executor holds the model stream and the answer text in
+/// memory, and the daemon cannot know whether the provider accepted the in-flight call, so a resumed
+/// run could answer a question that was already being answered. Reporting the interruption is
+/// honest; a `completed` run whose answer was never produced would not be.
+///
+/// This runs **before** the listener binds, so no client can observe a run in a non-terminal state
+/// that no process will ever advance.
+///
+/// # Errors
+///
+/// Returns the storage failure that prevented the accounting, after recording why the daemon
+/// stopped. Failing closed is the point: a daemon that served clients while unable to explain its
+/// own interrupted work would present a run that looks active and has no executor behind it.
+async fn settle_interrupted_runs(
+    database: &SqliteDatabase,
+    daemon_id: DaemonRunId,
+) -> Result<(), DaemonError> {
+    match jarvis_storage::recover_interrupted_runs(database, UtcTimestamp::now(&SystemClock)).await
+    {
+        Ok(recovered) if !recovered.is_empty() => {
+            // Logged with the identifiers rather than a bare count, so an operator can look up what
+            // was recovered instead of being told that something was.
+            tracing::warn!(
+                count = recovered.len(),
+                runs = ?recovered,
+                "settled runs interrupted by a previous process"
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = database
+                .mark_daemon_stopped(
+                    daemon_id,
+                    UtcTimestamp::now(&SystemClock),
+                    DaemonStopReason::StartupFailed,
+                )
+                .await;
+            Err(error.into())
+        }
+    }
+}
+
 /// Establishes every owned resource, failing closed before the daemon serves.
 ///
 /// Order matters: the credential is read before logging so the redactor can mask
@@ -226,6 +277,13 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
             .await;
         database.close().await;
         return Err(error.into());
+    }
+
+    // Recovery runs BEFORE the listener binds, so no client can observe a run in a non-terminal
+    // state that no process will ever advance.
+    if let Err(error) = settle_interrupted_runs(&database, daemon_id).await {
+        database.close().await;
+        return Err(error);
     }
 
     health.mark_ready()?;

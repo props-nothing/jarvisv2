@@ -60,14 +60,33 @@ Given deliberately mismatched config/state paths, an unavailable database, stale
 
 Given a scripted streaming model and an active run, when `jarvisd` is terminated at every persisted run transition, then restart either resumes from the documented boundary or marks the run with a truthful terminal/recoverable state. It never emits duplicated final output or loses an accepted user message.
 
-**Not yet satisfied.** `P2-007` delivered the durable half: `run_events` is a per-run ordered record
-with `UNIQUE (run_id, sequence)`, a run's first event is written in the same transaction as the run,
-and the SSE stream replays from that record by sequence cursor, so a reconnect after a restart can ask
-for everything after a known position rather than trusting an in-memory counter. What is missing is the
-other half of the sentence: "an active run" and "a scripted streaming model" do not exist yet, because
-nothing in `jarvisd` invokes a model, so a run cannot reach a transition to be terminated at. The
-criterion is therefore unproven rather than partially proven, and it closes with `P2-009` (scripted
-model adapter) and `P2-010` (restart at every persisted boundary).
+**Satisfied for the offline half; one clause is proven by construction rather than by test.** The
+evidence is the Phase 2 process gate, `tests/e2e/tests/phase2_gate.rs`, which runs the real `jarvisd`
+and `jarvis` binaries against a portable profile and proves:
+
+- **an active run whose stream reaches the client** — a run started over `POST /api/v1/runs` streams
+  `state_changed` events and ends at `run_completed`, and `jarvis ask` reaches the same API;
+- **restart marks an interrupted run truthfully** — the daemon is killed with two runs in flight (one
+  abandoned, one with a cancellation requested), and the restarted daemon settles the abandoned run
+  `failed` with `error_code = interrupted_by_restart` and the cancelled one `cancelled`. The recovery
+  is logged with the run identifiers, and each settled run gains exactly one terminal event, so a
+  client replaying the stream sees the settlement once;
+- **no accepted user message is lost** — the user's message is written in the same transaction as the
+  run it triggers (`session_repository::start_run` → `store_user_message`), so it survives a kill at
+  every boundary by construction. The assistant's answer is read back from the run's own
+  `output_completed` event rather than held in memory, so the transcript and the event stream cannot
+  disagree;
+- **no duplicated final output** — `P2-008`'s client rendered `output_delta` and `output_completed`
+  identically and printed the answer twice, because the completed event repeats every fragment. The
+  two are distinct readings now, with a test asserting they differ.
+
+**What this does not claim.** Recovery is truthfulness, not resumption: a run interrupted mid-call is
+reported as interrupted, and the partial answer is not replayed, because the executor holds the model
+stream in memory and the daemon cannot know whether the provider accepted the in-flight call. The
+scenario's "or" ("resumes… **or** marks the run with a truthful terminal/recoverable state") is
+therefore met by the second branch, deliberately. Cancellation in flight is proven at the crate level
+(`apps/jarvisd/src/executor.rs`), because a scripted model answers too quickly for the process gate to
+reliably race; `A04` records the same limit.
 
 ## A04: Cancellation
 
@@ -75,13 +94,30 @@ model adapter) and `P2-010` (restart at every persisted boundary).
 
 Given a run streaming model output, waiting on a tool, and waiting on approval in separate cases, when an authorized client cancels it, then new work stops, adapters receive cancellation, state settles once, and the client receives a terminal cancellation event.
 
-**Not yet satisfied, but one requirement is now enforced rather than assumed.** `P2-007` guarantees
-that cancellation is recorded as a **request**: `POST /api/v1/runs/{id}/cancel` writes
-`cancellation_requested_at` and returns the run in its current state, so the daemon cannot report "state
-settles once" by settling on the request and then settling again when the in-flight step notices.
-Cancelling also requires the caller's `expected_version`, so a client cannot cancel a run it has not
-actually read. The remaining clauses ("new work stops", "adapters receive cancellation", "a terminal
-cancellation event") require an executor to cancel and do not close until `P2-009`.
+**Satisfied for cancellation in flight; the remaining clauses are not reachable this phase.** The
+evidence is `apps/jarvisd/src/executor.rs`, which proves that a cancellation requested while a model
+call is parked settles the run `cancelled` **exactly once** — the loop re-reads the run after the call,
+because a cancellation is recorded by a different request and the value the loop holds cannot see it.
+The Phase 2 process gate adds the durable half: `POST /api/v1/runs/{id}/cancel` writes
+`cancellation_requested_at` and returns the run in its current state, so the daemon cannot report
+"state settles once" by settling on the request and then settling again when the step notices. The
+request also carries `expected_version`, so a client cannot cancel a run it has not read, and the gate
+proves a cancellation requested before a restart settles as `cancelled` rather than `failed`.
+
+**What this does not claim.** Two clauses are unreachable in this phase, and saying so is the honest
+report rather than a partial pass:
+
+- **"adapters receive cancellation"** — the cancellation is observed between executor steps and inside
+  the scripted model's own delay, but no provider adapter is wired to a `CancellationToken`, because no
+  live provider path exists yet (`P2-003` shipped the adapter with no credentials). A real HTTP call in
+  flight is not interrupted.
+- **"waiting on a tool" and "waiting on approval"** — neither state has an executor path until `P3`
+  provides tools and approvals.
+
+The process gate therefore asserts that an immediately-issued cancellation is *accepted or refused as a
+`409` conflict* and that the run still settles, rather than asserting which branch wins: a scripted
+model answers in about a second, so a process-level test cannot reliably race it. That race is what the
+crate test covers, deterministically.
 
 ## A05: Tool Approval Cannot Be Forged
 

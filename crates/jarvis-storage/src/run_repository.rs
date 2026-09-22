@@ -29,8 +29,8 @@
 //! paths (`P2-007`), so they are deliberately absent rather than stubbed.
 
 use jarvis_core::{
-    CorrelationId, EventSummary, ExpectedRunState, RunErrorCode, RunEventPayload, RunOutcome,
-    RunState, RunTransition, UtcTimestamp,
+    CorrelationId, EventSummary, ExpectedRunState, RunErrorCode, RunEventKind, RunEventPayload,
+    RunOutcome, RunState, RunTransition, UtcTimestamp,
 };
 use sqlx::Row;
 
@@ -244,6 +244,137 @@ pub async fn create_run(
     let run = find_run(database, &new.id).await?;
     debug_assert_eq!(run.state, RunState::Received);
     Ok(run)
+}
+
+/// The failure code stored on a run that a process restart interrupted.
+pub const INTERRUPTED_ERROR_CODE: &str = "interrupted_by_restart";
+
+/// Settles every run that a process restart left in flight.
+///
+/// Returns the identifiers it settled, so the caller can log what it recovered rather than reporting
+/// a count with no evidence.
+///
+/// # Why this exists, and why recovery is not a resume
+///
+/// A run's progress lives in memory: the executor holds the model stream and the answer text while
+/// it works. A daemon that dies mid-run therefore leaves a row in a non-terminal state with no
+/// process that will ever advance it. `FR-RUN-003` requires "crash recovery at documented
+/// boundaries", and the documented boundary this build can honor is **truthfulness**: the run is
+/// settled as failed with a code that says a restart interrupted it.
+///
+/// Resuming was the alternative and is rejected here on purpose. The daemon cannot know whether the
+/// provider accepted the in-flight call, so a resume could answer a question that was already being
+/// answered — and the model stream, not the run row, is where that partial answer lives. Reporting
+/// the interruption is honest; a `completed` run whose answer was never produced would not be, and
+/// neither would a `failed` run with no explanation.
+///
+/// A run whose cancellation was requested before the restart is settled as **cancelled** instead,
+/// because the operator's intent outranks the restart: the work was already meant to stop.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the scan or a settlement cannot be persisted. Both writes share one
+/// transaction per run, so a failure here leaves that run's state and its event stream consistent.
+pub async fn recover_interrupted_runs(
+    database: &SqliteDatabase,
+    now: UtcTimestamp,
+) -> Result<Vec<String>, DatabaseError> {
+    // Non-terminal states are exactly the ones a `NOT IN` list describes, and the index
+    // `agent_runs_active_idx` covers that predicate, so this scan does not walk the table.
+    let rows = sqlx::query(
+        "SELECT id, session_id, state, version, cancellation_requested_at \
+         FROM agent_runs \
+         WHERE state NOT IN ('completed', 'cancelled', 'failed')",
+    )
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "scan for interrupted runs",
+        source,
+    })?;
+
+    let mut settled = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(|source| DatabaseError::Sqlite {
+            operation: "decode an interrupted run id",
+            source,
+        })?;
+        let state_text: String = row
+            .try_get("state")
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "decode an interrupted run state",
+                source,
+            })?;
+        let state = state_text
+            .parse::<RunState>()
+            .map_err(|_| DatabaseError::StoredRunInvalid { field: "state" })?;
+        let version: i64 = row
+            .try_get("version")
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "decode an interrupted run version",
+                source,
+            })?;
+        let cancellation_requested: Option<String> = row
+            .try_get("cancellation_requested_at")
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "decode an interrupted run cancellation",
+                source,
+            })?;
+        let session_id: String =
+            row.try_get("session_id")
+                .map_err(|source| DatabaseError::Sqlite {
+                    operation: "decode an interrupted run session",
+                    source,
+                })?;
+
+        let cancelled = cancellation_requested.is_some();
+        let (transition, kind, summary, payload) = if cancelled {
+            (
+                RunTransition::cancelled(),
+                RunEventKind::RunCancelled,
+                "the run was cancelled before the daemon restarted",
+                r#"{"outcome":"cancelled","recovered":true}"#,
+            )
+        } else {
+            (
+                RunTransition::failed(RunErrorCode::new(INTERRUPTED_ERROR_CODE).map_err(|_| {
+                    DatabaseError::InvalidRunRequest {
+                        field: "error_code",
+                    }
+                })?),
+                RunEventKind::RunFailed,
+                "the run was interrupted by a daemon restart",
+                r#"{"outcome":"failed","error_code":"interrupted_by_restart","recovered":true}"#,
+            )
+        };
+
+        // The correlation is generated here rather than reconstructed: the original is on the run's
+        // earlier events, and inventing a link to it would claim a relation this write cannot prove.
+        let correlation_id = CorrelationId::new();
+        let event = NewRunEvent::new(
+            jarvis_core::RunId::new().to_string(),
+            &id,
+            kind,
+            Some(
+                EventSummary::new(summary)
+                    .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "summary" })?,
+            ),
+            RunEventPayload::new(payload)
+                .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "payload" })?,
+            correlation_id,
+            now,
+        )?;
+        let expected = ExpectedRunState::new(state, version);
+        let settlement = TerminalTransition::new(expected, transition, &event)?;
+        settle_run(database, &settlement).await?;
+
+        // The question is already in the transcript because it is written with the run, so recovery
+        // needs no message write. Nothing records an answer, because none was produced.
+        let _ = session_id;
+        settled.push(id);
+    }
+
+    Ok(settled)
 }
 
 /// Reads one run by identifier.
@@ -1631,5 +1762,169 @@ mod tests {
             .is_err(),
             "a non-terminal target must not be accepted by the settlement path"
         );
+    }
+
+    /// A run left in flight by a dead process is settled truthfully, not left looking active.
+    ///
+    /// This is the boundary `FR-RUN-003` calls "crash recovery": the state a client sees after a
+    /// restart must be one a process is actually in, and a run whose executor is gone is not active.
+    #[tokio::test]
+    async fn an_interrupted_run_is_settled_as_failed() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+
+        // Nothing is running: the run row is exactly what a killed process would leave behind.
+        let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+        assert_eq!(recovered, vec![run.id().to_owned()]);
+
+        let settled = must(find_run(&database, run.id()).await);
+        assert_eq!(settled.state(), RunState::Failed);
+        assert_eq!(settled.terminal_outcome(), Some(RunOutcome::Failed));
+        assert_eq!(
+            settled.error_code(),
+            Some(INTERRUPTED_ERROR_CODE),
+            "the stored code must say why, not just that it failed"
+        );
+
+        let kinds = must(
+            crate::read_run_events(
+                &database,
+                run.id(),
+                must(jarvis_core::ReplayRequest::new(
+                    jarvis_core::RunEventSequence::first(),
+                    100,
+                )),
+            )
+            .await,
+        );
+        assert_eq!(
+            kinds.last().map(crate::StoredRunEvent::kind),
+            Some(jarvis_core::RunEventKind::RunFailed),
+            "recovery must record the settlement in the stream a client replays"
+        );
+        database.close().await;
+    }
+
+    /// A run whose cancellation was requested before the restart settles **cancelled**, because the
+    /// operator's intent outranks the interruption. Settling it `failed` would report a daemon fault
+    /// for work that was already meant to stop.
+    #[tokio::test]
+    async fn an_interrupted_run_that_was_already_cancelled_settles_as_cancelled() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+        must(request_run_cancellation(&database, run.id(), run.expectation(), at(2)).await);
+
+        let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+        assert_eq!(recovered, vec![run.id().to_owned()]);
+
+        let settled = must(find_run(&database, run.id()).await);
+        assert_eq!(settled.state(), RunState::Cancelled);
+        assert_eq!(
+            settled.error_code(),
+            None,
+            "a cancellation is not a failure"
+        );
+        database.close().await;
+    }
+
+    /// Recovery is safe to run again. A daemon that crashed during recovery must not corrupt a run it
+    /// already settled, and a second startup must not re-settle anything.
+    #[tokio::test]
+    async fn recovery_is_idempotent() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+        must(recover_interrupted_runs(&database, at(3)).await);
+
+        let before = must(
+            crate::read_run_events(
+                &database,
+                run.id(),
+                must(jarvis_core::ReplayRequest::new(
+                    jarvis_core::RunEventSequence::first(),
+                    100,
+                )),
+            )
+            .await,
+        )
+        .len();
+
+        let second = must(recover_interrupted_runs(&database, at(4)).await);
+        assert!(second.is_empty(), "nothing is left in flight to recover");
+
+        let after = must(
+            crate::read_run_events(
+                &database,
+                run.id(),
+                must(jarvis_core::ReplayRequest::new(
+                    jarvis_core::RunEventSequence::first(),
+                    100,
+                )),
+            )
+            .await,
+        )
+        .len();
+        assert_eq!(
+            after, before,
+            "a settled run must not gain an event from a second recovery pass"
+        );
+        database.close().await;
+    }
+
+    /// The profile with nothing in flight recovers nothing, which is the common case on a clean start.
+    #[tokio::test]
+    async fn recovery_on_a_clean_profile_reports_nothing() {
+        let (_directory, database) = seeded_database().await;
+        let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+        assert!(recovered.is_empty());
+        database.close().await;
+    }
+
+    /// Recovery holds at **every** non-terminal boundary, not just the one a single test happens to
+    /// pick. A process can die after any committed transition, so a gap that only appears in one
+    /// state would be invisible to a test written against another.
+    #[tokio::test]
+    async fn every_non_terminal_boundary_recovers_truthfully() {
+        let (_directory, database) = seeded_database().await;
+
+        // The documented path, in order. Each entry is a boundary a process can die at.
+        let boundaries = [
+            RunState::Received,
+            RunState::ContextBuilding,
+            RunState::Planning,
+            RunState::Executing,
+            RunState::Observing,
+            RunState::Responding,
+        ];
+
+        for boundary in boundaries {
+            let id = jarvis_core::RunId::new().to_string();
+            let mut run = one_run(&database, &id).await;
+            // Walked rather than written directly, so the run reaches the boundary through the
+            // same guarded transitions a live executor uses.
+            for next in boundaries.into_iter().skip(1) {
+                if run.state() == boundary {
+                    break;
+                }
+                run = advance(&database, run, next).await;
+            }
+            assert_eq!(run.state(), boundary, "the run must reach its boundary");
+
+            let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+            assert_eq!(
+                recovered,
+                vec![id.clone()],
+                "a run left at {boundary} must be recovered"
+            );
+
+            let settled = must(find_run(&database, &id).await);
+            assert_eq!(settled.state(), RunState::Failed, "at {boundary}");
+            assert_eq!(
+                settled.error_code(),
+                Some(INTERRUPTED_ERROR_CODE),
+                "at {boundary}"
+            );
+        }
+
+        database.close().await;
     }
 }

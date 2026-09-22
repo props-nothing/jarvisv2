@@ -159,6 +159,16 @@ jobs:
         run: |
           cargo build --workspace --all-features --locked
           cargo test -p jarvis-acceptance --test phase1_gate --locked -- --nocapture
+      - name: Phase 2 acceptance gate
+        # Same shape as the Phase 1 gate, and the build is repeated deliberately: a
+        # stale `jarvisd` beside the test binary would let the gate pass against code
+        # that is not in this commit. That is not hypothetical — the gate's own
+        # falsification run passed until the daemon was rebuilt.
+        env:
+          ACCEPTANCE_REQUIRE_BINARIES: "1"
+        run: |
+          cargo build --workspace --all-features --locked
+          cargo test -p jarvis-acceptance --test phase2_gate --locked -- --nocapture
 
   dependency-policy:
     name: Dependency policy
