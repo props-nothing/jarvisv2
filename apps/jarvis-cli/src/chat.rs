@@ -39,6 +39,13 @@ use jarvis_protocol::{RunReply, RunStreamFrame, StreamReading, output_text, stat
 use crate::api_client::{ApiClient, ApiError};
 use crate::output::ExitStatus;
 
+/// Consecutive keep-alive frames with no event between them before a run is reported as stalled.
+///
+/// The daemon sends a keep-alive every 15 seconds for as long as a run is active, so this is about
+/// two minutes of an active run producing nothing. It bounds a stall that `read_timeout` cannot see,
+/// because the keep-alives themselves keep resetting that timeout.
+pub(crate) const MAX_IDLE_KEEP_ALIVES: u32 = 8;
+
 /// Streams one run to completion, returning the process exit status.
 pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
     // The endpoint is named before the request so a transport failure is diagnosable: "the daemon
@@ -66,6 +73,12 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
     // A run's stream begins with the state it was already in, so the first `state_changed` event is
     // the objective's acceptance, not progress. Rendering it would print the same state twice.
     let mut seen_first_state = false;
+    // Consecutive keep-alive frames seen with no event between them. The daemon sends one every 15
+    // seconds for as long as a run is active, and `read_timeout` cannot notice a stalled run because
+    // the keep-alives keep resetting it. The stream reports events in a steady flow when a run is
+    // progressing, so a long stretch of nothing but keep-alives is a stall, and without a bound the
+    // command would wait forever with no explanation.
+    let mut idle_keep_alives = 0_u32;
 
     loop {
         let frame = match stream.next_frame().await {
@@ -91,9 +104,28 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
                 return ExitStatus::from_code(error.code);
             }
             // The daemon sends keep-alives as SSE comments so they never enter the durable log.
-            // Printing one would present transport noise as run activity.
-            RunStreamFrame::KeepAlive => continue,
+            // Printing one would present transport noise as run activity, so they are counted and
+            // not rendered.
+            RunStreamFrame::KeepAlive => {
+                idle_keep_alives += 1;
+                if idle_keep_alives >= MAX_IDLE_KEEP_ALIVES {
+                    // Reported rather than waited on: a run that produces no event across this span
+                    // is stalled, and the most likely cause is that nothing is executing runs yet.
+                    // Without this bound the command would wait forever, because keep-alives defeat
+                    // the read timeout that would otherwise notice.
+                    eprintln!(
+                        "jarvis: run {} has produced no event across {} keep-alives; it is stalled, not working",
+                        reply.run_id, idle_keep_alives
+                    );
+                    eprintln!(
+                        "jarvis: nothing invokes a model until P2-009, so an accepted run stays in `received`"
+                    );
+                    return ExitStatus::Unavailable;
+                }
+                continue;
+            }
         };
+        idle_keep_alives = 0;
 
         match StreamReading::of(event.kind) {
             StreamReading::Output => {
