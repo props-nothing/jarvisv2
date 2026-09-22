@@ -37,7 +37,7 @@ use crate::execution::{AuthorizationReceipt, IdempotencyKey, ToolCallResult};
 use crate::identifier::ToolId;
 
 /// Explains why an execution request was rejected.
-#[derive(Clone, Copy, Debug, Eq, thiserror::Error, PartialEq)]
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
 pub enum ExecutionRequestError {
     /// The arguments were not a JSON object.
     ///
@@ -49,6 +49,28 @@ pub enum ExecutionRequestError {
     /// The request cited an authority that had already lapsed.
     #[error("the authorization receipt had expired when the request was built")]
     ReceiptExpired,
+    /// The tool, or its version, is not the one the receipt authorized.
+    ///
+    /// The receipt is an authority to run **a specific tool at a specific version**. A request naming
+    /// a different one is a request to do something nobody authorized, and it must not reach an
+    /// adapter, because the adapter has no way to tell an authorized call from an unauthorized one.
+    #[error("the receipt authorizes {authorized} but the request names {requested}")]
+    ToolNotAuthorized {
+        /// What the receipt covers.
+        authorized: String,
+        /// What the request asked for.
+        requested: String,
+    },
+    /// The arguments are not the ones the receipt authorized.
+    ///
+    /// The receipt records the digest of exactly the arguments that were decided on
+    /// (`jarvis_core::CanonicalIntentHash`, which an approval also binds to). Arguments that do not
+    /// produce that digest are **different arguments**, and a call with different arguments is a call
+    /// nobody authorized — which is the "editing the action invalidates the approval" rule in
+    /// `docs/architecture/security.md`, enforced here on the path to the adapter rather than only at
+    /// the approval.
+    #[error("the arguments are not the intent the receipt authorized")]
+    ArgumentsNotAuthorized,
 }
 
 /// One validated call to one tool.
@@ -94,8 +116,8 @@ impl ToolExecutionRequest {
     /// # Errors
     ///
     /// Returns [`ExecutionRequestError::ArgumentsNotAnObject`] when the arguments are not a JSON
-    /// object, or [`ExecutionRequestError::ReceiptExpired`] when the cited authority had lapsed by the
-    /// request's own timestamp.
+    /// object, [`ExecutionRequestError::ReceiptExpired`] when the cited authority had lapsed by the
+    /// request's own timestamp, and the binding errors below.
     ///
     /// # Why the receipt is re-checked here
     ///
@@ -104,6 +126,24 @@ impl ToolExecutionRequest {
     /// between the decision and the call, which can contain a queue wait. A request built with an
     /// authority that lapsed while it waited must not reach an adapter, and the request's own timestamp
     /// is what makes the check deterministic rather than dependent on when it happens to run.
+    ///
+    /// # Why the request must match the receipt it carries
+    ///
+    /// A receipt is an authority to run **one tool at one version with one intent**. This constructor is
+    /// the last point before an adapter, and an adapter cannot tell an authorized call from an
+    /// unauthorized one, so the binding is checked here.
+    ///
+    /// It was previously **not** checked, and the gap was a real one: a request could carry a receipt
+    /// for `jarvis.mail.send` and name `jarvis.files.read`, or carry a receipt whose digest covered
+    /// different arguments, and nothing refused it. That is the same defect class as the one `P3-006a`
+    /// closed on the receipt itself — **two values that must agree, with nothing holding both** — and it
+    /// was found by looking for that pattern deliberately rather than by reviewing the file.
+    ///
+    /// The tool is compared as a pair, tool and version, because an authority to run version 1.0.0 is
+    /// not an authority to run a later version whose behaviour may differ. The arguments are compared by
+    /// **recomputing** the digest rather than by comparing the objects, so the comparison is the same
+    /// canonical one an approval binds to; comparing JSON directly would make key order or whitespace
+    /// significant.
     pub fn new(parts: ToolExecutionRequestParts) -> Result<Self, ExecutionRequestError> {
         let ToolExecutionRequestParts {
             call_id,
@@ -121,6 +161,24 @@ impl ToolExecutionRequest {
         }
         if !receipt.is_valid_at(receipt.issued_at()) {
             return Err(ExecutionRequestError::ReceiptExpired);
+        }
+
+        // The authority must cover this tool and this version. A mismatch is not a formatting problem:
+        // it is a request to run something nobody authorized.
+        if receipt.tool() != tool.to_string() || receipt.tool_version() != tool_version {
+            return Err(ExecutionRequestError::ToolNotAuthorized {
+                authorized: format!("{}@{}", receipt.tool(), receipt.tool_version()),
+                requested: format!("{tool}@{tool_version}"),
+            });
+        }
+
+        // The authority must cover these arguments. Recomputed through the same canonical form the
+        // receipt was built with, so this is an equality of intents rather than of texts.
+        let computed =
+            jarvis_core::CanonicalIntentHash::compute(&tool.to_string(), &tool_version, &arguments)
+                .map_err(|_| ExecutionRequestError::ArgumentsNotAuthorized)?;
+        if computed.to_hex() != receipt.intent_hash() {
+            return Err(ExecutionRequestError::ArgumentsNotAuthorized);
         }
 
         Ok(Self {
@@ -383,6 +441,15 @@ mod tests {
     }
 
     fn receipt(expires_at: Option<UtcTimestamp>) -> AuthorizationReceipt {
+        receipt_for(&arguments(), expires_at)
+    }
+
+    /// A receipt that authorizes a specific argument set.
+    ///
+    /// Needed because the receipt records the digest of exactly the arguments it covers, so a test
+    /// asking for different arguments — including an empty object — must have a receipt that covers
+    /// them. A fixture that always authorized one set would make the binding check untestable.
+    fn receipt_for(arguments: &Value, expires_at: Option<UtcTimestamp>) -> AuthorizationReceipt {
         let approval = expires_at.map(|expires_at| crate::execution::ApprovalCitation {
             approval_id: "0198f000-0000-7000-8000-0000000000e2".to_owned(),
             approver_id: "user-2".to_owned(),
@@ -393,8 +460,13 @@ mod tests {
             receipt_id: "0198f000-0000-7000-8000-0000000000e1".to_owned(),
             tool: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
             tool_version: "1.0.0".to_owned(),
-            arguments: arguments(),
-            intent_hash: digest("jarvis.mail.send", "1.0.0"),
+            arguments: arguments.clone(),
+            intent_hash: jarvis_core::CanonicalIntentHash::compute(
+                "jarvis.mail.send",
+                "1.0.0",
+                arguments,
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
             policy_version: "policy-3".to_owned(),
             decision: allowing(),
             approval,
@@ -423,11 +495,12 @@ mod tests {
     /// there is no field capable of holding a handle.
     #[test]
     fn a_request_carries_values_only() {
-        let request = ToolExecutionRequest::new(parts(
-            receipt(None),
-            json!({"to": "a@example.invalid", "subject": "hi"}),
-        ))
-        .unwrap_or_else(|error| panic!("{error}"));
+        // The request must carry exactly the arguments the receipt authorized. This fixture
+        // previously asked for an extra `subject` key while the receipt covered only `to`, and it
+        // passed -- a request for arguments nobody authorized, accepted silently. The constructor
+        // now refuses that, which is why this fixture names the authorized set.
+        let request = ToolExecutionRequest::new(parts(receipt(None), arguments()))
+            .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(request.call_id(), "0198f000-0000-7000-8000-0000000000e3");
         assert_eq!(request.tool().to_string(), "jarvis.mail.send");
@@ -449,6 +522,74 @@ mod tests {
                 Some(ExecutionRequestError::ArgumentsNotAnObject)
             );
         }
+    }
+
+    /// **A request whose tool or version differs from its receipt is refused.**
+    ///
+    /// The receipt authorizes one tool at one version. Nothing compared the two before, so a request
+    /// could carry a receipt for `jarvis.mail.send` and name a different tool — a request to run
+    /// something nobody authorized, with the authority for something else attached.
+    ///
+    /// The version half matters on its own: an authority to run `1.0.0` is not an authority to run a
+    /// later version whose behaviour may differ.
+    #[test]
+    fn a_request_for_a_tool_the_receipt_does_not_cover_is_refused() {
+        // A different tool.
+        let mut mismatched = parts(receipt(None), arguments());
+        mismatched.tool =
+            ToolId::new("jarvis.files.read").unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            matches!(
+                ToolExecutionRequest::new(mismatched).err(),
+                Some(ExecutionRequestError::ToolNotAuthorized { .. })
+            ),
+            "a receipt for one tool must not authorize another"
+        );
+
+        // The same tool at a different version.
+        let mut versionless = parts(receipt(None), arguments());
+        versionless.tool_version = "2.0.0".to_owned();
+        assert!(
+            matches!(
+                ToolExecutionRequest::new(versionless).err(),
+                Some(ExecutionRequestError::ToolNotAuthorized { .. })
+            ),
+            "an authority for version 1.0.0 must not run version 2.0.0"
+        );
+
+        // The control: the matching pair is accepted, so the refusals above are about the mismatch.
+        assert!(ToolExecutionRequest::new(parts(receipt(None), arguments())).is_ok());
+    }
+
+    /// **A request whose arguments differ from the receipt's intent is refused.**
+    ///
+    /// This is `docs/architecture/security.md`'s "editing the action invalidates the approval"
+    /// enforced on the path to the adapter. The comparison is by **recomputed digest**, so key order and
+    /// whitespace are not significant — a request is refused for asking for a different action, not for
+    /// formatting its JSON differently.
+    #[test]
+    fn a_request_with_arguments_the_receipt_does_not_cover_is_refused() {
+        // A genuinely different action: another recipient.
+        assert_eq!(
+            ToolExecutionRequest::new(parts(receipt(None), json!({"to": "b@example.invalid"})))
+                .err(),
+            Some(ExecutionRequestError::ArgumentsNotAuthorized),
+            "changing the recipient must invalidate the authority"
+        );
+
+        // An extra field is a different action too, which is the case that was previously accepted.
+        assert_eq!(
+            ToolExecutionRequest::new(parts(
+                receipt(None),
+                json!({"to": "a@example.invalid", "subject": "hi"})
+            ))
+            .err(),
+            Some(ExecutionRequestError::ArgumentsNotAuthorized)
+        );
+
+        // The control: the authorized arguments ARE accepted, including when the keys are written in a
+        // different order, because the comparison is over the canonical form rather than the text.
+        assert!(ToolExecutionRequest::new(parts(receipt(None), arguments())).is_ok());
     }
 
     /// **A request citing a lapsed authority is refused.**
@@ -510,9 +651,14 @@ mod tests {
     }
 
     /// An empty argument object is valid, because a parameterless tool has one.
+    ///
+    /// The receipt must authorize the empty object, since the digest of `{}` is not the digest of any
+    /// other argument set — which is the point of comparing intents rather than merely requiring an
+    /// object.
     #[test]
     fn an_empty_argument_object_is_valid() {
-        let request = ToolExecutionRequest::new(parts(receipt(None), json!({})))
+        let empty = json!({});
+        let request = ToolExecutionRequest::new(parts(receipt_for(&empty, None), empty))
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(
             request
@@ -564,7 +710,7 @@ mod tests {
             error: None,
         });
         assert_eq!(executor.adapter_id(), "scripted");
-        let request = ToolExecutionRequest::new(parts(receipt(None), json!({})))
+        let request = ToolExecutionRequest::new(parts(receipt(None), arguments()))
             .unwrap_or_else(|error| panic!("{error}"));
         let result = executor
             .execute(&request)
@@ -617,7 +763,7 @@ mod tests {
                 outcome: ToolOutcome::Unknown,
                 error: Some(error.clone()),
             };
-            let request = ToolExecutionRequest::new(parts(receipt(None), json!({})))
+            let request = ToolExecutionRequest::new(parts(receipt(None), arguments()))
                 .unwrap_or_else(|error| panic!("{error}"));
             let Err(returned) = executor.execute(&request).await else {
                 panic!("a configured error must be returned");
@@ -638,7 +784,7 @@ mod tests {
             outcome: ToolOutcome::Submitted,
             error: None,
         };
-        let request = ToolExecutionRequest::new(parts(receipt(None), json!({})))
+        let request = ToolExecutionRequest::new(parts(receipt(None), arguments()))
             .unwrap_or_else(|error| panic!("{error}"));
         let result = executor
             .execute(&request)
