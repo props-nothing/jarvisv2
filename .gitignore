@@ -67,4 +67,6 @@ example/memory/long_term.json
 playwright-report/
 .coverage
 *.profraw
-*.profdata*.log
+*.profdata
+*.log
+
