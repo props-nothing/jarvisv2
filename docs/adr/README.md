@@ -53,3 +53,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0033](0033-filtering-a-list-is-not-authorization.md) | Filtering a list is not authorization | Accepted |
 | [0034](0034-a-delegated-check-that-cannot-express-the-rule.md) | A delegated check that cannot express the rule is not a control | Accepted |
 | [0035](0035-a-documented-invariant-with-no-test-is-a-convention.md) | A documented invariant with no test is a convention | Accepted |
+| [0036](0036-a-self-reported-name-is-never-a-permit.md) | A self-reported name is evidence or nothing, and never a permit | Accepted |

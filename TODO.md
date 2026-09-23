@@ -1343,7 +1343,6 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       JARVIS answers, because approval-shaped interaction belongs to the JARVIS approval path rather than a
       remote client (ADR-0025) — so the protocol's `input_required` and `task` paths are deliberately
       unreachable rather than unimplemented. No `run_events` row for a served call (`P3-012`).
-- [ ] `P3-009b` Serve the MCP endpoint: bind loopback, map the exposure policy onto the SDK's server fields.
 - [x] `P3-009b` Build the serving configuration, and drive the handler through the real SDK service.
       **`P3-009a`'s design argument became a functional one, and a gap `P3-009e` recorded is closed.** New code:
       `crates/jarvis-mcp-transport/src/serving.rs` (`ServingConfig`, `ServiceError`, `MCP_ENDPOINT_PATH`,
@@ -1426,7 +1425,43 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       **shipped** surface is SDK-free; that is recorded as a follow-up rather than half-built. The four recorded
       exceptions remain, with their reasons and their guard test. Nothing is bound, so `ServingConfig` is still
       reachable from a test and not from a client (`P3-009c`).
-- [ ] `P3-009c` Add the per-client allowlist and rate limits, and enforce the `Origin` decision over a real HTTP request.
+- [x] `P3-009g` Decide who may call: an allowlist whose subject is a credential, never a label.
+      **The inbound half of `ADR-0024`, and the design was decided by reading the protocol's shape before
+      drawing it.** New code: `crates/jarvis-mcp-transport/src/admission.rs` (`CallerAdmission`, `Fingerprint`,
+      `CallerLabel`, `AdmittedCaller`, `AdmissionVerdict`, `AdmissionError`) and 13 tests. **960 workspace tests,
+      40 suites**. ADR-0036.
+      **The finding: `clientInfo` is entirely client-chosen, so an allowlist keyed on it is a control a client
+      names itself into.** `Implementation` in the pinned SDK is `{name, title, version, description, icons,
+      website_url}`, decoded from per-request `_meta`, and nothing verifies any field — so a caller sending
+      `name = "vscode"` would be admitted **as VS Code** with no credential at all. That is *a server does not
+      name itself* arriving inbound, where it is worse because the label decides **permission** rather than
+      identity. The rule is now stated in the type: **a self-reported name is evidence or nothing, never a
+      permit** — the inbound mirror of `jarvis_mcp::ReportedIdentity`.
+      **A label mismatch is reported, never refused** — falsified by forcing `label_matches` to `true`, which
+      fails `a_label_mismatch_is_reported_rather_than_refused` with `left: Some(true)`. Refusing would make the
+      label a **second permit after the module says it is not one**, and would break every call from a valid
+      credential on a client version upgrade. A mismatch is worth *seeing*, so the operator decides.
+      **A pasted credential is refused locally as a fingerprint**, because `Fingerprint::parse` accepts only the
+      digest alphabet — a JWT (`eyJ…eyJ…`) or a `Bearer …` value fails with "it is probably not a fingerprint"
+      rather than being stored, compared, formatted into diagnostics, and committed. `Display` prints a
+      **prefix and a length**, so a log line names the caller without carrying a collectable digest.
+      **`local_only` is the default and admits nobody remotely**, which is the same decision `ServingConfig`
+      already makes for the bind — stated **twice on purpose**, because a control that depends on another
+      control having worked is not a control (a proxy or a changed bind would otherwise be enough). The two empty
+      states are opposites, so the accessor is `is_local_only()` rather than an emptiness check.
+      **Rate limiting is a bound here and the counting is the daemon's**: `decide` takes `spent_budget: bool`,
+      because a policy that mutates per request cannot be compared, logged, or reused. The budget is a **rate**
+      (twelve per minute), so a burst is not punished for the rest of a window. Refusals answer **`401`** for a
+      missing or unknown credential rather than `403` — the two are the same situation to a caller, and
+      distinguishing them would reveal which fingerprints exist — and `429` for a spent budget.
+      **Honest limits.** **Nothing binds**, so no request reaches this policy yet; binding plus applying both
+      decisions at the request layer is the next slice. **The token itself is unvalidated**: audience binding
+      (RFC 8707) and Protected Resource Metadata (RFC 9728) are the OAuth slice, and until they exist a remote
+      caller cannot be admitted at all — which is why `is_local_only` is the default rather than a warning.
+      `spent_budget` is **supplied by the caller**, so a daemon that never sets it has a rate limit that never
+      fires — recorded rather than implied, because a bound nothing enforces reads exactly like one that works.
+      The clock is not modelled, because a budget window needs one and that belongs with the counting.
+- [ ] `P3-009c` Bind the MCP endpoint in the daemon: loopback only, with the `Origin` and caller decisions enforced over a real request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.

@@ -207,6 +207,15 @@ It does not own business decisions. Generate TypeScript clients from its publish
   silently. A configuration allowing a **public** origin is refused outright, because serving off-host needs
   audience-bound tokens that are not built (ADR-0034). Binding a socket remains the daemon's, because network
   listeners belong to the composition root.
+
+  **`CallerAdmission` is the inbound mirror of this crate's oldest rule** (`P3-009g`): the allowlist's subject
+  is a **credential fingerprint**, and a client's `clientInfo` is recorded as evidence and never consulted to
+  permit. `clientInfo` is `{name, title, version, …}`, entirely client-chosen and unverified, so keying an
+  allowlist on it would let a caller send `name = "vscode"` and be admitted **as VS Code** — ADR-0024's defect
+  on the inbound side, where the label decides permission rather than identity (ADR-0036). A label mismatch is
+  **reported, never refused**, because the fingerprint already admitted the caller and refusing would make the
+  label a second permit. Rate limiting is a **bound** here (the daemon counts), because a policy that mutates
+  per request cannot be compared or reused.
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

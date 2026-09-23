@@ -55,6 +55,7 @@
 //! written for an MCP call (`P3-012`).
 
 mod adapter;
+mod admission;
 #[cfg(test)]
 #[path = "boundary_tests.rs"]
 mod boundary_tests;
@@ -68,6 +69,11 @@ mod serve;
 mod serving;
 
 pub use adapter::McpToolAdapter;
+pub use admission::{
+    AdmissionError, AdmissionVerdict, AdmittedCaller, CallerAdmission, CallerLabel,
+    DEFAULT_REQUESTS_PER_MINUTE, Fingerprint, MAX_ADMITTED_CALLERS, MAX_CALLER_LABEL_CHARS,
+    MAX_FINGERPRINT_CHARS,
+};
 pub use client::{
     McpCallResult, McpConnection, OwnedListing, ServerCapabilities, StdioCommand, ToolBuffer,
     connect_http, connect_over, connect_stdio,
