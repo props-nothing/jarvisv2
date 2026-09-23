@@ -216,6 +216,20 @@ It does not own business decisions. Generate TypeScript clients from its publish
   **reported, never refused**, because the fingerprint already admitted the caller and refusing would make the
   label a second permit. Rate limiting is a **bound** here (the daemon counts), because a policy that mutates
   per request cannot be compared or reused.
+
+  **`RequestGate` is where both inbound decisions are applied to one request, and an admitted request is a
+  type** (`P3-009i`). Every slice above recorded "a policy value nothing enforces", and a pair of checks has an
+  order whether or not anyone chose it, so the gate states both: `Origin` **first**, because the revision makes
+  `Origin` validation unconditional, which means a request failing **both** is reported as an origin refusal
+  (a `403`, the remedy a browser can act on) rather than as a `401` that tells the caller about its credential
+  while the origin went unexamined. `RequestAdmission` has **private fields and no public constructor**, so the
+  only way to hold one is the gate returning `Ok` — a `bool` would carry the information and none of the
+  guarantee, since `true` is also what a default-initialized field holds (ADR-0037). The gate takes **values,
+  never a request**: it cannot read a `HeaderMap` without a listener to produce one, and deriving those values
+  is the daemon's because the listener is. A `ServingConfig` and a `CallerAdmission` that look inconsistent
+  (loopback-only serving beside an allowlist with remote entries) are **not** reconciled, because the bind is
+  one control and the admission policy another, and a control that depends on another having worked is not a
+  control.
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

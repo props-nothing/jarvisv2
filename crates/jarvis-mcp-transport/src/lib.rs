@@ -61,6 +61,7 @@ mod admission;
 mod boundary_tests;
 mod client;
 mod endpoint;
+mod enforcement;
 mod error;
 mod host;
 mod host_config;
@@ -79,6 +80,7 @@ pub use client::{
     connect_http, connect_over, connect_stdio,
 };
 pub use endpoint::{EndpointError, MAX_ENDPOINT_BYTES, McpHttpEndpoint};
+pub use enforcement::{RequestAdmission, RequestGate, RequestRefusal};
 pub use error::{CallError, ConnectError, ListError};
 pub use host::{HostBuild, HostedServer, UnreadableServer, build_catalog};
 pub use host_config::{

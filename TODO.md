@@ -1480,6 +1480,46 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       which the bug satisfied perfectly. Nothing asserted the doc's own words about a local caller, so a shipped
       document described behaviour the code did not have. That is the same defect class this phase has found five
       times now, and the remedy is the same: **write the test that asserts the claim, in the claim's terms.**
+- [x] `P3-009i` Apply both inbound decisions to one request, in one place, and make an admitted request a type.
+      **Closes the limit every slice above recorded: "a policy value nothing enforces".** New code:
+      `crates/jarvis-mcp-transport/src/enforcement.rs` (`RequestGate`, `RequestAdmission`, `RequestRefusal`) and
+      11 tests. 99 transport tests; **974 workspace tests, 40 suites**. ADR-0037.
+      **The gate holds both policies and consults both**, so "both were applied" is structural rather than a
+      convention a caller keeps: there is no way to hold one policy and call it a gate.
+      **`RequestAdmission` has private fields and no public constructor**, so the only way to hold one is
+      `decide` returning `Ok`. A `bool` carries the same information and none of the guarantee — the caller
+      decides what `true` means, and `true` is also what a default-initialized field holds. This is `P3-009e`'s
+      "a catalogue is not a control" applied to admission rather than to tools.
+      **`Origin` is checked first, and that order is the specification's**: the revision says servers **MUST**
+      validate `Origin` on **all** incoming connections, so a request failing **both** is reported as an origin
+      refusal (`403`) rather than a `401` that tells the caller about its credential while the origin went
+      unexamined. Swapping the two blocks fails `a_hostile_origin_is_refused_before_the_credential_is_considered`
+      **and nothing else**, which is what makes that test the one holding the rule. The refusals keep different
+      statuses because they carry different remedies.
+      **`RequestAdmission` carries *how* the origin was decided, not only that it was** — `Absent` and `Allowed`
+      are different justifications for the same outcome, and an audit record that could not tell them apart
+      could not answer "was this a browser request", the question a loopback-only deployment most needs answered.
+      **The gate takes values, never a request.** A gate reading a `HeaderMap` could not be tested without one,
+      and deriving those values is the daemon's because the listener is.
+      **No consistency check between the two policies.** A loopback-only `ServingConfig` beside an allowlist with
+      remote entries looks contradictory and is not: the bind is one control, the admission policy another, and a
+      control that depends on another having worked is not a control (`P3-009g`'s rule). Reconciling them would
+      remove the second.
+      **Two bugs were found by this slice's own tests rather than by review.** `also_refused_admission` returned
+      `false` whenever the allowlist was `local_only`, conflating "the allowlist is empty" with "this request
+      carried nothing to check" — the same confusion `decide` had before `CallerOrigin`, reproduced within one
+      commit of being fixed; its test failed immediately. And a fixture used `https://jarvis.example.com` as an
+      allowed origin, which `ServingConfig::new` correctly refuses, so the fixture moved to a loopback origin —
+      the check working one layer up.
+      **The falsification needed two attempts and the first was wrong.** Disabling the admission refusal *and*
+      swapping the order left the order test **passing**, because that request was never refused on admission.
+      The first attempt proved "the pair is broken" rather than "the order is reversed"; only the second
+      isolates the property the test names. Worth remembering as a general shape.
+      **Honest limits.** **Nothing binds**, so no request reaches this gate — the binding is `P3-009c`, and the
+      four values are derived from nothing yet. `spent_budget` is still supplied by the caller, so a daemon that
+      never sets it has a rate limit that never fires. The **token remains unvalidated**: no RFC 8707 audience
+      binding and no RFC 9728 Protected Resource Metadata, so a remote caller can only be admitted against a
+      fingerprint an operator configured by hand.
 - [ ] `P3-009c` Bind the MCP endpoint in the daemon: loopback only, with the `Origin` and caller decisions enforced over a real request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
