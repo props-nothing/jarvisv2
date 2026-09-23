@@ -1186,10 +1186,12 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       necessary but not sufficient, and it was recorded as if it were the fix.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
       **Split into three recorded parts, because this reverses a platform decision and adds an auth surface.**
-      `P3-009a` (done below) is the policy value; `P3-009b` is the server transport wired to it; `P3-009c` is
-      the client allowlist and rate limiting. The slice is deliberately **not** one change: the research found
-      that the SDK's server defaults are permissive on the specification's MUSTs, so the policy has to exist
-      and be testable before anything inherits a default.
+      `P3-009a` (done below) is the policy value; `P3-009d` (done below) is the served surface, recorded under
+      its own number because "which tools may a caller reach" is a different question from "from where";
+      `P3-009b` is the server transport wired to both; `P3-009c` is the client allowlist and rate limiting. The
+      slice is deliberately **not** one change: the research found that the SDK's server defaults are
+      permissive on the specification's MUSTs, so the policy has to exist and be testable before anything
+      inherits a default.
 - [x] `P3-009a` Make server exposure a policy value: origin trust decisions the SDK cannot make.
       **The first server-side slice, and it exists because reading the SDK's server transport contradicted its
       own documentation.** New code: `crates/jarvis-mcp/src/exposure.rs` (`ServerExposure`, `AllowedOrigin`,
@@ -1243,6 +1245,55 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       refused outright. `Origin` is checked against a configured list only — there is no support for
       wildcard subdomains, deliberately, since a wildcard in an allowlist is the broadest possible reading of
       a narrow intent.
+- [x] `P3-009d` Decide what JARVIS serves: the served surface, with a transitive tool refused and named.
+      **Answers the question that actually decides whether exposure is safe** — which of our tools may a
+      remote client call — after `P3-009a` answered *from where*. New code:
+      `crates/jarvis-mcp/src/served.rs` (`served_tools`, `ServedTool`, `ExposureExclusion`, `ServableName`,
+      `MAX_EXPOSED_TOOLS`) and 11 tests. 103 `jarvis-mcp` tests; **911 workspace tests, 40 suites**.
+      ADR-0032.
+      **The central rule: a tool whose source is third-party code is never re-exposed.** The test is
+      `ToolSource::is_third_party()` (`Mcp`, `Runtime`, `Extension`). A **connector** tool *is* servable,
+      because JARVIS wrote the adapter and our own operator declared its risk — which is why the rule is not
+      "anything but `Native`". The reason is worth stating: our exposure decisions (origin allowlist,
+      loopback bind, `P3-009c`'s per-client allowlist) describe **this daemon**. A caller reaching
+      `mcp.github.search` through us has driven a call through our policy and then through a third party's
+      tool that policy never classified, in a context we did not choose — the `ToolEffectPolicy` governing it
+      was written for *our* use of that server on *this* machine. **Nested exposure is deliberately not
+      built**: consent, whose credentials execute the call, and which audit record owns it are unanswered
+      questions, and a federation feature must not arrive as a side effect of "expose my tools".
+      **Exposure gets its own type rather than reusing `McpCatalog`, because the rules are the opposite
+      direction's rules in three places.** Naming: outbound, rule 1 says a server does not name itself so we
+      invent the name; inbound, the only name a remote operator can be sure of is the **canonical identifier
+      transmitted verbatim**. Posture: outbound it is an operator's declaration about a third party
+      (ADR-0025); inbound it is irrelevant, because what matters is whether the source is code this project
+      wrote. Absence: outbound a server being unreachable excludes its tools; inbound a **known but
+      unavailable** tool is withheld, because advertising it offers a tool that fails on every call. One
+      plausible reuse would have given three wrong answers.
+      **A constructible tool that cannot be transmitted is excluded, not renamed.** The protocol
+      `SHOULD`-constrains a tool name to `A-Za-z0-9_.-`, and `ToolId`'s name segment legally contains `:` — so
+      `jarvis.files:read` is a real, registerable tool the wire cannot carry. Renaming would give a remote
+      caller a name the daemon's own operator cannot find in their configuration. The check is **stricter**
+      than the wire's alphabet: it admits exactly what the canonical rules produce, so uppercase is refused
+      too and a future identifier vocabulary cannot become transmittable by accident.
+      **The most consequential reason wins, and that ordering was falsified.** A transitive tool that is also
+      unavailable is reported as `Transitive`. Checking availability first makes the reason "the account is
+      not connected", so an operator reconnects an account and fixes nothing — the tool would still not be
+      exposed.
+      **Three falsifications, one per rule.** Removing the transitive guard serves `mcp.github.search`;
+      checking availability before source reports the unfixable reason; removing the bound serves 35 tools
+      instead of 32. The bound is checked **after** every eligibility check, so `dropped` means "withheld for
+      size" rather than "withheld", and the truncation is reported once as a **list** problem with `tool()`
+      returning `None` — an operator fixing one tool's availability would learn nothing from a size bound.
+      **Also fixed from a real inconsistency:** the name check's first version admitted uppercase while its
+      documentation claimed to enforce the canonical lowercase alphabet. The test asserting the documented
+      property failed, and the check was tightened to match its own description.
+      **Honest limits.** **Nothing serves anything yet** — `P3-009b` wires the transport to this value and to
+      `ServerExposure`, so these are two policy values with no listener behind them. **The served schema is
+      transmitted verbatim**, so a schema the protocol's own `x-mcp-header` rules reject is **not filtered on
+      the server side**; `check_tool_schema` is the client-side model for it and the server-side placement is
+      `P3-009b`'s. No per-client allowlist and no rate limiting (`P3-009c`). The posture attached to a served
+      tool is the **local** declaration unchanged, which is honest only because a third-party-sourced tool is
+      excluded outright — so there is no case where a posture about someone else's code is published.
 - [ ] `P3-009b` Serve the MCP endpoint: bind loopback, map the exposure policy onto the SDK's server fields.
 - [ ] `P3-009c` Add the per-client allowlist and rate limits, and prove the `-32020` and `Origin` refusals over a real HTTP request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

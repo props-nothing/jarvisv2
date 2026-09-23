@@ -81,6 +81,7 @@ mod catalog;
 mod conformance;
 mod definition;
 mod exposure;
+mod served;
 mod server;
 
 pub use catalog::{
@@ -99,6 +100,10 @@ pub use definition::{
 pub use exposure::{
     AllowedOrigin, ExposureError, MAX_ALLOWED_ORIGINS, MAX_ORIGIN_ENTRY_BYTES, OriginError,
     OriginVerdict, ServerExposure, is_loopback_host,
+};
+pub use served::{
+    ExposureError as ServedExposureError, ExposureExclusion, MAX_EXPOSED_TOOLS, ServableName,
+    ServedTool, served_tools,
 };
 pub use server::{
     CanonicalToolName, MAX_REPORTED_TEXT_CHARS, MAX_SERVER_NAME_CHARS, NameAssignments,

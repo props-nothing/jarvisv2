@@ -49,3 +49,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0029](0029-the-mcp-host-role-is-a-narrow-configuration-surface.md) | The MCP host role is a narrow configuration surface, and one parser per document | Accepted |
 | [0030](0030-the-daemon-dispatches-by-tool-identity.md) | The daemon dispatches by tool identity, and MCP servers live in their own document | Accepted |
 | [0031](0031-a-dependencys-default-is-not-a-policy.md) | A dependency's permissive default is not a policy, and an origin is a tuple | Accepted |
+| [0032](0032-a-transitive-tool-is-not-re-exposed.md) | A transitive tool is not re-exposed, and exposure is not the catalog | Accepted |

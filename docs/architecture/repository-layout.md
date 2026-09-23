@@ -176,6 +176,15 @@ It does not own business decisions. Generate TypeScript clients from its publish
   match ordinary browser traffic. **A default is the one value that changes without a line in this
   repository changing**, which is why the policy is stated here and mapped onto the SDK's fields in
   `P3-009b` rather than inherited (ADR-0031).
+
+  **`served_tools` is the other half of the inbound question** (`P3-009d`): *which* of our tools may a remote
+  client call, as opposed to from where. It does not reuse `McpCatalog`, because the rules run the opposite
+  way — outbound an operator names a server and a posture is declared about a third party, while inbound the
+  name is the **canonical identifier transmitted verbatim** and the question is whether the source is code
+  this project wrote. A tool whose source is third-party code is therefore **refused and named rather than
+  re-exposed**: our origin allowlist, loopback bind, and audit trail describe *this daemon*, and a nested
+  call would reach a third party's tool that our policy never classified, under a posture written for our own
+  use of it. Nested exposure is deliberately not built rather than built as a side effect (ADR-0032).
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value
