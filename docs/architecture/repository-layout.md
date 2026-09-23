@@ -165,6 +165,17 @@ It does not own business decisions. Generate TypeScript clients from its publish
   would make the reachable tool set depend on an ordering nobody declared meaningful; for the same reason
   it refuses two listings for one server and records a changed server self-description as an
   `IdentityDrift` instead of treating it as an error.
+
+  **`ServerExposure` is this crate's server-side half** (`P3-009a`): the origin allowlist JARVIS will serve
+  a browser from, as a **pure value** rather than the SDK's server configuration. It exists because reading
+  `rmcp`'s server transport showed its `Default` is permissive on the specification's MUSTs — an empty
+  `allowed_origins` disables `Origin` validation entirely, `legacy_session_mode` mints a session the
+  revision removed, and an absent `MCP-Protocol-Version` is treated as `2025-03-26`. The comparison is also
+  ours rather than the SDK's, because `origin_is_allowed` makes a portless entry a wildcard over every port
+  while treating an explicit default port as literal — so it can neither express the intended control nor
+  match ordinary browser traffic. **A default is the one value that changes without a line in this
+  repository changing**, which is why the policy is stated here and mapped onto the SDK's fields in
+  `P3-009b` rather than inherited (ADR-0031).
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

@@ -1185,6 +1185,66 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       isolated repetition samples the wrong thing. `P2-009a`'s finding 3 ("writes now re-read first") was
       necessary but not sufficient, and it was recorded as if it were the fix.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
+      **Split into three recorded parts, because this reverses a platform decision and adds an auth surface.**
+      `P3-009a` (done below) is the policy value; `P3-009b` is the server transport wired to it; `P3-009c` is
+      the client allowlist and rate limiting. The slice is deliberately **not** one change: the research found
+      that the SDK's server defaults are permissive on the specification's MUSTs, so the policy has to exist
+      and be testable before anything inherits a default.
+- [x] `P3-009a` Make server exposure a policy value: origin trust decisions the SDK cannot make.
+      **The first server-side slice, and it exists because reading the SDK's server transport contradicted its
+      own documentation.** New code: `crates/jarvis-mcp/src/exposure.rs` (`ServerExposure`, `AllowedOrigin`,
+      `OriginVerdict`, `OriginError`, `ExposureError`, `is_loopback_host`) and 17 tests. 92 `jarvis-mcp` tests;
+      **900 workspace tests, 40 suites**. ADR-0031. Research recorded live in
+      `docs/research/integrations/mcp.md`.
+      **The finding: `StreamableHttpServerConfig::default()` is permissive on exactly the MUSTs a security
+      story rests on.** From the vendored source — `allowed_origins: vec![]` with
+      `validate_empty_origin_allowlist: false` makes `validate_origin_header` return `Ok(())` **before reading
+      the header**, so the spec's "servers **MUST** validate `Origin`" is unenforced; its own doc comment says
+      it "disables Origin validation for backward compatibility". `legacy_session_mode: true` mints an
+      `Mcp-Session-Id` that `2026-07-28` (SEP-2567) removed. `stateless_protocol_metadata_required: false`
+      "preserv[es] today's legacy behavior where an absent header is treated as protocol version
+      `2025-03-26`". **The SDK is not uniformly permissive** — `allowed_hosts` defaults to loopback only and
+      the `-32020` header↔body check runs unconditionally — and that is what makes inheritance dangerous: a
+      fail-closed field and a fail-open field are indistinguishable at a call site.
+      **The second finding, from reading the comparison rather than its description.** The SDK's doc says an
+      `Origin` "must match per RFC 6454 `(scheme, host, port)`"; its `origin_is_allowed` is
+      `a_scheme == o_scheme && a_host == o_host && (a_port.is_none() || a_port == o_port)`. The
+      `a_port.is_none()` arm makes **a portless entry a wildcard over every port**, and browsers omit a default
+      port — so `https://x` admits `https://x:8443` (far broader than it reads) while `https://x:443`
+      false-rejects the normal traffic it was written to allow. **A control whose narrowest setting is a
+      wildcard and whose exact setting is wrong is not a control**, so JARVIS owns the comparison: a default
+      port and an omitted port are one origin, and no other port is.
+      **A real defect was found by a test rather than by inspection.** `AllowedOrigin` derived `Eq`, which
+      compares `port` as written, so the duplicate check accepted `https://x` and `https://x:443` as two
+      entries while `matches` correctly called them one origin — the operator's policy would hold one origin
+      twice with the file reading as two. `PartialEq`/`Eq`/`Ord` are now hand-written against the **effective**
+      port.
+      **Both central properties are pinned by falsification.** Replacing the default-port implication with
+      `unwrap_or(0)` fails `an_omitted_port_and_the_schemes_default_port_are_one_origin` and the duplicate test;
+      folding `Malformed` into `Absent` fails `a_malformed_origin_is_refused_rather_than_treated_as_absent` and
+      `the_default_policy_refuses_every_present_origin` — the second because a malformed `Origin` would become
+      the admitted shape, which **inverts the control** rather than merely weakening it.
+      **Decisions worth naming.** An empty allowlist is **enforced**, which is the opposite of the SDK's empty
+      default, so the accessor is `is_loopback_only()` and not `allowed_origins().is_empty()` — a reader
+      checking only for emptiness would conclude the reverse of what they hold. `Origin` is **not** an
+      authentication boundary (a non-browser client sends anything, and a client omitting the header is
+      admitted by the spec's own rule), so the real boundary is `requires_remote_bind()` and the refusal to be
+      reachable off-host at all. Every refusal answers the same `403`, so a hostile caller cannot enumerate the
+      allowlist by the refusal received. `null` is refused at both ends, because admitting the opaque origin
+      admits every sandboxed frame at once.
+      **Honest limits.** **Nothing serves anything yet**: this is a policy value with no transport behind it,
+      so `P3-009b` is what makes JARVIS reachable as a server, and the SDK field mapping is not written. There
+      is **no remote bind and therefore no OAuth resource server** — RFC 9728 Protected Resource Metadata and
+      RFC 8707 audience binding are MUSTs for a server that adopts OAuth, and they are not built, so a
+      remotely reachable JARVIS MCP server would be an **unauthenticated control plane**. That is why the
+      slice refuses exposure off-host rather than exposing and relying on JARVIS authorization in front of it.
+      **No per-client allowlist and no rate limiting** (`P3-009c`). The policy does **not** model
+      `allowed_hosts`, because the SDK's loopback-only default is already fail-closed and a remote bind is
+      refused outright. `Origin` is checked against a configured list only — there is no support for
+      wildcard subdomains, deliberately, since a wildcard in an allowlist is the broadest possible reading of
+      a narrow intent.
+- [ ] `P3-009b` Serve the MCP endpoint: bind loopback, map the exposure policy onto the SDK's server fields.
+- [ ] `P3-009c` Add the per-client allowlist and rate limits, and prove the `-32020` and `Origin` refusals over a real HTTP request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.

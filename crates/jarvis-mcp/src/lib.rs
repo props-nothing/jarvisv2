@@ -66,10 +66,21 @@
 //! There is also **no configuration surface yet**: a [`ConfiguredServer`] and its policy are built in
 //! code, so nothing reads them from `config.toml`. Every type here is therefore a capability a
 //! caller can use, not one an operator can currently reach.
+//!
+//! # The server side, and why it is a policy value here rather than SDK configuration
+//!
+//! [`ServerExposure`] is the first of this crate's types that faces **inward**: it decides which browser
+//! origins JARVIS will serve when JARVIS is the MCP server rather than the client. It lives here, and not
+//! in the transport crate next to the SDK, because the SDK's server defaults are **permissive on the
+//! specification's MUSTs** — an empty `allowed_origins` disables `Origin` validation entirely, and its own
+//! comparison makes a portless entry a wildcard over every port while treating an explicit default port as
+//! literal. A default is the one value that changes without a line in this repository changing, so the
+//! policy is stated as a value here and mapped onto the SDK's fields explicitly. See ADR-0031.
 
 mod catalog;
 mod conformance;
 mod definition;
+mod exposure;
 mod server;
 
 pub use catalog::{
@@ -84,6 +95,10 @@ pub use definition::{
     DEFAULT_MCP_SCOPE, DEFAULT_MCP_TIMEOUT_SECONDS, ExcludedTool, ListingOutcome, McpToolListing,
     PolicyError, ToolEffectPolicy, TranslatedTool, TranslationError, sanitize, tool_version,
     translate_listing, translate_tool,
+};
+pub use exposure::{
+    AllowedOrigin, ExposureError, MAX_ALLOWED_ORIGINS, MAX_ORIGIN_ENTRY_BYTES, OriginError,
+    OriginVerdict, ServerExposure, is_loopback_host,
 };
 pub use server::{
     CanonicalToolName, MAX_REPORTED_TEXT_CHARS, MAX_SERVER_NAME_CHARS, NameAssignments,

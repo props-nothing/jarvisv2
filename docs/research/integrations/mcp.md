@@ -195,6 +195,58 @@ Selected: **`rmcp` 3.4.0**, published `2026-09-15T15:44:08Z`.
   `reqwest-tls-no-provider`). Our existing policy is rustls with no system OpenSSL, so the `reqwest`
   variant is the one that matches.
 
+### Server-side requirements, verified live for `P3-009`
+
+Fetched `2026-07-28/basic/transports/streamable-http.md` and `2026-07-28/basic/authorization.md` on
+2026-09-23. These are the **server** obligations, which the client half did not need:
+
+- **`Origin` is a MUST.** Servers **MUST** validate `Origin` on all incoming connections and **MUST**
+  respond `403 Forbidden` when it is present and invalid. The response body **MAY** carry a JSON-RPC
+  error response with no `id`. Locally hosted servers **SHOULD** bind `127.0.0.1` only.
+- **Header↔body agreement is a MUST, and the stated threat is a proxy disagreement.** A server that
+  processes the body **MUST** reject a mismatch with `400 Bad Request` plus JSON-RPC `-32020`
+  (`HeaderMismatch`). The rationale given is that a load balancer routing on the header while the
+  server executes the body value would let the two disagree — so this is a control on *our own*
+  topology, not merely on the client.
+- **Required headers**: `MCP-Protocol-Version` (must equal the body's
+  `_meta.io.modelcontextprotocol/protocolVersion`), `Mcp-Method` (all requests), and `Mcp-Name` for
+  `tools/call`, `resources/read`, `prompts/get`. Header **names** compare case-insensitively; header
+  **values** are case-sensitive. `Mcp-Name` may arrive Base64-wrapped as `=?base64?…?=` and the
+  server **MUST** decode it before comparing.
+- **Unknown RPC method → `404` + JSON-RPC `-32601`**, which is deliberately distinguishable from the
+  `404` a legacy HTTP+SSE server returns for a path it does not host.
+- **Unsupported protocol version → `400` + `UnsupportedProtocolVersionError` listing the supported
+  versions.** An absent `MCP-Protocol-Version` may be treated as `2025-03-26` **only** by a server that
+  supports clients older than `2025-06-18`; a server that does not **MUST** reject it.
+- **Backward compatibility is specified as behaviour, not as a session.** A modern-only server
+  receiving legacy traffic **SHOULD** answer `405 Method Not Allowed` for GET/DELETE, ignore
+  `Mcp-Session-Id` (never mint or echo one), and ignore `Last-Event-ID`.
+- **Cancellation on HTTP is closing the SSE stream.** `notifications/cancelled` is stdio-only. The
+  server **SHOULD** stop work and **MUST NOT** send further messages for that request.
+- **Server-to-client interactions are never sent as requests on the stream** — they are embedded as
+  `inputRequests` inside `InputRequiredResult` (MRTR). This is a change from `2025-03-26`..`2025-11-25`.
+- **Authorization (optional, but normative when adopted).** An MCP server acting as an OAuth 2.1
+  resource server **MUST** implement Protected Resource Metadata (RFC 9728) and **MUST** validate that
+  an access token was issued **for it** as the intended audience (RFC 8707). Invalid or expired tokens
+  **MUST** get `401`. Insufficient scope **SHOULD** get `403` with `WWW-Authenticate: Bearer
+  error="insufficient_scope"` plus `scope` and `resource_metadata`. Servers **MUST** only accept
+  tokens valid for their own resources and **MUST NOT** accept or transit any other token. Stdio
+  **SHOULD NOT** follow the OAuth spec at all.
+
+**The decisive finding for `P3-009` is that the SDK's defaults are permissive on these MUSTs.** Read
+from `rmcp-3.4.0/src/transport/streamable_http_server/tower.rs`, `StreamableHttpServerConfig::default()`:
+
+| Field | Default | Spec requirement it leaves open |
+| --- | --- | --- |
+| `allowed_origins` | `vec![]` with `validate_empty_origin_allowlist: false` | `validate_origin_header` returns `Ok(())` immediately, so **`Origin` is not validated at all**. The doc comment says so: "Defaults to an empty list, which disables Origin validation for backward compatibility." `enforce_origin_validation()` is the opt-in. |
+| `legacy_session_mode` | `true` | Mints an `Mcp-Session-Id` per `initialize` for versions `< 2026-07-28`. SEP-2567 removes sessions from the revision we target. |
+| `stateless_protocol_metadata_required` | `false` | The doc comment states it "preserv[es] today's legacy behavior where an absent header is treated as protocol version `2025-03-26`" — the opposite of the reject rule above. |
+
+`allowed_hosts` **is** fail-closed by default (`localhost`, `127.0.0.1`, `::1`), and the `-32020`
+header validation is unconditional in `tower.rs` before handler dispatch. So the SDK is not uniformly
+permissive — which is exactly why the permissive fields must be **set explicitly rather than
+inherited**. A JARVIS-owned policy value is the control; the defaults are not.
+
 ## JARVIS Mapping
 
 | MCP concept | JARVIS side |
@@ -249,6 +301,28 @@ Selected: **`rmcp` 3.4.0**, published `2026-09-15T15:44:08Z`.
    resume mechanism to implement.
 10. **Treat an absent `resultType` as `"complete"`**, as the spec requires, so a legacy peer is not
     misread as malformed.
+
+**Server-side decisions (`P3-009`):**
+
+11. **Every SDK server field that is permissive on a MUST is set explicitly, never inherited.**
+    `allowed_origins` is set to an **allowlist** (or `enforce_origin_validation()` for the empty case),
+    `stateless_protocol_metadata_required` is **`true`**, and `legacy_session_mode` is **`false`** on the
+    modern path. Rationale: those three defaults each leave a spec MUST unenforced, and a default is the
+    one value that can change without a line in this repository changing. The JARVIS-owned policy value is
+    built from the operator's configuration, so "which origins are allowed" is a statement this project
+    makes rather than a value inherited from a dependency's `Default` impl.
+12. **Server exposure is loopback-bound, and the allowlist is an allowlist rather than a switch.**
+    The spec says a local server **SHOULD** bind `127.0.0.1`; JARVIS goes further and refuses to expose
+    the MCP server off-host at all in this slice, because a remote MCP server of our own requires the
+    OAuth resource-server half (RFC 9728 metadata, RFC 8707 audience validation) that is its own slice.
+    **A network-reachable JARVIS MCP server without audience-bound tokens would be an unauthenticated
+    control plane**, so the honest shape is "not reachable" rather than "reachable and unauthorized".
+13. **JARVIS authorization stays in front of the MCP server.** MCP authorization is transport-level and
+    optional; JARVIS scopes, approvals, and audit are not. A remote MCP client is an *actor* in the
+    existing model, so its calls pass the same pipeline, and the MCP layer never becomes a second
+    authorization mechanism.
+14. **`Mcp-Session-Id`, GET, and DELETE are refused rather than emulated.** The revision removed the
+    session, so serving one would be inventing state the protocol no longer has.
 
 ## Rejected Alternatives
 
@@ -374,3 +448,4 @@ about the protocol, not decisions of ours.
 | 2026-09-23 | `rmcp` 3.4.0 vendored source (`model.rs` `ts_union!`, `model/mrtr.rs`, `model/task.rs`, `service/client.rs`), read while implementing `tools/call` | **Three facts that change error handling, all read from source.** (1) The protocol's result union is `#[serde(untagged)]` — `ts_union!(@declare_end ..)` emits it — so a result whose `resultType` disagrees with its fields does **not** fail as "a malformed `input_required`"; it becomes the SDK's generic `ServiceError::UnexpectedResponse`, which names nothing. Hence `CallError::Undecodable`, which is distinct from `Unavailable` because the peer *did* answer. (2) `CallToolResponse` is `#[non_exhaustive]` with `Complete`/`InputRequired`/`Task`, and `call_tool_once` returns it directly (no MRTR driving), so the modes JARVIS cannot serve are refusable by name; the high-level `call_tool` drives MRTR rounds through a local `ClientHandler`, which **JARVIS does not register** — using it would produce a failure about a missing handler rather than a named refusal. (3) `CreateTaskResult` **flattens** the seed `Task` (`#[serde(flatten)] pub task: Task`) rather than nesting it under a `task` key, and `InputRequiredResult` requires `resultType: "input_required"` **and at least one of** `inputRequests`/`requestState` (custom deserializers, both present to stop greedy matching in the untagged union). A fixture written with the nested shape decoded as nothing and surfaced as `Undecodable` — which is how (1) was found. | GitHub Copilot |
 | 2026-09-23 | `rmcp` 3.4.0 vendored source (`transport/common/reqwest/streamable_http_client.rs`, `transport/streamable_http_client.rs`, `transport/common/mcp_headers.rs`), read while implementing `connect_http` | **Two facts that changed the client design, both read from source.** (1) **The SDK's `default_http_client` does not call `no_proxy`.** Its builder is `reqwest::Client::builder().pool_max_idle_per_host(0).redirect(Policy::none()).build()`, so proxy support is off **only because the SDK's manifest declares `reqwest` with `default-features = false`** (verified in its `Cargo.toml`: `version = "0.13.2", features = ["json","stream"], default-features = false`). That is a fact about a *dependency's* manifest, not a property of anything in this workspace, so a feature unification elsewhere could re-enable an unchosen intermediary with no local change. This crate therefore builds the client itself and passes it via `StreamableHttpClientTransport::with_client` (`reqwest::Client` implements the SDK's `StreamableHttpClient` trait, impl at `streamable_http_client.rs:49`). (2) The transport discriminates responses by **`Content-Type` prefix**: `text/event-stream` → SSE stream, `application/json` → JSON body, anything else → `UnexpectedContentType`; a non-2xx response whose body parses as a JSON-RPC error is surfaced as `McpError` rather than lost. Requests carry `Accept: text/event-stream, application/json` plus (on modern protocol versions) `Mcp-Method`/`Mcp-Name`, both confirmed on the wire by a hand-written HTTP server in `tests/http.rs`. | GitHub Copilot |
 | 2026-09-23 | `rmcp` 3.4.0 behaviour observed through `tools/call`, while implementing the `ToolExecutor` adapter | **What the transport does *not* classify, and therefore what an adapter must.** `McpCallResult` carries `is_error` straight from the server's `isError` and does no outcome reasoning — deliberately, because the transport cannot know whether an effect happened. Three cases were confirmed against a live scripted peer: (a) a tool answering with `isError: true` returns **`Ok`** from `call_tool`, not an error, so an adapter that only handled `Err` would record a tool's own refusal as a transport success; (b) a JSON-RPC error arrives as `CallError::PeerError` and an undecodable result as `CallError::Undecodable` — the latter because the result union is untagged, so a shape mismatch matches no variant; (c) **a peer that closes the connection after receiving a POST produces `CallError::Unavailable`, the same variant a connection that never opened produces**, so the classification of "sent, no answer" versus "nothing sent" is information only the adapter's own sequencing has. That is why the adapter treats `Unavailable` as ambiguous rather than as a refusal. | GitHub Copilot |
+| 2026-09-23 | spec 2026-07-28 `basic/transports/streamable-http.md` + `basic/authorization.md` (live fetch); `rmcp` 3.4.0 `transport/streamable_http_server/tower.rs` | **Server-side obligations, established for `P3-009`.** Live spec: `Origin` **MUST** be validated with `403` on an invalid present value; header↔body mismatch **MUST** be `400` + `-32020`, with the spec's own reason being that a load balancer routing on the header while the server executes the body value lets the two sources of truth disagree; unknown method → `404` + `-32601`; unsupported version → `400` listing supported versions; a modern-only server **SHOULD** answer `405` to GET/DELETE, ignore `Mcp-Session-Id`, ignore `Last-Event-ID`; cancellation on HTTP **is** closing the SSE stream; server-to-client interactions are MRTR `inputRequests`, never stream requests; an OAuth resource server **MUST** implement RFC 9728 metadata and validate token audience per RFC 8707, with `401` for invalid/expired and `403` + `insufficient_scope` for scope failure. **SDK finding, from source:** `StreamableHttpServerConfig::default()` is **permissive on those MUSTs** — `allowed_origins: vec![]` with `validate_empty_origin_allowlist: false` makes `validate_origin_header` return `Ok(())` immediately ("disables Origin validation for backward compatibility"), `legacy_session_mode: true` mints sessions for pre-`2026-07-28` versions, and `stateless_protocol_metadata_required: false` treats an absent `MCP-Protocol-Version` as `2025-03-26`. `allowed_hosts` **is** fail-closed (loopback only) and `-32020` validation is unconditional. The permissive fields must therefore be set explicitly rather than inherited. | GitHub Copilot |
