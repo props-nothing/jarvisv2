@@ -60,6 +60,14 @@ tracing.workspace = true
 # a read — on a single-threaded runtime the timeout and the read are the same thread and a hung
 # negotiation would hang the test instead of failing it.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+# The served-handler tests drive the SDK's **real** Streamable HTTP service rather than only the handler's
+# own method, so they build an `http::Request` and read an `http::Response` body. `tower` supplies
+# `ServiceExt::oneshot`, which is how the SDK's own tests drive its service. All three are already in the
+# lock (`http` and `http-body-util` through `axum`, `tower` through the daemon), so declaring them adds no
+# package — the same reasoning `reqwest` is declared rather than reached through `rmcp`.
+http = { version = "1.5", default-features = false }
+http-body-util = "0.1.5"
+tower.workspace = true
 # The host-join tests assert against canonical risk and approval values, which live in
 # `jarvis-tools`. It is already a transitive dependency through `jarvis-mcp`; declaring it here
 # rather than re-exporting the two enums from this crate keeps the transport's public surface

@@ -1344,7 +1344,49 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       remote client (ADR-0025) — so the protocol's `input_required` and `task` paths are deliberately
       unreachable rather than unimplemented. No `run_events` row for a served call (`P3-012`).
 - [ ] `P3-009b` Serve the MCP endpoint: bind loopback, map the exposure policy onto the SDK's server fields.
-- [ ] `P3-009c` Add the per-client allowlist and rate limits, and prove the `-32020` and `Origin` refusals over a real HTTP request.
+- [x] `P3-009b` Build the serving configuration, and drive the handler through the real SDK service.
+      **`P3-009a`'s design argument became a functional one, and a gap `P3-009e` recorded is closed.** New code:
+      `crates/jarvis-mcp-transport/src/serving.rs` (`ServingConfig`, `ServiceError`, `MCP_ENDPOINT_PATH`,
+      `MAX_REQUEST_BODY_BYTES`) and `tests/serving.rs` (11 tests driving the **real** service). 56 transport
+      tests; **942 workspace tests, 41 suites**. ADR-0034.
+      **The finding: origin validation cannot be delegated at all.** The SDK's `validate_origin_header`
+      compares against `allowed_origins` directly and has **no extension point** — `with_allowed_origins` is
+      the whole surface — so the comparison `P3-009a` rejected cannot be replaced. `ServingConfig::sdk`
+      therefore calls `disable_allowed_origins`, and `origin_check` is the decision; **enabling both would be
+      worse than disabling the SDK's**, because two checks with different rules would disagree about a
+      portless entry and the permissive one would be part of the answer, while a populated `allowed_origins`
+      would read as the control. A disabled field with the reason recorded is honest; an enabled field whose
+      rule is wrong is a false assurance.
+      **Every permissive SDK default is a stated value, and a test reads the SDK's `Default` alongside it**, so
+      an upgrade that changes a default fails rather than silently changing the policy: `legacy_session_mode`
+      `false`, `stateless_protocol_metadata_required` `true`, the body bound stated, `allowed_hosts` loopback,
+      and `NeverSessionManager` in place of an in-memory store for a protocol with no sessions.
+      **A configuration allowing a public origin is refused outright** rather than warned about, because serving
+      off-host needs RFC 9728 metadata and RFC 8707 audience binding that are not built, and a remotely
+      reachable MCP server without them is an unauthenticated control plane. The test is on the **host**, so
+      `http://localhost:3000` is served and `https://jarvis.example.com` is refused.
+      **Three facts were discovered by driving the real service rather than assumed.** The `Accept` header must
+      list both `application/json` **and** `text/event-stream` — sending only the first is answered
+      `406 Not Acceptable`, so `P3-009a`'s client obligation is enforced server-side too. A refused tool call is
+      **`200` with `result.isError: true`**, not a `4xx`, which is `P3-009e`'s decision seen from outside. And a
+      `GET` is `405` while an oversized body is `413`, both now pinned.
+      **This closes the gap `P3-009e` recorded**: `list_tools`, `call_tool`, and `server/discover` were
+      compiled but **never executed** through the SDK, so a response-shape mismatch had nowhere to fail. They
+      are now driven with a real `http::Request` and `http::Response`, which is the path a client's POST takes.
+      `server/discover` also confirms the modern revision is advertised and `2025-11-25` is not.
+      **A falsification corrected a test's own claim, for the second time this phase.**
+      `a_request_without_a_protocol_version_header_is_refused` was written as evidence for
+      `stateless_protocol_metadata_required(true)`; removing that line did **not** fail it, because the refusal
+      comes from the SDK's body-versus-header agreement rule — a body `_meta` version requires the matching
+      header whatever the flag says. `a_request_with_no_protocol_signals_at_all_is_refused` was added to isolate
+      the flag, and the first test's comment now names the property it actually pins.
+      **Honest limits.** **Nothing is bound**, deliberately: `ServingConfig` produces the SDK's service and
+      binding a socket is the daemon's, because `repository-layout.md` gives network listeners to the
+      composition root — so this is reachable from a test and not yet from a client. **Origin enforcement over
+      a real request is `P3-009c`'s** (the decision is here, the layer owning the request is there). No daemon
+      wiring, no per-client allowlist, no rate limiting. The `server` feature's five packages are recorded in
+      `docs/research/integrations/mcp.md` with the measurement that admitted them.
+- [ ] `P3-009c` Add the per-client allowlist and rate limits, and enforce the `Origin` decision over a real HTTP request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.

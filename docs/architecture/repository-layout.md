@@ -196,6 +196,17 @@ It does not own business decisions. Generate TypeScript clients from its publish
   pipeline, so a remote call's attribution stays the daemon's and the refusal rule is testable with no
   daemon (ADR-0033). Nothing is bound: there is no listener, so this is a handler a test can drive and not
   yet a server a client can reach.
+
+  **`ServingConfig` is the configuration a client would be served under, and it exists because a delegated
+  check that cannot express the rule is not a control** (`P3-009b`). The SDK's origin validation compares
+  against `allowed_origins` directly with **no extension point**, so the comparison this project needs cannot
+  be substituted — therefore the SDK's check is disabled, with the reason recorded, and JARVIS's policy is the
+  decision. Enabling both would be worse: two rules that disagree about a portless entry, one of them a
+  wildcard, and a populated `allowed_origins` that reads as the control. Every other permissive SDK default is
+  a stated value, and a test reads the SDK's own `Default` alongside it so an upgrade cannot change the policy
+  silently. A configuration allowing a **public** origin is refused outright, because serving off-host needs
+  audience-bound tokens that are not built (ADR-0034). Binding a socket remains the daemon's, because network
+  listeners belong to the composition root.
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

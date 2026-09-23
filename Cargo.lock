@@ -1241,6 +1241,8 @@ name = "jarvis-mcp-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
+ "http-body-util",
  "jarvis-core",
  "jarvis-mcp",
  "jarvis-tools",
@@ -1251,6 +1253,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tower",
  "tracing",
 ]
 

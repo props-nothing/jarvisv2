@@ -62,6 +62,7 @@ mod host;
 mod host_config;
 mod revision;
 mod serve;
+mod serving;
 
 pub use adapter::McpToolAdapter;
 pub use client::{
@@ -77,6 +78,9 @@ pub use host_config::{
 pub use serve::{
     JarvisMcpServer, SERVED_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, ServedToolRunner,
     bounded_reason, call_result, method_not_found_code,
+};
+pub use serving::{
+    MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT_PATH, ServiceError, ServingConfig, ServingConfigError,
 };
 // The naming strategy is **MCP** vocabulary, and it is re-exported so a composition root can choose one
 // without taking `jarvis-mcp` as a dependency of its own. A daemon declaring the pure translation crate

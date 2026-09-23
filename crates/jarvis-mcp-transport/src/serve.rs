@@ -109,6 +109,11 @@ pub trait ServedToolRunner: Send + Sync {
 }
 
 /// The MCP server handler: it advertises the served set and refuses anything outside it.
+///
+/// `Clone` because the SDK's Streamable HTTP service factory constructs one handler **per request**, so a
+/// shared handler must be clonable. Both fields are an `Arc` or a `Vec` of owned values, so a clone shares the
+/// runner and copies the served list — the expensive parts are not duplicated.
+#[derive(Clone)]
 pub struct JarvisMcpServer {
     served: Vec<ServedTool>,
     runner: Arc<dyn ServedToolRunner>,

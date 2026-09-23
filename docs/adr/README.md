@@ -51,3 +51,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0031](0031-a-dependencys-default-is-not-a-policy.md) | A dependency's permissive default is not a policy, and an origin is a tuple | Accepted |
 | [0032](0032-a-transitive-tool-is-not-re-exposed.md) | A transitive tool is not re-exposed, and exposure is not the catalog | Accepted |
 | [0033](0033-filtering-a-list-is-not-authorization.md) | Filtering a list is not authorization | Accepted |
+| [0034](0034-a-delegated-check-that-cannot-express-the-rule.md) | A delegated check that cannot express the rule is not a control | Accepted |
