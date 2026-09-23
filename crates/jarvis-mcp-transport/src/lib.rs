@@ -70,7 +70,7 @@ mod serving;
 
 pub use adapter::McpToolAdapter;
 pub use admission::{
-    AdmissionError, AdmissionVerdict, AdmittedCaller, CallerAdmission, CallerLabel,
+    AdmissionError, AdmissionVerdict, AdmittedCaller, CallerAdmission, CallerLabel, CallerOrigin,
     DEFAULT_REQUESTS_PER_MINUTE, Fingerprint, MAX_ADMITTED_CALLERS, MAX_CALLER_LABEL_CHARS,
     MAX_FINGERPRINT_CHARS,
 };

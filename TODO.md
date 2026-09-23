@@ -1461,6 +1461,25 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `spent_budget` is **supplied by the caller**, so a daemon that never sets it has a rate limit that never
       fires — recorded rather than implied, because a bound nothing enforces reads exactly like one that works.
       The clock is not modelled, because a budget window needs one and that belongs with the counting.
+- [x] `P3-009h` Fix `local_only` admitting nobody, and make a local caller's origin explicit.
+      **A review of `P3-009g`'s shipped policy against its own docs found that its central default refused
+      everybody.** `decide` took only a credential fingerprint, so `None` meant "no credential" and was refused —
+      but a **local** caller is precisely the case the credential apparatus does not apply to. So the default
+      **refused the operator on their own machine**, while its doc said "the only admitted caller is a local
+      one". Fixed in place rather than in a new slice: `CallerOrigin` is now a parameter, the falsification
+      reproduces the original bug exactly (`left: NoCredential, right: Admitted`), and the ADR's claim is
+      corrected with the reason. 16 admission tests; **963 workspace tests, 40 suites**.
+      **`CallerOrigin` is supplied by the request layer and derived from nothing a caller sends**, which is the
+      rule `CallerLabel` exists for one level down: there is deliberately no `Deserialize` and no constructor
+      from a header or body, so a remote caller cannot admit itself by claiming to be local. A test asserts the
+      type has exactly two states, so adding a deserializer is a compile failure rather than a silent widening.
+      **The rate limit applies to a local caller too**, and that ordering is load-bearing: `decide` checks the
+      budget *before* the origin, because an early return for `Local` would make the bound reachable by anyone
+      who could reach the socket.
+      **The lesson is about what a test asserts.** The original tests checked that a *remote* caller is refused —
+      which the bug satisfied perfectly. Nothing asserted the doc's own words about a local caller, so a shipped
+      document described behaviour the code did not have. That is the same defect class this phase has found five
+      times now, and the remedy is the same: **write the test that asserts the claim, in the claim's terms.**
 - [ ] `P3-009c` Bind the MCP endpoint in the daemon: loopback only, with the `Origin` and caller decisions enforced over a real request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.

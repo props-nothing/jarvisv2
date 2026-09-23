@@ -65,15 +65,32 @@ A digest answers the only question the allowlist asks, which is "is this caller 
 
 **5. `local_only` admits no remote caller, and the two empty states are named for the difference.**
 
-`CallerAdmission::local_only()` produces an empty, **enforced** allowlist, so the only admitted caller is a local
-one — which presents no credential and cannot produce `Admitted`. The accessor is `is_local_only()` rather than
-`admitted().is_empty()`, for the reason `ServerExposure::is_loopback_only()` exists: an empty allowlist that is
-enforced and one that is not are opposites, and a reader checking only for emptiness would conclude the reverse
-of what they hold.
+`CallerAdmission::local_only()` produces an empty, **enforced** allowlist, so a **remote** caller is refused and a
+**local** one is admitted. The accessor is `is_local_only()` rather than `admitted().is_empty()`, for the reason
+`ServerExposure::is_loopback_only()` exists: an empty allowlist that is enforced and one that is not are
+opposites, and a reader checking only for emptiness would conclude the reverse of what they hold.
 
 This is the **second statement** of the same decision `ServingConfig` already makes for the bind, and the
 redundancy is deliberate: a control that depends on another control having worked is not a control. If a proxy,
 a forwarded socket, or a misconfiguration changed the bind, this is what refuses the caller.
+
+> **CORRECTION (2026-09-23, `P3-009h`): the first version of this decision could not admit a local caller at
+> all, and its own doc said the opposite.** `decide` took only a credential fingerprint, so `None` meant "no
+> credential" and was refused — but a local caller is precisely the case the credential apparatus does not
+> apply to. So `local_only` refused **everybody** while this ADR said "the only admitted caller is a local
+> one". The fix is `CallerOrigin`, a value the **request layer** supplies and nothing a caller can send, and the
+> falsification reproduces the bug exactly (`left: NoCredential, right: Admitted`).
+>
+> **The lesson is about what a test asserts.** The original tests asserted the *doc's* claim about a local
+> caller nowhere — they checked that a remote caller is refused, which the bug satisfied. A shipped document
+> claiming behaviour the code does not have is the same defect class this phase has now found five times, and
+> the remedy is the same: write the test that asserts the doc's own words.
+
+**5b. The rate limit applies to a local caller too.**
+
+A runaway local client can monopolise the daemon as readily as a remote one, and exempting `Local` would make
+the bound reachable by anyone who could reach the socket. So `decide` checks the budget **before** it checks the
+origin, which is also why the origin cannot be an early return that skips it.
 
 **6. Rate limiting is a bound here, and the counting is the daemon's.**
 

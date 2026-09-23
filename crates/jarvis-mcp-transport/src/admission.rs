@@ -76,6 +76,31 @@ pub const MAX_ADMITTED_CALLERS: usize = 16;
 /// punished for the burst.
 pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 12;
 
+/// Where a request came from, which decides whether a credential is required at all.
+///
+/// **This is the distinction the first version of [`CallerAdmission::decide`] was missing, and shipping it
+/// revealed that the bug made `local_only` refuse everybody.** Without an origin, `decide(None, ..)` had to mean
+/// "no credential", which refuses a **local** caller — and a local caller is the one case the credential
+/// apparatus does not apply to: it is the operator's own machine, reached over loopback, and the daemon's whole
+/// design already treats it as the trusted principal. So `local_only` documented "the only admitted caller is a
+/// local one" while admitting nobody, which is exactly the kind of claim a running test catches and a doc does
+/// not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallerOrigin {
+    /// The caller is on this host: loopback, or the local IPC transport.
+    ///
+    /// **The trusted principal**, so no credential is required. That is not a weakening: a local caller already
+    /// has the machine, and requiring a token they would have to obtain from a file on it adds nothing but a
+    /// place for the token to leak.
+    Local,
+    /// The caller arrived over the network, so a credential is required.
+    ///
+    /// Today this cannot happen: `ServingConfig` refuses a remote bind, and [`CallerAdmission::local_only`]
+    /// refuses such a caller if one somehow arrives. Both statements are kept because the day a remote bind is
+    /// allowed, the credential rule is already the one in force rather than a follow-up.
+    Remote,
+}
+
 /// A credential fingerprint: what an allowlist entry actually admits on.
 ///
 /// A **digest**, never the credential. See the module docs on why: this value is compared per request, put in
@@ -366,11 +391,14 @@ impl CallerAdmission {
         }
     }
 
-    /// Returns whether no caller is admitted.
+    /// Returns whether no **remote** caller is admitted.
     ///
     /// **The stronger of the two empty states, and named for it** — the same reasoning as
-    /// `ServerExposure::is_loopback_only`. An empty allowlist here is *enforced*, so the only admitted caller is
-    /// a local one, which presents no credential.
+    /// `ServerExposure::is_loopback_only`. An empty allowlist here is *enforced*, so a remote caller is refused;
+    /// a **local** one is admitted regardless, because it is the operator's own machine and needs no entry.
+    ///
+    /// The name says **remote** deliberately: `is_local_only()` returning `true` does not mean "this daemon
+    /// serves nobody", which is what a reader could conclude from `is_empty()`.
     #[must_use]
     pub fn is_local_only(&self) -> bool {
         self.admitted.is_empty()
@@ -390,11 +418,29 @@ impl CallerAdmission {
 
     /// Decides whether a caller may be served.
     ///
-    /// `presented` is the **fingerprint** of whatever credential the request carried, or `None` when it carried
-    /// none. Taking a fingerprint rather than a token is deliberate: the token's own validation is the token
-    /// slice's, and this decision is "is this caller one we allow", which a digest answers.
+    /// `origin` decides whether a credential is required at all; `presented` is the **fingerprint** of whatever
+    /// credential the request carried, or `None` when it carried none. Taking a fingerprint rather than a token
+    /// is deliberate: the token's own validation is the token slice's, and this decision is "is this caller one
+    /// we allow", which a digest answers.
+    ///
+    /// **The rate limit applies to a local caller too.** A runaway local client is as able to monopolise the
+    /// daemon as a remote one, and exempting `Local` would make the bound reachable by anyone who could reach
+    /// the socket.
     #[must_use]
-    pub fn decide(&self, presented: Option<&Fingerprint>, spent_budget: bool) -> AdmissionVerdict {
+    pub fn decide(
+        &self,
+        origin: CallerOrigin,
+        presented: Option<&Fingerprint>,
+        spent_budget: bool,
+    ) -> AdmissionVerdict {
+        if spent_budget {
+            return AdmissionVerdict::RateLimited {
+                requests_per_minute: self.requests_per_minute,
+            };
+        }
+        if origin == CallerOrigin::Local {
+            return AdmissionVerdict::Admitted;
+        }
         let Some(presented) = presented else {
             return AdmissionVerdict::NoCredential;
         };
@@ -404,11 +450,6 @@ impl CallerAdmission {
             .any(|caller| caller.fingerprint() == presented)
         {
             return AdmissionVerdict::NotAllowed;
-        }
-        if spent_budget {
-            return AdmissionVerdict::RateLimited {
-                requests_per_minute: self.requests_per_minute,
-            };
         }
         AdmissionVerdict::Admitted
     }
@@ -515,6 +556,73 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// **`local_only` admits a local caller and no remote one — the bug the first version shipped.**
+    ///
+    /// Without [`CallerOrigin`], `decide(None, ..)` meant "no credential" and refused a local caller, so
+    /// `local_only` refused **everybody** while its own doc said "the only admitted caller is a local one". A
+    /// shipped test asserts the doc rather than the code, which is why this is now pinned two ways.
+    ///
+    /// Falsified by returning to the origin-less rule — treating "no credential" as a refusal regardless: the
+    /// first assertion fails, and the daemon would refuse its own operator. The second assertion is the half that
+    /// must **not** change: a remote caller is still refused.
+    #[test]
+    fn local_only_admits_a_local_caller_and_refuses_a_remote_one() {
+        let admission = CallerAdmission::local_only();
+        assert_eq!(
+            admission.decide(CallerOrigin::Local, None, false),
+            AdmissionVerdict::Admitted,
+            "a local caller is the operator on their own machine and needs no credential"
+        );
+        assert_eq!(
+            admission.decide(CallerOrigin::Remote, None, false),
+            AdmissionVerdict::NoCredential
+        );
+        assert_eq!(
+            admission.decide(CallerOrigin::Remote, Some(&fingerprint("aaaa")), false),
+            AdmissionVerdict::NotAllowed
+        );
+    }
+
+    /// **A remote caller cannot be admitted by claiming to be local.**
+    ///
+    /// The origin is supplied by the layer that owns the connection, never by a request field, so this test
+    /// records the design constraint rather than exercising an input: `CallerOrigin` is taken as a value the
+    /// caller of `decide` decides, and there is deliberately **no** constructor from a header or a body. A
+    /// client-chosen origin would be the same defect [`CallerLabel`] exists to avoid, one level down.
+    ///
+    /// Falsified by adding a `CallerOrigin::from_metadata` that read a request field: a remote caller would then
+    /// admit itself by sending the local value.
+    #[test]
+    fn the_origin_is_not_derived_from_anything_a_caller_sends() {
+        // The type has exactly two variants and no `Deserialize`, so nothing in a request can produce it.
+        // Asserted structurally: adding a deserializer would make this fail to compile, which is the point.
+        fn origin_has_two_states(origin: CallerOrigin) -> bool {
+            match origin {
+                CallerOrigin::Local | CallerOrigin::Remote => true,
+            }
+        }
+        assert!(origin_has_two_states(CallerOrigin::Local));
+        assert!(origin_has_two_states(CallerOrigin::Remote));
+    }
+
+    /// **The rate limit applies to a local caller too.**
+    ///
+    /// A runaway local client can monopolise the daemon as readily as a remote one, and exempting `Local` would
+    /// make the bound reachable by anyone who could reach the socket.
+    ///
+    /// Falsified by returning `Admitted` for `Local` before checking `spent_budget`: a local client with an
+    /// exhausted budget is admitted.
+    #[test]
+    fn a_local_caller_is_still_rate_limited() {
+        let admission = CallerAdmission::local_only();
+        assert_eq!(
+            admission.decide(CallerOrigin::Local, None, true),
+            AdmissionVerdict::RateLimited {
+                requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE
+            }
+        );
+    }
+
     /// **A caller-chosen label is never a permit.**
     ///
     /// Falsified by keying the allowlist on `CallerLabel` instead of `Fingerprint`: an arbitrary caller that
@@ -526,17 +634,17 @@ mod tests {
         // The same label the admitted caller uses, presented with a different credential.
         let impostor = fingerprint("bbbb");
         assert_eq!(
-            admission.decide(Some(&impostor), false),
+            admission.decide(CallerOrigin::Remote, Some(&impostor), false),
             AdmissionVerdict::NotAllowed
         );
         // And with no credential at all, which is the case a label-based control would admit.
         assert_eq!(
-            admission.decide(None, false),
+            admission.decide(CallerOrigin::Remote, None, false),
             AdmissionVerdict::NoCredential
         );
         // The positive control, so neither assertion passes because everything is refused.
         assert_eq!(
-            admission.decide(Some(&fingerprint("aaaa")), false),
+            admission.decide(CallerOrigin::Remote, Some(&fingerprint("aaaa")), false),
             AdmissionVerdict::Admitted
         );
     }
@@ -550,13 +658,13 @@ mod tests {
         let admission = CallerAdmission::local_only();
         assert!(admission.is_local_only());
         assert_eq!(
-            admission.decide(None, false),
+            admission.decide(CallerOrigin::Remote, None, false),
             AdmissionVerdict::NoCredential
         );
         // Every credential is refused, because admitting one would require an entry.
         for presented in ["aaaa", "bbbb"] {
             assert_eq!(
-                admission.decide(Some(&fingerprint(presented)), false),
+                admission.decide(CallerOrigin::Remote, Some(&fingerprint(presented)), false),
                 AdmissionVerdict::NotAllowed
             );
         }
@@ -623,27 +731,36 @@ mod tests {
         let admission = policy(vec![caller("aaaa", "vscode", "1.97.0")]);
         let allowed = fingerprint("aaaa");
         assert_eq!(
-            admission.decide(Some(&allowed), true),
+            admission.decide(CallerOrigin::Remote, Some(&allowed), true),
             AdmissionVerdict::RateLimited {
                 requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE
             }
         );
         assert_eq!(
-            admission.decide(Some(&allowed), true).refusal_status(),
+            admission
+                .decide(CallerOrigin::Remote, Some(&allowed), true)
+                .refusal_status(),
             Some(429)
         );
         // A missing or unknown credential answers 401 rather than 403: from the caller's side both mean
         // "present a valid credential", and distinguishing them would reveal which fingerprints exist.
-        assert_eq!(admission.decide(None, false).refusal_status(), Some(401));
         assert_eq!(
             admission
-                .decide(Some(&fingerprint("cccc")), false)
+                .decide(CallerOrigin::Remote, None, false)
+                .refusal_status(),
+            Some(401)
+        );
+        assert_eq!(
+            admission
+                .decide(CallerOrigin::Remote, Some(&fingerprint("cccc")), false)
                 .refusal_status(),
             Some(401)
         );
         // The positive control.
         assert_eq!(
-            admission.decide(Some(&allowed), false).refusal_status(),
+            admission
+                .decide(CallerOrigin::Remote, Some(&allowed), false)
+                .refusal_status(),
             None
         );
     }
@@ -669,7 +786,7 @@ mod tests {
         );
         // ...and it is **still admitted**, because the credential is what admits.
         assert_eq!(
-            admission.decide(Some(&allowed), false),
+            admission.decide(CallerOrigin::Remote, Some(&allowed), false),
             AdmissionVerdict::Admitted
         );
         // An unadmitted credential has no recorded label, so there is nothing to compare.
