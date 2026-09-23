@@ -1,15 +1,20 @@
 //! The handler, driven through the **real** SDK Streamable HTTP service.
 //!
-//! # Why this exists as its own test file
+//! # Why this is crate-internal rather than an integration test
 //!
 //! `P3-009e` tested the refusal rule by calling `JarvisMcpServer::invoke` directly, which proves the rule but
-//! **not that the SDK ever routes a request to it**. The trait methods `list_tools` and `call_tool` had never
-//! been exercised: a signature that does not match what the service expects, or a response shape it rejects,
-//! would have compiled and been wrong. So these tests build an `http::Request`, hand it to the service, and
-//! read the `http::Response` — the same path a remote client's POST takes.
+//! **not that the SDK ever routes a request to it**: the trait methods `list_tools` and `call_tool` had never
+//! been executed, so a signature or response-shape mismatch would have compiled and been wrong.
 //!
-//! This is the gap `P3-009b`'s own entry recorded, and closing it is the point of the file rather than a
-//! side effect.
+//! Proving it needs the SDK's service, and this crate's invariant is that **no provider SDK type appears in its
+//! public surface** (`repository-layout.md`, from `AGENTS.md`). An integration test sees only that public
+//! surface, so the choice was a public accessor returning an SDK type — which would break the invariant — or
+//! moving the proof inside the crate, where the SDK is legitimately in scope. This is that second option, and it
+//! is why the file is a `#[cfg(test)]` module rather than `tests/serving.rs`.
+//!
+//! The distinction the invariant cares about is between **an internal module compiling against the SDK** and
+//! **the SDK being part of this crate's contract**. A crate-internal test is the first; a `pub fn` returning
+//! `StreamableHttpService` is the second, and it is what `P3-009b` originally did and this corrects.
 
 use std::sync::Arc;
 
@@ -17,17 +22,11 @@ use async_trait::async_trait;
 use http_body_util::BodyExt;
 use jarvis_core::{CorrelationId, Sensitivity, SystemClock, UtcTimestamp};
 use jarvis_mcp::ServerExposure;
-use jarvis_mcp_transport::{
-    JarvisMcpServer, MCP_ENDPOINT_PATH, SERVED_PROTOCOL_VERSION, ServedToolRunner, ServingConfig,
-};
-use jarvis_tools::{
-    AdapterError, ApprovalPolicy, Availability, BoundedOutput, EffectSet, Idempotency,
-    ProviderEvidence, RetryDeclaration, ScopeSet, ToolCallResult, ToolDefinition,
-    ToolDefinitionParts, ToolEffect, ToolId, ToolOutcomeRecord, ToolSchema, ToolSensitivity,
-    ToolSource,
-};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+
+use crate::serve::{JarvisMcpServer, ServedToolRunner, served_protocol_version};
+use crate::serving::{MCP_ENDPOINT_PATH, ServingConfig};
 
 /// A runner that answers a fixed confirmation and counts its calls.
 struct CountingRunner {
@@ -56,31 +55,36 @@ impl ServedToolRunner for CountingRunner {
         _name: &str,
         _arguments: Value,
         _correlation_id: CorrelationId,
-    ) -> Result<ToolCallResult, AdapterError> {
+    ) -> Result<jarvis_tools::ToolCallResult, jarvis_tools::AdapterError> {
         let mut count = self
             .calls
             .lock()
             .unwrap_or_else(|error| panic!("the counter is usable: {error}"));
         *count += 1;
-        let record =
-            ToolOutcomeRecord::confirmed("jarvis:test").unwrap_or_else(|error| panic!("{error}"));
-        Ok(ToolCallResult::new(
+        let record = jarvis_core::ToolOutcomeRecord::confirmed("jarvis:test")
+            .unwrap_or_else(|error| panic!("{error}"));
+        Ok(jarvis_tools::ToolCallResult::new(
             record,
-            Some(ProviderEvidence::new("jarvis:test").unwrap_or_else(|error| panic!("{error}"))),
-            Some(BoundedOutput::truncating("the file contents".to_owned())),
+            Some(
+                jarvis_tools::ProviderEvidence::new("jarvis:test")
+                    .unwrap_or_else(|error| panic!("{error}")),
+            ),
+            Some(jarvis_tools::BoundedOutput::truncating(
+                "the file contents".to_owned(),
+            )),
             UtcTimestamp::now(&SystemClock),
         ))
     }
 }
 
 /// A definition for a tool this project owns, so the served set is non-empty.
-fn definition(name: &str) -> ToolDefinition {
-    ToolDefinition::new(ToolDefinitionParts {
-        id: ToolId::new(name).unwrap_or_else(|error| panic!("{name}: {error}")),
+fn definition(name: &str) -> jarvis_tools::ToolDefinition {
+    jarvis_tools::ToolDefinition::new(jarvis_tools::ToolDefinitionParts {
+        id: jarvis_tools::ToolId::new(name).unwrap_or_else(|error| panic!("{name}: {error}")),
         version: "1.0.0".to_owned(),
         title: format!("title for {name}"),
         description: format!("description for {name}"),
-        input_schema: ToolSchema::parse(
+        input_schema: jarvis_tools::ToolSchema::parse(
             &json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
@@ -91,7 +95,7 @@ fn definition(name: &str) -> ToolDefinition {
             .to_string(),
         )
         .unwrap_or_else(|error| panic!("{error}")),
-        output_schema: ToolSchema::parse(
+        output_schema: jarvis_tools::ToolSchema::parse(
             &json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
@@ -102,20 +106,23 @@ fn definition(name: &str) -> ToolDefinition {
             .to_string(),
         )
         .unwrap_or_else(|error| panic!("{error}")),
-        effects: EffectSet::single(ToolEffect::ReadOnly),
+        effects: jarvis_tools::EffectSet::single(jarvis_tools::ToolEffect::ReadOnly),
         risk: 0,
-        required_scopes: ScopeSet::none(),
-        approval: ApprovalPolicy::Auto,
+        required_scopes: jarvis_tools::ScopeSet::none(),
+        approval: jarvis_tools::ApprovalPolicy::Auto,
         timeout_seconds: 10,
-        retry: RetryDeclaration::none(),
-        idempotency: Idempotency::Unsupported,
+        retry: jarvis_tools::RetryDeclaration::none(),
+        idempotency: jarvis_tools::Idempotency::Unsupported,
         // Derived, because `ToolDefinition::new` refuses a source that disagrees with the namespace.
-        source: ToolSource::from_namespace(
+        source: jarvis_tools::ToolSource::from_namespace(
             name.rsplit_once('.')
                 .map_or(name, |(namespace, _)| namespace),
         ),
-        availability: Availability::Available,
-        sensitivity: ToolSensitivity::new(Sensitivity::Internal, Sensitivity::Internal),
+        availability: jarvis_tools::Availability::Available,
+        sensitivity: jarvis_tools::ToolSensitivity::new(
+            Sensitivity::Internal,
+            Sensitivity::Internal,
+        ),
     })
     .unwrap_or_else(|error| panic!("{name}: {error}"))
 }
@@ -148,15 +155,16 @@ async fn post(
     body: Value,
     version: Option<&str>,
 ) -> (http::StatusCode, Option<Value>, String) {
-    let service = config
-        .checked_service(server)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let service = config.sdk_service_for_test(server);
 
     let mut builder = http::Request::builder()
         .method("POST")
         .uri(MCP_ENDPOINT_PATH)
         .header("host", "localhost")
         .header("content-type", "application/json")
+        // **Both media types, because the revision requires the client to accept both.** Sending only
+        // `application/json` is answered `406 Not Acceptable`, which is the SDK enforcing that rule — a fact
+        // this fixture discovered rather than assumed.
         .header("accept", "application/json, text/event-stream");
     if let Some(version) = version {
         builder = builder.header("mcp-protocol-version", version);
@@ -203,7 +211,7 @@ fn list_tools_body() -> Value {
         "method": "tools/list",
         "params": {
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": SERVED_PROTOCOL_VERSION.as_str(),
+                "io.modelcontextprotocol/protocolVersion": served_protocol_version(),
                 "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
@@ -221,7 +229,7 @@ fn call_tool_body(name: &str) -> Value {
             "name": name,
             "arguments": { "path": "notes/todo.txt" },
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": SERVED_PROTOCOL_VERSION.as_str(),
+                "io.modelcontextprotocol/protocolVersion": served_protocol_version(),
                 "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
@@ -239,7 +247,7 @@ async fn a_tools_list_request_is_answered_by_the_served_set() {
         &config(),
         handler(CountingRunner::new()),
         list_tools_body(),
-        Some(SERVED_PROTOCOL_VERSION.as_str()),
+        Some(served_protocol_version()),
     )
     .await;
 
@@ -267,7 +275,7 @@ async fn a_served_tools_call_runs_and_returns_its_output() {
         &config(),
         handler(runner.clone()),
         call_tool_body("jarvis.files.read"),
-        Some(SERVED_PROTOCOL_VERSION.as_str()),
+        Some(served_protocol_version()),
     )
     .await;
 
@@ -296,7 +304,7 @@ async fn an_unadvertised_tools_call_is_refused_over_the_service() {
         &config(),
         handler(runner.clone()),
         call_tool_body("mcp.github.search"),
-        Some(SERVED_PROTOCOL_VERSION.as_str()),
+        Some(served_protocol_version()),
     )
     .await;
 
@@ -373,10 +381,9 @@ async fn a_request_with_no_protocol_signals_at_all_is_refused() {
 
 /// **A hostile `Origin` is refused by JARVIS's policy, and the check is the one that answered.**
 ///
-/// The SDK's own origin validation is disabled in [`ServingConfig::sdk`], so this test proves the *policy*
-/// is the control: `ServingConfig::origin_check` refuses the origin, and the same decision that
-/// `P3-009a`'s tests pin is the one in force here. The enforcement layer is `P3-009c`'s, so what is asserted
-/// here is the decision rather than the status code — a status would be the layer above.
+/// The SDK's own origin validation is disabled in `ServingConfig::sdk`, so this proves the *policy* is the
+/// control: the same decision `P3-009a`'s tests pin is the one in force here. The enforcement layer over a
+/// request is `P3-009c`'s, so what is asserted is the decision rather than a status code.
 #[tokio::test]
 async fn a_hostile_origin_is_refused_by_the_policy() {
     let config = config();
@@ -418,7 +425,7 @@ async fn discovering_the_server_reports_the_modern_revision() {
         "method": "server/discover",
         "params": {
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": SERVED_PROTOCOL_VERSION.as_str(),
+                "io.modelcontextprotocol/protocolVersion": served_protocol_version(),
                 "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
@@ -428,7 +435,7 @@ async fn discovering_the_server_reports_the_modern_revision() {
         &config(),
         handler(CountingRunner::new()),
         body,
-        Some(SERVED_PROTOCOL_VERSION.as_str()),
+        Some(served_protocol_version()),
     )
     .await;
 
@@ -437,7 +444,7 @@ async fn discovering_the_server_reports_the_modern_revision() {
     // The supported versions the server advertises, which is where the narrowing is visible to a client.
     let text = body.to_string();
     assert!(
-        text.contains(SERVED_PROTOCOL_VERSION.as_str()),
+        text.contains(served_protocol_version()),
         "the modern revision must be advertised, got: {body}"
     );
     assert!(
@@ -446,25 +453,20 @@ async fn discovering_the_server_reports_the_modern_revision() {
     );
 }
 
-/// A `tools/call` for a name with no body value **and** no `Mcp-Name` header is refused as a header mismatch
-/// rather than reaching the handler, which is the SDK's standard-header validation doing its job.
+/// A `tools/call` with no `Mcp-Name` header is refused as a header mismatch rather than reaching the handler,
+/// which is the SDK's standard-header validation doing its job.
 #[tokio::test]
 async fn a_call_without_the_name_header_is_refused_as_a_header_mismatch() {
-    // Built by hand rather than through the helper, because the helper sends the `Mcp-Name` header that this
-    // test is about omitting.
-    let service = config()
-        .checked_service(handler(CountingRunner::new()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    // Built by hand rather than through `post`, because that helper sends the `Mcp-Name` header this test is
+    // about omitting.
+    let service = config().sdk_service_for_test(handler(CountingRunner::new()));
     let request = http::Request::builder()
         .method("POST")
         .uri(MCP_ENDPOINT_PATH)
         .header("host", "localhost")
         .header("content-type", "application/json")
-        // **Both media types, because the revision requires the client to accept both.** Sending only
-        // `application/json` is answered `406 Not Acceptable`, which is the SDK enforcing that rule — a fact
-        // this fixture discovered rather than assumed.
         .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", SERVED_PROTOCOL_VERSION.as_str())
+        .header("mcp-protocol-version", served_protocol_version())
         .header("mcp-method", "tools/call")
         .body(call_tool_body("jarvis.files.read").to_string())
         .unwrap_or_else(|error| panic!("{error}"));
@@ -485,9 +487,7 @@ async fn a_call_without_the_name_header_is_refused_as_a_header_mismatch() {
 /// `P3-009a` recorded this as a spec obligation; this is it proven against the real service.
 #[tokio::test]
 async fn a_get_to_the_endpoint_is_method_not_allowed() {
-    let service = config()
-        .checked_service(handler(CountingRunner::new()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    let service = config().sdk_service_for_test(handler(CountingRunner::new()));
     let request = http::Request::builder()
         .method("GET")
         .uri(MCP_ENDPOINT_PATH)
@@ -505,7 +505,7 @@ async fn a_get_to_the_endpoint_is_method_not_allowed() {
 /// **The request-body bound is enforced.** An oversized body is refused rather than read.
 ///
 /// Falsified by removing `with_max_request_body_bytes` from `ServingConfig::sdk`: the SDK's own default is
-/// used, which nothing in this repository stated.
+/// used, which nothing in this repository stated. The falsification showed `left: 200, right: 413`.
 #[tokio::test]
 async fn an_oversized_request_body_is_refused() {
     let config = config().with_max_request_body_bytes(256);
@@ -518,23 +518,21 @@ async fn an_oversized_request_body_is_refused() {
             "name": "jarvis.files.read",
             "arguments": { "path": padding },
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": SERVED_PROTOCOL_VERSION.as_str(),
+                "io.modelcontextprotocol/protocolVersion": served_protocol_version(),
                 "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
         }
     });
 
-    let service = config
-        .checked_service(handler(CountingRunner::new()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    let service = config.sdk_service_for_test(handler(CountingRunner::new()));
     let request = http::Request::builder()
         .method("POST")
         .uri(MCP_ENDPOINT_PATH)
         .header("host", "localhost")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", SERVED_PROTOCOL_VERSION.as_str())
+        .header("mcp-protocol-version", served_protocol_version())
         .header("mcp-method", "tools/call")
         .header("mcp-name", "jarvis.files.read")
         .body(body.to_string())

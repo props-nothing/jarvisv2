@@ -214,8 +214,15 @@ It does not own business decisions. Generate TypeScript clients from its publish
   scope and no peer standing. Adopting `rmcp` beside them would make a security reviewer read the rules
   through a third-party data model, and would make the rules untestable without it. The split also keeps
   the SDK replaceable: if the transport is reimplemented against the wire, no naming, posture, or
-  conformance rule moves. No provider SDK type appears in this crate's public surface either — `AGENTS.md`
-  forbids SDK types crossing a JARVIS boundary, and an error type is a boundary. `build_catalog` is the
+  conformance rule moves. **No provider SDK type appears in this crate's public surface, with one recorded
+exception** — `AGENTS.md` forbids SDK types crossing a JARVIS boundary, and an error type is a boundary. The
+exception is `connect_over`, whose signature names `IntoTransport` and `RoleClient` because the negotiation
+tests drive the real SDK over an in-process duplex pair, and `P3-007` recorded that a fixture sharing the
+code's assumptions cannot find a revision defect. **Writing the boundary test is what revealed this**: the
+claim was already false before `P3-008b`, so the sentence now names the exception and
+`boundary_tests.rs` pins the list — a new name fails the test, and removing the exception is a change a
+reader must make deliberately. The clean end state is an off-by-default feature gating that visibility, so
+the shipped surface is SDK-free; it is recorded as a follow-up rather than half-built. `build_catalog` is the
   **join** between the two halves: it reads a live connection's identity and tool list and aggregates them
   into one `McpCatalog`, because the catalog's inputs can be constructed by hand and so a catalog test
   alone proves nothing about whether a listing that *arrived over a wire* becomes a definition with the

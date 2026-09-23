@@ -52,3 +52,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0032](0032-a-transitive-tool-is-not-re-exposed.md) | A transitive tool is not re-exposed, and exposure is not the catalog | Accepted |
 | [0033](0033-filtering-a-list-is-not-authorization.md) | Filtering a list is not authorization | Accepted |
 | [0034](0034-a-delegated-check-that-cannot-express-the-rule.md) | A delegated check that cannot express the rule is not a control | Accepted |
+| [0035](0035-a-documented-invariant-with-no-test-is-a-convention.md) | A documented invariant with no test is a convention | Accepted |

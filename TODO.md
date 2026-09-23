@@ -1386,6 +1386,46 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       a real request is `P3-009c`'s** (the decision is here, the layer owning the request is there). No daemon
       wiring, no per-client allowlist, no rate limiting. The `server` feature's five packages are recorded in
       `docs/research/integrations/mcp.md` with the measurement that admitted them.
+- [x] `P3-009f` Enforce the SDK-boundary invariant, and remove the leak `P3-009b` added.
+      **Written because reviewing `P3-009b` against `repository-layout.md` found that its public `sdk()` and
+      `service()` returned SDK types, which the docs had explicitly forbidden.** New code:
+      `crates/jarvis-mcp-transport/src/boundary_tests.rs` (5 tests) and `src/serving_transport_tests.rs`, which
+      is the SDK-facing transport proof moved **inside** the crate. **947 workspace tests, 40 suites**. ADR-0035.
+      **A documented invariant with no test is a convention, and this one had been wrong for two phases.**
+      `connect_over` (`P3-008e`) is public with `rmcp::transport::IntoTransport` and `rmcp::RoleClient` in its
+      signature, and `revision.rs` exposes three functions returning or taking `ProtocolVersion`. So the
+      sentence "no provider SDK type appears in this crate's public surface" was **not merely violated by
+      `P3-009b` — it had been false since `P3-008e`**, and every reader in between was misled in the reassuring
+      direction: someone asking "does an SDK type cross this boundary?" would have concluded no.
+      **The first version of the test did not catch the violation it was written for, and falsifying found it.**
+      It searched for the literal crate name `rmcp`, which finds a *fully-qualified* path and misses an
+      *imported* name — so `pub fn sdk(&self) -> StreamableHttpServerConfig` was reported clean, and restoring
+      that signature left the test green. The scan now collects the names a file imports from the SDK and checks
+      both forms, with unit tests for each: a public declaration naming the SDK in either form must be reported,
+      and a private one must not.
+      **The justified exposures are an exception list with reasons, and a companion test keeps it honest** —
+      each entry must still match a real declaration, so a rename or removal fails and deleting an exception is
+      a deliberate act. `connect_over` is a documented test seam; the three revision helpers exist to make the
+      `LATEST = V_2025_11_25` trap executable, and `describe_negotiated` takes the SDK's type deliberately so a
+      caller cannot pass a bare string that disagrees with what was negotiated.
+      **`P3-009b`'s own leak was removed rather than recorded.** `sdk()` and `service()` are private;
+      `tool_list`/`invoke` are `pub(crate)` because their return types are the SDK's `Tool` and `CallToolResult`,
+      with `serves()` as the public `bool` statement of the same rule; `served_protocol_version()` returns the
+      **wire string** rather than `ProtocolVersion`. Four dead items went with it (`bounded_reason`,
+      `method_not_found_code`, `SdkSurfacePosture`, and a `ServedEndpoint` wrapper that existed **only** to reach
+      an SDK type publicly — so removing the leak removed its reason to exist).
+      **The SDK-facing transport proof moved in-crate** to `src/serving_transport_tests.rs`, because an
+      integration test sees only the public surface and the accessor it needed would have been the violation. A
+      crate-internal module compiling against the SDK is not the same as the SDK being part of this crate's
+      contract, and only the second is what the invariant forbids.
+      **The one not-yet-consumed configuration carries `#[cfg_attr(not(test), expect(dead_code, ..))]`**, because
+      `sdk`/`service` are reached only from tests while nothing binds. An `expect` fails once the lint stops
+      firing, so the binding slice must delete it; the scoping is needed because the claim is true in only one
+      configuration, and an unconditional `expect` is unfulfilled in a test build.
+      **Honest limits.** `connect_over`'s visibility should move behind an off-by-default feature so the
+      **shipped** surface is SDK-free; that is recorded as a follow-up rather than half-built. The four recorded
+      exceptions remain, with their reasons and their guard test. Nothing is bound, so `ServingConfig` is still
+      reachable from a test and not from a client (`P3-009c`).
 - [ ] `P3-009c` Add the per-client allowlist and rate limits, and enforce the `Origin` decision over a real HTTP request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.

@@ -44,13 +44,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use jarvis_core::{CorrelationId, SafeMessage};
+use jarvis_core::CorrelationId;
 use jarvis_mcp::ServedTool;
 use jarvis_tools::{AdapterError, ToolCallResult, ToolOutcome};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
-    Implementation, ListToolsResult, ProtocolVersion, ServerCapabilities, ServerConfig,
-    TextContent, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, ProtocolVersion, ServerCapabilities, ServerConfig, TextContent, Tool,
 };
 use rmcp::service::{MaybeSendFuture, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -61,7 +60,21 @@ use serde_json::Value;
 /// Named explicitly rather than taken from the SDK, because `ProtocolVersion::LATEST` is `V_2025_11_25` —
 /// the legacy handshake era — so a default would advertise the wrong revision. This is the same fact
 /// `P3-008e` recorded for the client side, now with a second consequence.
-pub const SERVED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+///
+/// **Private**, because `ProtocolVersion` is an SDK type and a `pub const` of that type would put it in this
+/// crate's public surface. [`served_protocol_version`] is the public door, and it returns the wire string,
+/// which is JARVIS's own vocabulary for the same fact.
+const SERVED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// Returns the protocol revision this server speaks, as its wire string.
+///
+/// The string rather than the SDK's type, so this crate's public surface names no SDK type. `"2026-07-28"` is
+/// what a client sends and what this server compares against, so it is the form a caller outside this crate
+/// needs — the SDK's newtype adds nothing but a dependency at the boundary.
+#[must_use]
+pub fn served_protocol_version() -> &'static str {
+    SERVED_PROTOCOL_VERSION.as_str()
+}
 
 /// The server name as a remote client sees it.
 ///
@@ -158,9 +171,24 @@ impl JarvisMcpServer {
         self.served.iter().any(|served| served.name() == name)
     }
 
-    /// Builds the tool list a remote client sees.
+    /// Returns whether this server advertises **nothing**.
+    ///
+    /// Offered so a layer deciding whether to offer the endpoint asks the handler rather than scanning
+    /// `served_names`, and so the emptiness check has one home. An endpoint that advertises nothing is a
+    /// server a client cannot use.
     #[must_use]
-    pub fn tool_list(&self) -> Vec<Tool> {
+    pub fn is_empty(&self) -> bool {
+        self.served.is_empty()
+    }
+
+    /// Builds the tool list a remote client sees.
+    ///
+    /// **`pub(crate)` because `Tool` is an SDK type and this is not a surface a caller outside this crate
+    /// needs**: the trait impl below is what answers `tools/list`, and the daemon reaches this through the SDK
+    /// service rather than by calling it. A public `Vec<Tool>` would put the SDK's tool type in this crate's
+    /// contract, which is the invariant `boundary_tests.rs` enforces.
+    #[must_use]
+    pub(crate) fn tool_list(&self) -> Vec<Tool> {
         self.served
             .iter()
             .map(|served| {
@@ -196,10 +224,14 @@ impl JarvisMcpServer {
     /// This is the method the security property lives in, and it is public so it can be tested without
     /// constructing an SDK request context — the trait impl below is a thin delegation.
     ///
+    /// **`pub(crate)`**, because its return type is the SDK's `CallToolResult` and this crate's public surface
+    /// may not name an SDK type. The trait impl below is what a client reaches; [`Self::serves`] is the public
+    /// statement of the same rule, so a caller outside the crate can ask the question without the wire answer.
+    ///
     /// A name that is not served, or absent, is refused with the same answer so a caller cannot use the
     /// difference to enumerate what exists. An unserved name is indistinguishable from a tool that does
     /// not exist, which is the honest answer: this server does not have it.
-    pub async fn invoke(
+    pub(crate) async fn invoke(
         &self,
         name: Option<&str>,
         arguments: Option<serde_json::Map<String, Value>>,
@@ -241,6 +273,10 @@ fn refusal(message: &str) -> CallToolResult {
 
 /// Converts an established JARVIS outcome into the protocol's answer.
 ///
+/// **`pub(crate)`**: the return type is the SDK's `CallToolResult`, so this is an internal conversion rather
+/// than a boundary this crate offers. The outcome table below is the reasoning, and a caller outside the crate
+/// reasons about `ToolOutcome` itself rather than about the wire form.
+///
 /// # The table, and why each row is the way it is
 ///
 /// | Outcome | Reported as | Why |
@@ -255,7 +291,7 @@ fn refusal(message: &str) -> CallToolResult {
 /// success-or-error, so an unprovable outcome has to travel in the text rather than in a third state that
 /// does not exist. A caller that reads the message knows not to assume either way.
 #[must_use]
-pub fn call_result(result: &ToolCallResult) -> CallToolResult {
+pub(crate) fn call_result(result: &ToolCallResult) -> CallToolResult {
     let outcome = result.outcome();
     let detail = |fallback: &str| -> String {
         result
@@ -341,27 +377,6 @@ impl ServerHandler for JarvisMcpServer {
             .await;
         Ok(CallToolResponse::Complete(result))
     }
-}
-
-/// Bounds a message for the wire.
-///
-/// Provided so a caller can apply the same bound `SafeMessage` enforces internally without importing
-/// `jarvis_core` for one function. Returns `None` when the text cannot be a safe message at all, which a
-/// caller reports as a generic refusal rather than echoing.
-#[must_use]
-pub fn bounded_reason(text: &str) -> Option<String> {
-    SafeMessage::new(text)
-        .ok()
-        .map(|message| message.as_str().to_owned())
-}
-
-/// The error code a refusal travels under.
-///
-/// Named here rather than spelled at a call site, because a refused tool call is a **result** and this is
-/// reserved for the one case that is genuinely a protocol error: a method this server does not implement.
-#[must_use]
-pub const fn method_not_found_code() -> ErrorCode {
-    ErrorCode::METHOD_NOT_FOUND
 }
 
 #[cfg(test)]

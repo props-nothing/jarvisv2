@@ -55,6 +55,9 @@
 //! written for an MCP call (`P3-012`).
 
 mod adapter;
+#[cfg(test)]
+#[path = "boundary_tests.rs"]
+mod boundary_tests;
 mod client;
 mod endpoint;
 mod error;
@@ -76,8 +79,7 @@ pub use host_config::{
     HostConfigError, HostError, MAX_HOST_CONFIG_BYTES, McpHost, McpHostConfig, ServerTransport,
 };
 pub use serve::{
-    JarvisMcpServer, SERVED_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, ServedToolRunner,
-    bounded_reason, call_result, method_not_found_code,
+    JarvisMcpServer, SERVER_NAME, SERVER_VERSION, ServedToolRunner, served_protocol_version,
 };
 pub use serving::{
     MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT_PATH, ServiceError, ServingConfig, ServingConfigError,

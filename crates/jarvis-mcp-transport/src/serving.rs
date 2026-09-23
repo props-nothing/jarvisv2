@@ -47,6 +47,9 @@ use rmcp::transport::streamable_http_server::tower::{
 use crate::serve::JarvisMcpServer;
 use jarvis_mcp::{OriginVerdict, ServerExposure};
 
+/// The SDK's Streamable HTTP service, named once and **privately**.
+type SdkService = StreamableHttpService<JarvisMcpServer, NeverSessionManager>;
+
 /// The most bytes one request body may carry.
 ///
 /// A tool call's arguments are a JSON object that must satisfy the tool's input schema, and the largest
@@ -162,6 +165,19 @@ impl ServingConfig {
 
     /// Returns the SDK's server configuration, with every permissive default replaced by a stated value.
     ///
+    /// # Why this is **not** public
+    ///
+    /// A `StreamableHttpServerConfig` is an SDK type, and this crate's documented invariant is that **no
+    /// provider SDK type appears in its public surface** (`repository-layout.md`, from `AGENTS.md`'s "provider
+    /// SDK types must not cross JARVIS domain boundaries"). Returning it from a public function would make the
+    /// SDK part of this crate's contract, so a reader of the daemon could not tell which types are JARVIS's and
+    /// which are a dependency's.
+    ///
+    /// This was **wrong when first written and is corrected here**: `P3-009b` made it, `sdk()`, and
+    /// `service()` public, and a review against the invariant found them. Nothing outside this module needs the
+    /// SDK value — the daemon needs an endpoint and the decisions a layer must enforce, and
+    /// [`Self::checked_service`] wraps it into something bindable without naming the type.
+    ///
     /// # The origin fields are disabled deliberately
     ///
     /// `disable_allowed_origins` is called **because the check is JARVIS's**, not because origins go
@@ -169,7 +185,14 @@ impl ServingConfig {
     /// portless entry — and a permissive second answer is worse than none, because a reader would believe the
     /// permissive field was the control.
     #[must_use]
-    pub fn sdk(&self) -> StreamableHttpServerConfig {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no binding yet: the transport proof calls this, a bound endpoint will too"
+        )
+    )]
+    fn sdk(&self) -> StreamableHttpServerConfig {
         StreamableHttpServerConfig::default()
             // The session the revision removed. `NeverSessionManager` refuses `create_session`, so even a
             // legacy `initialize` cannot mint one.
@@ -190,36 +213,61 @@ impl ServingConfig {
 
     /// Builds the SDK's Streamable HTTP service over a handler factory.
     ///
+    /// Private for the same reason as [`Self::sdk`]: the return type names an SDK service and an SDK session
+    /// manager. The SDK-typed service is reached only from this crate's own transport tests, through
+    /// [`Self::sdk_service_for_test`].
+    ///
     /// The factory is called per request by the SDK, so a handler is constructed fresh rather than shared;
-    /// `JarvisMcpServer` holds an `Arc` runner, so the cost is a clone of the served list. A session manager
-    /// of `NeverSessionManager` is supplied because the revision has no sessions, and using the SDK's default
-    /// (`LocalSessionManager`) would store state for a protocol that removed it.
+    /// `JarvisMcpServer` holds an `Arc` runner, so the cost is a clone of the served list. `NeverSessionManager`
+    /// is supplied because the revision has no sessions, and the SDK's default (`LocalSessionManager`) would
+    /// store state for a protocol that removed it.
     #[must_use]
-    pub fn service(
-        &self,
-        server: JarvisMcpServer,
-    ) -> StreamableHttpService<JarvisMcpServer, NeverSessionManager> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no binding yet: the transport proof calls this, a bound endpoint will too"
+        )
+    )]
+    fn service(&self, server: JarvisMcpServer) -> SdkService {
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(NeverSessionManager::default()),
             self.sdk(),
         )
     }
+
+    /// Builds the SDK service, for a test that drives the **real** transport.
+    ///
+    /// `#[cfg(test)]` because nothing in the product calls it. A daemon binding this endpoint lives in
+    /// `apps/jarvisd`, which cannot see a private item of this crate — so the daemon wiring (which owns network
+    /// listeners per `repository-layout.md`) will need an SDK-typed accessor through an **off-by-default
+    /// feature**, and that is deliberately **not built here**. The reason is the same invariant as
+    /// [`Self::sdk`]: a public function returning an SDK type would put the SDK in this crate's contract, and
+    /// the right time to add an escape hatch is when a caller exists that needs it.
+    ///
+    /// **Not public, and not a `pub(crate)` escape hatch either** — a crate-internal door would be reachable
+    /// from this crate's own integration tests but would still be an SDK-typed function inside the crate that
+    /// claims none, so the invariant would be kept only in letter.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn sdk_service_for_test(&self, server: JarvisMcpServer) -> SdkService {
+        self.service(server)
+    }
 }
 
-/// Explains why a served handler could not be wrapped in the SDK's service.
+/// Explains why a served surface cannot be offered.
 ///
-/// Exists so the daemon can report a wiring failure as a named condition rather than a formatted SDK string,
-/// which is the rule `McpHttpEndpoint` already applies to an endpoint error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A JARVIS-owned condition rather than an SDK error, so a daemon can report it without naming an SDK type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceError {
     /// The handler's served set was empty.
     ///
-    /// An endpoint that advertises nothing is a server that cannot be used, and `jarvis_mcp::served_tools`
-    /// already refuses to produce one — so this can only arise from a caller constructing a handler directly
-    /// with an empty list. Reported rather than served, because a client would otherwise connect
-    /// successfully to a server offering nothing and have no way to tell a misconfiguration from an empty
-    /// registry.
+    /// `jarvis_mcp::served_tools` already refuses to produce an empty surface, so reaching this from the real
+    /// composition path is impossible — the check exists because `JarvisMcpServer::new` accepts any vector, and
+    /// a handler built by hand is the case it guards. A client connecting successfully to a server offering
+    /// nothing cannot tell a misconfiguration from an empty registry, which is why the condition is named
+    /// rather than served.
     NoToolsAdvertised,
 }
 
@@ -237,22 +285,27 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
+/// Explains why a served surface cannot be offered, when a caller asks.
+///
+/// The check lives on [`ServingConfig`] rather than being repeated by every layer that wraps a handler, so
+/// there is **one** place a daemon consults.
 impl ServingConfig {
-    /// Builds the service, refusing an endpoint that would advertise nothing.
+    /// Returns whether a handler may be offered to a client.
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError::NoToolsAdvertised`] when the handler's served set is empty.
-    pub fn checked_service(
-        &self,
-        server: JarvisMcpServer,
-    ) -> Result<StreamableHttpService<JarvisMcpServer, NeverSessionManager>, ServiceError> {
-        if server.served_names().is_empty() {
+    /// Returns [`ServiceError::NoToolsAdvertised`] when the served set is empty.
+    pub fn check_servable(server: &JarvisMcpServer) -> Result<(), ServiceError> {
+        if server.is_empty() {
             return Err(ServiceError::NoToolsAdvertised);
         }
-        Ok(self.service(server))
+        Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "serving_transport_tests.rs"]
+mod transport_tests;
 
 #[cfg(test)]
 mod tests {
@@ -512,24 +565,19 @@ mod tests {
         assert_eq!(config.sdk().max_request_body_bytes, 1024);
     }
 
-    /// An endpoint that would advertise nothing is refused rather than bound.
+    /// An endpoint that would advertise nothing is refused rather than offered.
     ///
-    /// Falsified by removing the check: the service is built, and a client connects successfully to a server
-    /// offering no tools — unable to tell a misconfiguration from an empty registry.
+    /// Falsified by removing the check: a client connects successfully to a server offering no tools — unable to
+    /// tell a misconfiguration from an empty registry.
     #[test]
     fn an_endpoint_with_no_tools_is_refused() {
-        let config = ServingConfig::loopback_only();
         let empty = JarvisMcpServer::new(Vec::new(), RecordingRunner::new());
         assert_eq!(
-            config.checked_service(empty).err(),
+            ServingConfig::check_servable(&empty).err(),
             Some(ServiceError::NoToolsAdvertised)
         );
-        // The positive control, so this is not passing because every service is refused.
-        assert!(
-            config
-                .checked_service(served_tool("jarvis.files.read"))
-                .is_ok()
-        );
+        // The positive control, so this is not passing because every handler is refused.
+        assert!(ServingConfig::check_servable(&served_tool("jarvis.files.read")).is_ok());
     }
 
     /// A clone of the handler serves the same set, because the SDK's factory clones one per request.
