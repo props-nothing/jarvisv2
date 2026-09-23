@@ -2,9 +2,11 @@
 
 mod build_info;
 mod control;
+mod dispatch;
 mod executor;
 mod gateway;
 mod health;
+mod mcp_host;
 mod run_service;
 mod singleton;
 mod sse;
@@ -183,6 +185,13 @@ struct Running {
     /// The composed tool pipeline, resolved at start for the same reason: an unusable workspace
     /// grant must fail the daemon rather than the first tool call.
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+    /// The connected MCP host, held so its connections stay open and can be closed on shutdown.
+    ///
+    /// Held **beside** the pipeline rather than inside it because the two have different lifetimes: the
+    /// pipeline's adapters are handed over permanently, while the host owns the connections those adapters
+    /// share and must be shut down after the pipeline stops being used. Dropping the host while the pipeline
+    /// still held an adapter would leave a call reaching a connection nobody was closing.
+    mcp: Option<crate::mcp_host::ComposedHost>,
     daemon_id: DaemonRunId,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
@@ -339,9 +348,12 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         None => None,
     };
 
-    // The tool pipeline is composed HERE, for the same reason the executor is: an unusable workspace
-    // grant must stop the daemon at startup rather than be discovered by the first tool call.
-    let tools = compose_tool_pipeline(loaded_config.config(), Arc::clone(&database))?;
+    // The tool pipeline and MCP host are composed HERE, for the same reason the executor is: an unusable
+    // workspace grant must stop the daemon at startup rather than be discovered by the first tool call.
+    // Extracted into its own function because composing them carries its own failure policy — an MCP failure
+    // is not fatal while a pipeline failure is — and `start` was at the length where clippy's `too_many_lines`
+    // is a signal that a function has grown a second responsibility.
+    let (mcp, tools) = compose_tools(loaded_config.config(), &paths, Arc::clone(&database)).await?;
 
     Ok(Running {
         health,
@@ -351,11 +363,89 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         database,
         credential,
         http_port,
+        mcp,
         executor,
         tools,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
+}
+
+/// Composes the MCP host and then the tool pipeline, in that order.
+///
+/// The order is forced: the pipeline registers the host's adapters, so the host must exist first.
+///
+/// **The two failures have opposite policies, deliberately.** An MCP failure is **not** fatal — a third-party
+/// server that is missing, hung, or colliding is a reason for those tools to be unavailable, not a reason for
+/// the daemon to refuse to serve anything, which is the same reasoning that makes one failed `tools/list` an
+/// exclusion rather than a failed run. Each failure is logged so the absence is visible rather than silent.
+/// A pipeline failure **is** fatal, because it covers the filesystem grant and the registry: an unusable
+/// grant or a colliding tool name is a configuration fault an operator must fix, and starting anyway would
+/// serve a tool set nobody declared.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::ToolWorkspaceRoots`] or [`DaemonError::ToolPipeline`] for an unusable grant or a
+/// rejected registration.
+async fn compose_tools(
+    config: &jarvis_storage::Config,
+    paths: &AppPaths,
+    database: Arc<SqliteDatabase>,
+) -> Result<
+    (
+        Option<crate::mcp_host::ComposedHost>,
+        Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+    ),
+    DaemonError,
+> {
+    let mcp = match crate::mcp_host::load_document(paths.config()) {
+        Ok(document) => match crate::mcp_host::compose_host(document.as_deref()).await {
+            Ok(host) => host,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the configured MCP servers are unavailable; their tools will not be offered"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "the MCP server configuration could not be read; its tools will not be offered"
+            );
+            None
+        }
+    };
+    if let Some(host) = &mcp {
+        // Logged with the counts, so an operator learns how many servers answered rather than only that
+        // something did. The servers that did *not* answer are named in the warn above when the whole host
+        // fails, and are available from `unreadable()` for a caller that reports them.
+        tracing::info!(
+            reachable = host.reachable_servers(),
+            tools = host.definitions().len(),
+            unreadable = host.unreadable().len(),
+            "composed the MCP host"
+        );
+    }
+
+    // The pipeline takes the adapters by value, so they are cloned out of the host. Each clone shares the
+    // host's connection through the adapter's own `Arc`, which is why the host can still close them.
+    let additional: Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )> = mcp
+        .as_ref()
+        .map(|host| {
+            host.adapters
+                .iter()
+                .map(|(definitions, adapter)| (definitions.clone(), Arc::clone(adapter)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tools = compose_tool_pipeline(config, database, additional)?;
+    Ok((mcp, tools))
 }
 
 /// Composes the tool pipeline from the configured workspace roots, or `None` when none are granted.
@@ -376,16 +466,32 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
 fn compose_tool_pipeline(
     config: &jarvis_storage::Config,
     database: Arc<SqliteDatabase>,
+    additional: Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
 ) -> Result<Option<Arc<crate::tool_pipeline::ToolPipeline>>, DaemonError> {
+    // **No filesystem roots and no additional adapters means no pipeline**, not an empty one. Registering
+    // the filesystem adapter over zero roots would let the daemon advertise a tool that fails every call,
+    // which reads to a caller as a broken tool rather than an absent capability. A pipeline is warranted as
+    // soon as *something* can run.
+    //
+    // `None` rather than an empty `WorkspaceRoots` for a daemon with no roots: that type **refuses an empty
+    // list** (`RootError::NoRoots`), deliberately, so a tool cannot silently read nothing while looking like
+    // a tool that works. The pipeline therefore registers the filesystem adapter only when a grant exists.
     let roots = match config.daemon().tool_workspace_roots() {
-        [] => return Ok(None),
-        roots => jarvis_tools::WorkspaceRoots::new(roots.iter())
-            .map_err(|source| DaemonError::ToolWorkspaceRoots { source })?,
+        [] if additional.is_empty() => return Ok(None),
+        [] => None,
+        roots => Some(
+            jarvis_tools::WorkspaceRoots::new(roots.iter())
+                .map_err(|source| DaemonError::ToolWorkspaceRoots { source })?,
+        ),
     };
-    let pipeline = crate::tool_pipeline::ToolPipeline::new(
+    let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
         database,
         roots,
         jarvis_tools::WorkspacePolicy::default(),
+        additional,
     )
     .map_err(|source| DaemonError::ToolPipeline { source })?;
     Ok(Some(Arc::new(pipeline)))
@@ -541,6 +647,7 @@ where
         http_port,
         executor,
         tools,
+        mcp,
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
@@ -593,6 +700,17 @@ where
 
     let shutdown_result = outcome.shutdown;
     let accept_failure = outcome.accept_failure;
+
+    // The MCP connections are closed **explicitly**, before the database, so a child process is stopped
+    // deliberately rather than left to its drop guard. The SDK's handle carries a cancellation guard, so a
+    // failure here still cancels — which is why a shutdown failure is logged rather than fatal: the daemon is
+    // exiting, and which servers did not stop cleanly is the useful part.
+    if let Some(mcp) = mcp
+        && let Err(failures) = mcp.close().await
+    {
+        tracing::warn!(?failures, "some MCP connections did not stop cleanly");
+    }
+
     health.begin_shutdown()?;
     let stop_reason = if shutdown_result.is_ok() && accept_failure.is_none() {
         DaemonStopReason::Signal

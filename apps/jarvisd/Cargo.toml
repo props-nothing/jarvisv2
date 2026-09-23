@@ -18,6 +18,12 @@ jarvis-core.workspace = true
 # arrow from application into an adapter, so the provider port is reached here where the
 # routing already lives.
 jarvis-models.workspace = true
+# The MCP host is composed here for the same reason the tool pipeline is: `repository-layout.md` has no
+# arrow from `jarvis-application` into an adapter crate, so a binary is the only place a third-party
+# server's tools can be joined to the canonical registry. This is the dependency that makes an MCP
+# server reachable by an **operator** rather than only by a test — the limit `P3-008a`..`P3-008i` each
+# recorded.
+jarvis-mcp-transport.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
 jarvis-storage.workspace = true
@@ -41,6 +47,14 @@ tracing.workspace = true
 # authentication and routing are tested as a real `tower` service rather than by calling the
 # handlers directly, which would bypass the layers the tests exist to falsify.
 tower.workspace = true
+# `ToolExecutor` is an async trait, so the test double in `dispatch` needs the same macro the trait is
+# declared with. A dev-dependency rather than a normal one: the daemon itself implements no executor.
+async-trait.workspace = true
+# The routing test builds an MCP definition the way the catalog does, which needs the translation types. A
+# dev-dependency because the daemon **never names an MCP type in production** — it composes the transport's
+# adapters and holds them as `dyn ToolExecutor`, so a normal dependency here would be one with no production
+# consumer.
+jarvis-mcp.workspace = true
 
 [lints]
 workspace = true

@@ -72,6 +72,12 @@ use crate::error::CallError;
 /// Holds a live connection rather than a way to open one, because opening is the host's decision and a
 /// server is a child process or a network endpoint whose lifecycle the host owns. One adapter therefore
 /// serves one server's tools, which is also what makes the evidence locator unambiguous.
+///
+/// `Clone` because it holds an `Arc<McpConnection>` and a routing map: a clone shares the same connection and
+/// the same routes, which is what lets the host keep a handle for shutdown while the pipeline owns one for
+/// dispatch. Two adapters built from one server would be two connections, which is the thing `HostedServer`
+/// holds an `Arc` to prevent.
+#[derive(Clone)]
 pub struct McpToolAdapter {
     server: String,
     connection: Arc<McpConnection>,

@@ -138,6 +138,222 @@ async fn pipeline_with(
     (directory, database, pipeline)
 }
 
+/// A pipeline over granted filesystem roots **and** an additional adapter.
+///
+/// # Why the filesystem adapter must be present for this to prove routing
+///
+/// The first version of the routing test built a pipeline with the MCP adapter as the **only** one, and the
+/// falsification run is what showed the test proved nothing: replacing the dispatch lookup with "return any
+/// adapter" left it green, because a table with one entry finds the right adapter however it is looked up. A
+/// routing test needs **at least two** candidates, or it cannot tell a correct lookup from an arbitrary one.
+///
+/// The roots are a real granted directory, so the filesystem adapter is registered and its two tools are in
+/// the table alongside the MCP tool. A call to the MCP identifier that reached the filesystem adapter would be
+/// an `AdapterError::NotImplemented` — or, worse, a read of whatever path the arguments named.
+async fn pipeline_with_extra(
+    roots: WorkspaceRoots,
+    definitions: Vec<jarvis_tools::ToolDefinition>,
+    adapter: Arc<dyn jarvis_tools::ToolExecutor>,
+) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline) {
+    let (directory, database) = database_with_run().await;
+    let pipeline = must(ToolPipeline::with_adapters(
+        Arc::clone(&database),
+        Some(roots),
+        WorkspacePolicy::default(),
+        vec![(definitions, adapter)],
+    ));
+    (directory, database, pipeline)
+}
+
+/// An adapter that records what it was asked to run and answers with a fixed confirmation.
+///
+/// A **recording** adapter rather than a scripted one, because the property under test is *routing*: which
+/// adapter ran, and with which arguments. An adapter that returned a fixed outcome either way would satisfy
+/// every result-shaped assertion, which is the same reasoning `ScriptedModel::seen_messages` follows for the
+/// conversation tests.
+#[derive(Default)]
+struct RecordingAdapter {
+    seen: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+#[async_trait::async_trait]
+impl jarvis_tools::ToolExecutor for RecordingAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "mcp-test"
+    }
+
+    async fn execute(
+        &self,
+        request: &jarvis_tools::ToolExecutionRequest,
+    ) -> Result<jarvis_tools::ToolCallResult, jarvis_tools::AdapterError> {
+        if let Ok(mut guard) = self.seen.lock() {
+            guard.push((request.tool().to_string(), request.arguments().clone()));
+        }
+        let record = must(ToolOutcomeRecord::confirmed("mcp:test/search"));
+        Ok(jarvis_tools::ToolCallResult::new(
+            record,
+            jarvis_tools::ProviderEvidence::new("mcp:test/search").ok(),
+            Some(jarvis_tools::BoundedOutput::truncating("found it")),
+            UtcTimestamp::now(&SystemClock),
+        ))
+    }
+}
+
+/// **The seam this slice adds: a call reaches the adapter that owns its definition, not another one.**
+///
+/// The pipeline held exactly one adapter before this slice, so dispatch was not a question it could get
+/// wrong. With two, a call to an MCP tool that reached the filesystem adapter would be an
+/// `AdapterError::NotImplemented` — or, worse, a read of whatever path the arguments happened to name.
+///
+/// **The falsification run is what made this test meaningful.** The first version registered the MCP adapter
+/// as the *only* one, and replacing the dispatch lookup with "return any adapter" left the whole suite green:
+/// a one-entry table finds the right adapter however it is looked up. Two candidates are therefore required,
+/// and the test asserts the *other* adapter did not run.
+#[tokio::test]
+async fn a_call_reaches_the_adapter_that_owns_its_definition() {
+    // A real granted root, so the filesystem adapter is registered and its two tools share the table with the
+    // MCP one. A file is written as well, so a misroute that happened to parse its arguments would find
+    // something to read rather than failing for a missing file — making "it did not run" an observation about
+    // routing rather than about the fixture.
+    let directory = TempRoot::new();
+    directory.write("notes/todo.txt", "buy milk");
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+
+    let definition = mcp_definition("mcp.test.search", "search");
+    let adapter = Arc::new(RecordingAdapter::default());
+    let (_directory, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![definition.clone()],
+        Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    // Three tools are dispatchable: the filesystem adapter's two and the MCP one. Asserted so a table that
+    // registered only one cannot make the routing assertion below vacuous — which is exactly how the first
+    // version of this test passed a falsification it should have failed.
+    assert_eq!(
+        pipeline.dispatchable_tools(),
+        3,
+        "the filesystem adapter's two tools and the additional one must all be dispatchable"
+    );
+
+    let arguments = json!({ "q": "pumps" });
+    // The correlation id is bound to a `let` because **the call id IS the correlation id** (`P3-006d`), so
+    // reading the stored row back needs the same value. The first version of this test passed
+    // `CorrelationId::new()` inline and then looked the row up under a hardcoded identifier that never
+    // existed, which failed with `ToolCallNotFound` — a *test* mistake that the storage layer correctly
+    // reported rather than resolving to something plausible.
+    let correlation_id = CorrelationId::new();
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.search",
+                arguments.clone(),
+                &mcp_actor(),
+                correlation_id,
+            )
+            .await,
+    );
+
+    // The recording adapter ran, and it saw the canonical identifier and the exact arguments.
+    let seen = adapter
+        .seen
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the additional adapter must run: {outcome:?}"
+    );
+    assert_eq!(seen[0].0, "mcp.test.search");
+    assert_eq!(seen[0].1, arguments);
+
+    // **And the outcome is the MCP adapter's confirmation, which a filesystem call cannot produce.** Its
+    // arguments would be `{"q": "pumps"}`, which the filesystem adapter refuses as a missing `path`, so a
+    // misroute appears as a refusal with a filesystem reason rather than as this confirmation.
+    let ToolPipelineOutcome::Executed(result) = outcome else {
+        panic!("a call to the additional adapter must execute, got {outcome:?}");
+    };
+    assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+    assert_eq!(
+        result
+            .evidence()
+            .map(jarvis_tools::ProviderEvidence::as_str),
+        Some("mcp:test/search"),
+        "the recorded evidence must be the additional adapter's, not the filesystem adapter's"
+    );
+
+    // The durable row agrees with the returned result, so the two cannot disagree across an await. Asserted by
+    // **reading the row back**, not by trusting the return value: `P3-005`'s ledger is what makes an outcome
+    // mean something, and a routing change must not stop it being written.
+    let stored = must(pipeline.call(&correlation_id.to_string()).await);
+    assert_eq!(stored.outcome(), ToolOutcome::Confirmed);
+    assert_eq!(
+        stored.record().evidence(),
+        Some("mcp:test/search"),
+        "the stored row must carry the additional adapter's evidence"
+    );
+    let _ = database;
+}
+
+/// An actor holding the scope an MCP tool requires.
+///
+/// `mcp.call` as well as `files.read`, which is what the gateway now grants — and the reason is a **real
+/// defect the first version of this test caught**: it used the filesystem-only actor, and the call was
+/// refused with `missing_scope`. That is a *correct* policy decision, so the test was failing for a legitimate
+/// reason rather than passing for the wrong one — which is exactly what the assertion's `{outcome:?}` was
+/// there to show.
+fn mcp_actor() -> ToolActor {
+    ToolActor::workspace_and_mcp(
+        LOCAL_WORKSPACE_ID,
+        RUN,
+        SessionChannel::Cli,
+        AuthenticationStrength::Credential,
+        "policy-1",
+    )
+    .unwrap_or_else(|| panic!("both fixed scope literals must be accepted"))
+}
+
+/// A read-only MCP-namespaced definition, built the way the catalog builds one.
+///
+/// Built through the transport's `translate_tool` with a read-only policy rather than assembled by hand, so
+/// the definition carries the same identifier, version, scope, and risk the catalog would produce — a
+/// hand-built one could declare a posture the catalog would never emit, and the routing test would then be
+/// exercising a tool that does not exist in production.
+///
+/// The MCP types come from `jarvis-mcp` **as a dev-dependency**, not as a normal one: the daemon composes
+/// adapters and never names an MCP type itself, so declaring the pure translation crate for production would
+/// be a dependency with no production consumer. A test that builds an MCP definition genuinely needs it.
+fn mcp_definition(id: &str, remote: &str) -> jarvis_tools::ToolDefinition {
+    let policy = must(jarvis_mcp::ToolEffectPolicy::read_only());
+    let schema = json!({
+        "type": "object",
+        "properties": { "q": { "type": "string" } },
+        "required": ["q"]
+    });
+    let listing = jarvis_mcp::McpToolListing {
+        name: remote,
+        title: None,
+        description: None,
+        input_schema: &schema,
+        output_schema: None,
+    };
+    let server = must(jarvis_mcp::ServerName::new("test"));
+    let translated = must(jarvis_mcp::translate_tool(
+        &server,
+        &listing,
+        jarvis_mcp::NamingStrategy::Prefixed,
+        &policy,
+    ));
+    assert_eq!(
+        translated.definition.id().to_string(),
+        id,
+        "the fixture's identifier must be the one the translation produces"
+    );
+    translated.definition
+}
+
 fn actor() -> ToolActor {
     ToolActor::workspace_reader(
         LOCAL_WORKSPACE_ID,

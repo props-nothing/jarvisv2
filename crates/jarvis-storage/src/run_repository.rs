@@ -680,6 +680,33 @@ pub async fn settle_run(
 /// there is no work left to stop. That is a fact about the run rather than about who is asking, so it
 /// cannot go stale.
 ///
+/// # Why the version is NOT advanced either (`P3-008j`)
+///
+/// ADR-0022 removed the *expectation* from this write but left `version = version + 1`, and that left the
+/// race it was written to fix. **A version exists to guard a write that depends on the version it read, and
+/// this write depends on nothing** — its predicate is a state and its effect is idempotent, so advancing the
+/// version protects nothing while invalidating every version the executor is holding.
+///
+/// The consequence was a **lost update rather than a refusal**, which is worse than the defect ADR-0022
+/// addressed. The executor's `advance` re-reads the run and *then* writes it guarded on what it read
+/// (`P2-009a` finding 3). A cancellation landing in that window is overwritten by that write: the run
+/// continues after being told to stop, the request is gone, and nothing reports it. The write also fails
+/// its own expectation, so the visible symptom is a `RunConflict` reading as a concurrency bug.
+///
+/// **This was found, not theorised.** `a_cancellation_requested_in_flight_settles_the_run_once` failed once
+/// under full-workspace load — the same flake ADR-0022 says it removed "structurally" and "verified by 12
+/// consecutive passes". Twelve isolated passes cannot sample a window that opens under load. It is now
+/// pinned by `a_progress_write_racing_a_cancellation_neither_conflicts_nor_loses_the_request`, which stages
+/// the interleaving **deterministically** instead of sleeping, because the defect is an ordering rather than
+/// a timing.
+///
+/// Falsifying that test is what showed which row is load-bearing, and it was **not** the one expected.
+/// Dropping the version guard from `transition_run` does **not** lose the request, because that write's
+/// `COALESCE` re-preserves `cancellation_requested_at` — the guard is what makes the *transition* fail,
+/// not what discards the intent. Dropping the `COALESCE` fails the test with `left: None`, which is the
+/// silent loss stated as evidence. So the two properties are pinned separately and each is really tested:
+/// the guard's absence is a `RunConflict`, and the `COALESCE`'s absence is a lost cancellation.
+///
 /// A repeat request is idempotent: `COALESCE` keeps the first request time, so the interval between
 /// asking and stopping stays measurable.
 ///
@@ -696,8 +723,7 @@ pub async fn request_run_cancellation(
     let result = sqlx::query(
         "UPDATE agent_runs \
          SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2), \
-             updated_at = ?2, \
-             version = version + 1 \
+             updated_at = ?2 \
          WHERE id = ?1 \
            AND state NOT IN ('completed', 'cancelled', 'failed')",
     )
@@ -722,9 +748,12 @@ pub async fn request_run_cancellation(
                 },
             });
         }
-        // Non-terminal and unmatched is not reachable through the statement above, so reaching it means
-        // a racing writer changed the row between the write and this read. A conflict is the honest
-        // report; silently succeeding would claim a request that was not recorded.
+        // A non-terminal state after a non-match is no longer reachable by a racing *write*, because
+        // this statement's predicate is exactly the condition the follow-up read evaluates — see the
+        // doc above on why the version is deliberately not advanced. It remains reachable by a racing
+        // **creation**: cancelling an identifier that does not exist yet, while another request creates
+        // it, leaves a live run that the statement above did not match. Reported rather than asserted
+        // away, because "impossible" is the claim that goes stale first.
         return Err(DatabaseError::RunConflict);
     }
 
@@ -1310,7 +1339,10 @@ mod tests {
         assert_eq!(requested.state(), RunState::Received);
         assert_eq!(requested.terminal_outcome(), None);
         assert_eq!(requested.cancellation_requested_at(), Some(at(3)));
-        assert_eq!(requested.version(), 2);
+        // The version is deliberately **not** advanced: see `request_run_cancellation`. Advancing it
+        // protects nothing (this write depends on no version) and invalidates the expectation every
+        // other writer is holding, which is how a cancellation came to be silently overwritten.
+        assert_eq!(requested.version(), 1);
 
         let settled = advance(&database, requested, RunState::Cancelled).await;
         assert_eq!(settled.state(), RunState::Cancelled);
@@ -1338,8 +1370,63 @@ mod tests {
         let second = must(request_run_cancellation(&database, RUN_A, at(9)).await);
 
         assert_eq!(second.cancellation_requested_at(), Some(at(3)));
-        assert_eq!(second.version(), 3);
+        // Neither request advances the version, for the reason documented on the function: the write
+        // depends on no version, so advancing one is pure invalidation of other writers' expectations.
+        assert_eq!(second.version(), 1);
         assert_eq!(second.state(), RunState::Received);
+    }
+
+    /// A progress write racing a cancellation request must neither conflict nor **lose the request**.
+    ///
+    /// This is the storage-level form of the flake `apps/jarvisd`'s
+    /// `a_cancellation_requested_in_flight_settles_the_run_once` showed under full-workspace load. It is
+    /// written as a **deterministic interleaving** rather than a sleep, because the defect is an ordering
+    /// and not a timing.
+    ///
+    /// `advance` re-reads the run and *then* writes it with a version guard. A cancellation landing in
+    /// that window trips the guard, so the progress write fails with `RunConflict` — the flake seen under
+    /// load. The `COALESCE` in the transition means the *request* survives that write, so the failure the
+    /// assertion below really pins is the one a careless edit causes: replacing the `COALESCE` with a bare
+    /// assignment loses the cancellation outright, and the run then continues after being told to stop.
+    ///
+    /// Both halves were falsified rather than assumed, and the results are on
+    /// `request_run_cancellation`: removing the version guard from the *cancel* write makes this test fail
+    /// with `RunConflict`; removing the `COALESCE` from the *transition* write makes it fail with
+    /// `left: None`. The second is worth the assertion because a `None` cancellation is the worse outcome —
+    /// a run that keeps working while holding no evidence it was asked to stop.
+    #[tokio::test]
+    async fn a_progress_write_racing_a_cancellation_neither_conflicts_nor_loses_the_request() {
+        let (_directory, database) = seeded_database().await;
+        let run = one_run(&database, RUN_A).await;
+
+        // Staged interleaving. The executor reads the run, a cancellation is recorded, and the executor's
+        // write then lands — which is exactly the window a live run opens several times a second, since
+        // every progress write bumps the version while the cancellation's write does the same.
+        let before = run.expectation();
+        let observed = must(request_run_cancellation(&database, RUN_A, at(1)).await);
+        assert_eq!(observed.cancellation_requested_at(), Some(at(1)));
+
+        let advanced = must(
+            transition_run(
+                &database,
+                RUN_A,
+                before,
+                &transition(RunState::ContextBuilding),
+                at(2),
+            )
+            .await,
+        );
+
+        assert_eq!(advanced.state(), RunState::ContextBuilding);
+        assert_eq!(
+            advanced.cancellation_requested_at(),
+            Some(at(1)),
+            "a progress write must not discard the cancellation it raced"
+        );
+        // And the request is still visible through a fresh read, which is the property the executor
+        // depends on: it re-reads between phases, so a preserved request ends the run.
+        let reread = must(find_run(&database, RUN_A).await);
+        assert_eq!(reread.cancellation_requested_at(), Some(at(1)));
     }
 
     #[tokio::test]

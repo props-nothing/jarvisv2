@@ -469,6 +469,35 @@ impl McpHost {
         self.catalog.definitions()
     }
 
+    /// Returns each adapter with **the definitions that adapter can run**.
+    ///
+    /// This is the pairing a registry needs: `ToolRegistry::define_all` and a dispatch table both have to be
+    /// told which contract an adapter executes, and deriving the two separately would let them disagree about
+    /// which tools exist. Returning the pair from one place is what keeps them from drifting — the
+    /// "two values that must agree" defect this project keeps finding, applied to registration.
+    ///
+    /// The grouping is by the **catalog's routing**, which is the only thing that knows a canonical
+    /// identifier's server, so a definition is attached to the adapter for the server the catalog says owns
+    /// it rather than to whichever adapter claims it.
+    #[must_use]
+    pub fn adapters_with_definitions(
+        &self,
+    ) -> Vec<(&McpToolAdapter, Vec<jarvis_tools::ToolDefinition>)> {
+        self.adapters
+            .iter()
+            .map(|adapter| {
+                let definitions = self
+                    .catalog
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.server.as_str() == adapter.server())
+                    .map(|entry| entry.definition.clone())
+                    .collect();
+                (adapter, definitions)
+            })
+            .collect()
+    }
+
     /// Finds the adapter that can run a tool, by canonical identifier.
     ///
     /// Returns `None` for a tool the host does not offer, so a dispatch cannot default to another server's
@@ -669,18 +698,20 @@ fn describe_endpoint_error(error: &EndpointError) -> String {
     error.to_string()
 }
 
-/// Extracts the host configuration section from a daemon configuration document, when present.
-///
-/// The daemon's own configuration is a different schema with its own validation, and this is deliberately
-/// **not** a second parser for it: the caller passes the already-extracted `[mcp]` section text. That keeps
-/// one schema owner (`jarvis-storage`) and one host-schema owner (here), with no overlap to disagree.
-///
-/// # Errors
-///
-/// Returns [`HostConfigError`] under the same conditions as [`McpHostConfig::parse`].
-pub fn parse_host_section(section: &str) -> Result<McpHostConfig, HostConfigError> {
-    McpHostConfig::parse(section)
-}
+// `parse_host_section` was REMOVED in `P3-008j`, and the reason is worth keeping where the code used to be.
+//
+// It existed for the shape where the daemon kept MCP servers in an `[mcp]` section of its own `config.toml`
+// and handed over the extracted section text. That shape was rejected — the daemon's schema validates by key
+// allowlist, so an `[mcp]` section would make a storage adapter learn one protocol's vocabulary — and the
+// daemon now reads `mcp-servers.toml` as a whole document and calls `McpHostConfig::parse` directly. The
+// helper therefore had **no caller outside its own test**, which is the declared-but-unconstructed shape this
+// project has recorded four times now (`ListError::NoIdentity`, `expected_version`,
+// `ReportedIdentity::agrees_with`, and this). A public helper whose only caller is a test proving it delegates
+// is a claim about a caller that does not exist.
+//
+// Its test went with it rather than being kept: it asserted the helper agreed with `parse`, a property of one
+// line of delegation, while the real property — that the daemon validates a document — is covered by
+// `tests/host_config.rs`.
 
 #[cfg(test)]
 mod tests {
@@ -905,24 +936,6 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("an oversized document must be refused"));
         assert_eq!(error, HostConfigError::DocumentTooLarge);
-    }
-
-    /// The host section helper is the same parser, so a caller extracting `[mcp]` from the daemon's
-    /// document gets identical validation rather than a second, weaker path.
-    #[test]
-    fn the_host_section_helper_uses_the_same_validation() {
-        let document =
-            "[[servers]]\nname = \"a\"\ntransport = { kind = \"stdio\", program = \"p\" }";
-        let direct = McpHostConfig::parse(document).unwrap_or_else(|error| panic!("{error}"));
-        let via_helper = parse_host_section(document).unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(direct.len(), via_helper.len());
-
-        // And a refusal is identical too, which is what makes the helper safe to use.
-        let bad = "server = 1";
-        assert_eq!(
-            McpHostConfig::parse(bad).err(),
-            parse_host_section(bad).err()
-        );
     }
 
     /// Configuring nothing and asking for a host is an error rather than an empty host.

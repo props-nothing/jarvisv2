@@ -1323,10 +1323,13 @@ dependencies = [
 name = "jarvisd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures-util",
  "jarvis-application",
  "jarvis-core",
+ "jarvis-mcp",
+ "jarvis-mcp-transport",
  "jarvis-models",
  "jarvis-observability",
  "jarvis-protocol",

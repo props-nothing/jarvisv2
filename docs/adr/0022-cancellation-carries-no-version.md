@@ -26,6 +26,13 @@ stale almost immediately, so:
   isolation and on the next full run. A nondeterministic test is itself a defect, and this one was
   reporting a real user-facing one.
 
+> **CORRECTION (2026-09-23, `P3-008j`): removing the expectation from the *request* did not remove the
+> race, and this ADR's claim that it did is struck rather than quietly edited.** The same test failed again
+> under full-workspace load, and the cause was the sentence in decision 4 below. `request_run_cancellation`
+> still advanced `version`, and a version exists to guard a write that depends on a version it read — this
+> one depends on nothing, so advancing it protected nothing while invalidating the expectation every other
+> writer held. See decision 7, which supersedes decision 4.
+
 `apps/jarvisd/src/run_service.rs` made it worse rather than better: it **re-read the run and then
 discarded what it read**, passing the caller's version instead of the fresh one. So the read was pure
 cost with no effect.
@@ -69,6 +76,10 @@ error and the interval between asking and stopping stays measurable. The old cod
 "no-op must not advance the version" concern does not arise: this write records intent, and a second
 identical intent is harmless.
 
+> **SUPERSEDED by decision 7 (2026-09-23).** "Harmless" was half-true in the way that matters: the extra
+> version is harmless to *this* write, and harmful to **every other writer**, whose expectation it
+> invalidates. A statement that looks only at its own effect will not notice that.
+
 **5. `CancelRunRequest` is deleted from the protocol rather than left with a permissive decoder.** It had
 `deny_unknown_fields`, so a client still sending `expected_version` would now get a `422` for a field the
 daemon ignores — an error for a request that should succeed. Deleting the type makes an old client fail
@@ -79,12 +90,52 @@ which was the assertion that encoded the wrong design. The new test asserts a bo
 accepted, that a repeat is accepted and preserves the first request time, and the storage test covers the
 settled refusal where it lives. The daemon test no longer reads or supplies a version at all.
 
+**7. A write that changes no state does not advance the version. (`P3-008j`, 2026-09-23)**
+
+`request_run_cancellation` sets `cancellation_requested_at` and `updated_at` and **leaves `version`
+untouched**. This supersedes decision 4.
+
+**A version is a guard for a write that depends on the version it read.** This write depends on nothing:
+its predicate is a **state**, its effect is idempotent under `COALESCE`, and the state machine does not
+mention the version. Advancing it therefore protects nothing, while invalidating the version every other
+writer is holding — including the executor, which holds one across the whole model call.
+
+**The defect it caused was a lost update, which is worse than the refusal this ADR was written to fix.**
+The executor's `advance` re-reads the run and then writes it guarded on what it read (`P2-009a` finding
+3). A cancellation landing between the two trips the guard, so the progress write reports `RunConflict`
+— a concurrency bug to a reader — and the run carries on. The intent does survive that write, because the
+transition's own `COALESCE` re-preserves it, but it survives **only** for a caller that re-reads and acts.
+
+**It was found by the gate, not by theory, and it is now pinned deterministically.**
+`a_progress_write_racing_a_cancellation_neither_conflicts_nor_loses_the_request` stages the interleaving
+explicitly instead of sleeping, because the defect is an **ordering** rather than a timing — which is why
+this ADR's "12 consecutive passes" could not have found it and why a sleep-based test cannot pin it.
+
+**Both properties were falsified, and the second falsification corrected an expectation.** Removing the
+version bump makes the new test fail with `RunConflict`. Removing the transition's `COALESCE` makes it fail
+with `left: None` — the cancellation silently gone — so the request-preservation assertion is load-bearing
+and is not merely a restatement of the first. The author's first draft of the test comment claimed the
+version bump alone was what discarded the intent; running the falsification showed that was **false**, and
+the comment was corrected to the mechanism that actually holds.
+
+**Why the version is not instead made monotonic some other way.** The alternative was to keep bumping it
+and have every guard retry on conflict. Rejected: retrying an optimistic guard hides which writer was
+overwriting what, and a run's progress writes are frequent enough that a cancellation would be retried
+against a moving target forever. Removing the bump removes the conflict rather than living with it.
+
 ## Consequences
 
 - A client can always cancel a run it can identify. The one refusal left is actionable: "it already
   stopped", which a client can report plainly.
-- The intermittent test failure is gone **structurally**, not by loosening a timeout: there is no
-  read-then-write window left to lose. Verified by 12 consecutive passes after the change.
+- ~~The intermittent test failure is gone **structurally**, not by loosening a timeout: there is no
+  read-then-write window left to lose. Verified by 12 consecutive passes after the change.~~ **CORRECTION
+  (2026-09-23): this was FALSE, and the sentence is struck rather than quietly edited.** The failure
+  recurred under full-workspace load. Two things were wrong with it: the claim, and the **method** that
+  produced it. Twelve isolated passes cannot sample a window that only opens under load, so "verified by 12
+  consecutive passes" was evidence of nothing — the same weak evidence this ADR elsewhere criticises when a
+  vendor presents it. What replaced it is a test that stages the interleaving explicitly and therefore
+  fails **every** time without the fix and passes **every** time with it. That is the shape a concurrency
+  regression needs; a repeated run is not.
 - A `RunConflict` from this path no longer means "you were too slow"; the only way to reach it is a
   racing writer between the write and the follow-up read, which is reported honestly rather than
   silently succeeding — claiming a request that was not recorded would be worse than a conflict.

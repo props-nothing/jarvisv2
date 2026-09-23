@@ -47,3 +47,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0027](0027-a-remote-endpoint-is-a-validated-value.md) | A remote MCP endpoint is a validated value, and its HTTP client is built here | Accepted |
 | [0028](0028-an-adapters-outcome-mapping-is-the-honesty-boundary.md) | An adapter's outcome mapping is the honesty boundary, and every row of it needs a test | Accepted |
 | [0029](0029-the-mcp-host-role-is-a-narrow-configuration-surface.md) | The MCP host role is a narrow configuration surface, and one parser per document | Accepted |
+| [0030](0030-the-daemon-dispatches-by-tool-identity.md) | The daemon dispatches by tool identity, and MCP servers live in their own document | Accepted |

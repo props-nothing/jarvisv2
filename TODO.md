@@ -216,6 +216,12 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
          placement, so the assembled context and the request agree;
       3. a cancellation requested during a model call bumps `version` without changing `state`, so the
          executor's next guarded write failed with a spurious `RunConflict`. Writes now re-read first;
+         **CORRECTION (2026-09-23): re-reading first was necessary but not sufficient, and it was not the
+         last word on this.** `P3-008j` found the same test failing under load again, because the
+         cancellation itself still bumped `version` and invalidated the expectation the executor was
+         holding across a model call. The fix is that a write changing no state does not advance the
+         version at all (ADR-0022 decision 7). See the `P3-008j` entry for the deterministic test that
+         replaced "it passed a few times".
       4. **`P2-008`'s client printed the answer twice**, because it rendered `output_delta` and
          `output_completed` identically and the completed event repeats every fragment. The two kinds
          are now distinct readings, with a test asserting they differ.
@@ -895,6 +901,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       - `P3-008h` made a server's tool a real `ToolExecutor` (the outcome mapping). ADR-0028.
       - `P3-008i` added the **host role**: the `[mcp]` configuration surface, and the first caller of the
         catalog's collision check. ADR-0029.
+      - `P3-008j` put the host role **in the daemon's startup path**: `mcp-servers.toml`, the dispatch table,
+        and the two-scope actor. ADR-0030. **This is the slice that makes an MCP server an operator-reachable
+        tool**, which is the limit all ten entries above recorded.
       **`build_catalog` is the composition that was missing.** `jarvis-mcp` could translate a listing
       nobody had fetched and `jarvis-mcp-transport` could fetch a listing nobody had translated, and
       **nothing joined them** — so every slice recorded the same honest limit, "a capability a caller can
@@ -943,10 +952,11 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       unconstructed variant reads downstream as a live condition, which is the `expected_version` class
       corrected at `P3-006c`.
       **Honest limits.** `connect_http` was covered by `P3-008g` below, which also closed this slice's
-      "nothing reads a `config.toml`" note only in part: there is still no MCP section in the
-      configuration schema, so nothing constructs a `HostedServer` outside a test and `apps/jarvisd` has
-      **zero** references to either MCP crate — `P3-009` is still what makes a server reachable, and it
-      now has one composition to call rather than two to reconcile incorrectly. A **cross-server
+      "nothing reads a `config.toml`" note only in part: the MCP servers were not read from any daemon
+      document, so nothing constructed a `HostedServer` outside a test and `apps/jarvisd` had
+      **zero** references to either MCP crate. **CORRECTION (2026-09-23): `P3-008j` closed that** — the daemon
+      loads `mcp-servers.toml` and constructs the host, so an MCP server is reachable from a running daemon.
+      A **cross-server
       collision** is detected and reported but nothing acts on it, because the daemon that would refuse
       to serve is `P3-009`. `tools/call` is proven over the wire and against a child process, and
       `P3-008h` makes it an adapter a policy-authorized request reaches — but **nothing composes that
@@ -996,8 +1006,11 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       residual rather than implying coverage. The standalone `GET`-for-SSE path is declined by the test
       server and is therefore **not covered**. `Mcp-Method`/`Mcp-Name` agreement is asserted on the
       client's *outgoing* request only — the server side's `-32020 HeaderMismatch` handling is `P3-009`.
-      There is still no MCP section in the configuration schema, so an endpoint is constructed by a
-      caller and nothing loads one from `config.toml`.
+      At the time of this slice the MCP servers were not read from any daemon document, so an endpoint was
+      constructed by a caller and nothing loaded one from `config.toml`. **CORRECTION (2026-09-23):**
+      `P3-008j` made `mcp-servers.toml` load endpoints, so an operator now writes one. The endpoint rules
+      here are what make that safe to write, which is why the slice order was right: the policy existed
+      before the reachability did.
 - [x] `P3-008h` Make a remote server's tool a real `ToolExecutor`, and get the outcome mapping right.
       **Closes the limit every preceding MCP slice recorded — "nothing drives it from a run" — at its last
       step.** New code: `crates/jarvis-mcp-transport/src/adapter.rs` (`McpToolAdapter`) and
@@ -1031,11 +1044,11 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `mcp.call` scope, and even a minimal-risk tool requires `ChannelEvidence` — so an `Absent` strength
       claim is a hold. Both turned every test into a held call, and both were visible only because the
       fixture asserts an allowance instead of assuming one.
-      **Honest limits.** **Nothing composes `McpToolAdapter` into the daemon** — no run drives an MCP tool,
-      no `ToolOutcome` from an MCP call is stored, there is still no MCP section in the configuration
-      schema, and `apps/jarvisd` still has zero references to either MCP crate, so `P3-009` remains the gate
-      for operator reachability. No `run_events` row is written for an MCP call (`P3-012` links calls to the
-      event log). The `Confirmed` for a successful call rests on the server's own `isError: false`, which
+      **Honest limits.** **At the time of this slice nothing composed `McpToolAdapter` into the daemon** — no
+      run drove an MCP tool, no `ToolOutcome` from an MCP call was stored, and `apps/jarvisd` had zero
+      references to either MCP crate. **CORRECTION (2026-09-23): `P3-008j` closed the composition**, so the
+      daemon now dispatches a policy-authorized request to an MCP adapter and stores its outcome. No
+      `run_events` row is written for an MCP call (`P3-012` links calls to the event log). The `Confirmed` for a successful call rests on the server's own `isError: false`, which
       the protocol gives no way to verify — the honest statement is that it is the strongest available
       evidence, and the design keeps it separate from the output so a reader can weigh it.
 - [x] `P3-008i` Add the MCP host role: the configuration surface, and the first caller of the collision check.
@@ -1077,12 +1090,100 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       moved ~13 test construction sites. `McpHost::close` drops the adapters before closing, because a
       connection can only be closed by its last owner, and a still-shared connection is **reported** rather
       than claimed as stopped.
-      **Honest limits.** The daemon **does not yet read an `[mcp]` section** — `apps/jarvisd` still has zero
-      references to either MCP crate — so this is a configuration surface a caller can drive and not one the
-      daemon loads; `P3-009` is now the one call that loads the section and holds a host. No `run_events` row is
+      **Honest limits.** At the time of this slice the daemon did not read an `mcp-servers.toml` document and
+      `apps/jarvisd` had **zero references to either MCP crate**, so this was a configuration surface a caller
+      could drive and not one the daemon loaded. **CORRECTION (2026-09-23): `P3-008j` closed that.** The daemon
+      now reads `mcp-servers.toml`, connects the host, registers its adapters, and dispatches to them, so the
+      sentence above describes this slice's boundary rather than the platform's. `P3-009` remains the gate for
+      the **other** direction (JARVIS as a server). No `run_events` row is
       written for an MCP call (`P3-012`). **No credential can appear in the document**: a remote server needing
       authentication needs the credential store and is its own slice. Connection **pooling and reconnect** are
       still unbuilt, so every host build reconnects.
+- [x] `P3-008j` Put the MCP host in the daemon: `mcp-servers.toml`, the dispatch table, and the two-scope actor.
+      **This closes the limit all ten preceding MCP slices recorded** — "a capability a caller can use, not one
+      an operator can reach" — because it is the first slice where `apps/jarvisd` references either MCP crate.
+      New code: `apps/jarvisd/src/dispatch.rs`, `apps/jarvisd/src/mcp_host.rs`, and `apps/jarvisd/src/tool_pipeline_tests.rs`;
+      changed: `tool_pipeline.rs`, `tool_actor.rs`, `gateway.rs`, `main.rs`. 103 transport + 14 new daemon
+      tests; **880 workspace tests, 40 suites**. ADR-0030.
+      **The dispatch table is its own type, and it refuses two things rather than resolving them.** A tool the
+      registry offers that no adapter can run (`DispatchError::Uncovered`) would be authorized by policy and
+      then fail, so it is a **startup** refusal; and a tool two adapters claim (`DispatchError::Duplicate`)
+      would make which one ran depend on registration order, so the same call could reach different providers
+      on different builds. The table is keyed by identifier because that is the key the receipt binds — a scan
+      would return the first match, which is an implicit ordering decision of exactly the kind this type exists
+      to make impossible.
+      **The falsification of the routing check PASSED when it should have failed, and that is the finding.**
+      Changing `adapter_for` to `self.adapters.values().next()` left
+      `a_call_reaches_the_adapter_that_owns_its_definition` **green**, because the test registered only **one**
+      adapter — "return any adapter" then finds the right one, so the test proved the dispatch table was
+      non-empty and nothing about routing. The fix was to register the filesystem adapter beside the MCP one
+      and assert the precondition explicitly (`dispatchable_tools() == 3`); re-running the falsification now
+      fails with `NotImplemented { tool: "mcp.test.search" }`, which is the misroute stated as evidence. **A
+      routing test needs at least two candidates, and the count has to be asserted or the second adapter can
+      be dropped later without the test noticing.** This is the same shape as `P3-008h`'s unpinned row: a
+      check that cannot fail is not a check.
+      **The MCP servers live in their own document, and the reason is that a failure there must not stop the
+      daemon.** `mcp-servers.toml` sits beside `config.toml` rather than as a section inside it, because the
+      daemon's schema is validated by **key allowlist** — an `[mcp]` section would mean `jarvis-storage`'s
+      schema learns one protocol's configuration vocabulary, which is a dependency from an adapter into a
+      protocol shape that `repository-layout.md` forbids in the other direction and would be just as wrong
+      here. Keeping the documents separate also means a third-party program that is missing, a server that
+      hangs, or a collision between two configured servers are all reasons for the **MCP tools** to be
+      unavailable rather than reasons for the daemon to refuse to start; each is logged so the absence is
+      visible rather than silent. A **pipeline** failure is fatal by contrast, because it covers the filesystem
+      grant and the registry: starting anyway would serve a tool set nobody declared.
+      **A missing document is not an error; an unreadable one is.** A daemon nobody configured servers on is
+      the normal case, and requiring the file would make every existing profile fail to start. But a document
+      that exists and cannot be read is reported, because an operator who wrote one and has it unreadable would
+      otherwise conclude their servers were configured and empty.
+      **`WorkspaceRoots` refuses an empty list, so the pipeline takes an `Option`.** `RootError::NoRoots` exists
+      precisely so a tool cannot silently read nothing while looking like a tool that works. A daemon with MCP
+      servers and no filesystem grant therefore registers **no filesystem adapter at all** rather than one over
+      zero roots — the tool is absent rather than present-and-failing. This surfaced as a *test* failure
+      (`NoRoots`) while writing the routing test, and the failure was the composition being wrong rather than
+      the test.
+      **The actor grants both scopes, and the narrow constructor had to stay.** `tool_actor.rs` gained
+      `workspace_and_mcp`, granting `files.read` **and** `mcp.call`; the gateway uses it, because
+      `workspace_reader` grants only `files.read` and **every MCP call would have been denied for a missing
+      scope**. Widening the existing constructor was rejected: a profile with no filesystem roots has no
+      filesystem tool to read, so granting `files.read` there would be a grant with no consumer. A test asserts
+      `MCP_CALL_SCOPE` equals `jarvis_mcp_transport::DEFAULT_MCP_CALL_SCOPE`, so the two copies of that literal
+      cannot drift apart silently.
+      **Honest limits.** No `run_events` row is written for an MCP call (`P3-012` links calls to the event
+      log), so the **call row** is the only durable record of it. The host is composed once at startup and
+      **never reconnects or pools**, so a server that dies stays unavailable until the daemon restarts.
+      `seen_before` is always empty, so an identity drift across a restart is **invisible** — `P3-009`'s
+      persistence problem, unchanged. The **`NamingStrategy` is hardcoded to `Prefixed`** and the file cannot
+      set it, so `Bare` is unreachable from configuration. A **collision refuses the MCP host and its tools are
+      simply absent** — the correct outcome, but the caller is not told which servers were dropped, only a log
+      line. And the daemon is proven to **compose** a host from a document, not to have serviced an MCP call
+      through a **run**: the routing test drives the pipeline directly rather than over HTTP.
+      **The gate failed on a pre-existing defect, and fixing it turned out to be this slice's most
+      consequential work.** `cargo test --workspace` failed `a_cancellation_requested_in_flight_settles_the_run_once`
+      with `the agent run was changed by another writer`. `apps/jarvisd/src/executor.rs` was **not modified by
+      this slice**, and the test passed 12/12 in isolation, so it was initially tempting to call it flaky and
+      re-run. It is a real lost-update race, and ADR-0022 — which claims to have fixed exactly this test
+      "structurally" and "verified by 12 consecutive passes" — **had not**: it removed the *expectation* from
+      the cancellation request but left `version = version + 1` on the write.
+      **A version is a guard for a write that depends on the version it read; this write depends on nothing.**
+      Its predicate is a state and its effect is idempotent under `COALESCE`, so advancing the version protects
+      nothing while invalidating the expectation every other writer holds — the executor holds one across the
+      whole model call. The fix is that the cancellation no longer advances the version at all (ADR-0022
+      decision 7; the superseded decision and the false sentence are both struck in place rather than edited
+      away).
+      **The reproduction is deterministic, and building it corrected a claim of my own.** `a_progress_write_racing_a_cancellation_neither_conflicts_nor_loses_the_request`
+      stages the read → cancel → write interleaving explicitly rather than sleeping, because the defect is an
+      **ordering** rather than a timing — which is precisely why "12 consecutive isolated passes" could not
+      have found it. Falsifying it found that my first test comment was **false**: I asserted that dropping the
+      version bump alone would lose the cancellation, and running it showed the transition's own `COALESCE`
+      re-preserves the request, so the test simply passes. Dropping the `COALESCE` is what fails it
+      (`left: None`), so the two properties are pinned separately and the comments now state the mechanism that
+      actually holds. **A test comment is a claim like any other, and the only way to know which property a
+      test pins is to break each one in turn.**
+      **The lesson supersedes the one the earlier slice recorded.** "It passed 6/6 after the change" and "12
+      consecutive passes" are not evidence about a *concurrency* defect: the window only opens under load, so
+      isolated repetition samples the wrong thing. `P2-009a`'s finding 3 ("writes now re-read first") was
+      necessary but not sufficient, and it was recorded as if it were the fix.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.

@@ -72,6 +72,8 @@ use jarvis_tools::{SchemaError, SchemaViolation};
 // rather than a missing import.
 use jarvis_tools::ToolExecutor;
 
+use crate::dispatch::{Dispatch, DispatchError};
+
 /// What one pipeline call produced.
 ///
 /// Three variants, and each is a different answer to "what should the caller do next": report the
@@ -179,6 +181,13 @@ pub enum ToolPipelineError {
     /// A schema validator was rejected, which is an authoring error.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    /// The dispatch table is unusable.
+    ///
+    /// A configuration fault rather than a call-time one: two adapters claiming one tool, or a registered
+    /// tool no adapter can run, means the pipeline must not start. Resolved here because the alternative is a
+    /// call that is authorized, admitted durably, and then fails for a reason unrelated to the request.
+    #[error(transparent)]
+    Dispatch(#[from] DispatchError),
 }
 
 /// Returns the instant a call started now must stop by.
@@ -235,14 +244,20 @@ fn describe(violations: &[SchemaViolation]) -> String {
         .join("; ")
 }
 
-/// The composed tool path: a registry, a policy engine, a call lifecycle, and one adapter.
+/// The composed tool path: a registry, a policy engine, a call lifecycle, and the adapters that run tools.
 ///
 /// Holds the registry by value so no caller can register into a registry this pipeline is not reading —
 /// a shared registry would let a tool appear to a caller that the pipeline cannot actually resolve.
 pub struct ToolPipeline {
     database: Arc<SqliteDatabase>,
     registry: ToolRegistry,
-    adapter: Arc<FilesystemReadTool>,
+    /// Which adapter runs which tool, resolved by canonical identifier.
+    ///
+    /// A table rather than one adapter because the pipeline already serves more than one tool area, and the
+    /// filesystem adapter is no longer the only one — the MCP host brings a second. The lookup is keyed by the
+    /// identifier the receipt binds, so the adapter that runs is the one the definition was authorized as
+    /// (see `dispatch.rs` for why the table refuses a duplicate claim and an uncovered registration).
+    dispatch: Dispatch,
     /// The granted workspace policy, held so every call is decided against the same grants.
     ///
     /// Held rather than passed per call because a caller-supplied policy would let the handler that
@@ -252,29 +267,105 @@ pub struct ToolPipeline {
 }
 
 impl ToolPipeline {
-    /// Builds the pipeline over granted workspace roots.
+    /// Builds the pipeline over granted workspace roots, with the filesystem adapter registered.
     ///
     /// Registers the filesystem adapter's **own** definitions rather than restating them, so policy
     /// reads the same contract the adapter enforces. A second copy of the schema or the risk level here
     /// would be a copy that can disagree, and the definition is what `P3-003` decides about — a
     /// disagreement would mean policy deciding about a tool other than the one being run.
     ///
+    /// `#[cfg(test)]` because the daemon composes through [`Self::with_adapters`] — the MCP host may add
+    /// adapters, so a production caller always has an `additional` list even when it is empty. Keeping a
+    /// second public constructor nothing calls is how a surface grows a method with no consumer, and the
+    /// tests want a three-argument form because they register no MCP servers.
+    ///
     /// # Errors
     ///
     /// Returns [`ToolPipelineError`] when the adapter's fixed definitions are rejected or the registry
     /// refuses a registration. Both are configuration faults, so this fails at startup rather than on
     /// the first call.
+    #[cfg(test)]
     pub fn new(
         database: Arc<SqliteDatabase>,
         roots: WorkspaceRoots,
         workspace: WorkspacePolicy,
     ) -> Result<Self, ToolPipelineError> {
+        Self::with_adapters(database, Some(roots), workspace, Vec::new())
+    }
+
+    /// Builds the pipeline over granted workspace roots **and any additional adapters**.
+    ///
+    /// `additional` carries adapters whose definitions are supplied by their own source — the MCP host's,
+    /// one per configured server. Each entry is `(definitions, adapter)`, so a caller states which contract
+    /// an adapter runs and the registry is populated from the same pair the dispatch table is. Reusing one
+    /// pair for both is what keeps the registry and the dispatch table from disagreeing about what exists.
+    ///
+    /// # An absent filesystem grant is not a filesystem tool
+    ///
+    /// `roots` is an `Option` rather than a possibly-empty `WorkspaceRoots`, because that type **refuses an
+    /// empty list**: `RootError::NoRoots` exists precisely so a tool cannot silently read nothing while
+    /// looking like a tool that works. A daemon configured only with MCP servers is therefore `None` here,
+    /// and the filesystem adapter is **not registered at all** — which is the honest shape: the tool is
+    /// absent rather than present-and-failing, exactly the reasoning `compose_tool_pipeline` already used
+    /// when it returned no pipeline over zero roots.
+    ///
+    /// The first version of this constructor took a `WorkspaceRoots` and tried to build one from an empty
+    /// list for the MCP-only case, which is how the contradiction surfaced: a *test* asserting a routing
+    /// property failed with `NoRoots`, and the failure was the composition being wrong rather than the test.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError`] for an unusable grant, a rejected definition, a registry refusal, a
+    /// duplicate claim between two adapters, or a registered tool no adapter can run. Every one is a
+    /// configuration fault, so all of them fail startup rather than a call.
+    pub fn with_adapters(
+        database: Arc<SqliteDatabase>,
+        roots: Option<WorkspaceRoots>,
+        workspace: WorkspacePolicy,
+        additional: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)>,
+    ) -> Result<Self, ToolPipelineError> {
         let mut registry = ToolRegistry::new();
-        registry.define_all(FilesystemReadTool::definitions()?)?;
+        let mut sources: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)> =
+            Vec::new();
+
+        // Registered first when granted, so the filesystem tools are the native ones a later MCP tool cannot
+        // shadow — a collision is refused by the registry either way, but the order makes which one is
+        // "already present" deterministic rather than dependent on the caller's list order.
+        if let Some(roots) = roots {
+            let filesystem_definitions = FilesystemReadTool::definitions()?;
+            registry.define_all(filesystem_definitions.clone())?;
+            sources.push((
+                filesystem_definitions,
+                Arc::new(FilesystemReadTool::new(roots)) as Arc<dyn ToolExecutor>,
+            ));
+        }
+
+        // The MCP definitions are registered from the **host's own** list, which came from the catalog, so
+        // the risk and effects policy reads are the ones the catalog derived from the operator's posture.
+        for (definitions, adapter) in additional {
+            registry.define_all(definitions.clone())?;
+            sources.push((definitions, adapter));
+        }
+
+        // The dispatch table is built from what each adapter declares, and then checked against the
+        // registry's tool list. The order matters: coverage is verified against what the registry actually
+        // holds, so a definition that failed to register cannot leave a hole this check would miss.
+        let dispatch = Dispatch::new(sources)?;
+        // Coverage is checked against the identifiers the **registry** holds, parsed back from its operator-facing
+        // inventory. Parsing can only fail for a key the registry itself produced, so a failure here is an
+        // authoring error rather than a configuration one — and it is reported rather than skipped, because a
+        // skipped identifier would be a hole the check exists to find.
+        let registered: Vec<ToolId> = registry
+            .inventory()
+            .iter()
+            .map(|entry| ToolId::new(&entry.id))
+            .collect::<Result<_, _>>()?;
+        dispatch.verify_covers(&registered)?;
+
         Ok(Self {
             database,
             registry,
-            adapter: Arc::new(FilesystemReadTool::new(roots)),
+            dispatch,
             workspace,
         })
     }
@@ -288,6 +379,19 @@ impl ToolPipeline {
     #[must_use]
     pub fn database(&self) -> &SqliteDatabase {
         &self.database
+    }
+
+    /// Returns how many tools are dispatchable.
+    ///
+    /// `#[cfg(test)]` because nothing in the product asks: a request names one tool and the pipeline resolves
+    /// it. The count is what a **routing** test needs — a table with one entry finds the right adapter however
+    /// it is looked up, so an assertion that dispatch works requires knowing there was more than one candidate.
+    /// The falsification run that made this accessor necessary is recorded on
+    /// `a_call_reaches_the_adapter_that_owns_its_definition`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn dispatchable_tools(&self) -> usize {
+        self.dispatch.len()
     }
 
     /// Runs one tool call through every gate.
@@ -524,7 +628,18 @@ impl ToolPipeline {
         )
         .await?;
 
-        let result = self.adapter.execute(&request).await?;
+        let result = match self.dispatch.adapter_for(request.tool()) {
+            Some(adapter) => adapter.execute(&request).await?,
+            // Unreachable through `call_tool`, which resolves the definition from the registry first and
+            // coverage was verified at construction — so a registered tool always has an adapter. Reported as
+            // a fault rather than defaulted, because the alternative would be running a call on an adapter
+            // that never claimed the tool.
+            None => {
+                return Err(ToolPipelineError::Dispatch(DispatchError::Uncovered {
+                    tool: tool.to_owned(),
+                }));
+            }
+        };
 
         // Written once and not replaceable, so a re-drive cannot downgrade an `Unknown` to a `Failed` —
         // which is how one sent message becomes two (`P3-005`).
@@ -554,7 +669,7 @@ impl ToolPipeline {
 }
 
 impl std::fmt::Debug for ToolPipeline {
-    /// Names the registered tool count and the adapter, and nothing else.
+    /// Names the registered tool count and the adapters, and nothing else.
     ///
     /// A pipeline holds a database handle and directory handles, neither of which belongs in a
     /// formatted value.
@@ -562,7 +677,7 @@ impl std::fmt::Debug for ToolPipeline {
         formatter
             .debug_struct("ToolPipeline")
             .field("tools", &self.registry.len())
-            .field("adapter", &self.adapter.adapter_id())
+            .field("dispatch", &self.dispatch)
             .finish_non_exhaustive()
     }
 }

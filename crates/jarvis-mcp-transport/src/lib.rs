@@ -29,9 +29,18 @@
 //!
 //! # What is not here yet
 //!
-//! Nothing in this crate is reachable from `jarvisd`: there is no configuration surface for MCP
-//! servers, and `P3-009` owns the daemon that would load one. So this is a capability a caller can
-//! use, not one an operator can reach — the same honest limit `P3-008a`..`P3-008d` each recorded.
+//! **An MCP server is operator-reachable as of `P3-008j`.** `apps/jarvisd` reads `mcp-servers.toml`, builds the
+//! host, registers each adapter, and dispatches an authorized request to the adapter its identifier names, so
+//! the limit that `P3-008a`..`P3-008i` each recorded — "a capability a caller can use, not one an operator can
+//! reach" — is closed. The wiring lives in the daemon rather than here, because composition is the
+//! composition root's job (`repository-layout.md`).
+//!
+//! Still not built, and recorded in `TODO.md` rather than implied: nothing is exercised against a real
+//! third-party server (the fixture is hand-written here, which proves the wire framing but not that a stranger
+//! agrees with it); no connection is pooled and nothing reconnects, so a server that dies stays unavailable
+//! until the daemon restarts; a server's self-report is observed only within one process, so an identity drift
+//! across a restart is invisible; the `NamingStrategy` is fixed at `Prefixed`; and no `run_events` row is
+//! written for an MCP call (`P3-012`).
 
 mod adapter;
 mod client;
@@ -51,8 +60,17 @@ pub use error::{CallError, ConnectError, ListError};
 pub use host::{HostBuild, HostedServer, UnreadableServer, build_catalog};
 pub use host_config::{
     HostConfigError, HostError, MAX_HOST_CONFIG_BYTES, McpHost, McpHostConfig, ServerTransport,
-    parse_host_section,
 };
+// The naming strategy is **MCP** vocabulary, and it is re-exported so a composition root can choose one
+// without taking `jarvis-mcp` as a dependency of its own. A daemon declaring the pure translation crate
+// just to name a strategy would be a dependency in the direction `repository-layout.md` reserves for
+// adapters, and the choice belongs to the crate that builds the host.
+pub use jarvis_mcp::NamingStrategy;
+// The scope every MCP tool requires, re-exported for the same reason as the strategy: the daemon must grant
+// it to an actor, and **two copies of this literal that must match** is the defect class this project keeps
+// finding. The daemon asserts its own constant against this one, so a divergence is a failing test rather
+// than every MCP call being denied for a missing scope.
+pub use jarvis_mcp::DEFAULT_MCP_SCOPE as DEFAULT_MCP_CALL_SCOPE;
 pub use revision::{
     MODERN_REVISION, describe_negotiated, modern_revision, sdk_default_is_modern,
     sdk_default_revision,

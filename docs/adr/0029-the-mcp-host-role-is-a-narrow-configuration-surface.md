@@ -27,6 +27,19 @@ so there is **one schema owner per document** and no overlap for two validators 
 daemon will read its own file, hand this crate the section, and get back a connected host — a shape that
 keeps the daemon's configuration schema from growing an MCP vocabulary it has no reason to hold.
 
+> **CORRECTION (2026-09-23, `P3-008j`): the `[mcp]`-section half of this decision was rejected, and the
+> reasoning still holds.** `apps/jarvisd` reads `mcp-servers.toml` as a **whole document** and calls
+> `McpHostConfig::parse` directly. An `[mcp]` section inside `config.toml` was rejected for the reason this
+> decision already gives from the other side: the daemon's schema is validated by **key allowlist**, so an
+> `[mcp]` section would make `jarvis-storage` learn one protocol's configuration vocabulary — the dependency
+> this paragraph was trying to avoid, arriving through the parser rather than through a type. A separate
+> document also keeps an MCP failure from being a daemon startup failure, which is the same reasoning that
+> makes one failed `tools/list` an exclusion rather than a failed run. **`parse_host_section` was a public
+> helper added for the rejected shape and it had no caller outside its own test**, so it was removed in
+> `P3-008j` — see the note where it used to be in `host_config.rs`. What survives from this decision is the
+> part that mattered: this crate owns the host schema and `jarvis-storage` owns the daemon's, with no
+> overlap.
+
 **2. The posture vocabulary is two classes, and the default is the severe one.**
 
 An operator writes `class = "read-only"` or nothing. Nothing means
@@ -95,9 +108,11 @@ own slice and belongs in the credential store.
   it is the statement that the connection is shared, and it moved ~13 test construction sites. That is the
   cost of saying it in the type rather than in a comment, and it is the right trade here because the
   alternative — two sessions whose lifecycles diverge — fails silently at shutdown.
-- Still **not reachable from `jarvisd`**: the daemon does not yet read an `[mcp]` section, so this is a
-  configuration surface a caller can drive and not one the daemon loads. `P3-009`/the host wiring is what
-  puts it in the daemon's startup path; the shape is now ready for that one call.
+- Still **not reachable from `jarvisd`** at the time of this slice: the daemon did not yet read an MCP
+  document, so this was a configuration surface a caller could drive and not one the daemon loads.
+  **CORRECTION (2026-09-23): `P3-008j` closed that.** The daemon now reads `mcp-servers.toml`, connects the
+  host, registers its adapters, and dispatches to them, so the shape this decision said was "ready for that
+  one call" is the shape that call was made against — with the one correction above.
 
 ## Alternatives rejected
 

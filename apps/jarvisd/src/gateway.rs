@@ -278,7 +278,8 @@ async fn call_tool(
         return error_response(
             StatusCode::NOT_FOUND,
             ErrorCode::Validation,
-            "no tool is registered: grant `daemon.tool_workspace_roots` to enable the filesystem tool",
+            "no tool is registered: grant `daemon.tool_workspace_roots` or configure MCP servers in \
+             `mcp-servers.toml` to enable tools",
         );
     };
 
@@ -290,7 +291,15 @@ async fn call_tool(
         Err(error) => return error.into_response(),
     };
 
-    let actor = crate::tool_actor::ToolActor::workspace_reader(
+    // The actor holds **both** tool areas' scopes, because this transport serves whichever tools the daemon
+    // composed: a filesystem tool when roots are granted, an MCP tool when servers are configured. The scope
+    // set is still derived here rather than accepted from the request, which is the rule that matters — a
+    // caller cannot name a scope, so it cannot widen its own authority.
+    //
+    // The construction is checked rather than unwrapped: a rejected literal is an authoring error, and the
+    // daemon failing closed on it is better than a caller being denied for a missing scope that reads as a
+    // policy problem.
+    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
         run.workspace_id.clone(),
         run.run_id.clone(),
         jarvis_core::SessionChannel::Cli,
@@ -298,7 +307,13 @@ async fn call_tool(
         // HTTP client on this transport has actually established.
         jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
-    );
+    ) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "the tool actor could not be built: a fixed scope literal was rejected",
+        );
+    };
 
     match tools
         .call_tool(

@@ -90,6 +90,14 @@ jarvis/
 
 The production composition root. It loads configuration, constructs adapters, runs migrations, starts workers and network listeners, exposes health, and coordinates graceful shutdown. Its handlers translate protocols into application commands and queries. They do not implement policy or workflows.
 
+It is the **only** place the pieces are joined, which is why it holds the joins that no library crate may
+state. `tool_pipeline.rs` sequences the gates and composes the adapters; `dispatch.rs` resolves a canonical
+tool identifier to the single adapter that runs it, refusing an uncovered tool at startup rather than after
+policy has authorized it; `mcp_host.rs` reads `mcp-servers.toml`, connects the host, and holds its
+connections for the process's life; `tool_actor.rs` describes the actor for the tool areas the profile
+actually grants. Each of those is a **decision about failure** rather than plumbing: an MCP failure removes
+tools, while a registry or filesystem-grant failure refuses to start.
+
 ### `apps/jarvis-cli`
 
 Parses commands, discovers the daemon, authenticates, sends protocol requests, renders results, and maps machine-readable errors to exit codes. Direct database or provider access is forbidden.
@@ -180,6 +188,16 @@ It does not own business decisions. Generate TypeScript clients from its publish
   which is the first caller of the catalog's collision check — a collision refuses the whole host rather than
   dropping a side, because serving a catalog whose contents depend on configuration order would make the
   reachable tool set a function of an ordering nobody declared meaningful (ADR-0029).
+
+  **The daemon now reads a document this crate owns, and that is what makes an MCP server an
+  operator-reachable tool.** `apps/jarvisd/src/mcp_host.rs` loads `mcp-servers.toml` (a separate document
+  from `config.toml`, because a third-party server that is missing, hung, or colliding must remove the MCP
+  *tools* rather than stop the daemon — the daemon's schema also validates by key allowlist, so an `[mcp]`
+  section would make a storage adapter learn one protocol's vocabulary). `apps/jarvisd/src/dispatch.rs` is
+  the table that resolves a canonical identifier to the one adapter that runs it, built from each adapter's
+  own definitions and refusing both a tool no adapter covers and a tool two adapters claim. Ten slices
+  recorded "a capability a caller can use, not one an operator can reach"; this is the one that ends it
+  (ADR-0030).
 - `jarvis-connectors`: OAuth/account lifecycle and provider-specific mail/calendar/etc. operations.
 - `jarvis-memory`: memory admission, scoring, embeddings, retrieval explanations, entity resolution.
 - `jarvis-workflows`: event inbox/outbox, scheduler, durable worker and step executors.
