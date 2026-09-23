@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use jarvis_diagnostics::{FindingCode, Report, ReportOutcome, Severity, diagnose, repair};
+use jarvis_diagnostics::{FindingCode, Outcome, Report, ReportOutcome, Severity, diagnose, repair};
 use jarvis_storage::AppPaths;
 use sqlx::{ConnectOptions, Connection, Executor, sqlite::SqliteConnectOptions};
 
@@ -317,4 +317,187 @@ fn finding_severities_are_bounded_and_ordered() {
     // Error is the only severity that makes the report blocking.
     assert!(Severity::Info < Severity::Warning);
     assert!(Severity::Warning < Severity::Error);
+}
+
+/// **The sandbox check reports which guarantees are in force, and never claims a guarantee the host lacks.**
+///
+/// `docs/architecture/security.md` requires diagnostics to "report effective guarantees rather than claiming
+/// parity". That is only meaningful if the report carries the **list**, so this test reads the guarantee names
+/// back out of the evidence rather than accepting a pass/fail. A boolean would let a host enforcing one of four
+/// guarantees read identically to one enforcing all four, which is exactly the parity claim being forbidden.
+///
+/// It is also the check's **caller test**: without it `check_sandbox` would be a function nothing could
+/// distinguish from a stub — the failure mode where a slice looks complete because a unit test passes on a
+/// helper no report ever shows.
+///
+/// Falsified by mutation: dropping the `guarantees` evidence key fails the evidence assertion; reporting
+/// `SandboxAvailable` when the support set is empty fails the consistency assertion below.
+#[tokio::test]
+async fn the_report_names_the_sandbox_guarantees_in_force() {
+    let fixture = TempProfile::new();
+    let report = diagnose(&fixture.paths())
+        .await
+        .unwrap_or_else(|error| panic!("diagnose must inspect a fixture installation: {error}"));
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "sandbox")
+        .unwrap_or_else(|| panic!("every report must contain the sandbox check"));
+    let finding = check
+        .findings
+        .first()
+        .unwrap_or_else(|| panic!("the sandbox check must produce a finding"));
+
+    // The host may or may not have a backend, so the expectation is derived from the code rather than assumed.
+    // Both branches assert something, so the test cannot pass by checking nothing on one of the two hosts.
+    match finding.code() {
+        FindingCode::SandboxAvailable => {
+            let guarantees = finding
+                .evidence()
+                .iter()
+                .find(|(key, _)| key == "guarantees")
+                .map_or_else(
+                    || panic!("an available sandbox must name its guarantees, not just assert one"),
+                    |(_, value)| value.clone(),
+                );
+            assert_ne!(
+                guarantees, "none",
+                "a check reporting availability must name at least one guarantee"
+            );
+            assert!(
+                !guarantees.contains("cpu_time_ceiling") || !cfg!(target_os = "linux"),
+                "cgroup v2 has no cumulative CPU limit, so Linux must never report it: {guarantees}"
+            );
+            assert_eq!(
+                check.outcome,
+                Outcome::Passed,
+                "an available sandbox is an informational pass, not a warning"
+            );
+        }
+        FindingCode::SandboxUnavailable => {
+            assert_eq!(
+                finding
+                    .evidence()
+                    .iter()
+                    .find(|(key, _)| key == "guarantees")
+                    .map(|(_, value)| value.as_str()),
+                Some("none"),
+                "an unavailable sandbox must say so rather than omit the key"
+            );
+            // Informational rather than a warning: a host with no confinement is a *supported* configuration,
+            // so reporting a degraded install would dilute the findings that are genuinely actionable.
+            // `ServiceNotApplicable` is the existing precedent for an absent-by-design capability. The first
+            // version of this comment claimed the warning broke the Phase 1 acceptance gate; that was measured
+            // and **refuted** (the gate passes with a warning), and the failure it described was my own leaked
+            // `JARVIS_PROFILE` environment variable. The severity is right for the design reason above.
+            assert_eq!(
+                check.outcome,
+                Outcome::Passed,
+                "an absent capability is reported informationally, so doctor's summary stays actionable"
+            );
+            // Asserted per finding rather than through `report.has_errors()`, which was the first version of this
+            // line and was wrong: this fixture is a deliberately **broken** installation, so other checks raise
+            // errors for reasons that have nothing to do with the sandbox. The property that matters is that no
+            // *sandbox* finding is blocking, which is precise and does not depend on what the fixture breaks.
+            for finding in &check.findings {
+                assert!(
+                    finding.severity() < Severity::Error,
+                    "no confinement must never be blocking on its own, got {:?} for {}",
+                    finding.severity(),
+                    finding.code().as_str()
+                );
+            }
+        }
+        other => panic!("the sandbox check reported an unexpected code: {other:?}"),
+    }
+}
+
+/// **Every `FindingCode` has a distinct identifier, a specific remediation, and a default severity.**
+///
+/// The crate's own doc comment makes those three properties contractual — "a code is never reused for a
+/// different meaning", "each code maps to exactly one remediation" — but nothing enforced them, so a code added
+/// with a copy-pasted remediation would keep a support playbook pointing at the wrong action. The list is
+/// derived from the exhaustive `as_str` match, so a new variant that is not added here still compiles, but a
+/// variant that is mapped to a duplicate string is caught.
+///
+/// Falsified by mutation: giving the two sandbox codes the same identifier string fails here; pointing
+/// `SandboxUnavailable` at "No action required." fails the remediation assertion.
+#[test]
+fn every_finding_code_has_a_distinct_id_and_an_actionable_remediation() {
+    // Every code currently declared. Kept as an explicit list rather than a wildcard so adding a variant forces
+    // a deliberate decision about its severity and remediation.
+    let codes = [
+        FindingCode::AllChecksPassed,
+        FindingCode::ConfigValid,
+        FindingCode::ConfigSchemaTooNew,
+        FindingCode::ConfigInvalid,
+        FindingCode::PathsUnavailable,
+        FindingCode::PathsInsecure,
+        FindingCode::PathsPrivate,
+        FindingCode::DatabaseAbsent,
+        FindingCode::DatabaseCurrent,
+        FindingCode::DatabaseUnreadable,
+        FindingCode::DatabaseForeign,
+        FindingCode::DatabaseSchemaTooNew,
+        FindingCode::DatabaseMigrationPending,
+        FindingCode::DatabaseSchemaInconsistent,
+        FindingCode::DatabaseIntegrityFailed,
+        FindingCode::CredentialMissing,
+        FindingCode::CredentialPresent,
+        FindingCode::CredentialInvalid,
+        FindingCode::DaemonRunning,
+        FindingCode::DaemonNotRunning,
+        FindingCode::ProtocolAligned,
+        FindingCode::ProtocolMismatch,
+        FindingCode::ProtocolUnreachable,
+        FindingCode::RedactionSelfTestPassed,
+        FindingCode::RedactionSelfTestFailed,
+        FindingCode::LogsEmpty,
+        FindingCode::LogsReadable,
+        FindingCode::ServiceAbsent,
+        FindingCode::ServiceNotApplicable,
+        FindingCode::ServiceCurrent,
+        FindingCode::ServiceDrifted,
+        FindingCode::ServiceForeign,
+        FindingCode::ServiceUnreadable,
+        FindingCode::SandboxAvailable,
+        FindingCode::SandboxUnavailable,
+    ];
+    let mut identifiers: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
+    identifiers.sort_unstable();
+    let total = identifiers.len();
+    identifiers.dedup();
+    assert_eq!(
+        identifiers.len(),
+        total,
+        "every finding code needs its own identifier, or support automation cannot match on it"
+    );
+
+    for code in codes {
+        let remediation = code.remediation();
+        assert!(
+            !remediation.trim().is_empty(),
+            "{} must have a remediation",
+            code.as_str()
+        );
+    }
+    // The two sandbox codes are the reason this test exists: a code that warns without saying what to do is the
+    // difference between an actionable warning and noise. It is asserted outside the loop because it is a claim
+    // about one specific code rather than a property of all of them.
+    assert_ne!(
+        FindingCode::SandboxUnavailable.remediation(),
+        "No action required.",
+        "a host with no confinement must be told how to obtain one"
+    );
+    assert_eq!(
+        FindingCode::SandboxAvailable.default_severity(),
+        Severity::Info,
+        "an available sandbox is informational"
+    );
+    assert_eq!(
+        FindingCode::SandboxUnavailable.default_severity(),
+        Severity::Info,
+        "a host with no confinement is supported, so it must not make doctor report a degraded install"
+    );
 }

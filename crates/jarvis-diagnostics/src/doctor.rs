@@ -261,6 +261,7 @@ pub async fn diagnose(paths: &AppPaths) -> Result<Report, DoctorError> {
         check_redaction(paths),
         check_logs(paths),
         check_service(paths),
+        check_sandbox(),
     ];
 
     Ok(Report {
@@ -756,6 +757,74 @@ fn check_logs(paths: &AppPaths) -> CheckResult {
     }
 }
 
+/// Reports which OS-level guarantees this host can actually enforce on a child process.
+///
+/// # Why this check exists, and why it is not an error on a host with none
+///
+/// `docs/architecture/security.md` requires that diagnostics "report effective guarantees rather than claiming
+/// parity". That requirement is only meaningful if the report names **what is in force**, so the evidence here
+/// is the guarantee list itself rather than a boolean "sandbox available" — a boolean would let a host with one
+/// guarantee out of four read the same as a host with all four.
+///
+/// The severity is a `Warning`, not an `Error`, because a host with no confinement is a **supported**
+/// configuration: JARVIS can run without ever executing code, and an operator who does not intend to enable an
+/// MCP server or any other code execution has nothing to fix. The finding's text states the consequence
+/// instead — that code execution may not be enabled here — so the warning is actionable rather than alarming,
+/// and a blocking severity would make a healthy install report as broken.
+///
+/// The backend is probed at check time, never constructed once and cached, because the answer is a property of
+/// the **running host**: a container without `cgroup2` mounted, or a user granted a delegated subtree since the
+/// last run, must be reported as it is now rather than as it was.
+///
+/// Falsified by mutation: reporting `Passed` with an empty guarantee list fails the availability test, and
+/// omitting the guarantee names from the evidence fails the test that reads them back out.
+fn check_sandbox() -> CheckResult {
+    const NAME: &str = "sandbox";
+    let backend = jarvis_sandbox::backend_for_host();
+    CheckResult::from_findings(
+        NAME,
+        vec![sandbox_finding(&backend.support(), backend.facility())],
+    )
+}
+
+/// Builds the sandbox finding for a support set and facility.
+///
+/// # Why this is separate from the probe, and not merely for tidiness
+///
+/// Splitting it is what makes the **available** branch testable on a host that has no backend. A falsification
+/// sweep demonstrated the cost of not splitting: mutating the guarantee-list evidence on the available branch
+/// was **not caught**, because that branch cannot execute on Windows. A branch that only one platform can reach
+/// is a branch whose formatting, severity, and evidence keys are all unmeasured everywhere else — and a report
+/// nobody can check is the same class of problem as a guarantee nobody can enforce.
+fn sandbox_finding(
+    support: &jarvis_sandbox::GuaranteeSupport,
+    facility: jarvis_sandbox::Support,
+) -> Finding {
+    if support.is_empty() {
+        return Finding::new(
+            FindingCode::SandboxUnavailable,
+            safe(
+                "this host cannot confine a child process, so no guarantee can be required of one",
+            ),
+        )
+        .with_evidence("facility", facility.as_str())
+        // `"none"` rather than an omitted key: an operator reading the JSON should see that the question was
+        // asked and the answer was none, not be left to infer it from a missing field.
+        .with_evidence("guarantees", "none");
+    }
+    let guarantees: Vec<&str> = support
+        .guarantees()
+        .iter()
+        .map(|guarantee| guarantee.as_str())
+        .collect();
+    Finding::new(
+        FindingCode::SandboxAvailable,
+        safe("this host can confine a child process and reports the guarantees in force"),
+    )
+    .with_evidence("facility", facility.as_str())
+    .with_evidence("guarantees", guarantees.join(","))
+}
+
 /// Flattens and bounds a diagnostic detail so it stays single-line and useful.
 fn bounded(detail: &str) -> String {
     let flattened: String = detail
@@ -785,6 +854,68 @@ pub const fn runtime_source_name(source: jarvis_storage::RuntimePathSource) -> &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Both branches of the sandbox finding, asserted directly rather than through whatever host runs the
+    /// suite.**
+    ///
+    /// A falsification sweep is the reason this test exists: with the two branches inside the probe function, a
+    /// mutation that dropped the guarantee-list evidence from the **available** branch was not caught, because
+    /// no Windows host can reach it. Constructing the support set here means every host measures both branches,
+    /// which is the only way the claim `security.md` makes — that diagnostics report the guarantees in force —
+    /// is verified rather than merely written.
+    ///
+    /// Falsified by mutation: omitting the `guarantees` evidence on either branch fails here; swapping the two
+    /// finding codes fails here; reporting availability for an empty set fails here.
+    #[test]
+    fn the_sandbox_finding_reports_both_branches() {
+        use jarvis_sandbox::{Guarantee, GuaranteeSupport, Support};
+
+        let none = sandbox_finding(&GuaranteeSupport::default(), Support::Unconfined);
+        assert_eq!(none.code(), FindingCode::SandboxUnavailable);
+        assert_eq!(
+            none.evidence()
+                .iter()
+                .find(|(key, _)| key == "guarantees")
+                .map(|(_, value)| value.as_str()),
+            Some("none"),
+            "an unavailable sandbox must state the answer rather than omit the key"
+        );
+        assert_eq!(
+            none.evidence()
+                .iter()
+                .find(|(key, _)| key == "facility")
+                .map(|(_, value)| value.as_str()),
+            Some("unconfined")
+        );
+
+        let some = sandbox_finding(
+            &GuaranteeSupport::from_guarantees([
+                Guarantee::TreeTermination,
+                Guarantee::MemoryCeiling,
+            ]),
+            Support::CgroupV2,
+        );
+        assert_eq!(some.code(), FindingCode::SandboxAvailable);
+        let guarantees = some
+            .evidence()
+            .iter()
+            .find(|(key, _)| key == "guarantees")
+            .map_or_else(
+                || panic!("an available sandbox must name its guarantees, not just assert one"),
+                |(_, value)| value.clone(),
+            );
+        assert_eq!(
+            guarantees, "tree_termination,memory_ceiling",
+            "the list is what an operator reads to know what is in force, in a stable order"
+        );
+        assert_eq!(
+            some.evidence()
+                .iter()
+                .find(|(key, _)| key == "facility")
+                .map(|(_, value)| value.as_str()),
+            Some("cgroup_v2")
+        );
+    }
 
     #[test]
     fn bounded_details_are_single_line_and_capped() {

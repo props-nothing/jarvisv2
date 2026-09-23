@@ -10,6 +10,7 @@ members = [
     "crates/jarvis-models",
     "crates/jarvis-observability",
     "crates/jarvis-protocol",
+    "crates/jarvis-sandbox",
     "crates/jarvis-storage",
     "crates/jarvis-tools",
     "tests/e2e",
@@ -63,6 +64,7 @@ jarvis-mcp-transport = { path = "crates/jarvis-mcp-transport", version = "0.1.0"
 jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
 jarvis-observability = { path = "crates/jarvis-observability", version = "0.1.0" }
 jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
+jarvis-sandbox = { path = "crates/jarvis-sandbox", version = "0.1.0" }
 jarvis-storage = { path = "crates/jarvis-storage", version = "0.1.0" }
 jarvis-tools = { path = "crates/jarvis-tools", version = "0.1.0" }
 # Pinned exactly, and with NO features enabled. The default feature set is

@@ -1217,6 +1217,7 @@ dependencies = [
  "jarvis-core",
  "jarvis-observability",
  "jarvis-protocol",
+ "jarvis-sandbox",
  "jarvis-storage",
  "serde_json",
  "sqlx",
@@ -1295,6 +1296,15 @@ dependencies = [
  "jarvis-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "jarvis-sandbox"
+version = "0.1.0"
+dependencies = [
+ "jarvis-core",
  "thiserror",
  "tokio",
 ]

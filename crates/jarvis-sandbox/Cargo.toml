@@ -1,0 +1,24 @@
+[package]
+name = "jarvis-sandbox"
+description = "OS-level confinement for child processes: the contract, and one restricted backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+thiserror.workspace = true
+# The launch half returns a `tokio::process::Child`, because that is what the caller hands to the MCP SDK's
+# `TokioChildProcess`. A runtime-neutral abstraction would be converted straight back at the boundary for no
+# gain, and it would hide that spawning is the operation. This mirrors `jarvis-storage`, which is likewise
+# non-pure because the thing it wraps is.
+tokio = { workspace = true, features = ["process", "rt"] }
+
+[dev-dependencies]
+# The tests assert against the **public** API and really spawn processes, so they need the async runtime,
+# `io-util` to drain a child's pipes, and the macros for `#[tokio::test]`.
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }
+
+[lints]
+workspace = true

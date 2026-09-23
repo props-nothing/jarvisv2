@@ -1725,7 +1725,61 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       shared between revisions must run **twice** — once per era — because `2025-11-25` and earlier use the
       stateful `initialize` handshake while `2026-07-28` is stateless with per-request `_meta`.
       Cross-SDK interoperability is likewise blocked for the same reason: it needs a foreign client to connect.
-- [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
+- [x] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
+  - **Shape of the crate.** `crates/jarvis-sandbox` with `policy.rs` (the request, the guarantees, and the
+    refusal), `backend.rs` (the `SandboxBackend` contract, `GuaranteeSupport`, `backend_for_host`, the launcher
+    seam), and `linux.rs` (the cgroup v2 backend, `#[cfg(target_os = "linux")]`). `docs/adr/0041` records the
+    decision; `docs/research/integrations/os-process-sandboxing.md` records the live documentation evidence.
+  - **A guarantee is an enum, not a boolean, and it is refused when it cannot be enforced.** `Guarantee` names
+    `TreeTermination`, `ProcessCountCeiling`, `MemoryCeiling`, `CpuRateCeiling`, and `CpuTimeCeiling`;
+    `SandboxPolicy::new` resolves a request's `required` list against the backend **once, at construction**, and
+    `SandboxError::UnsupportedGuarantee` names the first guarantee the backend cannot provide. There is no
+    "applied but weaker" outcome, because a caller who declared a requirement has already stopped checking — so a
+    silently weaker sandbox is the one configuration nobody audits.
+  - **`unsafe_code = "forbid"` decided the platform split.** Every Windows job-object call is `unsafe` FFI, so
+    the job-object backend **cannot exist** in this workspace; Linux cgroup v2 is a **filesystem** interface
+    (`pids.max`, `memory.max`, `cpu.max`, `cgroup.kill`), so it needs no FFI and is the backend that exists.
+    `backend_for_host()` **probes the running host** rather than reporting the compiled target, and reports an
+    **empty** support set on Windows and macOS, which makes every requirement a refusal there.
+  - **`CpuTimeCeiling` is deliberately absent from the Linux backend**, and the omission is the load-bearing
+    assertion. cgroup v2 accounts CPU time in `cpu.stat` but has **no limit file for a cumulative total** — only
+    the rate form in `cpu.max` — while a Windows job object has `PerJobUserTimeLimit` and no rate form. That
+    asymmetry is why CPU is two `Guarantee` variants rather than one, and `cgroup_v2_guarantees()` lives in the
+    always-compiled `backend.rs` so a **non-Linux** host can still falsify the omission.
+  - **`RLIMIT_NPROC` is rejected as a fallback, by construction.** It is counted **per user id**, so a child that
+    reaches its own limit can still `fork` — each new process gets a fresh budget under the same uid. Only a
+    tree-scoped counter makes a fork bomb fail. Reporting `ProcessCountCeiling` on its strength would be a
+    guarantee a fork bomb walks straight through.
+  - **Confined before the child exists, with the one unclosable window stated.** Limits are written before the
+    spawn (which is what `memory.max` needs, since a limit applied afterwards is applied after the allocation),
+    and the spawn is **injected** by the caller so only it decides about pipes. cgroup v2 has no atomic
+    spawn-into-cgroup, so the migrate window is recorded as a limit rather than described as closed, and a test
+    reads `/proc/<pid>/cgroup` to prove the child really landed in the launch's cgroup.
+  - **First caller: `doctor`.** `check_sandbox` reports `sandbox.available` / `sandbox.unavailable` with the
+    **facility and the guarantee list** as evidence — the list, not a boolean, because a boolean would let a host
+    enforcing one of four read identically to one enforcing all four. Both are `Severity::Info`, following
+    `ServiceNotApplicable`: a capability absent **by design** is informational, and `sandbox.unavailable`'s
+    remediation names the `systemd Delegate=yes` action that would change the answer.
+  - **Falsified.** 24 mutations across the crate and the doctor check, applied one at a time and each restored in
+    a `try/finally`: 13/13 for the sandbox crate, 11/11 for the doctor check, with the tree re-verified clean and
+    the restored suite re-run green afterwards. Two tests were **strengthened because a mutation survived them**:
+    the kill test asserted only `Ok`, which a no-op `kill` also satisfies, so it now asks the operating system
+    whether the pid is still alive; and the working-directory test now asserts the temp directory differs from the
+    daemon's first, so dropping `current_dir` cannot pass.
+  - **Honest limits.** (1) The Windows/macOS backend **does not exist**, so no guarantee is available there and
+    enabling code execution needs either a lint relaxation for a job-object crate or a separate helper process,
+    with its own ADR. (2) **No network policy, no child filesystem confinement, and no privilege reduction** —
+    `Isolation::Restricted` bounds *resources*, and a confined child can still open any file and reach any host
+    this process can. (3) The Linux tests are **compiled but have not been executed** in this development
+    environment; they skip loudly when no cgroup is delegated, printing what could not be checked. (4)
+    `connect_stdio` in `jarvis-mcp-transport` is **not wired** to this crate: that needs a trait seam so the
+    transport does not depend on `jarvis-sandbox`, and the slice's phrase "before exposing code execution" is
+    satisfied by the contract existing with refusal working, not by an execution path using it.
+  - **`cargo clippy --target x86_64-unknown-linux-gnu` is part of this crate's gate**, and earned its place: it
+    found six defects invisible on Windows, including an import unused only on Linux, two collapsible `if let`
+    chains, identical `match` arms, an error-type mismatch in the kill path, and a duplicated `linux` module from
+    declaring `mod linux;` in both `lib.rs` and `backend.rs` (a `#[path]` module declared twice includes the file
+    **twice**, as two modules with distinct copies of every type).
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.
 
 ## P4: Memory And Context

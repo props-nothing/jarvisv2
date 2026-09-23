@@ -101,6 +101,17 @@ pub enum FindingCode {
     ServiceForeign,
     /// The per-user service definition could not be read.
     ServiceUnreadable,
+    /// The host can confine a child process and reports which guarantees are in force.
+    SandboxAvailable,
+    /// The host cannot confine a child process, so no guarantee can be required of one.
+    ///
+    /// Informational rather than a warning because a host with no confinement is a **supported**
+    /// configuration: JARVIS runs without executing code, so an operator who never enables an MCP server has no
+    /// defect and no action to take. `ServiceNotApplicable` is the existing precedent — a capability absent
+    /// **by design** is `Info`, and the remediation still says how to obtain it. Raising this to a warning would
+    /// make `jarvis doctor` report a degraded install on every Windows and macOS host, which would dilute the
+    /// findings that are genuinely actionable.
+    SandboxUnavailable,
 }
 
 impl FindingCode {
@@ -141,6 +152,8 @@ impl FindingCode {
             Self::ServiceDrifted => "service.drifted",
             Self::ServiceForeign => "service.foreign",
             Self::ServiceUnreadable => "service.unreadable",
+            Self::SandboxAvailable => "sandbox.available",
+            Self::SandboxUnavailable => "sandbox.unavailable",
         }
     }
 
@@ -165,6 +178,8 @@ impl FindingCode {
             | Self::ServiceCurrent
             | Self::ServiceNotApplicable
             | Self::LogsReadable
+            | Self::SandboxAvailable
+            | Self::SandboxUnavailable
             | Self::RedactionSelfTestPassed => Severity::Info,
             Self::ConfigSchemaTooNew
             | Self::ConfigInvalid
@@ -201,6 +216,7 @@ impl FindingCode {
             | Self::ProtocolAligned
             | Self::ServiceCurrent
             | Self::ServiceNotApplicable
+            | Self::SandboxAvailable
             | Self::RedactionSelfTestPassed => "No action required.",
             Self::ConfigSchemaTooNew => {
                 "Install the JARVIS build that supports this configuration schema, or restore an older config.toml."
@@ -261,6 +277,12 @@ impl FindingCode {
             }
             Self::ServiceUnreadable => {
                 "Check the definition file's permissions and contents before deciding whether to replace it."
+            }
+            Self::SandboxUnavailable => {
+                "A child process started by JARVIS cannot be confined on this host, so no code execution may be \
+                 enabled. On Linux, grant this user a delegated cgroup v2 subtree (for example with \
+                 `systemd`'s `Delegate=yes` on a user unit) so `pids.max`, `memory.max` and `cgroup.kill` become \
+                 available, then run `jarvis doctor` again."
             }
         }
     }

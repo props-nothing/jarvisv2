@@ -10,6 +10,9 @@ publish.workspace = true
 jarvis-core.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
+# A check, not a dependency in the other direction: `jarvis-sandbox` knows nothing about diagnostics, so the
+# report can name the guarantees in force without the sandbox crate taking a view on how they are reported.
+jarvis-sandbox.workspace = true
 jarvis-storage.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
