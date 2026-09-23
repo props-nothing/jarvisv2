@@ -12,6 +12,11 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# The acceptance gates build a temporary root with a name that cannot repeat across runs, which is
+# `jarvis_core::scratch_tag`. A **normal** dependency rather than a dev-only one because the gates live in
+# `tests/`, which cargo compiles against the crate's own dependency list; `jarvis-storage` already brings
+# `jarvis-core` into the graph, so declaring it adds no package.
+jarvis-core.workspace = true
 jarvis-storage.workspace = true
 
 [dev-dependencies]

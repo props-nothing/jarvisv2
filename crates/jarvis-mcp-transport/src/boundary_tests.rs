@@ -344,6 +344,29 @@ fn the_scan_reports_a_public_declaration_that_names_the_sdk() {
     assert!(offenders[0].1.contains("pub fn sdk"));
 }
 
+/// **A public type alias naming the SDK is reported, and its own `fn`-only probe would not have shown that.**
+///
+/// `P3-009c` added a `pub type` alias and a `ResponseBody` alias, which is the shape a leak would take next: an
+/// alias is a `pub` item whose declaration is a signature-like position without any `fn`. This asserts the scan
+/// covers it **at the line that would be reported** rather than by inference from the `fn` probe above.
+///
+/// The fixture carries its own `use rmcp::…` line, because the scan is **per file** and keys the imported-name
+/// form off the imports in the same source. That is the correct behaviour — a file using an imported SDK name
+/// must have the import — and it is worth stating because the fixture written without it **failed**, which is
+/// how the dependency was found rather than assumed.
+#[test]
+fn the_scan_reports_a_public_type_alias_that_names_the_sdk() {
+    let source = "use rmcp::transport::streamable_http_server::tower::StreamableHttpService;\n\
+                  pub type Leaked = StreamableHttpService<JarvisMcpServer, NeverSessionManager>;\n";
+    let offenders = offending_lines(source);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "a public alias naming the SDK must be reported, got: {offenders:?}"
+    );
+    assert!(offenders[0].1.starts_with("pub type Leaked"));
+}
+
 /// A private declaration naming the SDK is **not** reported, which is the whole point.
 #[test]
 fn the_scan_ignores_a_private_declaration() {

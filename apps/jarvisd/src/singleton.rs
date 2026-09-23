@@ -131,24 +131,16 @@ fn write_metadata(file: &File, build: BuildInfo) -> Result<(), SingletonError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::path::PathBuf;
 
     use super::*;
-
-    static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "jarvisd-singleton-{}-{sequence}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("jarvisd-singleton-{}", jarvis_core::scratch_tag()));
             if let Err(error) = fs::create_dir_all(&path) {
                 panic!("create singleton test directory: {error}");
             }

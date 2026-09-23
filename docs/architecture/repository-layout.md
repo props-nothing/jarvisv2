@@ -230,6 +230,20 @@ It does not own business decisions. Generate TypeScript clients from its publish
   (loopback-only serving beside an allowlist with remote entries) are **not** reconciled, because the bind is
   one control and the admission policy another, and a control that depends on another having worked is not a
   control.
+
+  **`ServedEndpoint` is the layer a listener mounts, and a network request is never a local caller**
+  (`P3-009c-a`). It is a `tower` service wrapping the SDK's Streamable HTTP service rather than a route handler,
+  because that service **is** a `Service<Request<Body>>` — so the wrap is one `impl Service` instead of a second
+  routing layer and a second body type, and `axum::Router::fallback_service` accepts any `Service`. It derives
+  the gate's four values from a real request and answers `RequestRefusal::refusal_status`, which is where
+  "nothing binds" ends. `CallerOrigin::Remote` is **hard-coded**, and that is the slice's central decision:
+  `Local` means the operator on their own machine, established by the daemon's *transport* (a named pipe, a
+  socket it holds), and a loopback bind is not that evidence because any local process and a browser on the same
+  machine can reach `127.0.0.1` — deriving it from a peer address would be `CallerOrigin`'s own defect one layer
+  down. An oversized `Origin` is **truncated, never treated as absent**, because absent is *admitted* by the
+  spec's own rule, so collapsing it into `None` inverts the control. `into_service` returns `impl Service`,
+  keeping the SDK's service out of this crate's contract, while `ResponseBody` is public — a fact about
+  `http-body-util` rather than about MCP, which is why naming it is not a leak (ADR-0038).
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

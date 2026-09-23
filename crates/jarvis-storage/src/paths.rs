@@ -576,20 +576,16 @@ fn run_permission_command(command: &mut std::process::Command) -> Result<(), Pat
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!(
-                "jarvis-storage-paths-{}-{sequence}",
-                std::process::id()
+                "jarvis-storage-paths-{}",
+                jarvis_core::scratch_tag()
             )))
         }
 

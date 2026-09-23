@@ -1167,6 +1167,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jarvis-acceptance"
 version = "0.1.0"
 dependencies = [
+ "jarvis-core",
  "jarvis-storage",
  "reqwest",
  "serde_json",
@@ -1241,7 +1242,9 @@ name = "jarvis-mcp-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "http",
+ "http-body",
  "http-body-util",
  "jarvis-core",
  "jarvis-mcp",

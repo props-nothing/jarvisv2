@@ -547,24 +547,19 @@ fn storage_error(error: &DatabaseError) -> Response {
 }
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use axum::body::Body;
+    use std::path::PathBuf;
     use tower::ServiceExt as _;
 
     use super::*;
-
-    static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     /// Owns a temporary profile directory and removes it on drop.
     struct TempProfile(PathBuf);
 
     impl TempProfile {
         fn new() -> Self {
-            let sequence = DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("jarvis-gateway-{}-{sequence}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("jarvis-gateway-{}", jarvis_core::scratch_tag()));
             std::fs::create_dir_all(&path)
                 .unwrap_or_else(|error| panic!("create temp profile: {error}"));
             Self(path)

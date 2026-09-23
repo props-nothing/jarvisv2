@@ -13,22 +13,18 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use jarvis_core::{LocalEndpoint, is_valid_profile};
 use jarvis_storage::{AppPaths, PathMode, RuntimePathSource, portable_layout};
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new(label: &str) -> Self {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jarvis-portable-{label}-{}-{sequence}",
-            std::process::id()
+            "jarvis-portable-{label}-{}",
+            jarvis_core::scratch_tag()
         ));
         fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create temp dir: {error}"));
         Self(path)

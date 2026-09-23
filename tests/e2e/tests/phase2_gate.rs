@@ -43,7 +43,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -85,17 +84,14 @@ const NON_TERMINAL: [&str; 7] = [
 /// The terminal event names a settled run's stream ends with.
 const TERMINAL_EVENTS: [&str; 3] = ["run_completed", "run_cancelled", "run_failed"];
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Removes the gate's temporary root when the test ends, pass or fail.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jarvis-phase2-{label}-{}-{sequence}",
-            std::process::id()
+            "jarvis-phase2-{label}-{}",
+            jarvis_core::scratch_tag()
         ));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
         Self(path)

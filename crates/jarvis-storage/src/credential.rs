@@ -163,20 +163,16 @@ fn secure(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jarvis-storage-credential-{}-{sequence}",
-                std::process::id()
+                "jarvis-storage-credential-{}",
+                jarvis_core::scratch_tag()
             ));
             fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create temp dir: {error}"));
             Self(path)

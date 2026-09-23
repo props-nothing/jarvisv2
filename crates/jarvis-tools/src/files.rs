@@ -512,7 +512,6 @@ fn describe_io_error(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use jarvis_core::{CorrelationId, ToolOutcome};
     use serde_json::json;
@@ -523,18 +522,13 @@ mod tests {
     use crate::risk::Risk;
     use crate::workspace::WorkspaceRoots;
 
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
     /// A temporary directory removed when the test ends, pass or fail.
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "jarvis-files-tool-{}-{sequence}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("jarvis-files-tool-{}", jarvis_core::scratch_tag()));
             fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
             // Canonicalized because `temp_dir()` on Windows can return an 8.3 short form whose text
             // differs from the long form a handle resolution reports.

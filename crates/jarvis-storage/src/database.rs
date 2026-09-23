@@ -1049,25 +1049,19 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fmt::Debug,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::fmt::Debug;
 
     use sqlx::SqliteConnection;
 
     use super::*;
 
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
-
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jarvis-storage-database-{}-{sequence}",
-                std::process::id()
+                "jarvis-storage-database-{}",
+                jarvis_core::scratch_tag()
             ));
             must(fs::create_dir_all(&path));
             Self(path)

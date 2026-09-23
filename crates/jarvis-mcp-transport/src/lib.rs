@@ -56,6 +56,7 @@
 
 mod adapter;
 mod admission;
+mod binding;
 #[cfg(test)]
 #[path = "boundary_tests.rs"]
 mod boundary_tests;
@@ -74,6 +75,14 @@ pub use admission::{
     AdmissionError, AdmissionVerdict, AdmittedCaller, CallerAdmission, CallerLabel, CallerOrigin,
     DEFAULT_REQUESTS_PER_MINUTE, Fingerprint, MAX_ADMITTED_CALLERS, MAX_CALLER_LABEL_CHARS,
     MAX_FINGERPRINT_CHARS,
+};
+// The binding layer (`P3-009c`): the tower service a daemon mounts, and the two decisions every request passes.
+// `ResponseBody` and the header/limit constants are exported because a daemon needs the body type to name its
+// router's response and may want to state the bounds it is serving under; `ResponseBody` is a fact about
+// `http-body-util` rather than about the MCP SDK, which is why naming it here keeps the SDK out of the contract.
+pub use binding::{
+    BEARER_SCHEME, CREDENTIAL_HEADER, MAX_ORIGIN_HEADER_CHARS, REFUSAL_CODE, ResponseBody,
+    ServedEndpoint,
 };
 pub use client::{
     McpCallResult, McpConnection, OwnedListing, ServerCapabilities, StdioCommand, ToolBuffer,

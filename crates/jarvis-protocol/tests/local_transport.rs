@@ -4,7 +4,6 @@
 //! named pipe) and drive the protocol v1 handshake and request loop over it.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use jarvis_core::{
     ClientCredential, CorrelationId, DaemonRunId, ErrorCode, LocalEndpoint, LocalListener,
@@ -16,16 +15,13 @@ use jarvis_protocol::{
     WireError, serve,
 };
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new() -> Self {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jarvis-protocol-transport-{}-{sequence}",
-            std::process::id()
+            "jarvis-protocol-transport-{}",
+            jarvis_core::scratch_tag()
         ));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create temp dir: {error}"));
         Self(path)
@@ -40,8 +36,11 @@ impl Drop for TempDirectory {
 
 fn endpoint(directory: &TempDirectory) -> LocalEndpoint {
     if cfg!(windows) {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        LocalEndpoint::named_pipe(&format!("jarvis-test-{}-{sequence}", std::process::id()))
+        // A non-repeating tag rather than the pid plus a counter: a **live** process with a recycled pid and a
+        // counter at 0 would collide with this one, and two live test processes on one pipe name is the same
+        // defect class as two runs sharing a directory. A pipe needs no `Drop` to be cleaned up, but it does
+        // need a name that cannot be taken.
+        LocalEndpoint::named_pipe(&format!("jarvis-test-{}", jarvis_core::scratch_tag()))
             .unwrap_or_else(|error| panic!("pipe endpoint: {error}"))
     } else {
         LocalEndpoint::unix_socket(&directory.0, "test")

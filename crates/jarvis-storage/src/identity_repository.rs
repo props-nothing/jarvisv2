@@ -99,27 +99,20 @@ pub async fn load_local_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::{fs, path::PathBuf};
 
     use sqlx::Row;
 
     use super::*;
     use crate::DEFAULT_DATABASE_FILENAME;
 
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
-
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jarvis-local-identity-{}-{sequence}",
-                std::process::id()
+                "jarvis-local-identity-{}",
+                jarvis_core::scratch_tag()
             ));
             fs::create_dir_all(&path).unwrap_or_else(|error| panic!("temp dir: {error}"));
             Self(path)

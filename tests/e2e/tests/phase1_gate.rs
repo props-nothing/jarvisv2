@@ -21,7 +21,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -39,17 +38,14 @@ const POLL: Duration = Duration::from_millis(100);
 /// `JARVIS_*` variable as a configuration error and would refuse to start.
 const REQUIRE_BINARIES_ENV: &str = "ACCEPTANCE_REQUIRE_BINARIES";
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Removes the gate's temporary root when the test ends, pass or fail.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jarvis-acceptance-{label}-{}-{sequence}",
-            std::process::id()
+            "jarvis-acceptance-{label}-{}",
+            jarvis_core::scratch_tag()
         ));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
         Self(path)

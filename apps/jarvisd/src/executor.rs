@@ -1156,6 +1156,10 @@ mod tests {
     }
 
     /// Opens a real migrated database, so the seeded identity rows are present.
+    ///
+    /// The pair is ordered `(database, profile)` deliberately: Rust drops tuple fields in declaration order, so
+    /// a profile placed first is removed while the pool still holds the database file open — a sharing
+    /// violation on Windows that `Drop` swallows.
     async fn database() -> (TempProfile, Arc<SqliteDatabase>) {
         let profile = TempProfile::new();
         let database = SqliteDatabase::open(&profile.database_path())

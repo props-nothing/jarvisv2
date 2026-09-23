@@ -16,7 +16,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use jarvis_core::{CorrelationId, SessionChannel, SystemClock, ToolOutcome, UtcTimestamp};
 use jarvis_storage::{
@@ -31,8 +30,6 @@ use serde_json::json;
 use super::{ToolPipeline, ToolPipelineError, ToolPipelineOutcome};
 use crate::tool_actor::ToolActor;
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 const SESSION: &str = "0198f000-0000-7000-8000-000000000003";
 const RUN: &str = "0198f000-0000-7000-8000-0000000000c3";
 const EVENT: &str = "0198f000-0000-7000-8000-0000000000e4";
@@ -42,10 +39,9 @@ struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new() -> Self {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jarvis-tool-pipeline-{}-{sequence}",
-            std::process::id()
+            "jarvis-tool-pipeline-{}",
+            jarvis_core::scratch_tag()
         ));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
         // Canonicalized because `temp_dir()` on Windows can return an 8.3 short form whose text
@@ -105,6 +101,10 @@ fn at(offset_seconds: i128) -> UtcTimestamp {
 }
 
 /// A database with the seeded local identity and one live run, plus the directory holding it.
+///
+/// The pair is ordered `(TempRoot, Arc<SqliteDatabase>)` deliberately: Rust drops tuple fields in declaration
+/// order, so a directory placed first is removed while the pool still holds the database file open. On Windows
+/// that is a sharing violation, and `Drop` swallows it — which leaked one directory per test silently.
 async fn database_with_run() -> (TempRoot, Arc<SqliteDatabase>) {
     let directory = TempRoot::new();
     let database = Arc::new(must(
@@ -221,7 +221,7 @@ async fn a_call_reaches_the_adapter_that_owns_its_definition() {
 
     let definition = mcp_definition("mcp.test.search", "search");
     let adapter = Arc::new(RecordingAdapter::default());
-    let (_directory, database, pipeline) = pipeline_with_extra(
+    let (_directory, _database, pipeline) = pipeline_with_extra(
         roots,
         vec![definition.clone()],
         Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -294,7 +294,6 @@ async fn a_call_reaches_the_adapter_that_owns_its_definition() {
         Some("mcp:test/search"),
         "the stored row must carry the additional adapter's evidence"
     );
-    let _ = database;
 }
 
 /// An actor holding the scope an MCP tool requires.

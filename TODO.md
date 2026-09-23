@@ -1520,7 +1520,73 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       never sets it has a rate limit that never fires. The **token remains unvalidated**: no RFC 8707 audience
       binding and no RFC 9728 Protected Resource Metadata, so a remote caller can only be admitted against a
       fingerprint an operator configured by hand.
-- [ ] `P3-009c` Bind the MCP endpoint in the daemon: loopback only, with the `Origin` and caller decisions enforced over a real request.
+- [x] `P3-009c-a` Bind the endpoint: a tower service that derives both decisions from a real request.
+      **The layer `P3-009i` recorded as missing — "nothing binds, so no request reaches this gate."** New code:
+      `crates/jarvis-mcp-transport/src/binding.rs` (`ServedEndpoint`, `ResponseBody`, `CREDENTIAL_HEADER`,
+      `BEARER_SCHEME`, `MAX_ORIGIN_HEADER_CHARS`, `REFUSAL_CODE`) and 12 tests. 112 transport tests.
+      ADR-0038.
+      **It is a `tower` service wrapping the SDK's own service, not a route handler.** The SDK's Streamable HTTP
+      service *is* a `Service<Request<Body>>`, so wrapping it is one `impl Service` rather than a second routing
+      layer and a second body type; `axum::Router::fallback_service` accepts any `Service`. The wrapping is also
+      what makes the layer provable — a real request is the only evidence the four values were **derived** rather
+      than handed over.
+      **A network request is `CallerOrigin::Remote`, always, and that is the slice's central decision.** `Local`
+      means the operator on their own machine, established by the daemon's **transport** (a named pipe, a socket
+      it holds). A loopback *bind* is not that evidence: any local process, and a browser on the same machine,
+      can reach `127.0.0.1`. Deriving `Local` from a peer address would be `CallerOrigin`'s own defect one layer
+      down — a property of the request deciding admission — and a daemon wanting a local caller admitted does so
+      through the **allowlist**. Falsified: changing the literal to `Local` fails three tests, including the
+      anonymous remote caller being **admitted**.
+      **An oversized `Origin` is truncated, never treated as absent** — because absent is *admitted* by the spec's
+      own rule, so collapsing an oversized value into `None` **inverts** the control. Falsified by adding a
+      `.filter(…)`: the response became **`200 OK` with the full tool list served**.
+      **The credential requires its scheme, compared case-insensitively.** A bare digest in `Authorization` is not
+      valid HTTP. Falsified in both directions: removing the scheme check admits the bare digest (`200` where
+      `401` is required); removing the case-insensitivity would refuse a client sending `bearer`.
+      **The refusal names the policy class and never the verdict**, because on the wire a verdict helps a hostile
+      caller enumerate the allowlist. `RequestRefusal::reason` names it and is for the log.
+      **The boundary test was extended to the shape that would leak next, and the probe found it.** `P3-009c`
+      adds a `pub type` alias (`ResponseBody`), and a `pub type` is a signature-like public declaration with no
+      `fn` — which the existing scan's `pub fn` probe would not have exercised. A `pub type Leaked =
+      StreamableHttpService<…>` was added to the **real source** as a live probe and the scanner reported it by
+      line; the probe was removed and replaced with a test over the same text. **That test failed on its first
+      run**, because the scan keys imported names off the `use rmcp::…` line *in the same file* and the fixture
+      had none — correct behaviour, discovered rather than assumed.
+      **Honest limits.** **The daemon does not mount this yet** (`P3-009c-b`), so the layer is proven by tests and
+      not by a socket. `spent_budget` is still a literal `false`, recorded at the call site rather than left to
+      inference: the rate limit the gate could apply never fires. The admitted `RequestAdmission` is logged on a
+      span and dropped — an admission is observable but **not attributable**, because attributing an MCP call
+      needs a correlation id the request does not carry (`P3-012`). The **token remains unvalidated** (no RFC
+      8707 audience binding, no RFC 9728 Protected Resource Metadata), so a remote caller can only be admitted
+      against a fingerprint an operator configured by hand.
+- [ ] `P3-009c-b` Mount the endpoint in the daemon: choose the loopback port, wire the policies from configuration, and prove a real socket refuses an anonymous remote caller.
+- [ ] `P3-013` Close the test-scratch directory leak: `sqlx::Pool` has no `Drop` that closes connections.
+      **Found while running the `P3-009c-a` gate suite, and it is a real defect in the test fixtures rather than
+      in shipped code.** Two causes were behind one symptom and only the first is fixed.
+      **Fixed: the naming collision.** ~19 scratch-directory helpers built a path as
+      `temp_dir() / format!("jarvis-<what>-{pid}-{sequence}")` with `static …: AtomicU64 = AtomicU64::new(0)`
+      beside it — so the sequence starts at 0 in every process and a pid is **reusable**. A directory survives
+      whenever a test fails or the suite is killed (no `Drop` runs), and the next run with the same pid reopened
+      the previous run's database. Measured: `jarvis-storage` passed **144/144 alone** and produced ~20
+      `UNIQUE constraint failed: sessions.id` failures inside a full-workspace run. Now one helper,
+      `jarvis_core::scratch_tag()` (a `UUIDv7`), used by all 22 sites, with a test asserting 1,000 tags are
+      distinct — because two distinct values would have passed for the broken scheme too.
+      **NOT fixed: the directory is never removed.** `%TEMP%` held **28,226** `jarvis-*` directories. Instrumenting
+      the `Drop` showed `remove_dir_all` failing with "the process does not have access to the file" — a Windows
+      sharing violation. **Mechanism, read from the vendored source:** `sqlx-core-0.9.0/src/pool/mod.rs` has
+      **no `impl Drop for Pool`**; closing is only reachable through `Pool::close`, an explicit `async fn` that
+      marks the pool closed and then closes each idle connection. So dropping the pool does **not** close the
+      connections, and the SQLite file keeps an open handle. Confirmed by experiment: `database.close().await`
+      before the removal makes `remove_dir_all` return `Ok`.
+      **A wrong explanation was recorded first and corrected.** The remaining leak was attributed to tuple drop
+      order (`(TestDirectory, SqliteDatabase)` dropping the directory first) and "fixed" by reversing it — the
+      count did **not** change (19 before, 19 after), because with no `Drop` impl on the pool the order cannot
+      matter. The reversal was reverted. **A fix that does not move the measured number is not the fix.**
+      Scope: ~122 call sites across 9 files. The shape that works is an explicit `close().await` before the
+      directory guard drops, which `Drop` cannot express because `close` is async — so this needs either a
+      fixture-owned `async fn finish(self)` each test calls, or a synchronous close on `SqliteDatabase`
+      (`libsqlite3-sys` exposes `sqlite3_close`). It is recorded rather than papered over, and it is
+      **test-only**: no shipped path relies on a pool dropping.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.

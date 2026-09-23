@@ -818,11 +818,8 @@ mod tests {
 
     impl TempProfile {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "jarvis-sessions-{}-{}",
-                std::process::id(),
-                jarvis_core::SessionId::new()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("jarvis-sessions-{}", jarvis_core::scratch_tag()));
             std::fs::create_dir_all(&path)
                 .unwrap_or_else(|error| panic!("create temp profile: {error}"));
             Self(path)

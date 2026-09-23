@@ -251,21 +251,17 @@ impl std::fmt::Debug for WorkspaceRoots {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     /// A temporary directory removed when the test ends, pass or fail.
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jarvis-workspace-roots-{}-{sequence}",
-                std::process::id()
+                "jarvis-workspace-roots-{}",
+                jarvis_core::scratch_tag()
             ));
             fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
             // The path is canonicalized because `std::env::temp_dir()` on Windows can return an

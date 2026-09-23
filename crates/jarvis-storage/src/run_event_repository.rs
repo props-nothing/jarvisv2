@@ -524,7 +524,6 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
@@ -532,8 +531,6 @@ mod tests {
         DEFAULT_DATABASE_FILENAME, SqliteDatabase,
         run_repository::{NewRun, StoredRun, create_run, transition_run},
     };
-
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     const USER: &str = "0198f000-0000-7000-8000-000000000001";
     const WORKSPACE: &str = "0198f000-0000-7000-8000-000000000002";
@@ -545,11 +542,8 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "jarvis-run-events-{}-{sequence}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("jarvis-run-events-{}", jarvis_core::scratch_tag()));
             must(fs::create_dir_all(&path));
             Self(path)
         }

@@ -46,6 +46,16 @@ rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The binding layer (`P3-009c`) is a `tower` service over `http` types, so the daemon can mount it on its
+# router without this crate naming the MCP SDK's service. `bytes` is the body's item type in that service's
+# response. All three are already in the graph — `http` and `bytes` through the SDK and `axum`, `tower` through
+# the daemon — so declaring them adds no package; they are declared rather than reached through `rmcp` for the
+# same reason `reqwest` is: the type must be the workspace's, not whatever a dependency happens to re-export.
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+tower.workspace = true
 # The host configuration surface (`P3-008i`) is a TOML document, so the MCP host role knows the same
 # document format as the daemon's own configuration. Parsing it here rather than in `jarvis-storage`
 # keeps one schema owner per document: the daemon's schema stays in storage, and the MCP section's
@@ -65,8 +75,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 # `ServiceExt::oneshot`, which is how the SDK's own tests drive its service. All three are already in the
 # lock (`http` and `http-body-util` through `axum`, `tower` through the daemon), so declaring them adds no
 # package — the same reasoning `reqwest` is declared rather than reached through `rmcp`.
-http = { version = "1.5", default-features = false }
-http-body-util = "0.1.5"
+http.workspace = true
+http-body-util.workspace = true
 tower.workspace = true
 # The host-join tests assert against canonical risk and approval values, which live in
 # `jarvis-tools`. It is already a transitive dependency through `jarvis-mcp`; declaring it here

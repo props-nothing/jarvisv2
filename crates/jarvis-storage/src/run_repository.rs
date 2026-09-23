@@ -897,14 +897,11 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
     use crate::DEFAULT_DATABASE_FILENAME;
     use jarvis_core::RunTransitionError;
-
-    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     const USER: &str = "0198f000-0000-7000-8000-000000000001";
     const WORKSPACE: &str = "0198f000-0000-7000-8000-000000000002";
@@ -916,10 +913,9 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jarvis-run-state-machine-{}-{sequence}",
-                std::process::id()
+                "jarvis-run-state-machine-{}",
+                jarvis_core::scratch_tag()
             ));
             must(fs::create_dir_all(&path));
             Self(path)

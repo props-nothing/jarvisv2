@@ -16,7 +16,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::*;
@@ -26,8 +25,6 @@ use crate::{
 };
 use jarvis_core::ToolOutcomeRecord;
 
-static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
-
 const SESSION: &str = "0198f000-0000-7000-8000-000000000003";
 const RUN: &str = "0198f000-0000-7000-8000-0000000000c3";
 const CALL: &str = "0198f000-0000-7000-8000-0000000000d1";
@@ -36,11 +33,8 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new() -> Self {
-        let sequence = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "jarvis-tool-calls-{}-{sequence}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("jarvis-tool-calls-{}", jarvis_core::scratch_tag()));
         must(fs::create_dir_all(&path));
         Self(path)
     }

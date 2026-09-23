@@ -185,13 +185,6 @@ impl ServingConfig {
     /// portless entry — and a permissive second answer is worse than none, because a reader would believe the
     /// permissive field was the control.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no binding yet: the transport proof calls this, a bound endpoint will too"
-        )
-    )]
     fn sdk(&self) -> StreamableHttpServerConfig {
         StreamableHttpServerConfig::default()
             // The session the revision removed. `NeverSessionManager` refuses `create_session`, so even a
@@ -221,15 +214,17 @@ impl ServingConfig {
     /// `JarvisMcpServer` holds an `Arc` runner, so the cost is a clone of the served list. `NeverSessionManager`
     /// is supplied because the revision has no sessions, and the SDK's default (`LocalSessionManager`) would
     /// store state for a protocol that removed it.
+    ///
+    /// # Why this is now `pub(crate)` when it was private
+    ///
+    /// `P3-009c` binds a listener, and the layer that mounts the SDK's service lives in this crate
+    /// ([`crate::binding`]). It needs the service, and an **integration** test in `apps/jarvisd` cannot reach a
+    /// `pub(crate)` item of this crate — which is why the daemon's own proof drives its router rather than
+    /// naming this type. A crate-internal door is not an SDK-typed item in this crate's *public* surface, so the
+    /// invariant `boundary_tests.rs` enforces is kept; the alternative it was written against — a `pub fn`
+    /// returning `StreamableHttpService` — is still refused.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no binding yet: the transport proof calls this, a bound endpoint will too"
-        )
-    )]
-    fn service(&self, server: JarvisMcpServer) -> SdkService {
+    pub(crate) fn service(&self, server: JarvisMcpServer) -> SdkService {
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(NeverSessionManager::default()),

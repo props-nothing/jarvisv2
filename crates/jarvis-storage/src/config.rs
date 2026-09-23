@@ -814,20 +814,16 @@ fn config_io(operation: &'static str, error: &io::Error) -> ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-
-    static CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let sequence = CONFIG_TEST_ID.fetch_add(1, Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!(
-                "jarvis-storage-config-{}-{sequence}",
-                std::process::id()
+                "jarvis-storage-config-{}",
+                jarvis_core::scratch_tag()
             )))
         }
 
