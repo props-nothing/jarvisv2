@@ -36,10 +36,10 @@ const SESSION: &str = "0198f000-0000-7000-8000-000000000003";
 
 /// A temporary root removed when the test ends, pass or fail.
 ///
-/// **Owned for the test's lifetime and still leaked on this platform** — see `P3-013`: `sqlx::Pool` has no
-/// `Drop` that closes connections, so the database file stays open and `remove_dir_all` hits a sharing
-/// violation that `Drop` swallows. The guard is kept because it is correct on a platform where the file is not
-/// held, and because dropping it would make the leak invisible rather than recorded.
+/// The removal goes through `jarvis_core::remove_scratch_dir` rather than a bare `remove_dir_all`, because this
+/// fixture holds a database and the handle is released late and off-thread — see `P3-013` and
+/// `docs/development/testing.md`. A bare call here fails with a Windows sharing violation that the `let _ =`
+/// swallows, so the directory leaks while every test still passes.
 struct TempRoot(std::path::PathBuf);
 
 impl TempRoot {
@@ -69,7 +69,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        jarvis_core::remove_scratch_dir(&self.0);
     }
 }
 

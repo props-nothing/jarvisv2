@@ -73,7 +73,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        jarvis_core::remove_scratch_dir(&self.0);
     }
 }
 
@@ -102,11 +102,13 @@ fn at(offset_seconds: i128) -> UtcTimestamp {
 
 /// A database with the seeded local identity and one live run, plus the directory holding it.
 ///
-/// The tuple carries the directory so the fixture cannot leak it, and the directory is **still leaked on a
-/// platform where the database file is open** — see `P3-013`. An earlier version of this comment claimed the
-/// field order fixed that; it does not, and the claim was withdrawn: `sqlx::Pool` has **no `Drop`** that closes
-/// connections, so no ordering can release the file. Reversing the pair changed the directory count by zero,
-/// which is how the wrong explanation was found.
+/// The tuple carries the directory so the fixture cannot leak it. **An earlier version of this comment explained
+/// the leak by tuple drop order and claimed that reversing the pair fixed it — both the claim and the explanation
+/// were wrong, and the correction is worth keeping.** Reversing the pair changed the directory count by **zero**
+/// (19 before, 19 after), because the file is not held by the directory guard at all: `sqlx` releases it **late and
+/// off-thread**, so `Drop` order cannot matter. The real mechanism is in `P3-013` and
+/// `docs/development/testing.md`; `TempRoot`'s removal now goes through `jarvis_core::remove_scratch_dir`, which
+/// retries until the handle is released. *A fix that does not move the measured number is not the fix.*
 async fn database_with_run() -> (TempRoot, Arc<SqliteDatabase>) {
     let directory = TempRoot::new();
     let database = Arc::new(must(

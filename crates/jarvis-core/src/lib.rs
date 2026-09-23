@@ -59,7 +59,9 @@ pub use run_event::{
 pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};
 pub use session::{InvalidSessionField, MAX_SESSION_TITLE_CHARS, SessionChannel, SessionStatus};
-pub use testkit::scratch_tag;
+pub use testkit::{
+    MAX_SCRATCH_REMOVAL_ATTEMPTS, SCRATCH_REMOVAL_INTERVAL, remove_scratch_dir, scratch_tag,
+};
 pub use timestamp::{Clock, InvalidTimestamp, SystemClock, UtcTimestamp};
 pub use tool_outcome::{
     InvalidToolOutcome, MAX_OUTCOME_DETAIL_CHARS, ToolOutcome, ToolOutcomeError, ToolOutcomeRecord,

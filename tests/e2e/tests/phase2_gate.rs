@@ -147,7 +147,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        jarvis_core::remove_scratch_dir(&self.0);
     }
 }
 

@@ -30,7 +30,7 @@ impl TempDirectory {
 
 impl Drop for TempDirectory {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        jarvis_core::remove_scratch_dir(&self.0);
     }
 }
 

@@ -102,6 +102,40 @@ No fixture contains real tokens, cookies, emails, names, phone numbers, calendar
 
 Keep malformed, failed, paginated, rate-limited, empty, duplicated, out-of-order, and provider-upgrade fixtures alongside happy paths.
 
+## Scratch Directories And Asynchronous Teardown
+
+A fixture's scratch directory **must** be removed through `jarvis_core::remove_scratch_dir`, and its name **must**
+contain `jarvis_core::scratch_tag()`. Both rules exist because violating either is invisible at runtime: a
+violation leaks a directory and every test still passes.
+
+**Naming.** A name built from a pid, a timestamp, or a counter that resets is reusable, so a directory left behind
+by a killed run can be reopened by the next one — which is how a whole suite's fixtures began failing with
+`UNIQUE constraint failed`. A `UUIDv7` is unique across processes and across runs.
+
+**Removal.** `std::fs::remove_dir_all` in a guard's `Drop` **cannot** work for a fixture holding a database, and
+the reason is worth knowing rather than rediscovering: `sqlx` releases the SQLite file late and on a spawned task,
+so the failure is a race. Measured on Windows — drop then remove immediately fails **every** time, while drop,
+wait 250 ms, then remove always succeeds. Two tempting fixes are worse than the problem:
+
+- a bounded **blocking** retry still fails, because sleeping starves the current-thread runtime the pool needs;
+- awaiting a close on a **fresh runtime inside a worker thread deadlocks**, and a deadlock in teardown is worse
+  than a leaked directory.
+
+Handing the removal to a **detached** thread that retries works: it does not starve the runtime, and it keeps
+trying across the point where the runtime tears down. The window is **measured**: no retry at all left **124**
+directories per full-workspace run, and the shipped version leaves **7–10**. Two designs measured *worse* or no
+better and are recorded so they are not retried — a **ten-second** per-call window left the same handful, and an
+**always-running** retry loop left **22**, because a thread competing for CPU across the whole suite delays the
+runtime teardowns that are what actually release the handles. What remains are fixtures holding an
+`Arc<SqliteDatabase>` — through a `ToolPipeline` — past the directory guard, so the handle is released at the end
+of the test (which the window covers) or at process exit (which nothing in-process can reach). Such a fixture
+should await its own close before the guard drops.
+
+The rule is enforced by a source scan in `jarvis-core`'s testkit rather than by a behavioural test, because no
+assertion can observe a directory *not* leaking without measuring the filesystem around a whole suite. The scan
+requires the discarded-result form (`let _ = …remove_dir_all(&self.0)`), so it catches a bypass without flagging
+its own explanation or an unrelated removal.
+
 ## Time And IDs
 
 Inject clocks, UUID sources, randomness, and retry schedules. Tests use deterministic IDs and explicit time advancement. Scheduler suites cover daylight-saving gaps/overlaps and missed-run policy using real IANA zones.

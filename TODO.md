@@ -1617,9 +1617,13 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       something nobody chose; the caller allowlist is where a deployment says *who* may call. The **token remains
       unvalidated** (no RFC 8707 audience binding, no RFC 9728 Protected Resource Metadata), so a remote caller can
       only be admitted against a fingerprint an operator configured by hand.
-- [ ] `P3-013` Close the test-scratch directory leak: `sqlx::Pool` has no `Drop` that closes connections.
+- [x] `P3-013` Close the test-scratch directory leak: a fixture's `Drop` cannot await the close that releases the file.
       **Found while running the `P3-009c-a` gate suite, and it is a real defect in the test fixtures rather than
-      in shipped code.** Two causes were behind one symptom and only the first is fixed.
+      in shipped code.** Two causes were behind one symptom, and both are now fixed. New code:
+      `jarvis_core::remove_scratch_dir` plus the `MAX_SCRATCH_REMOVAL_ATTEMPTS`/`SCRATCH_REMOVAL_INTERVAL`
+      constants in `crates/jarvis-core/src/testkit.rs`, all 27 guard `Drop` impls converted, and a source scan that
+      keeps future fixtures from reverting. Also `docs/development/testing.md` (the rule) and
+      `docs/architecture/repository-layout.md`.
       **Fixed: the naming collision.** ~19 scratch-directory helpers built a path as
       `temp_dir() / format!("jarvis-<what>-{pid}-{sequence}")` with `static …: AtomicU64 = AtomicU64::new(0)`
       beside it — so the sequence starts at 0 in every process and a pid is **reusable**. A directory survives
@@ -1628,22 +1632,48 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `UNIQUE constraint failed: sessions.id` failures inside a full-workspace run. Now one helper,
       `jarvis_core::scratch_tag()` (a `UUIDv7`), used by all 22 sites, with a test asserting 1,000 tags are
       distinct — because two distinct values would have passed for the broken scheme too.
-      **NOT fixed: the directory is never removed.** `%TEMP%` held **28,226** `jarvis-*` directories. Instrumenting
-      the `Drop` showed `remove_dir_all` failing with "the process does not have access to the file" — a Windows
-      sharing violation. **Mechanism, read from the vendored source:** `sqlx-core-0.9.0/src/pool/mod.rs` has
-      **no `impl Drop for Pool`**; closing is only reachable through `Pool::close`, an explicit `async fn` that
-      marks the pool closed and then closes each idle connection. So dropping the pool does **not** close the
-      connections, and the SQLite file keeps an open handle. Confirmed by experiment: `database.close().await`
-      before the removal makes `remove_dir_all` return `Ok`.
-      **A wrong explanation was recorded first and corrected.** The remaining leak was attributed to tuple drop
-      order (`(TestDirectory, SqliteDatabase)` dropping the directory first) and "fixed" by reversing it — the
-      count did **not** change (19 before, 19 after), because with no `Drop` impl on the pool the order cannot
-      matter. The reversal was reverted. **A fix that does not move the measured number is not the fix.**
-      Scope: ~122 call sites across 9 files. The shape that works is an explicit `close().await` before the
-      directory guard drops, which `Drop` cannot express because `close` is async — so this needs either a
-      fixture-owned `async fn finish(self)` each test calls, or a synchronous close on `SqliteDatabase`
-      (`libsqlite3-sys` exposes `sqlite3_close`). It is recorded rather than papered over, and it is
-      **test-only**: no shipped path relies on a pool dropping.
+      **Fixed: the directory is never removed — and the recorded mechanism was wrong in two places.** The entry
+      above used to say `sqlx-core-0.9.0/src/pool/mod.rs` has **no `impl Drop for Pool`** and that `Pool::close` is
+      an `async fn`. Both are false: `PoolInner` **has** a `Drop` (`src/pool/inner.rs`) and `PoolConnection`
+      **has** one (`src/pool/connection.rs`), and `Pool::close` is a **sync fn returning a lazy future**
+      (`pool/mod.rs:441`). The real behaviour: `PoolInner::close()` calls `mark_closed()` and closes the
+      connections **in the future's body**, `PoolInner::Drop` **never awaits** that future, and
+      `PoolConnection::Drop` hands the connection back by **spawning a task**. So the file is released **late and
+      off-thread**, and the teardown failure is a **race**, not a permanent hold.
+      **Six shapes were measured, and each obvious fix fails for a different reason** — this is the part worth
+      keeping:
+      - drop then `remove_dir_all` immediately ⇒ **fails 5/5**; drop, `await` 250 ms, remove ⇒ **always Ok**;
+      - a bounded **blocking** retry (50 × 10 ms) ⇒ **still fails**: `std::thread::sleep` starves the
+        current-thread runtime, so the spawn that returns the connection never runs;
+      - a **background thread** retrying `remove_dir_all` for 1 s ⇒ **still fails**, for the same reason: it only
+        *waits* for a release that needs the runtime to make progress;
+      - dropping the **runtime** first, or `shutdown_timeout(5s)` after ⇒ **fails**; no runtime alive + a real 1 s
+        delay ⇒ **Ok**;
+      - driving `database.close()` on a **fresh runtime inside a worker thread** ⇒ **DEADLOCKS**, because the close
+        future waits on a semaphore only the *original* runtime can release. **A deadlock in teardown is worse
+        than the leaked directory**, so that shape must never be shipped.
+      **What is shipped:** a **detached thread** that retries, spawned from `Drop` (which cannot await). It does not
+      starve the runtime, and it keeps trying across the point where the runtime tears down. The window is
+      **measured**: no retry left **124** directories per full-workspace run and this leaves **7–10**. Two variants
+      measured worse or no better and are recorded so they are not retried — a **ten-second** per-call window left
+      the same handful (a window covers a *delay*, not a release scheduled after it has closed), and an
+      **always-running** retry loop left **22**, because a thread competing for CPU across the whole suite delays
+      the teardowns that actually release the handles.
+      **What remains, honestly:** the residual handful are fixtures that hold an `Arc<SqliteDatabase>` — through a
+      `ToolPipeline` — past the directory guard, so the handle is released at the **end of the test** (covered by
+      the window) or at **process exit** (which nothing in-process can reach). Those directories **are** removable
+      once the process has exited, which is how the race was confirmed rather than inferred. The old "28,226"
+      figure is also misleading as a measure of the current suite: **546 of 615** sampled directories came from
+      three fixture families (`fnd007`, `fnd013`, `fnd014`) that **no longer exist in the source**, so a historical
+      total answers "how bad did it get" rather than "what does the current code do".
+      **The guard is a source scan, not a behavioural test**, because no assertion can observe a directory *not*
+      leaking without measuring the filesystem around a whole suite. It requires the **discarded-result** form
+      (`let _ = …remove_dir_all(&self.0)`), so it catches a bypass without flagging its own explanation or an
+      unrelated removal — and it **names the offending file and line** when it fires (falsified by reverting one
+      fixture, which it reported at `crates/jarvis-tools/src/workspace.rs:303`). The scan initially matched its own
+      prose and read every file in `target/`, which cost **85 s**; skipping comments and reading only `.rs` files
+      brought it to **0.4 s**.
+      **Test-only**: no shipped path relies on a pool dropping.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.

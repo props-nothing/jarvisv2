@@ -120,6 +120,18 @@ Owns stable vocabulary and invariants:
 
 Allowed dependencies should remain small and provider-neutral. No Axum, SQLx, Tauri, MCP SDK, or vendor SDK.
 
+**`testkit` is the one testing helper the whole workspace shares, and its two rules are about *invisible*
+mistakes** (`P3-013`). `scratch_tag()` returns a `UUIDv7` so a scratch directory name cannot repeat across runs —
+a pid and a resetting counter can, which let a killed run's directory be reopened and produced
+`UNIQUE constraint failed` in a whole suite. `remove_scratch_dir` removes a scratch directory **by retrying on a
+detached thread**, because a guard's `Drop` cannot await and the handle `sqlx` holds is released late and
+off-thread: a plain `remove_dir_all` in `Drop` fails with a Windows sharing violation and the `let _ =` swallows
+it, which left **124** directories per suite run and was invisible because every test still passed. Two tempting
+fixes are worse and are recorded in `docs/development/testing.md`: a blocking retry starves the runtime that
+releases the handle, and awaiting a close on a fresh runtime inside a worker thread **deadlocks**. A source scan
+in the same module keeps future fixtures from reverting to the bare call — no assertion can observe a directory
+*not* leaking without measuring the filesystem around a whole suite.
+
 ### `jarvis-application`
 
 Owns use cases and transaction boundaries:
