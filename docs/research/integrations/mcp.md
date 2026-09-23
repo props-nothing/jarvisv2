@@ -247,6 +247,28 @@ header validation is unconditional in `tower.rs` before handler dispatch. So the
 permissive — which is exactly why the permissive fields must be **set explicitly rather than
 inherited**. A JARVIS-owned policy value is the control; the defaults are not.
 
+### The server **handler** half, verified from source for `P3-009e`
+
+| Fact | Where | Consequence |
+| --- | --- | --- |
+| `ProtocolVersion::default()` is `LATEST`, and `LATEST = V_2025_11_25` | `model.rs` | `ServerConfig::default()`/`InitializeResult::new` advertises the **legacy handshake era**. A server inheriting it claims a revision it does not implement. |
+| `ServerHandler::supported_protocol_versions` defaults to `ProtocolVersion::KNOWN_VERSIONS` | `handler/server.rs` | **Every** version the SDK knows, legacy ones included, so a server inheriting it accepts an `initialize` handshake whose semantics this build does not drive. |
+| `ServerConfig` is a **type alias** for `InitializeResult` | `model.rs` | `get_info` returns the same value sent as the `initialize` response, so both surfaces are one statement. |
+| `Tool` is **`#[non_exhaustive]`** | `model/tool.rs` | A struct literal is rejected by the compiler; `Tool::new_with_raw` is the constructor, so a protocol revision adding a field cannot be missed at a literal. |
+| `CallToolResult` carries a `result_type` discriminator | `model.rs` | Constructors default it to `Some(ResultType::COMPLETE)` and the handler clears it for older peers, so JARVIS does not set it. |
+| `CallToolResult::error` is the visible answer; `Err(McpError)` is rendered opaquely | `handler/server.rs` docs | A **refused tool call is a result about that call**, so it must travel as `CallToolResult::error` — a protocol error would reach the caller as "Tool result missing due to internal error". |
+| `NeverSessionManager` exists and **refuses** `create_session` | `transport/streamable_http_server/session/never.rs` | The SDK provides the sessionless path directly, so emulating the removed session is unnecessary — the honest choice is this manager. |
+
+**Server feature cost, measured rather than reasoned.** Adding `server`, `transport-io`, and
+`transport-streamable-http-server` to the workspace's `rmcp` features resolves **five new packages**:
+`schemars` 1.2.2, `schemars_derive` 1.2.2, `serde_derive_internals` 0.30.0, `dyn-clone` 1.0.20, and
+`pastey` 0.2.3. Nothing is removed, and **no new duplicate arises** — the duplicate `name@version` sets
+before and after are identical (`base64`, `block-buffer`, `cpufeatures`, `crypto-common`, `digest`,
+`getrandom`, `hashbrown`, `io-lifetimes`, `r-efi`, `sha2`, `syn`, `windows-sys`). `chrono`, `tower`,
+`sse-stream`, `http-body`, and `uuid` were **already** in the lock. `cargo deny check` reports
+advisories, bans, licenses, and sources **all ok** with the server features enabled. Note `schemars` is
+pulled with `chrono04`, which is why `chrono` was already present.
+
 ## JARVIS Mapping
 
 | MCP concept | JARVIS side |
@@ -323,6 +345,20 @@ inherited**. A JARVIS-owned policy value is the control; the defaults are not.
     authorization mechanism.
 14. **`Mcp-Session-Id`, GET, and DELETE are refused rather than emulated.** The revision removed the
     session, so serving one would be inventing state the protocol no longer has.
+15. **`tools/list` filtering is not authorization, so `tools/call` re-derives the decision.** An MCP
+    client may call any name whether or not it was advertised; nothing in the protocol couples the two.
+    A server that only filtered the list would have a **catalogue, not a control**. The served set is
+    therefore held by the handler and a name outside it is refused **before the runner is consulted** —
+    pinned by a test whose runner panics if it is reached, because "refused" and "refused before
+    anything ran" are different claims.
+16. **Both handler defaults above are overridden by naming one revision.** `protocol_version` is set to
+    `V_2026_07_28` and `supported_protocol_versions` returns that one version, because the SDK's
+    defaults advertise the legacy era and accept every version it knows.
+17. **A refused or ambiguous call travels as `CallToolResult::error`, never as a JSON-RPC error** — the
+    SDK's own documentation says a protocol error is rendered opaquely, so the caller would not see the
+    message. An unprovable outcome (`Unknown`) must also *say* it is unknown rather than report a
+    failure, because a caller reading "failed" would reasonably retry and a retry of a non-idempotent
+    effect is a second effect.
 
 ## Rejected Alternatives
 
@@ -449,3 +485,4 @@ about the protocol, not decisions of ours.
 | 2026-09-23 | `rmcp` 3.4.0 vendored source (`transport/common/reqwest/streamable_http_client.rs`, `transport/streamable_http_client.rs`, `transport/common/mcp_headers.rs`), read while implementing `connect_http` | **Two facts that changed the client design, both read from source.** (1) **The SDK's `default_http_client` does not call `no_proxy`.** Its builder is `reqwest::Client::builder().pool_max_idle_per_host(0).redirect(Policy::none()).build()`, so proxy support is off **only because the SDK's manifest declares `reqwest` with `default-features = false`** (verified in its `Cargo.toml`: `version = "0.13.2", features = ["json","stream"], default-features = false`). That is a fact about a *dependency's* manifest, not a property of anything in this workspace, so a feature unification elsewhere could re-enable an unchosen intermediary with no local change. This crate therefore builds the client itself and passes it via `StreamableHttpClientTransport::with_client` (`reqwest::Client` implements the SDK's `StreamableHttpClient` trait, impl at `streamable_http_client.rs:49`). (2) The transport discriminates responses by **`Content-Type` prefix**: `text/event-stream` → SSE stream, `application/json` → JSON body, anything else → `UnexpectedContentType`; a non-2xx response whose body parses as a JSON-RPC error is surfaced as `McpError` rather than lost. Requests carry `Accept: text/event-stream, application/json` plus (on modern protocol versions) `Mcp-Method`/`Mcp-Name`, both confirmed on the wire by a hand-written HTTP server in `tests/http.rs`. | GitHub Copilot |
 | 2026-09-23 | `rmcp` 3.4.0 behaviour observed through `tools/call`, while implementing the `ToolExecutor` adapter | **What the transport does *not* classify, and therefore what an adapter must.** `McpCallResult` carries `is_error` straight from the server's `isError` and does no outcome reasoning — deliberately, because the transport cannot know whether an effect happened. Three cases were confirmed against a live scripted peer: (a) a tool answering with `isError: true` returns **`Ok`** from `call_tool`, not an error, so an adapter that only handled `Err` would record a tool's own refusal as a transport success; (b) a JSON-RPC error arrives as `CallError::PeerError` and an undecodable result as `CallError::Undecodable` — the latter because the result union is untagged, so a shape mismatch matches no variant; (c) **a peer that closes the connection after receiving a POST produces `CallError::Unavailable`, the same variant a connection that never opened produces**, so the classification of "sent, no answer" versus "nothing sent" is information only the adapter's own sequencing has. That is why the adapter treats `Unavailable` as ambiguous rather than as a refusal. | GitHub Copilot |
 | 2026-09-23 | spec 2026-07-28 `basic/transports/streamable-http.md` + `basic/authorization.md` (live fetch); `rmcp` 3.4.0 `transport/streamable_http_server/tower.rs` | **Server-side obligations, established for `P3-009`.** Live spec: `Origin` **MUST** be validated with `403` on an invalid present value; header↔body mismatch **MUST** be `400` + `-32020`, with the spec's own reason being that a load balancer routing on the header while the server executes the body value lets the two sources of truth disagree; unknown method → `404` + `-32601`; unsupported version → `400` listing supported versions; a modern-only server **SHOULD** answer `405` to GET/DELETE, ignore `Mcp-Session-Id`, ignore `Last-Event-ID`; cancellation on HTTP **is** closing the SSE stream; server-to-client interactions are MRTR `inputRequests`, never stream requests; an OAuth resource server **MUST** implement RFC 9728 metadata and validate token audience per RFC 8707, with `401` for invalid/expired and `403` + `insufficient_scope` for scope failure. **SDK finding, from source:** `StreamableHttpServerConfig::default()` is **permissive on those MUSTs** — `allowed_origins: vec![]` with `validate_empty_origin_allowlist: false` makes `validate_origin_header` return `Ok(())` immediately ("disables Origin validation for backward compatibility"), `legacy_session_mode: true` mints sessions for pre-`2026-07-28` versions, and `stateless_protocol_metadata_required: false` treats an absent `MCP-Protocol-Version` as `2025-03-26`. `allowed_hosts` **is** fail-closed (loopback only) and `-32020` validation is unconditional. The permissive fields must therefore be set explicitly rather than inherited. | GitHub Copilot |
+| 2026-09-23 | `rmcp` 3.4.0 `handler/server.rs`, `model.rs`, `model/tool.rs`, `model/mrtr.rs`, `transport/streamable_http_server/{tower.rs,session/never.rs}`; workspace `cargo metadata` + `cargo deny` with the server features on | **The handler half, and the cost of enabling it (`P3-009e`).** Four source facts that each change the server design: `ProtocolVersion::default()` is `LATEST` = `V_2025_11_25`, so `ServerConfig::default()` advertises the **legacy handshake era**; `supported_protocol_versions` defaults to `KNOWN_VERSIONS`, i.e. **every** version including legacy ones; `Tool` is `#[non_exhaustive]`, so a struct literal is rejected and `Tool::new_with_raw` is the constructor; and `NeverSessionManager` **refuses** `create_session`, which is exactly the sessionless behaviour the revision requires. `ServerConfig` is a type alias for `InitializeResult`, so `get_info` and the `initialize` response are one statement. From the trait docs: `Err(McpError)` is rendered **opaquely** by clients ("the caller will not see your message"), so a refused tool call must travel as `CallToolResult::error`. **Feature cost measured, not reasoned:** enabling `server` + `transport-io` + `transport-streamable-http-server` resolves five new packages (`schemars` 1.2.2, `schemars_derive` 1.2.2, `serde_derive_internals` 0.30.0, `dyn-clone` 1.0.20, `pastey` 0.2.3), removes nothing, and introduces **no new duplicate** � the duplicate `name@version` sets before and after are identical. `cargo deny` all four categories ok. | GitHub Copilot |

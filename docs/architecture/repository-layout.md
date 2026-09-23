@@ -185,6 +185,17 @@ It does not own business decisions. Generate TypeScript clients from its publish
   re-exposed**: our origin allowlist, loopback bind, and audit trail describe *this daemon*, and a nested
   call would reach a third party's tool that our policy never classified, under a posture written for our own
   use of it. Nested exposure is deliberately not built rather than built as a side effect (ADR-0032).
+
+  **`JarvisMcpServer` is the crate's server half** (`P3-009e`), and its central property is that
+  **filtering `tools/list` is not authorization**. An MCP client may call any name whether or not it was
+  advertised, so the handler holds the served set and refuses an unserved name **before the runner is
+  consulted** — a catalogue is not a control, and the difference is pinned by a test whose runner panics if
+  it is reached. Both SDK server defaults are overridden by naming one revision, because
+  `ProtocolVersion::default()` is `LATEST` = the **legacy** `2025-11-25` and `supported_protocol_versions`
+  defaults to every version the SDK knows. The runner is a **port** (`ServedToolRunner`) rather than the
+  pipeline, so a remote call's attribution stays the daemon's and the refusal rule is testable with no
+  daemon (ADR-0033). Nothing is bound: there is no listener, so this is a handler a test can drive and not
+  yet a server a client can reach.
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

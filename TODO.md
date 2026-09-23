@@ -1294,6 +1294,55 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `P3-009b`'s. No per-client allowlist and no rate limiting (`P3-009c`). The posture attached to a served
       tool is the **local** declaration unchanged, which is honest only because a third-party-sourced tool is
       excluded outright — so there is no case where a posture about someone else's code is published.
+- [x] `P3-009e` Serve the handler: refuse an unadvertised tool before anything runs, and name one revision.
+      **The first place JARVIS is the one being called, and the slice whose title is its central rule.** New
+      code: `crates/jarvis-mcp-transport/src/serve.rs` (`JarvisMcpServer`, `ServedToolRunner`,
+      `call_result`, `SERVED_PROTOCOL_VERSION`) and 11 tests. 47 transport tests; **922 workspace tests, 40
+      suites**. ADR-0033.
+      **Filtering a list is not authorization, and that is the finding.** An MCP client may call **any** tool
+      name whether or not the server advertised it — nothing in the protocol couples `tools/list` to
+      `tools/call`. A server that only filtered the list would have a **catalogue, not a control**. So the
+      handler holds the served set and `invoke` refuses an unserved name **before the runner is consulted**,
+      and the test's runner **panics if it is reached** — because "the call was refused" and "the call was
+      refused before anything ran" are different claims and only the second is the security property.
+      **Falsified: removing the check fails with `the runner must not be reached for mcp.github.search`.**
+      **Two SDK server defaults are wrong for this revision, and the research had recorded both before the
+      code existed.** `ProtocolVersion::default()` is `LATEST`, and `LATEST` is **`V_2025_11_25`** — the legacy
+      handshake era — so `ServerConfig::default()` advertises a revision this build does not implement; the
+      falsification prints `left: ProtocolVersion("2025-11-25")` as evidence. And
+      `supported_protocol_versions` defaults to `KNOWN_VERSIONS`, i.e. **every** version the SDK knows
+      including the legacy ones, so a server inheriting it would accept an `initialize` handshake whose
+      semantics it does not drive and the client could not tell. Both are narrowed to `V_2026_07_28`.
+      **A refused call travels as a result, not as a protocol error.** The SDK's own documentation says
+      `Err(McpError)` is rendered **opaquely** — the caller sees "Tool result missing due to internal error" —
+      so a refusal that travelled that way would be unreadable. The outcome table is the honesty boundary one
+      level above `McpToolAdapter`'s, and its important row is **`Unknown`**: it must *say* the outcome is
+      unknown rather than report a failure, because a caller reading "failed" would reasonably retry and a
+      retry of a non-idempotent effect is a second effect. Falsified by mapping `Unknown` onto the failure
+      text. A **truncation** is likewise stated in the content rather than silently applied.
+      **No annotations are advertised.** `readOnlyHint`/`destructiveHint`/`idempotentHint` are exactly what a
+      policy engine wants, and the specification warns clients to treat them as untrusted — so a tool's
+      declared effects stay in the JARVIS contract (ADR-0025) rather than being restated where the protocol
+      says not to believe them.
+      **The `server` feature's cost was measured before enabling it.** Five new packages (`schemars` 1.2.2,
+      `schemars_derive` 1.2.2, `serde_derive_internals` 0.30.0, `dyn-clone` 1.0.20, `pastey` 0.2.3), nothing
+      removed, and **no new duplicate** — the duplicate `name@version` sets before and after are identical
+      (`chrono`, `tower`, `sse-stream`, `http-body`, and `uuid` were already locked). `cargo deny` reports all
+      four categories ok with the features on. Recorded in `docs/research/integrations/mcp.md` because a
+      dependency decision should cite measurement rather than preference.
+      **A fixture mistake was caught by the type it was testing.** The first `served` fixture declared
+      `ToolSource::Native` for `gmail.messages.send`, and `ToolDefinition::new` **refused** it because the
+      namespace implies a connector — so a test cannot construct a definition the production path would
+      reject. The fixture now derives the source from the identifier.
+      **Honest limits.** **Nothing is bound.** There is no loopback HTTP listener, no stdio serve, and no
+      daemon wiring, so a remote client cannot reach this handler — `P3-009b` is the transport and `P3-009c`
+      is the per-client allowlist and rate limiting. `ServedToolRunner` has **no daemon implementation**, so a
+      served call cannot yet pass the JARVIS pipeline: its actor, scopes, approvals, idempotency key, and
+      durable call row are all unexercised from this direction, and that wiring needs a run-versus-remote
+      attribution decision a slice must make explicitly. `CallToolResponse::Complete` is the only variant
+      JARVIS answers, because approval-shaped interaction belongs to the JARVIS approval path rather than a
+      remote client (ADR-0025) — so the protocol's `input_required` and `task` paths are deliberately
+      unreachable rather than unimplemented. No `run_events` row for a served call (`P3-012`).
 - [ ] `P3-009b` Serve the MCP endpoint: bind loopback, map the exposure policy onto the SDK's server fields.
 - [ ] `P3-009c` Add the per-client allowlist and rate limits, and prove the `-32020` and `Origin` refusals over a real HTTP request.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.

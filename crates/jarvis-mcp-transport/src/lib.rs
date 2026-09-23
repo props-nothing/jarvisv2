@@ -27,6 +27,14 @@
 //! `ClientLifecycleMode::Discover`, and a test asserts the SDK's `LATEST` is not that revision**, so
 //! that a future bump which changes this is caught rather than absorbed.
 //!
+//! # A note on the two directions
+//!
+//! The client half discovers and calls *someone else's* server; the server half
+//! ([`JarvisMcpServer`]) is JARVIS being called. The server half's important property is that filtering
+//! `tools/list` is **not** authorization: an MCP client may call any name, whether or not it was
+//! advertised, so the handler refuses an unserved name **before anything runs**. Both halves override the
+//! SDK's permissive or legacy defaults explicitly — see the module docs on `serve`.
+//!
 //! # What is not here yet
 //!
 //! **An MCP server is operator-reachable as of `P3-008j`.** `apps/jarvisd` reads `mcp-servers.toml`, builds the
@@ -34,6 +42,10 @@
 //! the limit that `P3-008a`..`P3-008i` each recorded — "a capability a caller can use, not one an operator can
 //! reach" — is closed. The wiring lives in the daemon rather than here, because composition is the
 //! composition root's job (`repository-layout.md`).
+//!
+//! **Nothing is bound yet.** `JarvisMcpServer` is a handler with no listener: no loopback HTTP bind, no
+//! stdio serve, and no daemon wiring, so a remote client cannot reach it (`P3-009b`/`P3-009c`). What is
+//! proven is the part that is a decision rather than plumbing — that an unadvertised tool cannot run.
 //!
 //! Still not built, and recorded in `TODO.md` rather than implied: nothing is exercised against a real
 //! third-party server (the fixture is hand-written here, which proves the wire framing but not that a stranger
@@ -49,6 +61,7 @@ mod error;
 mod host;
 mod host_config;
 mod revision;
+mod serve;
 
 pub use adapter::McpToolAdapter;
 pub use client::{
@@ -60,6 +73,10 @@ pub use error::{CallError, ConnectError, ListError};
 pub use host::{HostBuild, HostedServer, UnreadableServer, build_catalog};
 pub use host_config::{
     HostConfigError, HostError, MAX_HOST_CONFIG_BYTES, McpHost, McpHostConfig, ServerTransport,
+};
+pub use serve::{
+    JarvisMcpServer, SERVED_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, ServedToolRunner,
+    bounded_reason, call_result, method_not_found_code,
 };
 // The naming strategy is **MCP** vocabulary, and it is re-exported so a composition root can choose one
 // without taking `jarvis-mcp` as a dependency of its own. A daemon declaring the pure translation crate
