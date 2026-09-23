@@ -61,6 +61,8 @@ mod binding;
 #[path = "boundary_tests.rs"]
 mod boundary_tests;
 mod client;
+#[cfg(test)]
+mod conformance;
 mod endpoint;
 mod enforcement;
 mod error;

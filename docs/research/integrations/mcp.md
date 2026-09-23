@@ -520,6 +520,84 @@ about the protocol, not decisions of ours.
   a caller can mount. That is what makes `ServedEndpoint::into_service` possible as `impl Service` rather
   than as a recorded boundary exception — a new exception was not needed, and none was added.
 
+### Cache hints are required by `2026-07-28` on list results, and the SDK omits them by default (`P3-010`)
+
+Read from the revision's **machine-readable** schema, which is the authority rather than this project's
+memory of the human-readable pages:
+
+```jsonc
+// $defs.ListToolsResult
+"required": ["cacheScope", "resultType", "tools", "ttlMs"]
+// $defs.DiscoverResult
+"required": ["cacheScope", "capabilities", "resultType", "supportedVersions", "ttlMs"]
+// $defs.ReadResourceResult / ListResourcesResult / ListPromptsResult / ListResourceTemplatesResult
+"required": ["cacheScope", "resultType", "ttlMs", …]
+```
+
+`ttlMs` is an integer (`minimum: 0`) and `cacheScope` is `"private" | "public"`, with the schema's own
+description of the difference being whether the response "does not contain user-specific data" and may
+therefore be shared "across authorization contexts" by an intermediary.
+
+**`rmcp` 3.4.0 models both, and deliberately leaves them unset by default.** `ListToolsResult::with_all_items`
+sets `ttl_ms: None, cache_scope: None`, and the field documentation states the reason verbatim: *"Required by
+spec version 2026-07-28, but optional here to maintain compatibility with older spec versions."* The SDK's own
+`tests/test_cache_hints.rs` pins that behaviour with a test named
+`cache_hints_are_omitted_when_absent`, asserting the serialized form is exactly
+`{"tools": [], "resultType": "complete"}`.
+
+The consequence is a **conformance defect for any server that advertises this revision alone**, because the
+compatibility argument the default protects does not apply to it. This project is exactly that case:
+`JarvisMcpServer::supported_protocol_versions` narrows to one revision, so it must set the hints itself —
+`list_tools` was emitting a document the revision's schema rejects.
+
+Two asymmetries worth recording, because they show the omission is a per-type default rather than a policy:
+
+- `DiscoverResult` is **not** affected: `DiscoverResult::from_server_info` sets `ttl_ms: 0` and
+  `cache_scope: CacheScope::Private` itself, so `server/discover` conforms without an override.
+- `CallToolResult` requires only `["content", "resultType"]`, so `tools/call` was never affected. The
+  requirement is on *cacheable* results, not on every result.
+
+`JARVIS` answers `cacheScope: "private"` and `ttlMs: 0`. Both are posture rather than tuning: the endpoint is
+admission-gated, so telling an intermediary it MAY share a response across authorization contexts contradicts
+the control, and the served set derives from a policy an operator can change, so a cached list would keep
+offering a tool this server had stopped serving. `0` is the schema's own answer for "immediately stale".
+
+**How this was verified, and why the authority is not the SDK.** The conformance test validates the
+**serialized document the server emits** against a vendored slice of the revision's schema
+(`crates/jarvis-mcp-transport/tests/spec/`, derived by reference closure from `ListToolsResult` and
+`DiscoverResult`) using `jsonschema` — a general-purpose validator with no MCP knowledge. Three layers, none
+sharing an assumption with another. Removing either builder call fails with
+`"ttlMs" is a required property`, and the slice carries a negative control proving it rejects the omitted
+shape, so the check is not vacuous.
+
+### The official conformance framework, and why it cannot run against this daemon yet (`P3-010`)
+
+`modelcontextprotocol/conformance` is the project's own conformance suite (TypeScript, Apache-2.0, invoked as
+`npx @modelcontextprotocol/conformance`). Its server mode connects to a running server as an MCP client, sends
+test requests, and validates **every JSON-RPC message on the wire** against the per-version spec JSON schema
+via its `wire-schema-valid` check — the same authority the vendored slice uses, applied to the whole
+conversation rather than to one result.
+
+Two facts about it are worth keeping:
+
+- **`--requirements <revision>` is the flag that makes a conformance claim meaningful.** `--suite` and
+  `--spec-version` describe the suite *as it is today*, and the suite keeps growing: a scenario merged after a
+  revision shipped still carries that revision's applicability tag. `requirements/<revision>.yaml` names
+  exactly the scenarios that revision requires, and only scored scenarios affect the exit code
+  (`extension`, `added-after-release`, and `pending` scenarios run and are reported but cannot fail).
+- **A per-revision set must run a shared scenario twice**, because `2025-11-25` and earlier use the stateful
+  `initialize` handshake while `2026-07-28` is stateless with per-request `_meta`. Passing on one wire says
+  nothing about the other.
+
+**It cannot be pointed at this daemon today, and that is a recorded limit rather than a test that was
+skipped.** `jarvisd` builds its endpoint with `CallerAdmission::local_only()`, and `P3-009g` made that
+*enforce* — a **remote** caller is refused even on loopback, because a loopback bind is not evidence that a
+caller is the operator. The Inspector and the conformance harness are both third-party clients, so both are
+refused before any MCP method is reached. Running either end to end needs audience-bound tokens (RFC 8707) and
+Protected Resource Metadata (RFC 9728), which remain unbuilt and are recorded as the reason the token is
+unvalidated. Until then the offline schema validation above is the strongest available evidence, and the live
+run is named here as the next step rather than implied to have happened.
+
 ## Verification Log
 
 | Date | Versions checked | Relevant change or no-change evidence | Researcher |
@@ -535,3 +613,4 @@ about the protocol, not decisions of ours.
 | 2026-09-23 | spec 2026-07-28 `basic/transports/streamable-http.md` (the `Origin` requirement, read again while writing the enforcement gate); `rmcp` 3.4.0 `transport/streamable_http_server/tower.rs` | **The fact that fixes the server's check order, and a measured refutation of a plausible delegation.** The spec's `Origin` sentence has **no branch for a caller that presents a valid credential** — it is "**MUST** validate the `Origin` header on **all** incoming connections", so the both-fail case must be answered `403` rather than `401`, which is why the enforcement gate checks the origin first. Re-reading `tower.rs` to see whether the SDK could own *any* part of the inbound caller check found it cannot: `StreamableHttpServerConfig`'s complete public field set is `sse_keep_alive`, `sse_retry`, `legacy_session_mode`, `json_response`, `cancellation_token`, `allowed_hosts`, `allowed_origins`, `session_store`, `max_request_body_bytes`, and `stateless_protocol_metadata_required` — two header checks (`Host` and `Origin`), three session/stream knobs, a body bound, and two protocol-era flags. There is **no** hook for credential admission, rate limiting, or any header beyond those two, so `disable_allowed_origins()` plus a JARVIS-owned check is the only shape in which the rule this project needs is expressible at all. Also confirmed by measurement: a request omitting **both** the protocol-version header and the modern `_meta` signal is refused, which is what isolates `stateless_protocol_metadata_required(true)` from the SDK's separate body-versus-header rule. | GitHub Copilot |
 | 2026-09-23 | `rmcp` 3.4.0 `transport/streamable_http_server/tower.rs` + `server_side_http.rs` (the service impl and the private `BoxResponse` alias), read while writing the binding layer | **The fact that let a server-side binding layer avoid a new boundary exception.** `StreamableHttpService<S, M>` implements `tower_service::Service<Request<RequestBody>>` with `type Response = BoxResponse` and `type Error = Infallible`; `BoxResponse` is a **private** alias for `http::Response<BoxBody<Bytes, Infallible>>`, and `BoxBody` belongs to `http-body-util` rather than to `rmcp`. So the SDK's service can be wrapped by an `impl Service` that names only `http`/`http-body-util` types, and the response body can be public without the SDK entering the crate's contract — `boundary_tests.rs` was **not** extended with a new exception, which was the expected outcome and is worth recording because the alternative (a `pub fn` returning `StreamableHttpService`) was the violation that boundary test exists to catch. The service is `Clone`, so mounting it on two routers shares the session manager and the schema cache. Also verified from the same read: `poll_ready` returns `Ready(Ok(()))` unconditionally, so no backpressure is lost by wrapping it. | GitHub Copilot |
 | 2026-09-24 | spec 2026-07-28 `basic/transports/streamable-http.md`; `rmcp` 3.4.0 `transport/streamable_http_server/tower.rs` (the config field list, re-read while mounting the endpoint) | **Nothing on the wire changed for this slice; what changed is that a request can now reach the server.** Two findings are worth recording because each is a *measurement* rather than a reading. (1) **The SDK still offers no hook for the inbound caller check** â€” the complete public field set of `StreamableHttpServerConfig` was re-read at the mount site and is the same ten fields (`sse_keep_alive`, `sse_retry`, `legacy_session_mode`, `json_response`, `cancellation_token`, `allowed_hosts`, `allowed_origins`, `session_store`, `max_request_body_bytes`, `stateless_protocol_metadata_required`), so the JARVIS-owned gate remains the only expressible shape. (2) **Two guards this project relies on had no test at all, proven by mutation rather than suspected.** Disabling the tool-declaration approval check (`definition.approval() != ApprovalPolicy::Auto`) left the suite **green at 13/13**; replacing `build_endpoint`'s caller-policy argument with `CallerAdmission::local_only()` left it **green at 14/14**. The second is the instructive one: every other test already passed `local_only()`, so a parameter that is always given one value is indistinguishable from a parameter that is ignored. Both now have tests, and both mutations fail exactly the test that names the property. Also re-confirmed from the spec rather than from memory: the `Origin` requirement is unconditional over **all** incoming connections, which is why a both-fail request is answered `403` and not `401`. | GitHub Copilot |
+| 2026-09-24 | spec `2026-07-28` machine-readable `schema.json` (raw.githubusercontent, 181,474 bytes) and `basic/transports/streamable-http.md`; `rmcp` 3.4.0 `src/model.rs`, `src/handler/server.rs`, `tests/test_cache_hints.rs`; `modelcontextprotocol/conformance` README + `modelcontextprotocol/inspector` README | **A conformance defect, found by reading the authority instead of the SDK (`P3-010`).** `ListToolsResult` declares `"required": ["cacheScope","resultType","tools","ttlMs"]` in this revision, and `DiscoverResult` requires `["cacheScope","capabilities","resultType","supportedVersions","ttlMs"]`. `rmcp` models both fields and **deliberately omits them by default** — `with_all_items` sets `ttl_ms: None, cache_scope: None`, with the field doc saying *"Required by spec version 2026-07-28, but optional here to maintain compatibility with older spec versions"*, pinned by the SDK's own `cache_hints_are_omitted_when_absent`. A multi-era server is right to omit them; this server narrows to one era, so it was emitting a document the revision rejects. **Two asymmetries show it is a per-type default and not a policy:** `DiscoverResult::from_server_info` *does* set both, so `server/discover` conformed, and `CallToolResult` requires only `["content","resultType"]`, so `tools/call` was never affected. Fixed by setting `cacheScope: "private"` (the endpoint is admission-gated, so telling an intermediary it MAY share across authorization contexts contradicts the control) and `ttlMs: 0` (a stale served set would keep offering a tool this server had stopped serving). **Verified against three independent layers** — the protocol's vendored schema slice, `jsonschema` (no MCP knowledge), and this server's own serialization — with a negative control proving the slice rejects the omitted shape; removing `.with_ttl_ms(..)` fails with `"ttlMs" is a required property`. Also established: the official `modelcontextprotocol/conformance` framework (Apache-2.0, `npx`) validates every wire message against the per-version schema and its `--requirements <revision>` flag is what makes a tier claim meaningful (`--suite`/`--spec-version` describe the suite as it grows), and **it cannot be pointed at this daemon today** because `jarvisd` uses the enforcing `CallerAdmission::local_only()` and a third-party client is refused before any method — recorded as a limit blocked on RFC 8707/9728 tokens, not as a skipped test. | GitHub Copilot |

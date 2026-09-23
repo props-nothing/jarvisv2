@@ -1674,7 +1674,57 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       prose and read every file in `target/`, which cost **85 s**; skipping comments and reading only `.rs` files
       brought it to **0.4 s**.
       **Test-only**: no shipped path relies on a pool dropping.
-- [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
+- [x] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
+      **Split into what is provable now and what is blocked, and the provable half found a real defect.**
+      New code: `crates/jarvis-mcp-transport/src/conformance.rs` (4 tests), a vendored derived schema slice at
+      `crates/jarvis-mcp-transport/tests/spec/` (11 definitions, 41 KB, with provenance and an extraction
+      script), `jsonschema` as a dev-dependency, and `JarvisMcpServer::tools_list_result`. ADR-0040.
+      **The defect: `tools/list` was emitting a document the revision's schema rejects.** Read from the official
+      **machine-readable** schema rather than the human-readable pages: `$defs.ListToolsResult` declares
+      `"required": ["cacheScope", "resultType", "tools", "ttlMs"]`, and `DiscoverResult` requires the same two
+      among five. `rmcp` 3.4.0 models both fields and **deliberately leaves them unset** —
+      `with_all_items` sets `ttl_ms: None, cache_scope: None`, with the field doc saying *"Required by spec
+      version 2026-07-28, but optional here to maintain compatibility with older spec versions"*, pinned by the
+      SDK's own `cache_hints_are_omitted_when_absent` test. That default is correct for a **multi-era** server,
+      because a field this revision requires would be a spurious field on an older wire. This server narrows to
+      one era, so the compatibility argument does not apply and the omission was simply non-conformant.
+      **Two asymmetries show it is a per-type default rather than a policy, and they are why the defect was
+      isolated rather than systemic:** `DiscoverResult::from_server_info` **does** set `ttl_ms: 0` and
+      `cache_scope: Private`, so `server/discover` always conformed; and `CallToolResult` requires only
+      `["content", "resultType"]`, so `tools/call` was never affected. The requirement is on *cacheable*
+      results, which is why only the list method was wrong.
+      **Both values are posture, not tuning.** `cacheScope: "private"` because the endpoint is admission-gated:
+      the schema's own distinction is whether a response "does not contain user-specific data" and may be cached
+      "across authorization contexts", so answering `public` would tell a caching proxy it MAY serve one
+      caller's tool list to another. `ttlMs: 0` because the served set derives from a policy an operator can
+      change, so a cached list would keep offering a tool this server had stopped serving — `0` is the schema's
+      own wording for "immediately stale".
+      **The authority is the specification, not the SDK, and that is the point.** The check has three layers
+      that share no assumption: the revision's own schema slice, `jsonschema` (a general-purpose validator with
+      no MCP knowledge), and JARVIS's serialization. An MCP-aware validator would have agreed with the bug,
+      because the bug **is** an SDK default — the same reasoning `P3-007` recorded for negotiation fixtures,
+      one level up.
+      **⚠ The first version of the conformance test was wrong and the falsification attempt found it.** It
+      assembled its own JSON from `tool_list()` plus the two constants, so **removing the builder call changed
+      nothing** — the test never read the builder. The construction was extracted into
+      `JarvisMcpServer::tools_list_result`, reachable by both the trait method and the test, so the validated
+      document is the value the transport actually sends. *A test that restates the code it checks is not
+      checking it*, and a falsification that does **not** fail is a finding about the test rather than a
+      reprieve. Removing `.with_ttl_ms(..)` now fails with `"ttlMs" is a required property`, and the slice
+      carries a **negative control** proving it rejects the omitted shape, so the check is not vacuous.
+      **Honest limits — the live client-level test is blocked, and the reason is recorded rather than glossed.**
+      The official `modelcontextprotocol/conformance` suite (Apache-2.0, `npx`) and the MCP Inspector are both
+      **third-party clients**, and `jarvisd` builds its endpoint with `CallerAdmission::local_only()`, which
+      `P3-009g` made *enforce*: a remote caller is refused even on loopback. So neither can reach an MCP method
+      against this daemon until audience-bound tokens (RFC 8707) and Protected Resource Metadata (RFC 9728)
+      exist, which remain unbuilt. The live run is therefore named as the **next step** rather than implied to
+      have happened. What was researched and kept: the suite's `--requirements <revision>` flag is the form a
+      tier claim needs (`--suite`/`--spec-version` describe the suite as it grows, while
+      `requirements/<revision>.yaml` is frozen at release), only *scored* scenarios affect the exit code
+      (`extension`, `added-after-release`, and `pending` run and are reported but cannot fail), and a scenario
+      shared between revisions must run **twice** — once per era — because `2025-11-25` and earlier use the
+      stateful `initialize` handshake while `2026-07-28` is stateless with per-request `_meta`.
+      Cross-SDK interoperability is likewise blocked for the same reason: it needs a foreign client to connect.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.
 

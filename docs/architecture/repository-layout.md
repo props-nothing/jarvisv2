@@ -275,6 +275,16 @@ It does not own business decisions. Generate TypeScript clients from its publish
   for a non-idempotent tool that retry is a second effect. `into_service` pins `Future = ResponseFuture` with
   `Clone + Send + Sync + 'static`, because an opaque `impl Service` says nothing about `Service::Future` being
   `Send` and the omission otherwise surfaces at the **mount site** (ADR-0039).
+
+  **`conformance.rs` measures this server against the protocol, not against the SDK** (`P3-010`), and the
+  distinction is the whole point: the defect it found *is* an `rmcp` default. `$defs.ListToolsResult` declares
+  `"required": ["cacheScope", "resultType", "tools", "ttlMs"]`, and `with_all_items` leaves two of those unset
+  **deliberately — for multi-era compatibility**, which is correct for a server serving several eras and wrong
+  for one that advertises a single revision. A vendored **derived** slice of the official schema lives at
+  `tests/spec/` (11 definitions by reference closure, not hand-picked), and `jsonschema` — a validator with no
+  MCP knowledge — checks the document the server actually emits, so three layers share no assumption. The
+  construction is extracted into `tools_list_result` because the first version of the test assembled its own
+  JSON and therefore kept passing after the builder call was removed (ADR-0040).
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value

@@ -1249,6 +1249,7 @@ dependencies = [
  "jarvis-core",
  "jarvis-mcp",
  "jarvis-tools",
+ "jsonschema",
  "reqwest",
  "rmcp",
  "serde",

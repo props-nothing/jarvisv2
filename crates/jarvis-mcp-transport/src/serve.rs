@@ -39,6 +39,21 @@
 //!
 //! Both are narrowed to one version, because the honest statement is "this server speaks
 //! `2026-07-28`" rather than "this server speaks whatever the SDK happens to list".
+//!
+//! # A third SDK default is overridden for the same reason, and it is a conformance defect rather than a
+//! design choice
+//!
+//! `ListToolsResult::with_all_items` leaves `ttl_ms` and `cache_scope` **unset**, and the SDK documents why:
+//! *"Required by spec version 2026-07-28, but optional here to maintain compatibility with older spec
+//! versions."* That is the correct default **for a server that serves several eras**, because a field
+//! `2026-07-28` requires would be a spurious field on an older wire.
+//!
+//! This server narrows to one era, so the compatibility argument does not apply and the omission is simply
+//! non-conformant: the revision's schema declares
+//! `"required": ["cacheScope", "resultType", "tools", "ttlMs"]` on `ListToolsResult`, and the same on
+//! `DiscoverResult`. Those four names were read from the official machine-readable schema, and
+//! `conformance.rs` validates this server's **emitted** results against that schema's own `$defs` — so the
+//! claim is checked by the independent document rather than by the SDK that omits the fields.
 
 use std::fmt;
 use std::sync::Arc;
@@ -48,8 +63,9 @@ use jarvis_core::CorrelationId;
 use jarvis_mcp::ServedTool;
 use jarvis_tools::{AdapterError, ToolCallResult, ToolOutcome};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, ProtocolVersion, ServerCapabilities, ServerConfig, TextContent, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Implementation, ListToolsResult, ProtocolVersion, ServerCapabilities, ServerConfig,
+    TextContent, Tool,
 };
 use rmcp::service::{MaybeSendFuture, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -65,6 +81,22 @@ use serde_json::Value;
 /// crate's public surface. [`served_protocol_version`] is the public door, and it returns the wire string,
 /// which is JARVIS's own vocabulary for the same fact.
 const SERVED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// How long a client may treat a `tools/list` answer as fresh, in milliseconds.
+///
+/// **Zero, which is a statement rather than a placeholder.** The revision requires a `ttlMs` on cacheable
+/// results, and the honest value for this server is "do not cache": the served set is derived from a
+/// configuration and a policy that an operator can change, and a client holding a cached list would keep
+/// offering a tool this server had stopped serving — or, worse, keep *not* offering one it had started
+/// serving. A `0` is the spec's own answer for that ("the response SHOULD be considered immediately stale").
+///
+/// The alternative a server is tempted into is a large number to "save round trips", which trades a bounded
+/// cost for an unbounded correctness problem: the whole point of the served surface is that it is the
+/// authority on what a caller may reach.
+///
+/// `pub(crate)` rather than private because `conformance.rs` asserts the serialized document carries this
+/// value, and a test that repeated the literal would keep passing after the constant changed.
+pub(crate) const SERVED_RESULT_TTL_MS: u64 = 0;
 
 /// Returns the protocol revision this server speaks, as its wire string.
 ///
@@ -188,6 +220,29 @@ impl JarvisMcpServer {
     /// service rather than by calling it. A public `Vec<Tool>` would put the SDK's tool type in this crate's
     /// contract, which is the invariant `boundary_tests.rs` enforces.
     #[must_use]
+    /// Builds the `tools/list` result this server emits.
+    ///
+    /// **Extracted so the conformance test validates the same document the handler emits, rather than a
+    /// document the test built.** The first version of that test assembled its own JSON from
+    /// `tool_list()` and the two constants, which meant it would have kept passing after the real
+    /// construction changed — the failure mode where a test asserts a *restatement* of the code instead of
+    /// the code. `list_tools` needs a `RequestContext`, which requires a `Peer` a unit test cannot build, so
+    /// the construction lives here where both can reach it.
+    ///
+    /// The cache hints are set here, and the reason is that this revision requires them: see the module
+    /// documentation. `conformance.rs` validates the serialized result against the official schema, so
+    /// removing either builder call fails that test rather than passing silently.
+    ///
+    /// `pub(crate)` so the conformance test can reach it; the trait method above is public through
+    /// `ServerHandler`, and this is the construction behind it rather than a second entry point.
+    pub(crate) fn tools_list_result(&self) -> ListToolsResult {
+        // No pagination: the served set is bounded by `jarvis_mcp::MAX_EXPOSED_TOOLS`, and a cursor over a
+        // list that always fits in one response would be a mechanism a client must implement for no gain.
+        ListToolsResult::with_all_items(self.tool_list())
+            .with_ttl_ms(SERVED_RESULT_TTL_MS)
+            .with_cache_scope(CacheScope::Private)
+    }
+
     pub(crate) fn tool_list(&self) -> Vec<Tool> {
         self.served
             .iter()
@@ -358,9 +413,7 @@ impl ServerHandler for JarvisMcpServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_
     {
-        // No pagination: the served set is bounded by `jarvis_mcp::MAX_EXPOSED_TOOLS`, and a cursor over a
-        // list that always fits in one response would be a mechanism a client must implement for no gain.
-        std::future::ready(Ok(ListToolsResult::with_all_items(self.tool_list())))
+        std::future::ready(Ok(self.tools_list_result()))
     }
 
     async fn call_tool(
@@ -380,7 +433,14 @@ impl ServerHandler for JarvisMcpServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// A server with exactly one served tool, for the conformance module.
+    ///
+    /// `pub(crate)` because the conformance test needs a server and must not duplicate the fixture: a second
+    /// construction path is a second thing that can drift from what the daemon builds.
+    pub(crate) fn server_with_one_tool() -> super::JarvisMcpServer {
+        super::JarvisMcpServer::new(vec![served("jarvis.files.read")], NeverCalledRunner::new())
+    }
     use super::*;
 
     use std::sync::Mutex;

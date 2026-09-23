@@ -83,3 +83,8 @@ tower.workspace = true
 # rather than re-exporting the two enums from this crate keeps the transport's public surface
 # free of the domain vocabulary it does not own.
 jarvis-tools.workspace = true
+# The conformance test validates this server's **emitted** documents against the vendored spec schema, and the
+# validator must not be the SDK that emitted them: an MCP-aware library would share assumptions with the code
+# under test, which is exactly what `P3-010` exists to avoid. `jsonschema` is a general-purpose 2020-12
+# validator with no MCP knowledge, and it is already in the lock through `jarvis-tools`.
+jsonschema.workspace = true
