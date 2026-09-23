@@ -7,6 +7,7 @@ mod executor;
 mod gateway;
 mod health;
 mod mcp_host;
+mod mcp_serve;
 mod run_service;
 mod singleton;
 mod sse;
@@ -90,6 +91,12 @@ enum DaemonError {
         /// Why composition failed, which names the rejected definition or root.
         #[source]
         source: crate::tool_pipeline::ToolPipelineError,
+    },
+    #[error("the MCP endpoint could not be served")]
+    McpServe {
+        /// Why the endpoint could not be built or bound, which names the reason.
+        #[source]
+        source: crate::mcp_serve::RemoteMcpError,
     },
 }
 
@@ -192,6 +199,19 @@ struct Running {
     /// share and must be shut down after the pipeline stops being used. Dropping the host while the pipeline
     /// still held an adapter would leave a call reaching a connection nobody was closing.
     mcp: Option<crate::mcp_host::ComposedHost>,
+    /// The bound MCP endpoint JARVIS **serves**, when `daemon.mcp_serve_port` is set.
+    ///
+    /// Distinct from `mcp` in both direction and lifetime: `mcp` is the outbound host (JARVIS calling
+    /// *someone else's* server), while this is the inbound endpoint (a client calling *ours*). They are held
+    /// separately because shutting one down must not depend on the other having stopped, and a daemon may
+    /// legitimately have either without the other.
+    serving_mcp: Option<crate::mcp_serve::ServingMcp>,
+    /// The MCP endpoint's stop signal, watched by the wait loop so a dead listener is detectable.
+    ///
+    /// Held **here** rather than inside [`crate::mcp_serve::ServingMcp`] for the same reason the REST
+    /// transport's signal is: the transport owns the shutdown sender, and the wait loop must be able to await
+    /// the receiver. Keeping it in `Running` is what lets `run` watch it alongside the other two branches.
+    mcp_stop: Option<tokio::sync::oneshot::Receiver<()>>,
     daemon_id: DaemonRunId,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
 }
@@ -355,6 +375,18 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
     // is a signal that a function has grown a second responsibility.
     let (mcp, tools) = compose_tools(loaded_config.config(), &paths, Arc::clone(&database)).await?;
 
+    // The **inbound** endpoint, composed after the pipeline for the forced reason that it serves the
+    // pipeline's own definitions. A failure here is fatal unlike the outbound host's, because the operator
+    // explicitly enabled a port: a daemon that reported itself ready with an endpoint it never bound would be
+    // the "listener nobody notices is dead" case the REST transport's comments describe.
+    let (serving_mcp, mcp_stop) = compose_serving_mcp(
+        loaded_config.config(),
+        &database,
+        tools.as_ref(),
+        loaded_config.config().daemon().mcp_serve_port(),
+    )
+    .await?;
+
     Ok(Running {
         health,
         paths,
@@ -364,6 +396,8 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         credential,
         http_port,
         mcp,
+        serving_mcp,
+        mcp_stop,
         executor,
         tools,
         daemon_id,
@@ -497,6 +531,102 @@ fn compose_tool_pipeline(
     Ok(Some(Arc::new(pipeline)))
 }
 
+/// Builds and binds the inbound MCP endpoint, when the operator enabled one.
+///
+/// # Why this is separate from `compose_tools`, and why its failures are fatal
+///
+/// `compose_tools` treats an MCP **host** failure as non-fatal, because a third-party server that is missing or
+/// hung is a reason for those tools to be unavailable rather than for the daemon to refuse to serve anything.
+/// This function is the opposite case: the operator explicitly named a port, so anything that stops the endpoint
+/// being served is something they must fix. An endpoint that failed to build or bind must therefore stop the
+/// daemon rather than leave it reporting itself ready with a port nobody is listening on.
+///
+/// # The order is forced
+///
+/// It runs after the pipeline, because the endpoint serves the pipeline's own definitions and the served surface
+/// must be the same list the dispatcher covers. Building it before the pipeline would mean serving a list
+/// nothing can run.
+///
+/// # The workspace comes from the profile, never from a request
+///
+/// `load_local_identity` reads the seeded local identity, which is the same source the gateway uses. A remote
+/// MCP client therefore acts in the profile's own workspace and cannot name another — the rule
+/// `docs/architecture/identity-and-workspaces.md` states, applied to a protocol whose requests carry even less.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::McpServe`] for anything that stops the endpoint being served: no tool to serve, a
+/// refused exposure policy or served surface, or a port that cannot be bound. Returns
+/// [`DaemonError::DatabaseError`] when the local identity cannot be read, which is the same failure the gateway
+/// would hit on its first tool call and is better reported at startup.
+async fn compose_serving_mcp(
+    config: &jarvis_storage::Config,
+    database: &Arc<SqliteDatabase>,
+    tools: Option<&Arc<crate::tool_pipeline::ToolPipeline>>,
+    port: Option<u16>,
+) -> Result<
+    (
+        Option<crate::mcp_serve::ServingMcp>,
+        Option<tokio::sync::oneshot::Receiver<()>>,
+    ),
+    DaemonError,
+> {
+    let Some(port) = port else {
+        return Ok((None, None));
+    };
+    let _ = config;
+
+    // The pipeline is the endpoint's whole enforcement path, so an endpoint without one has nothing to serve.
+    // Reported as a distinct error from a bound port, because the remedy is different: grant roots or configure
+    // a server, rather than change the port.
+    let Some(pipeline) = tools else {
+        return Err(DaemonError::McpServe {
+            source: crate::mcp_serve::RemoteMcpError::NoTools,
+        });
+    };
+
+    let identity = jarvis_storage::load_local_identity(database)
+        .await
+        .map_err(DaemonError::Database)?;
+
+    // The definitions come from the pipeline's own registry, so the served surface and the dispatch table
+    // describe one set of tools. `definitions()` is what the pipeline registered, which is exactly the list
+    // `dispatch.verify_covers` checked.
+    let definitions = pipeline
+        .definitions()
+        .map_err(|source| DaemonError::ToolPipeline { source })?;
+    let workspace_id = identity.workspace_id().to_owned();
+
+    let (runner, endpoint) = crate::mcp_serve::build_endpoint(
+        Arc::clone(pipeline),
+        &definitions,
+        &workspace_id,
+        // **`local_only`**, which is `P3-009g`'s safe default: it admits nobody remotely, so the endpoint
+        // serves the tools an operator's own MCP client can reach on this machine and refuses every remote
+        // caller. A remote allowlist needs audience-bound tokens (RFC 8707) that are not built, which is what
+        // that default records.
+        jarvis_mcp_transport::CallerAdmission::local_only(),
+    )
+    .map_err(|source| DaemonError::McpServe { source })?;
+
+    let (serving, stopped) = crate::mcp_serve::ServingMcp::bind(port, endpoint)
+        .await
+        .map_err(|source| DaemonError::McpServe { source })?;
+
+    tracing::info!(
+        port = serving.port(),
+        tools = definitions.len(),
+        // The policy in force is **stated**, so an operator can confirm a configuration was loaded rather than
+        // comparing files against a running process. `is_loopback_only` is the fact that matters: it is the
+        // admission default that refuses every remote caller, and it is the value a deployment would have to
+        // change deliberately.
+        origins_loopback_only = serving.policy().admission().is_local_only(),
+        "serving JARVIS tools over MCP"
+    );
+    let _ = runner;
+    Ok((Some(serving), Some(stopped)))
+}
+
 /// A bound and served loopback HTTP transport.
 ///
 /// Owning the serving task rather than dropping it into a detached spawn is what makes a dead
@@ -583,53 +713,113 @@ struct WaitOutcome {
     shutdown: io::Result<()>,
     accept_failure: Option<jarvis_core::TransportError>,
     http_stopped: bool,
+    /// Whether the **inbound MCP endpoint** stopped on its own.
+    ///
+    /// A separate flag rather than folded into `http_stopped`, because the two are different ports serving
+    /// different protocols: an operator reading "a listener stopped" would not know which to look at, and the
+    /// remedy differs.
+    mcp_stopped: bool,
 }
 
-/// Waits for a shutdown signal, a local-listener failure, or an HTTP-listener failure.
+/// Waits for a shutdown signal, a local-listener failure, or either HTTP listener failing.
 ///
-/// The HTTP listener is a third branch of the same select rather than a detached task, so a
-/// listener that dies takes the shutdown path instead of leaving the daemon reporting itself ready
-/// with no transport behind it.
+/// **Both listeners are branches of the same select** rather than detached tasks, so a listener that dies takes
+/// the shutdown path instead of leaving the daemon reporting itself ready with no transport behind it. Each
+/// stop signal is optional because a deployment may enable either listener, both, or neither — and `None` for a
+/// listener that was never bound is not a missing branch but the absence of one.
 async fn wait_for_exit<F>(
     shutdown: F,
     accept_loop: std::pin::Pin<Box<dyn Future<Output = jarvis_core::TransportError> + Send>>,
     http_stop: Option<tokio::sync::oneshot::Receiver<()>>,
+    mcp_stop: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> WaitOutcome
 where
     F: Future<Output = io::Result<()>>,
 {
-    // A pinned receiver so the select polls it by reference, keeping ownership inside this
-    // function. Awaiting it by value in an arm would move it out of the `if let`, and the other
-    // arms would then have to return it.
-    if let Some(receiver) = http_stop {
-        let mut stop = Box::pin(receiver);
-        tokio::select! {
-            result = shutdown => WaitOutcome {
-                shutdown: result,
-                accept_failure: None,
-                http_stopped: false,
-            },
-            failure = accept_loop => WaitOutcome {
-                shutdown: Ok(()),
-                accept_failure: Some(failure),
-                http_stopped: false,
-            },
-            _ = &mut stop => WaitOutcome {
-                shutdown: Ok(()),
-                accept_failure: None,
-                http_stopped: true,
-            },
-        }
-    } else {
-        let (shutdown, accept_failure) = tokio::select! {
-            result = shutdown => (result, None),
-            failure = accept_loop => (Ok(()), Some(failure)),
-        };
-        WaitOutcome {
-            shutdown,
-            accept_failure,
+    // Both signals are normalised to one boxed future type, so the select has a fixed shape rather than nested
+    // `if let`s whose arms multiply with each listener. A listener that was never bound becomes a future that
+    // never completes, which is how "there is nothing to watch" is expressed — and it keeps the two `stopped`
+    // flags distinguishable in the outcome rather than collapsing them into one.
+    let mut http_stop = stop_signal(http_stop);
+    let mut mcp_stop = stop_signal(mcp_stop);
+
+    tokio::select! {
+        result = shutdown => WaitOutcome {
+            shutdown: result,
+            accept_failure: None,
             http_stopped: false,
-        }
+            mcp_stopped: false,
+        },
+        failure = accept_loop => WaitOutcome {
+            shutdown: Ok(()),
+            accept_failure: Some(failure),
+            http_stopped: false,
+            mcp_stopped: false,
+        },
+        () = &mut http_stop => WaitOutcome {
+            shutdown: Ok(()),
+            accept_failure: None,
+            http_stopped: true,
+            mcp_stopped: false,
+        },
+        () = &mut mcp_stop => WaitOutcome {
+            shutdown: Ok(()),
+            accept_failure: None,
+            http_stopped: false,
+            mcp_stopped: true,
+        },
+    }
+}
+
+/// A listener's stop signal, or a future that never completes when there is no listener to watch.
+///
+/// The receiver's `Result` is discarded — a `RecvError` means the sender was dropped, which for a one-shot stop
+/// signal means the transport is gone, and that is the same event as the signal being sent for this purpose. The
+/// `None` arm is `std::future::pending`, which is not a stub: it is the honest expression of "this listener was
+/// never bound", and it is what lets one `select!` cover a daemon with either listener, both, or neither.
+fn stop_signal(
+    receiver: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    match receiver {
+        Some(receiver) => Box::pin(async move {
+            let _ = receiver.await;
+        }),
+        None => Box::pin(std::future::pending::<()>()),
+    }
+}
+
+/// Stops whatever network listeners were running, in the one order that matters.
+///
+/// The **inbound** MCP endpoint is stopped before the outbound MCP host is closed, and after the REST transport.
+/// The order matters in one direction only: this endpoint's handler holds the pipeline, so closing it before the
+/// pipeline's adapters are dropped avoids a request being served against an adapter that is going away.
+///
+/// An unexpected stop is logged at error level rather than returned: the daemon is already exiting, and which
+/// listener died first is the diagnostic, not a second failure to report.
+async fn stop_transports(
+    http: Option<HttpTransport>,
+    serving_mcp: Option<crate::mcp_serve::ServingMcp>,
+    http_port: Option<u16>,
+    outcome: &WaitOutcome,
+) {
+    if let Some(transport) = http {
+        let port = transport.port();
+        transport.shutdown().await;
+        tracing::info!(port, "HTTP transport stopped");
+    }
+    if let Some(serving) = serving_mcp {
+        let port = serving.port();
+        serving.shutdown().await;
+        tracing::info!(port, "MCP endpoint stopped");
+    }
+    if outcome.http_stopped {
+        tracing::error!(
+            port = http_port.unwrap_or(0),
+            "the HTTP transport stopped unexpectedly"
+        );
+    }
+    if outcome.mcp_stopped {
+        tracing::error!("the MCP endpoint stopped unexpectedly");
     }
 }
 
@@ -648,6 +838,8 @@ where
         executor,
         tools,
         mcp,
+        serving_mcp,
+        mcp_stop,
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
@@ -665,6 +857,9 @@ where
         mode = if root.is_some() { "portable" } else { "native" },
         secrets_masked = logging.secret_count(),
         http_port = http_port.unwrap_or(0),
+        mcp_serve_port = serving_mcp
+            .as_ref()
+            .map_or(0, crate::mcp_serve::ServingMcp::port),
         "daemon ready"
     );
 
@@ -685,18 +880,8 @@ where
         None => (None, None),
     };
 
-    let outcome = wait_for_exit(shutdown, accept_loop, http_stop).await;
-    if let Some(transport) = http {
-        let port = transport.port();
-        transport.shutdown().await;
-        tracing::info!(port, "HTTP transport stopped");
-    }
-    if outcome.http_stopped {
-        tracing::error!(
-            port = http_port.unwrap_or(0),
-            "the HTTP transport stopped unexpectedly"
-        );
-    }
+    let outcome = wait_for_exit(shutdown, accept_loop, http_stop, mcp_stop).await;
+    stop_transports(http, serving_mcp, http_port, &outcome).await;
 
     let shutdown_result = outcome.shutdown;
     let accept_failure = outcome.accept_failure;

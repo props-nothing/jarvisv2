@@ -157,6 +157,9 @@ pub enum ToolPipelineError {
     /// collide with something already registered, so the pipeline must not start at all.
     #[error("the registry rejected a definition: {0}")]
     Registration(#[from] jarvis_tools::RegistrationError),
+    /// A registered tool could not be read back, which means the registry and its own inventory disagree.
+    #[error("a registered tool could not be resolved: {0}")]
+    Registry(#[from] jarvis_tools::RegistryError),
     /// The granted roots could not be opened.
     #[error(transparent)]
     Roots(#[from] RootError),
@@ -471,6 +474,168 @@ impl ToolPipeline {
         // 6-7. Execute through the adapter and record what it established.
         self.execute_and_record(prepared, tool, &definition, correlation_id)
             .await
+    }
+
+    /// Returns every registered definition, in the registry's stable order.
+    ///
+    /// Offered so a caller that must state *what this daemon can do* — the inbound MCP endpoint's served
+    /// surface — reads the same list dispatch was verified against. Deriving it any other way would be a second
+    /// statement of which tools exist, and the two could disagree in the direction that matters: a tool served
+    /// with no adapter to run it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError`] when an inventory entry cannot be resolved back to its definition. That is
+    /// unreachable for a key the registry itself produced — the same reasoning
+    /// [`Self::with_adapters`] gives when it parses identifiers back from the inventory — so a failure here is
+    /// reported rather than skipped, because a skipped tool would be a hole in the served surface.
+    pub fn definitions(&self) -> Result<Vec<jarvis_tools::ToolDefinition>, ToolPipelineError> {
+        let ids: Vec<ToolId> = self
+            .registry
+            .inventory()
+            .iter()
+            .map(|entry| ToolId::new(&entry.id))
+            .collect::<Result<_, _>>()?;
+        ids.iter()
+            .map(|id| {
+                self.registry
+                    .get(id)
+                    .cloned()
+                    .map_err(ToolPipelineError::Registry)
+            })
+            .collect()
+    }
+
+    /// Runs one tool call for a **remote MCP caller**, applying every gate a local call gets and recording no
+    /// call row.
+    ///
+    /// # Why this exists beside `call_tool` rather than as a flag on it
+    ///
+    /// A remote MCP call cannot be a `tool_calls` row: `0007_tool_calls.sql` declares
+    /// `run_id TEXT NOT NULL REFERENCES agent_runs (id)`, and an MCP request has no run. So the steps that
+    /// write rows — `authorize_and_admit` and `execute_and_record` — cannot be used, and the honest shape is a
+    /// second entrypoint rather than a `record: bool` the caller could set wrongly.
+    ///
+    /// **What is shared, and that is the point.** The definition comes from the same registry, and
+    /// [`Self::validate`] and [`evaluate`] are the *same functions* `call_tool` calls, over the same
+    /// `WorkspacePolicy` and the same dispatcher. A remote call therefore reaches the identical adapter with
+    /// the identical confinement (`ADR-0020`) and the identical policy decision, and the only difference is
+    /// that nothing is persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError`] for a fault, and [`ToolPipelineOutcome::Refused`] for a decision. A
+    /// decision requiring an approval is **refused** rather than returned as
+    /// [`ToolPipelineOutcome::AwaitingApproval`]: there is no run to park, and handing a caller an approval
+    /// shape it cannot complete would be a promise nothing can keep.
+    ///
+    /// # This records nothing, which is a recorded limit
+    ///
+    /// A remote call is **not** in the ledger, so it is observable in a log and not in the audit trail.
+    /// `P3-012` owns linking calls to a durable log; until then the absence is stated here rather than left for
+    /// a reader to discover.
+    pub async fn call_remote_tool(
+        &self,
+        tool: &str,
+        arguments: Value,
+        actor: &ToolActor,
+        correlation_id: CorrelationId,
+    ) -> Result<ToolPipelineOutcome, ToolPipelineError> {
+        let id = ToolId::new(tool)?;
+        let definition = match self.registry.get(&id) {
+            Ok(definition) => definition.clone(),
+            Err(_) => {
+                return Err(ToolPipelineError::UnknownTool {
+                    tool: tool.to_owned(),
+                });
+            }
+        };
+
+        // 1. Validate, with the same function the local path uses. A remote caller does not get a weaker
+        //    argument check than an operator's own call, which is the failure a second implementation would
+        //    produce.
+        Self::validate(&definition, tool, &arguments)?;
+
+        // 2. Decide, with the same engine over the same definitions.
+        let decision = evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: actor.authority(),
+            workspace: &self.workspace,
+            channel: actor.channel(),
+            claimed_strength: actor.claimed_strength(),
+            available: definition.availability().is_available(),
+            // `none`, deliberately: an MCP request carries no target and this module does not read one out of
+            // free-form arguments. A target assessment invented from arguments would be a second classifier
+            // deciding risk, which is the thing `TargetAssessment` exists to keep singular.
+            target: TargetAssessment::none(),
+        });
+        if decision.is_denied() {
+            return Ok(ToolPipelineOutcome::Refused {
+                reason_code: decision.reason_code(),
+            });
+        }
+        // A held decision is a refusal on this path, and the reason code says so rather than reporting the
+        // workspace's `require_approval` code as if an approval were obtainable.
+        if decision.decision() == jarvis_tools::Decision::RequireApproval {
+            return Ok(ToolPipelineOutcome::Refused {
+                reason_code: "mcp_call_cannot_hold_an_approval",
+            });
+        }
+        // A second, independent statement, because `ApprovalPolicy` is a declaration on the **tool** and the
+        // engine's threshold is a **workspace** setting. A tool declaring an approval its workspace would not
+        // ask for must still not run here, and a test varying only the workspace would not catch removing this.
+        if definition.approval() != jarvis_tools::ApprovalPolicy::Auto {
+            return Ok(ToolPipelineOutcome::Refused {
+                reason_code: "mcp_call_cannot_hold_an_approval",
+            });
+        }
+
+        // 3-4. Build the authority and run, with no admission and no outcome write. The intent is computed and
+        //      the receipt carried, so the adapter checks the same binding it always does.
+        let intent =
+            CanonicalIntentHash::compute(tool, definition.version(), &arguments).map_err(|_| {
+                ToolPipelineError::UnintelligibleIntent {
+                    tool: tool.to_owned(),
+                }
+            })?;
+        let now = UtcTimestamp::now(&SystemClock);
+        let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
+            receipt_id: correlation_id.to_string(),
+            tool: id.clone(),
+            tool_version: definition.version().to_owned(),
+            arguments: arguments.clone(),
+            intent_hash: intent,
+            policy_version: actor.policy_version().to_owned(),
+            decision: decision.clone(),
+            // No approval, and none is possible: a held decision returned above. A citation here would be
+            // inventing authority this path never obtained.
+            approval: None,
+            correlation_id,
+            issued_at: now,
+        })?;
+
+        let key = IdempotencyKey::generate()?;
+        let request = ToolExecutionRequest::new(ToolExecutionRequestParts {
+            call_id: correlation_id.to_string(),
+            tool: id,
+            tool_version: definition.version().to_owned(),
+            arguments,
+            receipt,
+            idempotency_key: key,
+            deadline: deadline_after(now, definition.timeout_seconds()),
+            correlation_id,
+        })?;
+
+        match self.dispatch.adapter_for(request.tool()) {
+            Some(adapter) => Ok(ToolPipelineOutcome::Executed(Box::new(
+                adapter.execute(&request).await?,
+            ))),
+            // Unreachable through this path for the same reason as the local one: coverage was verified at
+            // construction. Reported as a fault rather than defaulted.
+            None => Err(ToolPipelineError::Dispatch(DispatchError::Uncovered {
+                tool: tool.to_owned(),
+            })),
+        }
     }
 
     /// Validates arguments against the definition's compiled input schema.

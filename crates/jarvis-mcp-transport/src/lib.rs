@@ -111,6 +111,20 @@ pub use jarvis_mcp::NamingStrategy;
 // finding. The daemon asserts its own constant against this one, so a divergence is a failing test rather
 // than every MCP call being denied for a missing scope.
 pub use jarvis_mcp::DEFAULT_MCP_SCOPE as DEFAULT_MCP_CALL_SCOPE;
+// The three items a composition root needs to build an **inbound** endpoint, re-exported for the same reason
+// as the strategy and the scope: `P3-009c-b` makes the daemon serve its own tools, so the daemon must name the
+// exposure policy, the served-surface function, and the error both can return. Declaring `jarvis-mcp` as a
+// normal dependency of the daemon would work and would put a crate the daemon does not otherwise use into its
+// dependency list; re-exporting keeps the boundary in the crate that owns the integration, exactly as
+// `NamingStrategy` already is.
+//
+// **Two distinct error types, and the names look deceptively alike.** `jarvis-mcp`'s `exposure` module has
+// `ExposureError` (an origin allowlist that cannot be built) and its `served` module has a *separate*
+// `ExposureError` — re-exported by that crate as `ServedExposureError`. They are not aliases of one enum, which
+// is exactly the trap this comment exists to prevent: importing the wrong one compiles as a name and fails as a
+// missing `From` impl at the `?` site. This re-exports the **served** one, because that is what `served_tools`
+// returns; an origin allowlist that cannot be built is reached through `ServingConfigError` instead.
+pub use jarvis_mcp::{ServedExposureError, ServerExposure, served_tools};
 pub use revision::{
     MODERN_REVISION, describe_negotiated, modern_revision, sdk_default_is_modern,
     sdk_default_revision,

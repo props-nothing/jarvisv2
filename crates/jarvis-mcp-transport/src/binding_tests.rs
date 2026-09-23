@@ -553,3 +553,37 @@ async fn the_debug_output_omits_the_sdk_interior() {
         );
     }
 }
+/// **The service is `Send + Sync + Clone` and its future is `Send + 'static`, which is what mounting needs.**
+///
+/// Written because mounting it on a real router failed with `<… as Service<…>>::Future cannot be sent between
+/// threads safely`, and the error named the **mount site's** generic parameter rather than anything here — an
+/// opaque `impl Service<…>` exposes only its declared bounds, and the future is an **associated** type, so the
+/// return type said nothing about it.
+///
+/// The fix was to pin `Service::Future` to a named alias ([`crate::binding::ResponseFuture`]), which makes the
+/// bound a contract this crate states. **This test is what holds it**: without it, dropping `Send` from the
+/// alias would compile here and fail in the daemon.
+#[test]
+fn the_service_and_its_future_are_send_and_sync() {
+    fn assert_mountable<T>(_: &T)
+    where
+        T: Send + Sync + Clone + 'static,
+    {
+    }
+    fn assert_future_is_send<F: Send + 'static>(_: &F) {}
+
+    let runner = CountingRunner::new();
+    let built = endpoint(ServingConfig::loopback_only(), admitting("vscode"), &runner);
+    let service = built.into_service::<String>();
+    assert_mountable(&service);
+
+    // The future is named through the alias rather than inferred, so a change to the alias's bounds is a
+    // **compile** failure in this file instead of a mount-time failure in a binary. The body never runs; only
+    // the type's `Send + 'static` matters, which is why the closure returns the same `Result` shape.
+    let future: crate::binding::ResponseFuture = Box::pin(async {
+        Ok(http::Response::new(crate::binding::ResponseBody::new(
+            http_body_util::Full::new(bytes::Bytes::new()),
+        )))
+    });
+    assert_future_is_send(&future);
+}

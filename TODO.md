@@ -1552,14 +1552,71 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       line; the probe was removed and replaced with a test over the same text. **That test failed on its first
       run**, because the scan keys imported names off the `use rmcp::…` line *in the same file* and the fixture
       had none — correct behaviour, discovered rather than assumed.
-      **Honest limits.** **The daemon does not mount this yet** (`P3-009c-b`), so the layer is proven by tests and
-      not by a socket. `spent_budget` is still a literal `false`, recorded at the call site rather than left to
-      inference: the rate limit the gate could apply never fires. The admitted `RequestAdmission` is logged on a
-      span and dropped — an admission is observable but **not attributable**, because attributing an MCP call
+      **Honest limits.** **The daemon does not mount this yet** (`P3-009c-b`, which now does), so at the time this
+      slice closed the layer was proven by tests and not by a socket. `spent_budget` is still a literal `false`,
+      recorded at the call site rather than left to inference: the rate limit the gate could apply never fires.
+      The admitted `RequestAdmission` is logged on a span and dropped — an admission is observable but **not
+      attributable**, because attributing an MCP call
       needs a correlation id the request does not carry (`P3-012`). The **token remains unvalidated** (no RFC
       8707 audience binding, no RFC 9728 Protected Resource Metadata), so a remote caller can only be admitted
       against a fingerprint an operator configured by hand.
-- [ ] `P3-009c-b` Mount the endpoint in the daemon: choose the loopback port, wire the policies from configuration, and prove a real socket refuses an anonymous remote caller.
+- [x] `P3-009c-b` Mount the endpoint in the daemon: choose the loopback port, wire the policies from configuration, and prove a real socket refuses an anonymous remote caller.
+      `apps/jarvisd/src/mcp_serve.rs` (the runner, the endpoint, the bound listener), `mcp_serve_tests.rs`, plus
+      `ToolActor::remote`, `ToolPipeline::call_remote_tool`/`definitions`, `Running`/`start`/`run`/`wait_for_exit`
+      in `apps/jarvisd/src/main.rs`, and `mcp_serve_port` in `crates/jarvis-storage/src/config.rs`. ADR-0039.
+      **The endpoint is bound on loopback on its own port and served under both inbound policies.** The REST
+      transport's flag is separate: the two listeners have different trust boundaries and different answers to "who
+      may call", so sharing a port would make one admission policy govern the other's traffic. `Some(0)` and a port
+      with no granted workspace roots are refused at configuration time, because either would report a daemon ready
+      on a listener that cannot answer.
+      **A remote call has no run, and the schema is the authority.** `0007_tool_calls.sql` declares
+      `run_id TEXT NOT NULL REFERENCES agent_runs (id)`, so a call with no run cannot be written as a `tool_calls`
+      row. Inventing a run identifier to satisfy the column was the tempting shortcut and the foreign key refuses
+      it. `call_remote_tool` therefore writes **no** row, and that is recorded as a limit rather than presented as
+      completeness.
+      **A second entrypoint rather than a `record: bool`**, so "may this call write a row" is a property of which
+      function was called and cannot be set wrongly by an argument whose name does not say what is lost.
+      **Parity is by calling the same code**: the same `validate`, the same `evaluate` over the same definition,
+      workspace policy, and dispatcher. The differences are exactly two — the audit record and the approval outcome.
+      **An approval is refused, not bypassed, and there are two independent checks**: the engine's
+      `Decision::RequireApproval` (a *workspace* threshold) and `definition.approval() != ApprovalPolicy::Auto`
+      (a *tool* declaration), both refused with `mcp_call_cannot_hold_an_approval` — because reporting the
+      workspace's own code would tell a client an approval is obtainable when this path cannot hold one.
+      **⚠ The second check had no test, and that was measured rather than suspected: mutating it to `false && …`
+      left the suite green at 13/13.** A test now registers a real `ToolDefinition` declaring
+      `ApprovalPolicy::Ask` at risk 0 — so the default workspace threshold of `Moderate` cannot hold the call,
+      making the declaration the only thing under test — beside a **counting** adapter that must not be reached.
+      The mutation now fails exactly that one test.
+      **⚠ The caller policy was not covered either**: replacing `build_endpoint`'s `caller_policy` argument with
+      `CallerAdmission::local_only()` left 14/14 green, because every other test already passes `local_only()` and
+      a parameter that is always given one value is indistinguishable from one that is ignored. A test that passes
+      an *admitted caller* now pins the pass-through, and it asserts its own fixture is not the default so it
+      cannot silently become a duplicate of its neighbours.
+      **The remote actor's scopes are the union of the served definitions' `required_scopes`** — exactly what the
+      advertised tools demand. Never `mcp.call`, which is this daemon's grant to call someone else's server: on the
+      inbound direction that is a scope with the right name and the wrong direction. **The first version granted
+      nothing and every call was refused with `missing_scope`**; its own test caught it, and reverting to
+      `ScopeSet::none()` fails four tests.
+      **An adapter's own error is propagated unchanged.** `map_pipeline_error` returns `AdapterCall(error)` as-is,
+      preserving `AdapterError`'s three-way claim — `RefusedBeforeReaching`, `ProviderRefused`, and
+      `AmbiguousAfterReaching`. Rewriting all three into "nothing was reached" would tell a client to retry a call
+      whose effect is unknown, and for a non-idempotent tool the retry is **a second effect**. Every other pipeline
+      error is raised before the dispatcher is consulted, so mapping those to `RefusedBeforeReaching` is a
+      statement the code supports. Tested by **constructing** the ambiguous value, since no served adapter returns
+      one. Also `into_service` now pins `Future = ResponseFuture` with `Clone + Send + Sync + 'static`, because an
+      opaque `impl Service` says nothing about `Service::Future` being `Send` and the omission otherwise surfaces
+      at the **mount site** in an error naming its generic parameter rather than this layer.
+      **Five mutations were run, one property each**, and each failed exactly the test naming it: the scope union
+      (4 tests), the held-decision refusal (1), the tool-declaration refusal (1), the empty-surface refusal (1), and
+      the caller policy (1).
+      **Honest limits.** A remote call is **observable but not attributable**: it is logged and has no `tool_calls`
+      row, because that row needs a run — `P3-012` owns the durable link. `spent_budget` is still a literal
+      `false`, so the rate limit the gate can apply never fires. The origin list is **not configurable**:
+      `build_endpoint` builds `ServerExposure::loopback_only()` through `ServingConfig::new` rather than reading a
+      configured list, because a configurable list is a value that can make a startup either fail or serve
+      something nobody chose; the caller allowlist is where a deployment says *who* may call. The **token remains
+      unvalidated** (no RFC 8707 audience binding, no RFC 9728 Protected Resource Metadata), so a remote caller can
+      only be admitted against a fingerprint an operator configured by hand.
 - [ ] `P3-013` Close the test-scratch directory leak: `sqlx::Pool` has no `Drop` that closes connections.
       **Found while running the `P3-009c-a` gate suite, and it is a real defect in the test fixtures rather than
       in shipped code.** Two causes were behind one symptom and only the first is fixed.

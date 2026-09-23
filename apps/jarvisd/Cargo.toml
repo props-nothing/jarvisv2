@@ -24,6 +24,11 @@ jarvis-models.workspace = true
 # server reachable by an **operator** rather than only by a test — the limit `P3-008a`..`P3-008i` each
 # recorded.
 jarvis-mcp-transport.workspace = true
+# `ToolExecutor` is an async trait, and `RemoteMcpRunner` implements `ServedToolRunner` — which is declared
+# with the same macro, so implementing it needs `async_trait` in scope at the impl site. Already a
+# dev-dependency for the same reason (the `dispatch` test double); promoted to a normal one now that a
+# **production** impl exists, because a dev-dependency is not in scope for the binary.
+async-trait.workspace = true
 jarvis-observability.workspace = true
 jarvis-protocol.workspace = true
 jarvis-storage.workspace = true

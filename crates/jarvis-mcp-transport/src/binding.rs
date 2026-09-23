@@ -66,6 +66,20 @@ type SdkService = StreamableHttpService<JarvisMcpServer, NeverSessionManager>;
 /// contract, and the type must be exact because the SDK's response is passed through unchanged when admitted.
 pub type ResponseBody = BoxBody<Bytes, Infallible>;
 
+/// The future this layer returns from one request.
+///
+/// **Named and public because `Send` has to be in the contract, not just in the type.** An `impl Service`
+/// return type exposes only its declared bounds, and the future is an *associated* type — so an opaque
+/// `impl Service<…>` says nothing about whether `Service::Future` is `Send`. `axum::Router::fallback_service`
+/// requires `T::Future: Send + 'static`, so mounting this without naming the future fails at the **mount
+/// site**, where the error names the caller's generic parameter rather than anything in this crate.
+///
+/// Pinning the associated type to this alias makes the whole contract checkable here: the boxing, the `Send`,
+/// and the `'static` lifetime are statements this crate makes, and a future change that dropped one fails to
+/// compile in this file rather than in a daemon.
+pub type ResponseFuture =
+    Pin<Box<dyn Future<Output = Result<Response<ResponseBody>, Infallible>> + Send + 'static>>;
+
 /// The header an MCP client presents its credential in.
 ///
 /// `Authorization`, and the value is expected to be a **digest** rather than the credential itself — see
@@ -157,10 +171,28 @@ impl ServedEndpoint {
     /// `impl Service` rather than the concrete type, so the SDK's service stays out of this crate's public
     /// surface while a caller can still mount it. `axum::Router::fallback_service` accepts any `Service`, and
     /// **naming** the type is the only thing an SDK-free contract forbids.
+    ///
+    /// # Why the returned type is `Clone + Send + Sync`
+    ///
+    /// `axum::Router::fallback_service` requires all three, and `P3-009c-b` mounts this on a real router — so
+    /// they are stated as bounds rather than left to be discovered at the mount site, where the error names the
+    /// **caller's** generic parameter and not this function. `CheckingService` is `Clone` because the SDK's
+    /// service is, `Send`/`Sync` because every field is, and the future is `Send` because the SDK's `Service`
+    /// impl returns `BoxFuture<'static, …> + Send`.
     #[must_use]
     pub fn into_service<B>(
         self,
-    ) -> impl Service<Request<B>, Response = Response<ResponseBody>, Error = Infallible>
+    ) -> impl Service<
+        Request<B>,
+        Response = Response<ResponseBody>,
+        Error = Infallible,
+        // The associated type is pinned rather than left opaque, so the `Send` bound is part of this
+        // crate's contract and a change that dropped it fails here. See [`ResponseFuture`].
+        Future = ResponseFuture,
+    > + Clone
+    + Send
+    + Sync
+    + 'static
     where
         B: Body + Send + 'static,
         B::Data: Send + 'static,
@@ -264,7 +296,7 @@ where
 {
     type Response = Response<ResponseBody>;
     type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = ResponseFuture;
 
     fn poll_ready(
         &mut self,

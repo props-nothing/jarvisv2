@@ -102,9 +102,11 @@ fn at(offset_seconds: i128) -> UtcTimestamp {
 
 /// A database with the seeded local identity and one live run, plus the directory holding it.
 ///
-/// The pair is ordered `(TempRoot, Arc<SqliteDatabase>)` deliberately: Rust drops tuple fields in declaration
-/// order, so a directory placed first is removed while the pool still holds the database file open. On Windows
-/// that is a sharing violation, and `Drop` swallows it — which leaked one directory per test silently.
+/// The tuple carries the directory so the fixture cannot leak it, and the directory is **still leaked on a
+/// platform where the database file is open** — see `P3-013`. An earlier version of this comment claimed the
+/// field order fixed that; it does not, and the claim was withdrawn: `sqlx::Pool` has **no `Drop`** that closes
+/// connections, so no ordering can release the file. Reversing the pair changed the directory count by zero,
+/// which is how the wrong explanation was found.
 async fn database_with_run() -> (TempRoot, Arc<SqliteDatabase>) {
     let directory = TempRoot::new();
     let database = Arc::new(must(

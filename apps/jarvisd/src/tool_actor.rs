@@ -12,7 +12,7 @@
 //! workspace would let a caller name a workspace it was never granted. [`ToolActor`] carries
 //! identifiers read from those sources rather than parsed from a request body.
 
-use jarvis_core::SessionChannel;
+use jarvis_core::{CorrelationId, SessionChannel};
 
 use jarvis_tools::{ActorAuthority, AuthenticationStrength};
 use jarvis_tools::{Scope, ScopeSet};
@@ -41,6 +41,88 @@ pub struct ToolActor {
 }
 
 impl ToolActor {
+    /// Describes the actor an **inbound MCP call** is made under.
+    ///
+    /// # The scopes are the served tools' own requirements, and that is derived rather than chosen
+    ///
+    /// The first version of this constructor granted **no** scopes, on the reasoning that the narrowest grant
+    /// is the safest. Its own test caught the error: `FilesystemReadTool::definitions` declares
+    /// `required_scopes: ScopeSet::single("files.read")`, and the policy engine requires the actor to cover the
+    /// **tool's** declared scopes — so an actor holding nothing was refused every call with `missing_scope`. The
+    /// endpoint would have been built, bound, and answer every request with a refusal, which reads to an
+    /// operator as a policy misconfiguration rather than as this constructor.
+    ///
+    /// So the grant is the union of the served definitions' own `required_scopes`: the actor holds **exactly
+    /// what running the served tools requires, and nothing else**. That is derived from the same list `P3-009d`
+    /// built the served surface from, so a tool that is not served cannot widen it.
+    ///
+    /// # What is deliberately *not* granted
+    ///
+    /// **`mcp.call`**, which is the mistake this doc exists to prevent. That literal is *this daemon's* grant to
+    /// call **someone else's** server, so attaching it to an inbound call would put the outbound grant on the
+    /// inbound direction — a scope with the right name and the wrong direction, which is worse than a missing
+    /// one because it reads as intentional. It is not in the union above because no served tool declares it.
+    ///
+    /// # The other two fields
+    ///
+    /// - **`SessionChannel::Api`.** Not a claim about the transport: a remote client is not a JARVIS client, and
+    ///   labelling it `Cli` would say an operator's own local invocation made the call. The policy engine's
+    ///   strength cap reads it.
+    /// - **`AuthenticationStrength::Credential`**, which is what `P3-009g`'s allowlist actually establishes: a
+    ///   caller is admitted only against a configured credential fingerprint. The engine **caps** this by
+    ///   channel, so it is a claim rather than a proof — and the allowlist, not this value, is what admits.
+    ///
+    /// `run_id` is the correlation identity of the call: a remote call has **no run**, and a fabricated
+    /// identifier that looked like a real one would appear in a receipt as a run an operator could look up and
+    /// find missing. The pipeline's remote path writes no call row, so this value is never persisted.
+    #[must_use]
+    pub fn remote(
+        workspace_id: impl Into<String>,
+        correlation_id: CorrelationId,
+        policy_version: impl Into<String>,
+        served: &[jarvis_tools::ToolDefinition],
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            run_id: correlation_id.to_string(),
+            scopes: Self::required_scopes_for(served),
+            channel: SessionChannel::Api,
+            claimed_strength: AuthenticationStrength::Credential,
+            policy_version: policy_version.into(),
+        }
+    }
+
+    /// Returns the union of the scopes every served tool declares as required.
+    ///
+    /// A union rather than an intersection, because the actor must be able to run **any** tool the endpoint
+    /// advertises: an intersection would satisfy a tool whose requirements are a subset and refuse the rest,
+    /// which would make the served surface a promise the actor cannot keep.
+    ///
+    /// A scope literal that cannot be reconstructed is **skipped**, and the consequence is a refusal rather
+    /// than an over-grant: the only failure is a malformed declaration, and omitting it means the tool that
+    /// declared it is refused for a missing scope — the fail-closed direction. `the_served_scopes_are_valid`
+    /// asserts the literals this build produces are accepted, so the skip is proved unreachable.
+    ///
+    /// The round trip through `Display` and `Scope::new` is deliberate: `Scope` has no borrowed accessor, and
+    /// re-parsing is what makes the *validity* of each declaration a property this function checks rather than
+    /// one it assumes about a value it was handed.
+    fn required_scopes_for(served: &[jarvis_tools::ToolDefinition]) -> ScopeSet {
+        let mut scopes = Vec::new();
+        for definition in served {
+            for required in definition.required_scopes().iter() {
+                let Ok(scope) = Scope::new(required.to_string()) else {
+                    // Skipped rather than substituted: a declaration this build cannot reconstruct means the
+                    // tool that declared it is refused for a missing scope, which is the fail-closed direction.
+                    continue;
+                };
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        ScopeSet::new(scopes)
+    }
+
     /// Describes an actor with read access to a workspace **and the ability to call MCP tools**, over a
     /// channel at a stated strength.
     ///

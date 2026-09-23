@@ -56,3 +56,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0036](0036-a-self-reported-name-is-never-a-permit.md) | A self-reported name is evidence or nothing, and never a permit | Accepted |
 | [0037](0037-an-admitted-request-is-a-type.md) | An admitted request is a type, and the check order is a decision | Accepted |
 | [0038](0038-a-network-request-is-never-a-local-caller.md) | A network request is never a local caller, and a policy refusal is a wire answer | Accepted |
+| [0039](0039-a-remote-mcp-call-has-no-run.md) | A remote MCP call has no run, and its enforcement is the same enforcement | Accepted |

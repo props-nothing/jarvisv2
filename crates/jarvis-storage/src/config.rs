@@ -119,6 +119,26 @@ pub struct DaemonConfig {
     /// call, whereas an absent tool is simply not something the model can ask for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_workspace_roots: Vec<PathBuf>,
+    /// Whether JARVIS serves its own tools over MCP, and on which loopback port.
+    ///
+    /// # Why this is separate from `http_enabled`
+    ///
+    /// `http_enabled` serves the **JARVIS REST API**, which authenticates with the profile credential and
+    /// speaks this project's own protocol. Serving MCP means accepting a *third-party protocol's* requests
+    /// from clients that are not JARVIS, which is a different trust boundary with a different policy in
+    /// front of it (`P3-009a`/`P3-009g`/`P3-009i`). Making one switch enable both would mean an operator
+    /// who wanted the REST API also opened an MCP endpoint, which is the kind of coupling this project keeps
+    /// finding one level down.
+    ///
+    /// It is also a separate **port** rather than a path on the REST listener for the same reason plus two
+    /// mechanical ones: the MCP transport takes over the whole request (`axum`'s `fallback_service`, not a
+    /// route, because the SDK's service dispatches on its own headers and methods), so a second listener is
+    /// simpler than a nested router; and two listeners mean a mistake in one cannot expose the other.
+    ///
+    /// `None` means the endpoint is **not served at all**, which is the default: a daemon that opened an
+    /// inbound protocol port unasked would contradict the reason this project prefers OS-native local IPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_serve_port: Option<u16>,
 }
 
 fn default_http_port() -> u16 {
@@ -155,6 +175,12 @@ impl DaemonConfig {
     pub fn tool_workspace_roots(&self) -> &[PathBuf] {
         &self.tool_workspace_roots
     }
+
+    /// Returns the loopback port JARVIS serves its own tools over MCP on, when enabled.
+    #[must_use]
+    pub const fn mcp_serve_port(&self) -> Option<u16> {
+        self.mcp_serve_port
+    }
 }
 
 impl Default for DaemonConfig {
@@ -168,6 +194,8 @@ impl Default for DaemonConfig {
             executor_model: None,
             // Empty: no filesystem tool is registered until an operator grants roots.
             tool_workspace_roots: Vec::new(),
+            // Not served: an inbound MCP endpoint is opt-in, deliberately.
+            mcp_serve_port: None,
         }
     }
 }
@@ -316,6 +344,20 @@ impl Config {
         // construction rather than by policy.
         if self.daemon.http_enabled && self.daemon.http_port == 0 {
             return Err(ConfigError::InvalidHttpPort);
+        }
+        // The same rule for the MCP endpoint, and it matters more here: an MCP **client** is configured with
+        // a URL, so an ephemeral port would leave a third-party client unable to reach a server the operator
+        // believes they enabled. `Some(0)` is refused rather than normalised.
+        if self.daemon.mcp_serve_port == Some(0) {
+            return Err(ConfigError::InvalidMcpServePort);
+        }
+        // An MCP endpoint with nothing to serve is refused at startup rather than left to answer every
+        // request with an empty catalogue. `served_tools` already refuses an empty surface, so this is the
+        // **configuration-time** form of the same decision: an operator who enabled the endpoint without
+        // granting roots or configuring a server would otherwise get a daemon that reports itself ready
+        // with a port that cannot answer anything.
+        if self.daemon.mcp_serve_port.is_some() && self.daemon.tool_workspace_roots.is_empty() {
+            return Err(ConfigError::McpServeWithoutTools);
         }
         Ok(())
     }
@@ -510,6 +552,24 @@ pub enum ConfigError {
     /// leaves a client with no port it could name.
     #[error("daemon.http_port must be between 1 and 65535 when http_enabled is true")]
     InvalidHttpPort,
+    /// The MCP endpoint was enabled with a port that cannot be named.
+    ///
+    /// Refused for the same reason as [`Self::InvalidHttpPort`], and it matters more here because an MCP
+    /// **client** is configured with a URL: an ephemeral port would leave a third-party client unable to
+    /// reach a server the operator believes they enabled.
+    #[error("daemon.mcp_serve_port must be between 1 and 65535 when set")]
+    InvalidMcpServePort,
+    /// The MCP endpoint was enabled with no tool that could be served.
+    ///
+    /// Refused at startup rather than left to answer every request with an empty catalogue. `served_tools`
+    /// refuses an empty surface already, so this is the configuration-time form of the same decision: an
+    /// operator who enabled the endpoint without granting roots would otherwise get a daemon that reports
+    /// itself ready with a port that can answer nothing.
+    #[error(
+        "daemon.mcp_serve_port requires a tool to serve: set daemon.tool_workspace_roots or configure \
+         an MCP server"
+    )]
+    McpServeWithoutTools,
     /// A prefixed environment key is not part of the explicit override contract.
     #[error("unknown configuration environment variable: {key}")]
     UnknownEnvironmentKey {
@@ -607,6 +667,7 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "http_port",
                 "executor_model",
                 "tool_workspace_roots",
+                "mcp_serve_port",
             ],
             &mut unknown,
         );
@@ -706,6 +767,24 @@ where
                     });
                 }
                 config.daemon.executor_model = Some(name.to_owned());
+            }
+            "JARVIS_MCP_SERVE_PORT" => {
+                // An empty value is refused rather than treated as "not served", for the same reason
+                // `JARVIS_EXECUTOR_MODEL=` is: it reads as "enable this" and would otherwise silently
+                // disable it, leaving an operator to debug a client connection instead of a setting.
+                let text = environment_text(&value, "JARVIS_MCP_SERVE_PORT")?;
+                if text.trim().is_empty() {
+                    return Err(ConfigError::InvalidEnvironmentValue {
+                        key: "JARVIS_MCP_SERVE_PORT",
+                    });
+                }
+                config.daemon.mcp_serve_port =
+                    Some(
+                        text.parse()
+                            .map_err(|_| ConfigError::InvalidEnvironmentValue {
+                                key: "JARVIS_MCP_SERVE_PORT",
+                            })?,
+                    );
             }
             _ => {
                 return Err(ConfigError::UnknownEnvironmentKey {

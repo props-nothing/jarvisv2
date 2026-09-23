@@ -244,6 +244,25 @@ It does not own business decisions. Generate TypeScript clients from its publish
   spec's own rule, so collapsing it into `None` inverts the control. `into_service` returns `impl Service`,
   keeping the SDK's service out of this crate's contract, while `ResponseBody` is public — a fact about
   `http-body-util` rather than about MCP, which is why naming it is not a leak (ADR-0038).
+
+  **`jarvisd` mounts it, and a remote call is a second entrypoint into the tool path** (`P3-009c-b`). The
+  composition root owns the listener because it owns every network listener: `compose_serving_mcp` builds the
+  endpoint over the already-composed pipeline and `ServingMcp` binds loopback on `mcp_serve_port`, a field
+  **separate** from `http_enabled` because the two listeners have different trust boundaries and different
+  answers to "who may call". A remote call reaches `ToolPipeline::call_remote_tool`, whose whole reason to exist
+  rather than a `record: bool` on `call_tool` is that "may this call write a row" must be a property of *which
+  function was called* and not an argument a caller can set wrongly. It writes **no `tool_calls` row**, and the
+  authority is the schema: `0007_tool_calls.sql` declares `run_id TEXT NOT NULL REFERENCES agent_runs (id)`, so a
+  call with no run **cannot be stored** — inventing a run identifier is refused by the foreign key rather than by
+  a comment. Parity is achieved by calling the same `validate`, the same `evaluate`, and the same dispatcher, and
+  the only differences are the audit record and the approval outcome: an approval is **refused, not bypassed**,
+  by two independent checks (the engine's workspace threshold and the tool's own `ApprovalPolicy` declaration),
+  because there is no run to park a held decision in and running it is the unsafe direction. `map_pipeline_error`
+  propagates an adapter's own error **unchanged** so `AdapterError`'s three-way claim survives — collapsing
+  `AmbiguousAfterReaching` into `RefusedBeforeReaching` would tell a client to retry an unknown-effect call, and
+  for a non-idempotent tool that retry is a second effect. `into_service` pins `Future = ResponseFuture` with
+  `Clone + Send + Sync + 'static`, because an opaque `impl Service` says nothing about `Service::Future` being
+  `Send` and the omission otherwise surfaces at the **mount site** (ADR-0039).
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
   `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
   the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value
