@@ -1,6 +1,24 @@
 //! A scripted MCP peer, so the negotiation is driven against the **wire** rather than against this
 //! crate's own assumptions.
 //!
+//! # Why the whole module allows dead code
+//!
+//! This is a shared test-support module, and Cargo compiles it **once per integration-test binary**.
+//! Each binary uses a different subset of it — `wire.rs` needs the scripted replies, `host.rs` and
+//! `http.rs` need the fixture builders, `adapter.rs` needs only the discover and tool-list shapes — so a
+//! per-item `allow` would have to name, for every helper, the binaries that happen not to use it. That
+//! list would go stale on the next test file added, and the failure mode is a build error in an unrelated
+//! test.
+//!
+//! The alternative — deleting what one binary does not use — is worse: the helpers exist precisely
+//! because several suites need them, and removing one because a single binary stopped referring to it
+//! would delete another suite's fixture. So the allowance is module-wide and says so, which is honest
+//! about what it covers rather than hiding it item by item.
+#![allow(
+    dead_code,
+    reason = "shared test support compiled once per test binary; each uses a subset"
+)]
+//!
 //! # Why not the SDK's server
 //!
 //! The SDK ships a server, and using it would be less code. It would also be worthless as evidence
@@ -44,6 +62,14 @@ enum Reply {
     Result(Value),
     /// A JSON-RPC error with the given code and message.
     Error { code: i64, message: String },
+    /// No reply, and the connection is **closed** immediately.
+    ///
+    /// The one behaviour a scripted reply cannot express: a peer that simply never answers is
+    /// indistinguishable from one that is slow, so a test for "the request went out and no answer came
+    /// back" needs the connection to end. That is the case the MCP adapter classifies as
+    /// `AmbiguousAfterReaching`, and it is the mapping that decides whether a non-idempotent effect can be
+    /// retried — so it needs to be reachable rather than assumed.
+    HangUp,
 }
 
 /// A scripted MCP server speaking the stdio wire format.
@@ -86,8 +112,29 @@ impl ScriptedPeer {
         self
     }
 
-    /// Returns the requests seen so far, in order.
+    /// Scripts a method to be answered with **silence and a closed connection**.
+    ///
+    /// For the case where "the request went out and no answer came back" is the behaviour under test —
+    /// the ambiguity an adapter must not confuse with a refusal, because calling it a refusal would invite
+    /// a retry that duplicates a non-idempotent effect.
     #[must_use]
+    pub fn hanging_up(mut self, method: &str) -> Self {
+        self.replies.insert(method.to_owned(), Reply::HangUp);
+        self
+    }
+
+    /// Returns the requests seen so far, in order.
+    ///
+    /// Unused by `host.rs`, which asserts on `methods()` and `saw()` instead — but this is a shared
+    /// test support module compiled once per test binary, so the lint would fire on the binary that
+    /// happens not to call it. Deleting it to satisfy the lint would remove the one accessor that
+    /// exposes the full request (params included), which is what an assertion about per-request
+    /// metadata needs.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "shared test support; used by wire.rs, not by host.rs"
+    )]
     pub fn seen(&self) -> &[SeenRequest] {
         &self.seen
     }
@@ -177,6 +224,9 @@ impl PeerHandle {
                         "id": id,
                         "error": { "code": code, "message": message }
                     }),
+                    // The connection ends with no reply. `break` rather than `continue`, so the pipe is
+                    // closed and the client observes a dead peer rather than a silent one.
+                    Reply::HangUp => break,
                 };
                 let mut bytes = serde_json::to_vec(&envelope).unwrap_or_default();
                 bytes.push(b'\n');

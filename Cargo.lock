@@ -1234,13 +1234,17 @@ dependencies = [
 name = "jarvis-mcp-transport"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "jarvis-core",
  "jarvis-mcp",
+ "jarvis-tools",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

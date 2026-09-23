@@ -22,12 +22,16 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use jarvis_mcp::{McpToolListing, ReportedIdentity, ServerName};
-use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, Implementation, Tool,
+};
 use rmcp::service::{ClientLifecycleMode, ClientServiceExt, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::Value;
 
-use crate::error::{ConnectError, ListError};
+use crate::endpoint::{McpHttpEndpoint, build_http_client};
+use crate::error::{CallError, ConnectError, ListError};
 use crate::revision::{MODERN_REVISION, modern_revision};
 
 /// Identity JARVIS advertises to a server, and the version it advertises it with.
@@ -239,6 +243,127 @@ impl McpConnection {
             .map(|_reason| ())
             .map_err(|error| error.to_string())
     }
+
+    /// Calls one of the server's tools by its **server-side** name.
+    ///
+    /// `remote` is the name the server listed, not the canonical JARVIS identifier: `tools/call`
+    /// must carry the name the server knows, and sending the canonical id would be the translation
+    /// applied twice. A caller gets that name from `McpCatalog`'s routing, which is why the catalog
+    /// keeps it beside the definition rather than discarding it.
+    ///
+    /// Uses the single-round request rather than the SDK's MRTR-driving helper. That is deliberate:
+    /// the helper fulfils `input_required` rounds by calling a client `ClientHandler`, and this crate
+    /// registers none — the only human answer in JARVIS comes through its own approval path, not a
+    /// third-party server's form. A single round makes `input_required` and `task` **visible** as
+    /// refusals (see [`CallError::InputRequired`] and [`CallError::Task`]) instead of leaving the SDK
+    /// to fail on a missing handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallError::Unavailable`] when the request did not complete,
+    /// [`CallError::PeerError`] when the peer answered with a protocol error,
+    /// [`CallError::InputRequired`] when the server needs an MRTR round this crate cannot supply, and
+    /// [`CallError::Task`] when the server answered with a task this crate does not poll.
+    pub async fn call_tool(
+        &self,
+        remote: &str,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<McpCallResult, CallError> {
+        let params =
+            CallToolRequestParams::new(remote.to_owned()).with_arguments(arguments.clone());
+        // `call_tool_once` returns the union of complete/input_required/task. The last two are modes
+        // this crate declared no capability for, so they are refused by name rather than silently
+        // treated as a result — a server that returned `task` and got an empty success back would
+        // make the caller believe work was finished that had not started.
+        let response = self
+            .service
+            .call_tool_once(params)
+            .await
+            .map_err(|error| CallError::from_sdk(&error))?;
+        match response {
+            CallToolResponse::Complete(result) => Ok(McpCallResult::from_sdk(&result)),
+            CallToolResponse::InputRequired(_) => Err(CallError::InputRequired),
+            CallToolResponse::Task(_) => Err(CallError::Task),
+            // `CallToolResponse` is `#[non_exhaustive]`, so an SDK bump can add a response kind. It
+            // is refused rather than treated as complete: a new kind is by definition one whose
+            // result this crate cannot describe, and defaulting it to success would hand the caller
+            // an empty result for a call that may have done nothing or may not have finished.
+            _ => Err(CallError::Unavailable(
+                "the server answered the tool call with a response kind this client does not \
+                 understand"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
+/// What a tool call produced, in JARVIS terms rather than the SDK's.
+///
+/// # The name, and the collision it avoids
+///
+/// `jarvis-tools` has a type called `ToolCallResult` too, and it is a different thing: that one is an
+/// adapter's **established outcome** with its evidence and bounded output. This one is a **raw wire
+/// result** — what the server sent, before any outcome decision. The two are deliberately separate
+/// because the conversion between them is where the honesty rules live, and it is the MCP adapter's
+/// job rather than the transport's: a transport that guessed an outcome would be guessing about a
+/// provider it does not know.
+///
+/// The names are therefore kept distinct on purpose. `McpCallResult` names the protocol; a name shared
+/// with the domain type would invite exactly the conflation the split exists to prevent.
+///
+/// # Why a tool that reports failure is not a `CallError`
+///
+/// The protocol carries two different kinds of bad news and they belong in different layers. A
+/// **JSON-RPC error** means the request itself was refused — an unknown tool, a malformed argument
+/// object — and no effect happened, so it is a [`CallError`]. A **`CallToolResult` with `isError`
+/// set** means the tool *ran* and reported that it could not do what was asked, which is an outcome
+/// and not a transport failure. Folding the second into the first would lose the distinction
+/// `ToolOutcome` exists to make, and would make a tool's own honest refusal look like a broken
+/// connection.
+///
+/// `structured_content` is surfaced separately from `text` because the protocol allows a tool to
+/// return either, and a caller that wanted the structured object should not have to re-parse a
+/// stringified copy of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpCallResult {
+    /// The tool reported a failure. The call completed; the work did not.
+    pub is_error: bool,
+    /// The concatenated text blocks, which is what a model-facing tool result usually is.
+    pub text: String,
+    /// The structured object, when the server supplied one.
+    pub structured: Option<Value>,
+}
+
+impl McpCallResult {
+    /// Returns whether the tool reported success.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        !self.is_error
+    }
+
+    /// Converts an SDK result into JARVIS terms, dropping the SDK type.
+    ///
+    /// `is_error` is read as `false` when absent, because the protocol says an absent flag means the
+    /// call succeeded — the same "absent means the default" rule `resultType` follows. Text is the
+    /// concatenation of the text blocks: a result may carry images or embedded resources, and those
+    /// are **not** flattened into text here. Doing so would invent a representation JARVIS has not
+    /// decided on (an image belongs in the content pipeline, not in a string), so a non-text block
+    /// contributes nothing to `text` rather than a placeholder like `[image]` that a model would
+    /// then treat as data.
+    fn from_sdk(result: &rmcp::model::CallToolResult) -> Self {
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text())
+            .map(|text| text.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            is_error: result.is_error.unwrap_or(false),
+            text,
+            structured: result.structured_content.clone(),
+        }
+    }
 }
 
 /// Owns the wire form of a server's tool list so [`McpToolListing`] can borrow from it.
@@ -360,19 +485,31 @@ pub async fn connect_stdio(
 
 /// Connects to a remote MCP server over Streamable HTTP.
 ///
+/// Takes a **validated** [`McpHttpEndpoint`] rather than a string, so the scheme, credential, fragment,
+/// and plaintext-remote rules are properties of the value instead of conventions this call site is
+/// trusted to follow. `docs/architecture/security.md` lists SSRF and unsafe redirects as a threat with
+/// a URL-policy mitigation; a `&str` satisfied none of it.
+///
+/// The HTTP client is built by [`build_http_client`] rather than by the SDK's own convenience
+/// constructor, so that no-proxy, no-redirect, and TLS-only-off-loopback are **statements this crate
+/// makes** rather than defaults inherited from a dependency's manifest. See `endpoint.rs` for why that
+/// distinction matters: proxy support in the SDK's client is off today only because of a feature flag in
+/// the SDK's `Cargo.toml`, which a feature unification elsewhere in the graph could change with nothing
+/// here changing.
+///
 /// # Errors
 ///
-/// As [`connect_stdio`], plus [`ConnectError::Refused`] when the endpoint is not one the transport
-/// will connect to.
+/// As [`connect_stdio`], plus [`ConnectError::Unreachable`] when the HTTP client cannot be built.
 pub async fn connect_http(
     server: &ServerName,
-    endpoint: &str,
+    endpoint: &McpHttpEndpoint,
 ) -> Result<McpConnection, ConnectError> {
     // No client-level total timeout: an MCP connection is long-lived and a total bound would kill a
     // healthy session. This is the same defect `docs/research/integrations/mcp.md` records for the
-    // model client's stream, where a total `timeout` terminated every healthy stream at the
-    // deadline.
-    let transport = StreamableHttpClientTransport::from_uri(endpoint);
+    // model client's stream, where a total `timeout` terminated every healthy stream at the deadline.
+    let client = build_http_client(endpoint)?;
+    let config = StreamableHttpClientTransportConfig::with_uri(endpoint.as_str().to_owned());
+    let transport = StreamableHttpClientTransport::with_client(client, config);
     connect_over(server, transport).await
 }
 

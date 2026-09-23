@@ -359,7 +359,9 @@ async fn a_protocol_error_on_the_tool_list_is_not_reported_as_unreachable() {
         jarvis_mcp_transport::ListError::PeerError(message) => {
             assert!(message.contains("method not found"), "{message}");
         }
-        other => panic!("expected a peer error, got {other:?}"),
+        jarvis_mcp_transport::ListError::Unavailable(message) => {
+            panic!("a protocol error must not read as an unreachable peer: {message}")
+        }
     }
 }
 
@@ -384,4 +386,227 @@ fn the_error_types_are_constructible_without_the_sdk() {
     assert!(legacy.to_string().contains("2025-11-25"));
     assert!(legacy.to_string().contains("2026-07-28"));
     assert!(list_error.to_string().contains("timed out"));
+}
+
+/// **`tools/call` over the wire.** The transport can now run a tool, which `P3-008e` recorded as
+/// absent. The name sent must be the **server's own** name, not the canonical identifier: sending the
+/// canonical id would be the translation applied twice, and the peer here records what it received so
+/// the assertion is about bytes rather than about a call that returned `Ok`.
+#[tokio::test]
+async fn a_tool_call_sends_the_servers_own_name_and_reads_the_result() {
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .answering(
+            "tools/call",
+            json!({
+                "resultType": "complete",
+                "content": [{ "type": "text", "text": "search ran" }],
+                "isError": false
+            }),
+        );
+    let (client_side, peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("q".to_owned(), json!("pumps"));
+    let result = connection
+        .call_tool("search", &arguments)
+        .await
+        .unwrap_or_else(|error| panic!("a well-formed call must return: {error}"));
+
+    assert!(result.is_success());
+    assert_eq!(result.text, "search ran");
+    assert!(result.structured.is_none());
+
+    drop(connection);
+    let seen = peer.finish().await;
+    let call = seen
+        .seen()
+        .iter()
+        .find(|request| request.method == "tools/call")
+        .unwrap_or_else(|| panic!("the peer must have seen a tools/call request"));
+    assert_eq!(call.params["name"], "search");
+    assert_eq!(call.params["arguments"]["q"], "pumps");
+}
+
+/// **A tool that reports failure is not a transport error.** A `CallToolResult` with `isError` set
+/// means the tool *ran* and could not do what was asked — an outcome, not a broken connection.
+/// Collapsing it into a `CallError` would lose the distinction `ToolOutcome` exists to make, and would
+/// make a tool's own honest refusal look like an unreachable server.
+#[tokio::test]
+async fn a_tool_that_reports_failure_is_a_result_not_an_error() {
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .answering(
+            "tools/call",
+            json!({
+                "resultType": "complete",
+                "content": [{ "type": "text", "text": "no such document" }],
+                "isError": true
+            }),
+        );
+    let (client_side, _peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let result = connection
+        .call_tool("search", &serde_json::Map::new())
+        .await
+        .unwrap_or_else(|error| panic!("a tool failure is a result, not an error: {error}"));
+    assert!(!result.is_success());
+    // The tool's own explanation is preserved, which is what a caller records as the failure reason.
+    assert_eq!(result.text, "no such document");
+}
+
+/// A JSON-RPC error on `tools/call` is a **peer** error, not an unreachable one — the same distinction
+/// `tools/list` already makes, asserted for the call path so the two cannot drift apart.
+#[tokio::test]
+async fn a_protocol_error_on_a_tool_call_is_not_reported_as_unreachable() {
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .failing("tools/call", -32602, "unknown tool");
+    let (client_side, _peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let error = connection
+        .call_tool("missing", &serde_json::Map::new())
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a JSON-RPC error must not read as a successful call"));
+    assert!(
+        matches!(error, jarvis_mcp_transport::CallError::PeerError(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("unknown tool"), "{error}");
+}
+
+/// **An MRTR round is refused by name, not left to fail deeper in.** Revision `2026-07-28` lets a
+/// server answer a call with `input_required` and expect the client to retry with answers. JARVIS
+/// declares no input handler — the only human answer comes through JARVIS's own approval path — so a
+/// round cannot be fulfilled. This uses the single-round request deliberately, which turns the mode
+/// into a **named refusal** instead of an SDK error about a missing handler.
+#[tokio::test]
+async fn a_server_that_demands_client_input_is_refused_by_name() {
+    // `InputRequiredResult` requires `resultType: "input_required"` **and at least one of**
+    // `inputRequests` or `requestState` — its custom deserializer enforces both, precisely so the
+    // variant cannot greedily match an unrelated object in the untagged union. `requestState` alone
+    // is a valid round: the specification allows a server to ask the client to retry with an opaque
+    // state handle, which is what a load-shedding server does, and it needs no client input handler
+    // to *describe*.
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .answering(
+            "tools/call",
+            json!({ "resultType": "input_required", "requestState": "opaque-handle" }),
+        );
+    let (client_side, _peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let error = connection
+        .call_tool("send_mail", &serde_json::Map::new())
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an MRTR round cannot be fulfilled and must be refused"));
+    assert!(
+        matches!(error, jarvis_mcp_transport::CallError::InputRequired),
+        "a demand for input must be refused by name, not as an opaque failure: {error}"
+    );
+    // The refusal points at the mechanism JARVIS actually has, so an operator is not sent hunting a
+    // setting that does not exist.
+    assert!(error.to_string().contains("approval"), "{error}");
+}
+
+/// **A task answer is refused by name.** `2026-07-28` moved Tasks to an extension and this crate
+/// declares no tasks capability, so a server returning one is speaking a mode JARVIS never asked for.
+/// Treating it as an empty success would tell the caller that work finished which had not started.
+#[tokio::test]
+async fn a_task_answer_is_refused_rather_than_read_as_success() {
+    // `CreateTaskResult` **flattens** the seed task rather than nesting it under a `task` key — a fact
+    // that is easy to get wrong, and the first version of this fixture did (it nested, so the untagged
+    // union matched nothing and the refusal arrived as `Undecodable` instead of `Task`). `taskId`,
+    // `status`, `createdAt`, and `lastUpdatedAt` are required; the rest are optional.
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .answering(
+            "tools/call",
+            json!({
+                "resultType": "task",
+                "taskId": "task-1",
+                "status": "working",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUpdatedAt": "2026-01-01T00:00:00Z",
+                "ttlMs": null
+            }),
+        );
+    let (client_side, _peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let error = connection
+        .call_tool("long_job", &serde_json::Map::new())
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a task must not read as a completed call"));
+    assert!(
+        matches!(error, jarvis_mcp_transport::CallError::Task),
+        "a task answer must be refused by name: {error}"
+    );
+    assert!(error.to_string().contains("task"), "{error}");
+}
+
+/// **A result whose shape contradicts its `resultType` is reported as undecodable, not as a network
+/// fault.** The protocol's result union is deserialized as an **untagged** enum, so a mismatch is not
+/// reported as "a malformed `input_required`" — it becomes the SDK's generic `UnexpectedResponse`.
+/// Classifying that as "the call did not complete" would describe an unreachable peer and send an
+/// operator to check a connection that is working, so it has its own variant.
+#[tokio::test]
+async fn a_result_whose_shape_contradicts_its_type_is_reported_as_undecodable() {
+    // Declares `task` but carries none of the task fields, so no variant of the union can match.
+    let script = ScriptedPeer::new()
+        .answering("server/discover", discover_result("fixture", None, true))
+        .answering(
+            "tools/call",
+            json!({ "resultType": "task", "unexpected": true }),
+        );
+    let (client_side, _peer) = peer_pair(script);
+    let connection = connect_over(&server("fixture"), client_side)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let error = connection
+        .call_tool("search", &serde_json::Map::new())
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an undecodable result must not read as a success"));
+    assert!(
+        matches!(error, jarvis_mcp_transport::CallError::Undecodable(_)),
+        "an answer that could not be decoded is a protocol disagreement, not an unreachable peer: \
+         {error}"
+    );
+}
+
+/// `CallError` must be constructible from plain values, for the same reason the other two are: a
+/// caller that matched on an SDK variant would have a reason to keep the SDK in its dependency list.
+#[test]
+fn the_call_error_is_constructible_without_the_sdk() {
+    let unavailable = jarvis_mcp_transport::CallError::Unavailable("peer left".to_owned());
+    let peer = jarvis_mcp_transport::CallError::PeerError("unknown tool".to_owned());
+    let undecodable =
+        jarvis_mcp_transport::CallError::Undecodable("unexpected response".to_owned());
+    let input = jarvis_mcp_transport::CallError::InputRequired;
+    let task = jarvis_mcp_transport::CallError::Task;
+
+    assert!(unavailable.to_string().contains("did not complete"));
+    assert!(peer.to_string().contains("unknown tool"));
+    assert!(undecodable.to_string().contains("untagged"));
+    assert!(input.to_string().contains("MRTR"));
+    assert!(task.to_string().contains("task"));
 }

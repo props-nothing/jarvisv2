@@ -880,6 +880,209 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `resources` and `prompts` capabilities are not modelled because nothing consumes them, and the
       SDK's automatic response caching is left at its default rather than deliberately configured.
 - [ ] `P3-008` Implement MCP client/host adapters for stdio and Streamable HTTP behind canonical tools.
+      **Most of this is delivered, split across five slices that each answered one question; what remains
+      is named at the end of this entry rather than being folded into a checkmark.**
+      - `P3-008a` settled **what a tool is called** (`jarvis-mcp`: `ServerName`, `ReportedIdentity`,
+        `canonical_tool_name`, `NamingStrategy`, `NameAssignments`, schema conformance). ADR-0024.
+      - `P3-008b` settled **what a tool may do** (`ToolEffectPolicy`, the translation, per-tool
+        exclusion). ADR-0025.
+      - `P3-008c`/`P3-008d` settled **what happens when servers collide or a server changes its
+        self-description** (`McpCatalog`, `IdentityDrift`, `CatalogError::DuplicateListing`).
+      - `P3-008e` settled **the wire** (`jarvis-mcp-transport`: `rmcp` 3.4.0, `Discover` never `Auto`,
+        a bounded negotiation, `tools/list`). ADR research in `docs/research/integrations/mcp.md`.
+      - `P3-008f` settled **the join** and closed the two limits the five above each recorded. ADR-0026.
+      - `P3-008g` settled **the remote endpoint policy** and closed the `connect_http` limit. ADR-0027.
+      - `P3-008h` made a server's tool a real `ToolExecutor` (the outcome mapping). ADR-0028.
+      - `P3-008i` added the **host role**: the `[mcp]` configuration surface, and the first caller of the
+        catalog's collision check. ADR-0029.
+      **`build_catalog` is the composition that was missing.** `jarvis-mcp` could translate a listing
+      nobody had fetched and `jarvis-mcp-transport` could fetch a listing nobody had translated, and
+      **nothing joined them** — so every slice recorded the same honest limit, "a capability a caller can
+      use, not one an operator can reach". `HostedServer { configured, connection }` carries the
+      operator's name and posture with the live connection in one value, so a policy cannot be paired
+      with a different server's tools; `ServerListing`'s reported identity is read from the
+      **connection** rather than from the tool result, because `P3-008d`'s drift check compares that
+      value against a previous observation and a host that defaulted it would make the check compare a
+      value with itself. A server that cannot be read does not fail the build — one flaky third-party
+      process must not empty the model's tool list — and its reason is kept in `HostBuild::unreadable`,
+      which distinguishes "unreachable" from "refused" from "declared no tools capability" rather than
+      letting all three look like the catalog's generic "offered no listing". A server that declared no
+      `tools` capability is **not asked**, and a test asserts the request was never sent.
+      **`tools/call` now exists**, which `P3-008e` recorded as absent. It uses the SDK's **single-round**
+      request deliberately: the high-level helper drives MRTR rounds through a client `ClientHandler`,
+      and JARVIS registers none because the only human answer comes through JARVIS's own approval path.
+      So the modes JARVIS cannot serve are **refused by name** (`CallError::InputRequired`,
+      `CallError::Task`) instead of failing on a missing handler or, worse, reading as an empty success
+      for work that had not started. A tool returning `isError: true` is a **result, not an error** — it
+      ran and refused, which is an outcome, not a broken connection.
+      **A real defect was found by writing a fixture wrongly, and the message a user would have seen is
+      why the fix matters.** The protocol's result union is `#[serde(untagged)]` (read in the pinned
+      SDK's `model.rs`, `ts_union!`), so a result whose declared `resultType` disagrees with its fields
+      does not fail as "a malformed `task`" — it becomes the SDK's generic `UnexpectedResponse`. The
+      first `CreateTaskResult` fixture nested the task instead of **flattening** it (the SDK uses
+      `#[serde(flatten)]`), so nothing matched and the refusal arrived as `Unavailable`, whose text is
+      "the call did not complete" — describing an unreachable peer and sending an operator to inspect a
+      connection that is working. That is now its own variant, `CallError::Undecodable`, whose text
+      names the untagged-union cause. Same family as the other opaque-diagnostic defects this project has
+      recorded.
+      **`connect_stdio` is now exercised against a real child process**, closing `P3-008e`'s "entirely
+      unexercised" limit. `src/bin/fixture_peer.rs` is a hand-written server behind the off-by-default
+      `fixture-peer` feature — so `cargo build --workspace` never builds it and it cannot be mistaken
+      for a shipped binary — and it writes the wire framing itself rather than using the SDK, for the
+      reason the scripted peer does: a client and server from one library share their assumptions, so a
+      disagreement with the specification would pass. Tests cover spawning, negotiating, listing,
+      calling, that the configured arguments reach the child, and that a **program which cannot be
+      spawned is refused rather than hung** — the failure a user hits first. The skip path was
+      falsified: deleting the fixture under `ACCEPTANCE_REQUIRE_BINARIES=1` fails with the actionable
+      message, and `cargo test` alone does not rebuild it (the recorded stale-binary trap).
+      **Also removed a dead error variant found during review.** `ListError::NoIdentity` was declared,
+      documented as "a signal worth surfacing", and constructed by nothing — absence of an identity is
+      an empty `ReportedIdentity` on a working value, which is precisely what makes a server that
+      *stops* naming itself observable. Removing it made a test's wildcard arm match exactly one
+      variant, which clippy caught, so the removal also tightened an assertion. A declared-but-
+      unconstructed variant reads downstream as a live condition, which is the `expected_version` class
+      corrected at `P3-006c`.
+      **Honest limits.** `connect_http` was covered by `P3-008g` below, which also closed this slice's
+      "nothing reads a `config.toml`" note only in part: there is still no MCP section in the
+      configuration schema, so nothing constructs a `HostedServer` outside a test and `apps/jarvisd` has
+      **zero** references to either MCP crate — `P3-009` is still what makes a server reachable, and it
+      now has one composition to call rather than two to reconcile incorrectly. A **cross-server
+      collision** is detected and reported but nothing acts on it, because the daemon that would refuse
+      to serve is `P3-009`. `tools/call` is proven over the wire and against a child process, and
+      `P3-008h` makes it an adapter a policy-authorized request reaches — but **nothing composes that
+      adapter into the daemon**, so no run drives an MCP tool yet, and no `ToolOutcome` from an MCP call
+      is stored. `P3-012` is the gate for that. Connection **pooling and reconnect** are unbuilt, so
+      every build reconnects. The catalog's `MAX_MCP_SERVERS` bound is enforced but the server count is
+      still the caller's to supply.
+- [x] `P3-008f` Join discovery to authority: build a catalog from live connections, and add `tools/call`.
+      **Recorded as its own slice rather than folded into `P3-008`, so the five preceding entries stay
+      legible as five questions answered.** New code: `crates/jarvis-mcp-transport/src/host.rs`
+      (`HostedServer`, `HostBuild`, `UnreadableServer`, `build_catalog`), `McpConnection::call_tool`
+      with `ToolCallResult`, `CallError`, `src/bin/fixture_peer.rs`, and `tests/{host,stdio}.rs` plus
+      five new `wire.rs` tests. 42 transport tests; **806 workspace tests, 37 suites**. ADR-0026.
+      Findings, the defect the tests found, the falsified skip guard, and every honest limit are in the
+      `P3-008` entry above; this line exists so the ledger shows the slice happened.
+- [x] `P3-008g` Make a remote endpoint a validated value, and build the HTTP client in this crate.
+      **Closes `P3-008f`'s recorded limit that `connect_http` was "entirely unexercised", and closes a
+      real client-policy gap found while researching it.** `connect_http` took a bare `&str`, so every
+      rule `docs/architecture/security.md` lists for "SSRF and unsafe redirects" was implicit and
+      unenforced. New code: `crates/jarvis-mcp-transport/src/endpoint.rs` (`McpHttpEndpoint`,
+      `EndpointError`, `build_http_client`) and `tests/http.rs` (10 tests against a hand-written HTTP/1.1
+      server). `connect_http` now takes `&McpHttpEndpoint`. 62 transport tests; ADR-0027.
+      **The client-policy gap is the finding worth recording.** The SDK's `default_http_client` disables
+      redirects but **does not call `no_proxy`**, so proxy support there is off *only* because the SDK's
+      manifest pins `reqwest` with `default-features = false` — a fact in a dependency's `Cargo.toml`,
+      not a property of anything in this workspace. A feature unification elsewhere in the graph could
+      re-enable an unchosen intermediary with nothing here changing. `jarvis-models` already refuses the
+      same thing explicitly for the model client, so the two adapters were making different choices
+      about the same hazard. This crate now builds the client itself and passes it through the SDK's
+      `with_client`, making each choice a statement rather than an inherited default.
+      **The endpoint rules are properties of the value**: scheme is `http`/`https`; no userinfo (a
+      credential in a URL is a substring of every log line naming it, the rule `ApiKey::new` already
+      enforces); no `#` fragment (never sent to a server, so a URL carrying one expresses something other
+      than what the request will do); no interior whitespace; and **TLS off loopback**, since a plaintext
+      remote MCP session carries tool arguments and results in the clear. Loopback recognition uses
+      whole-host comparison, so `127.0.0.1.evil.example` is correctly remote.
+      **The redirect test's assertion order is load-bearing, and falsifying it is what showed why.**
+      Allowing redirects made the test fail on a *message* assertion first (the refusal that arrives is a
+      protocol error whose text does not mention `302`), so the run ended before the security property was
+      examined — the test would have failed for a formatting reason while the thing it exists to catch
+      went unobserved. With the property asserted first, re-running the falsification reports the
+      redirect target actually receiving the request (a `GET` carrying `mcp-protocol-version` and a
+      `referer` for the original host), which is the vulnerability stated as evidence.
+      **Honest limits.** **DNS resolution and private-range blocking are deliberately NOT claimed** — a
+      point-in-time answer is the wrong shape for a question where a name can resolve differently when
+      connected, which is why `security.md` lists rebinding defense separately; the module records the
+      residual rather than implying coverage. The standalone `GET`-for-SSE path is declined by the test
+      server and is therefore **not covered**. `Mcp-Method`/`Mcp-Name` agreement is asserted on the
+      client's *outgoing* request only — the server side's `-32020 HeaderMismatch` handling is `P3-009`.
+      There is still no MCP section in the configuration schema, so an endpoint is constructed by a
+      caller and nothing loads one from `config.toml`.
+- [x] `P3-008h` Make a remote server's tool a real `ToolExecutor`, and get the outcome mapping right.
+      **Closes the limit every preceding MCP slice recorded — "nothing drives it from a run" — at its last
+      step.** New code: `crates/jarvis-mcp-transport/src/adapter.rs` (`McpToolAdapter`) and
+      `tests/adapter.rs` (15 tests). `McpCallResult` was renamed from `ToolCallResult`, because
+      `jarvis-tools` has a different type of that name and the two must not be conflated: one is a raw wire
+      result, the other is an established outcome with its evidence and bounded output. ADR-0028.
+      **The conversion is the subject, and its table is in the module.** A tool that reports failure is
+      `Failed` with the server's reason (it ran and refused); a JSON-RPC error is `ProviderRefused` (the
+      peer answered, so nothing happened); an undecodable answer is `AmbiguousAfterReaching` (the server
+      answered, so it ran something); a transport failure after sending is `AmbiguousAfterReaching`; MRTR
+      and Tasks are `ProviderRefused`; an unrouted identifier is `NotImplemented`; a past deadline is
+      `RefusedBeforeReaching`. Evidence is a **locator** (`mcp:<operator's server>/<server's tool>`) and
+      output is content, kept separate because `tools-and-connectors.md` requires it — and the operator's
+      name is used rather than the server's own claim, since ADR-0024 makes that claim evidence and not an
+      identifier.
+      **A falsification found a missing test, which is the most useful outcome here.** Changing the
+      `Unavailable` mapping from `AmbiguousAfterReaching` to `RefusedBeforeReaching` left the suite
+      **green**: no test covered a transport failure at all, so the one row deciding whether a
+      non-idempotent effect may be repeated was unpinned. The scripted peer gained `HangUp` — a method
+      answered with silence and a **closed** connection, the only way to express "sent, no answer" — and
+      that test now fails the falsification with the exact wrong claim ("refused the call before reaching a
+      provider: Transport closed"). **A row in a mapping table is a claim until a test pins it.**
+      **The design was wrong once and the reason is already load-bearing elsewhere.** The first version put
+      the server's own tool name into the request's `arguments` under a reserved key. That violates the
+      tool's input schema *and* the authorization digest, which `ToolExecutionRequest::new` recomputes and
+      compares — so every request would have failed its own binding check. Both properties exist
+      deliberately (`P3-001`'s contract, `P3-006b`'s binding), so the routing moved into the adapter,
+      supplied from the catalog entries at construction and filtered to one server so an identifier cannot
+      be sent to a server it does not belong to.
+      **Two fixture mistakes are recorded in the test rather than fixed silently**: an MCP tool requires the
+      `mcp.call` scope, and even a minimal-risk tool requires `ChannelEvidence` — so an `Absent` strength
+      claim is a hold. Both turned every test into a held call, and both were visible only because the
+      fixture asserts an allowance instead of assuming one.
+      **Honest limits.** **Nothing composes `McpToolAdapter` into the daemon** — no run drives an MCP tool,
+      no `ToolOutcome` from an MCP call is stored, there is still no MCP section in the configuration
+      schema, and `apps/jarvisd` still has zero references to either MCP crate, so `P3-009` remains the gate
+      for operator reachability. No `run_events` row is written for an MCP call (`P3-012` links calls to the
+      event log). The `Confirmed` for a successful call rests on the server's own `isError: false`, which
+      the protocol gives no way to verify — the honest statement is that it is the strongest available
+      evidence, and the design keeps it separate from the output so a reader can weigh it.
+- [x] `P3-008i` Add the MCP host role: the configuration surface, and the first caller of the collision check.
+      **Closes the limit nine slices recorded — "a capability a caller can use, not one an operator can
+      reach" — at its last step.** New code: `crates/jarvis-mcp-transport/src/host_config.rs`
+      (`McpHostConfig`, `McpHost`, `ServerTransport`, `HostConfigError`, `HostError`) and
+      `tests/host_config.rs` (7 tests including the whole journey). 103 transport tests. ADR-0029.
+      **A test starts from TOML text and ends with a call**: configuration → spawn a real child process →
+      negotiate → list → translate → catalog → adapter → `Confirmed`, all through the fixture binary. A
+      stdio server is spawned by the configuration itself, so the test proves the *program string an
+      operator wrote* is what runs.
+      **`has_cross_server_collision()` has its first caller**, held since `P3-008c` with a documented
+      instruction and nobody to follow it. A collision refuses the **whole host**, and the same test's
+      `Prefixed` control proves the refusal is about the collision rather than about an unusable
+      configuration.
+      **The posture vocabulary is two classes and the default is the severe one.** An operator writes
+      `class = "read-only"` or nothing; nothing means `unclassified` — risk 3, every call held — so
+      **omitting something fails closed**. A full `ToolEffectPolicy` in a file would be a vocabulary with no
+      consumer; the one thing an operator can usefully narrow today is "this only reads". An unknown class is
+      **refused**, because a typo must not silently leave a server at the permissive value an operator was
+      trying to set.
+      **Two findings, both from getting something wrong first.**
+      1. **The collision message named one server twice.** It was built from `CatalogExclusion`'s `server`
+         field, but a collision entry records only the server that *lost* the assignment, so two colliding
+         tools produced `["bravo", "bravo"]` — while the remedy ("rename one of them") needs **both**. The
+         refusal now carries the catalog's own `NameCollision` text, which names both sides. A refusal that
+         does not identify what must change is the opaque-diagnostic defect in the one place an operator has
+         nothing else to go on.
+      2. **A parse error claimed a cause it could not know.** `InvalidDocument` said "an unknown key is
+         refused rather than ignored", but a syntax error, a misspelled key, and a wrong value type all arrive
+         as the same deserialization failure. A fixture using a Windows path in a TOML **basic** string — where
+         `\U` begins an invalid escape — reported a syntax error as a key mistake, sending an operator to
+         check keys that were correct. The message now carries a **character offset** and warns about the most
+         likely cause; the parser's own text is not forwarded, because it can echo a document that holds paths
+         and hostnames.
+      **`HostedServer` changed shape** (`McpConnection` → `Arc<McpConnection>`) so the catalog build and the
+      adapters share **one** connection per server. That is a statement, not tidiness: two connections would be
+      two sessions (or two child processes) whose lifecycles diverge, and shutdown would close only one; it
+      moved ~13 test construction sites. `McpHost::close` drops the adapters before closing, because a
+      connection can only be closed by its last owner, and a still-shared connection is **reported** rather
+      than claimed as stopped.
+      **Honest limits.** The daemon **does not yet read an `[mcp]` section** — `apps/jarvisd` still has zero
+      references to either MCP crate — so this is a configuration surface a caller can drive and not one the
+      daemon loads; `P3-009` is now the one call that loads the section and holds a host. No `run_events` row is
+      written for an MCP call (`P3-012`). **No credential can appear in the document**: a remote server needing
+      authentication needs the credential store and is its own slice. Connection **pooling and reconnect** are
+      still unbuilt, so every host build reconnects.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
 - [ ] `P3-010` Add MCP Inspector conformance tests and cross-SDK interoperability tests.
 - [ ] `P3-011` Define sandbox contracts and implement one restricted process backend before exposing code execution.

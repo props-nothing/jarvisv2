@@ -158,14 +158,28 @@ It does not own business decisions. Generate TypeScript clients from its publish
   it refuses two listings for one server and records a changed server self-description as an
   `IdentityDrift` instead of treating it as an error.
 - `jarvis-mcp-transport`: the **impure** half of the MCP integration — the SDK dependency, the
-  `server/discover` negotiation, and the stdio/Streamable-HTTP transports (`P3-008e`). Separate from
-  `jarvis-mcp` because that crate's value is that it is pure: the authority rules are verified as
-  functions of their arguments, with no SDK type in scope and no peer standing. Adopting `rmcp` beside
-  them would make a security reviewer read the rules through a third-party data model, and would make
-  the rules untestable without it. The split also keeps the SDK replaceable: if the transport is
-  reimplemented against the wire, no naming, posture, or conformance rule moves. No provider SDK type
-  appears in this crate's public surface either — `AGENTS.md` forbids SDK types crossing a JARVIS
-  boundary, and an error type is a boundary.
+  `server/discover` negotiation, the stdio/Streamable-HTTP transports, `tools/call`, the host join, and
+  the `ToolExecutor` adapter (`P3-008e`..`P3-008h`). Separate from `jarvis-mcp` because that crate's value
+  is that it is pure: the authority rules are verified as functions of their arguments, with no SDK type in
+  scope and no peer standing. Adopting `rmcp` beside them would make a security reviewer read the rules
+  through a third-party data model, and would make the rules untestable without it. The split also keeps
+  the SDK replaceable: if the transport is reimplemented against the wire, no naming, posture, or
+  conformance rule moves. No provider SDK type appears in this crate's public surface either — `AGENTS.md`
+  forbids SDK types crossing a JARVIS boundary, and an error type is a boundary. `build_catalog` is the
+  **join** between the two halves: it reads a live connection's identity and tool list and aggregates them
+  into one `McpCatalog`, because the catalog's inputs can be constructed by hand and so a catalog test
+  alone proves nothing about whether a listing that *arrived over a wire* becomes a definition with the
+  right posture (ADR-0026). `McpHttpEndpoint` is a **validated** remote endpoint — scheme, credentials,
+  fragment, and TLS-off-loopback are properties of the value rather than conventions at a call site — and
+  this crate **builds the HTTP client** it hands to the SDK, so no-proxy and no-redirect are statements
+  this project makes rather than defaults inherited from the SDK's manifest (ADR-0027). `McpToolAdapter`
+  makes a remote server's tool a real `ToolExecutor`, and its **outcome mapping is the honesty boundary**:
+  each row decides whether an effect may be repeated, so a transport failure after sending is
+  `AmbiguousAfterReaching` rather than a refusal (ADR-0028). `McpHostConfig` is the **host role**: the
+  `[mcp]` configuration surface, which owns only that section so one schema owner exists per document, and
+  which is the first caller of the catalog's collision check — a collision refuses the whole host rather than
+  dropping a side, because serving a catalog whose contents depend on configuration order would make the
+  reachable tool set a function of an ordering nobody declared meaningful (ADR-0029).
 - `jarvis-connectors`: OAuth/account lifecycle and provider-specific mail/calendar/etc. operations.
 - `jarvis-memory`: memory admission, scoring, embeddings, retrieval explanations, entity resolution.
 - `jarvis-workflows`: event inbox/outbox, scheduler, durable worker and step executors.

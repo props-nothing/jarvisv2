@@ -33,15 +33,26 @@
 //! servers, and `P3-009` owns the daemon that would load one. So this is a capability a caller can
 //! use, not one an operator can reach — the same honest limit `P3-008a`..`P3-008d` each recorded.
 
+mod adapter;
 mod client;
+mod endpoint;
 mod error;
+mod host;
+mod host_config;
 mod revision;
 
+pub use adapter::McpToolAdapter;
 pub use client::{
-    McpConnection, OwnedListing, ServerCapabilities, StdioCommand, ToolBuffer, connect_http,
-    connect_over, connect_stdio,
+    McpCallResult, McpConnection, OwnedListing, ServerCapabilities, StdioCommand, ToolBuffer,
+    connect_http, connect_over, connect_stdio,
 };
-pub use error::{ConnectError, ListError};
+pub use endpoint::{EndpointError, MAX_ENDPOINT_BYTES, McpHttpEndpoint};
+pub use error::{CallError, ConnectError, ListError};
+pub use host::{HostBuild, HostedServer, UnreadableServer, build_catalog};
+pub use host_config::{
+    HostConfigError, HostError, MAX_HOST_CONFIG_BYTES, McpHost, McpHostConfig, ServerTransport,
+    parse_host_section,
+};
 pub use revision::{
     MODERN_REVISION, describe_negotiated, modern_revision, sdk_default_is_modern,
     sdk_default_revision,

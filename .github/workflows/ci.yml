@@ -118,6 +118,15 @@ jobs:
         #
         # `shell: bash` because the default shell on windows-latest is PowerShell, where
         # redirecting a native command's stderr fails the step even on success.
+        #
+        # `ACCEPTANCE_REQUIRE_BINARIES` turns a *skip* into a failure. The stdio tests in
+        # `jarvis-mcp-transport` exercise `connect_stdio` against a real child process and
+        # skip when the fixture binary is absent; `--all-features` builds it, so the skip
+        # cannot legitimately happen here, and without this a fixture that silently stopped
+        # being built would make those tests pass by not running. Same pattern, and the same
+        # name, as the phase gates below.
+        env:
+          ACCEPTANCE_REQUIRE_BINARIES: "1"
         shell: bash
         run: cargo test --workspace --all-features --locked > test.txt 2>&1
       - name: Annotate test failures

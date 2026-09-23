@@ -6,7 +6,7 @@
 //! split into two crates exists to prevent. So the SDK's error is **classified** here — transport
 //! fault, protocol fault, or a refusal the peer stated — and only the classification travels.
 
-use rmcp::service::ClientInitializeError;
+use rmcp::service::{ClientInitializeError, ServiceError};
 
 /// A connection could not be established, or the negotiation did not complete.
 #[derive(Debug, thiserror::Error)]
@@ -81,14 +81,110 @@ pub enum ListError {
     /// that a retry will not change, whereas an unavailable peer is worth another attempt.
     #[error("the server answered the tool list request with an error: {0}")]
     PeerError(String),
+}
 
-    /// The reported server identity could not be read from the initialization result.
+// NOTE: there was briefly a `NoIdentity(String)` variant here, described as "the server's
+// initialization result carried no usable identity". It was **wrong twice**, and it is recorded
+// rather than quietly deleted because both halves are the class of defect this project keeps
+// finding.
+//
+// First, **no code ever constructed it.** Under a modern `server/discover` response the identity is
+// optional, and `McpConnection::reported_identity` returns an *empty* `ReportedIdentity` for its
+// absence — deliberately, because a server that *stops* naming itself is exactly the drift
+// `P3-008d` must be able to observe, and a connection error would discard that observation. So the
+// variant was unreachable, and a declared-but-unconstructed error variant reads as a live condition
+// to everyone downstream.
+//
+// Second, its doc comment said a missing identity is "a signal worth surfacing", which **contradicts
+// the code**: the code surfaces it as an empty identity in the *value*, not as an error. That is the
+// same shape as the `expected_version` claim corrected at `P3-006c` — a statement written from the
+// intent of a change rather than from what the change does.
+//
+// A third `ListError` variant is therefore not added until something can *produce* it. Absence of an
+// identity is a fact on `ReportedIdentity`, not a failure of the listing.
+
+/// A tool call was sent and did not produce a result this crate can hand back.
+///
+/// Four outcomes, kept apart because their remedies differ and collapsing them would send an operator
+/// to the wrong one. In particular **a tool that reports a failure is not an error here**: a
+/// `CallToolResult` with `isError` set is a *successful call whose tool refused*, and it belongs in
+/// the outcome vocabulary (`ToolOutcome`), not in a transport error. Only the cases below mean the
+/// call did not complete in a way this crate can describe.
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
+    /// The request did not reach a result — the peer went away, or the transport failed.
     ///
-    /// A missing name is not a connection failure — the connection worked — but it does mean the
-    /// operator's record of what answered cannot be checked, which `P3-008d` treats as a signal
-    /// worth surfacing rather than inventing a placeholder for.
-    #[error("the server's initialization result carried no usable identity: {0}")]
-    NoIdentity(String),
+    /// The caller cannot know whether the server began the effect, which is exactly what
+    /// `AdapterError::AmbiguousAfterReaching` encodes one layer up.
+    #[error("the tool call did not complete: {0}")]
+    Unavailable(String),
+
+    /// The peer answered with a JSON-RPC protocol error rather than a result.
+    ///
+    /// A fact about the server or the request that a retry will not change: an unknown tool, a bad
+    /// argument shape, a refused method.
+    #[error("the server answered the tool call with an error: {0}")]
+    PeerError(String),
+
+    /// The server's answer could not be decoded into a result this client recognises.
+    ///
+    /// **Its own case, and the reason is a measured SDK behaviour.** The protocol's result union is
+    /// deserialized as an **untagged** enum, so a mismatch between the declared `resultType` and the
+    /// object's actual fields does not fail as "a malformed `input_required`" — it fails as the SDK's
+    /// generic `UnexpectedResponse`, which carries no information about which field was wrong. This
+    /// variant exists so an operator sees "the server sent a shape this client could not read" rather
+    /// than "the call did not complete", which would send them to inspect the network. It is reported
+    /// as a *protocol* disagreement, because the peer answered and the answer was unusable.
+    #[error(
+        "the server's tool call result could not be decoded: {0}; the protocol's result union is \
+         untagged, so this usually means the declared resultType and the object's fields disagree"
+    )]
+    Undecodable(String),
+
+    /// The server asked for more input, which JARVIS cannot supply.
+    ///
+    /// Revision `2026-07-28` added **MRTR** (multi round-trip requests), where a server answers a
+    /// call with `input_required` and the client retries the original request with the answers. The
+    /// SDK can drive those rounds by invoking a client `ClientHandler`. **JARVIS declares no
+    /// such handler**, because the only human in this system answers through JARVIS's own approval
+    /// path and not through a third-party server's form — so a round could not be fulfilled and this
+    /// is refused by name rather than left to fail deeper in.
+    #[error(
+        "the server requires additional input to complete the call (MRTR), and JARVIS supplies no \
+         input handler; a tool that needs a human answer must ask through JARVIS's approval path"
+    )]
+    InputRequired,
+
+    /// The server answered with a long-running **task** instead of a result.
+    ///
+    /// `2026-07-28` moved Tasks to an extension. This crate declares no tasks capability and polls no
+    /// task, so a server returning one is speaking a mode JARVIS did not ask for. Refused by name
+    /// rather than treated as an empty success.
+    #[error(
+        "the server answered the tool call with a long-running task, which JARVIS does not poll"
+    )]
+    Task,
+}
+
+impl CallError {
+    /// Classifies an SDK call failure without retaining its type.
+    ///
+    /// Matched on variants rather than message text, so a reworded SDK error cannot silently
+    /// reclassify a protocol refusal as an unreachable peer.
+    ///
+    /// `UnexpectedResponse` is mapped to [`Self::Undecodable`] rather than to
+    /// [`Self::Unavailable`], and that distinction is the whole reason the variant exists. The SDK
+    /// produces it when a response did not match any variant of the **untagged** result union — so
+    /// the peer *did* answer, and the answer was unusable. Reporting that as "the call did not
+    /// complete" would describe a network fault and send an operator to check a connection that is
+    /// working.
+    pub(crate) fn from_sdk(error: &ServiceError) -> Self {
+        match error {
+            ServiceError::McpError(_) => Self::PeerError(error.to_string()),
+            ServiceError::UnexpectedResponse => Self::Undecodable(error.to_string()),
+            _ => Self::Unavailable(error.to_string()),
+        }
+    }
 }
 
 impl ConnectError {

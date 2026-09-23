@@ -43,3 +43,7 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0023](0023-tool-pipeline-composition-root.md) | The tool pipeline is composed in the daemon over the adapter's own definitions | Accepted |
 | [0024](0024-a-server-does-not-name-itself.md) | A server does not name itself, and two MCP tool names never become one identifier | Accepted |
 | [0025](0025-mcp-effects-come-from-an-operator.md) | An MCP server's effects and risk come from an operator, never from the server | Accepted |
+| [0026](0026-the-host-join-between-discovery-and-authority.md) | Discovery is joined to authority only where both halves are visible | Accepted |
+| [0027](0027-a-remote-endpoint-is-a-validated-value.md) | A remote MCP endpoint is a validated value, and its HTTP client is built here | Accepted |
+| [0028](0028-an-adapters-outcome-mapping-is-the-honesty-boundary.md) | An adapter's outcome mapping is the honesty boundary, and every row of it needs a test | Accepted |
+| [0029](0029-the-mcp-host-role-is-a-narrow-configuration-surface.md) | The MCP host role is a narrow configuration surface, and one parser per document | Accepted |
