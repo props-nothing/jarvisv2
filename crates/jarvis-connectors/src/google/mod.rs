@@ -35,6 +35,7 @@
 //!   Google that no source supports.
 
 pub mod client;
+pub mod credential;
 pub mod definitions;
 pub mod request;
 

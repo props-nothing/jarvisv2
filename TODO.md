@@ -3239,6 +3239,54 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     budget accounting happens here**, so nothing connects a request to a `classify` decision; and only `Accept`
     is stated, so a transport still has to supply `Authorization` and whatever else a live call needs — a
     coverage gap rather than a decision.
+  - **This round built the credential boundary.** `crates/jarvis-connectors/src/google/credential.rs` +
+    `credential_tests.rs` (10 new tests, so **223 in the crate**). **`ADR-0061`.**
+  - **⭐ THE FINDING: ADR-0060 CLOSED ONE ROUTE AND NOT THE ONES THAT ACTUALLY LEAK.** Giving `HttpRequest`
+    no credential field makes a token unrepresentable *in a URL*, but a token reaches an artifact through an
+    **impl**, not a data structure: a derived `Debug` (one `{:?}` in a log renders whatever the struct holds),
+    a `Serialize` into a durable row or a wire DTO, a `Display` in a transport's error wrapper, or a plain
+    `String` argument that every holder can print. So `AccessToken` implements **neither `Serialize` nor a
+    derived `Debug`** — the `Debug` is hand-written to `[REDACTED]` plus the character count, which is not the
+    value and is what distinguishes two credentials in a diagnostic.
+  - **The absence of `Serialize` is ASSERTED, not described, and the assertion was falsified.** A
+    `compile_fail` doctest serializes the token, so a later `#[derive(Serialize)]` breaks the build. **A
+    `compile_fail` test can pass for the wrong reason** — a bad import path also fails to compile — so I replaced
+    the serialization line with a call that *should* compile and the doctest then **failed**, which is what
+    proves it fails for the serialization. Second such assertion in the workspace, after `SecretRef`.
+  - **The bytes are reachable through one accessor and its name is the warning.** `with_exposed(|token| ..)`
+    takes a **closure** rather than returning a `&str`, so the borrow cannot outlive the call and a caller
+    cannot move the material somewhere a later `Debug` could reach; and the closure gets only the text, not the
+    token, so reaching it requires writing the word `exposed`.
+  - **The header is rendered by the token, not by the transport** — `authorization_header_value()` is the
+    single place the bytes and the scheme meet. A transport building `"Bearer " + value` itself is where a
+    missing space or a **doubled** scheme comes from, and the doubled scheme is a real shape because a pasted
+    value may already carry it.
+  - **A pasted `Authorization` header reports removing the scheme, not the whitespace.** `Bearer <token>`
+    contains both, so the **scheme check runs first** and the message says what to do; a whitespace-first check
+    would report “contains whitespace” — true, useless, and it sends a reader hunting an invisible character.
+    `P5-004` records the same ordering decision for an API key, and the variants are separate because the
+    remedies differ. A 20-character floor then makes a client-id paste mistake surface at construction rather
+    than at the provider, where a generic auth error points at the credential's *validity* instead of its
+    *shape*.
+  - **The type may name which credential it came from without naming what it is.** `origin: Option<SecretRef>`
+    is the one field a diagnostic prints — “the stored refresh exchange for this account failed” — and a
+    `SecretRef`'s own redaction is **asserted** rather than assumed. Every refusal's message is asserted not to
+    render the value it refused, and for **every variant at once**, because a new variant is the case that
+    would forget.
+  - **⭐ MY OWN MEASUREMENT WAS WRONG AND THE ARITHMETIC CAUGHT IT.** A workspace run appeared to report
+    “30 suites, 1 failed, 1 compile error”, which sent me looking for a failure that did not exist. The cause:
+    **`Select-String` is CASE-INSENSITIVE by default**, so a pattern of `FAILED` matched the `0 failed` in every
+    one of the 48 `test result` lines — inflating the “failed” count and truncating the file I was reading into
+    a stale fragment. The real totals are **48 suites / 1477 passed / 0 failed**. **Use `-CaseSensitive` for a
+    verdict search**, and prefer counting `test result:` lines and parsing `N passed` / `N failed` from each.
+  - **Limits:** **nothing holds an `AccessToken` in production code** — no transport, no token source, no
+    exchange, so the type has no caller outside its tests; **the material is not zeroized on drop** (`zeroize`
+    is not a dependency and a partial answer about which types zeroize would imply coverage it lacks);
+    `authorization_header_value()` **allocates a second buffer holding the credential**, which is a small
+    widening recorded rather than hidden; `Debug` on a `Vec<u8>` derived from the header would still print it,
+    because this type controls its own rendering and not anything derived from it; the length floor is a
+    heuristic and proves nothing about validity; and **nothing checks the token is for Google**, because
+    provenance is not a property a string carries.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
