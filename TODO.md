@@ -2201,7 +2201,59 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
       (1114 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 175 tests.
-- [ ] `P4-004` Implement exact, full-text, recency, importance, entity, and workspace retrieval before adding embeddings.
+- [x] `P4-004` Implement exact, full-text, recency, importance, entity, and workspace retrieval before adding embeddings.
+      `crates/jarvis-core/src/retrieval.rs` + `retrieval/tests.rs` (21 tests, `jarvis-core` 196). The
+      document's two retrieval stages as pure functions over records. `ADR-0046`.
+      **Eligibility is a filter, not a low score** — and three of the six rules could not be ranking signals
+      at all. A foreign workspace's memory is not a poorly-ranked result; ranking it and dropping it later
+      would make one user's score depend on what another user stored. A superseded or expired claim is not
+      "less relevant" but "not current", and the document requires it stop being retrieved *as current* — a
+      ranker that surfaced it would need every consumer to re-check. A memory above the destination's
+      ceiling must not be admitted and then redacted, because a redaction transforms content already inside
+      the assembly step.
+      **"Actor authorization" and "workspace policy" are one check here, recorded rather than silently
+      merged.** In this platform actor authorization *is* workspace membership — `P4-002`'s reads all bind
+      `workspace_id` — so a separate actor rule would always pass, which is worse than an absent rule
+      because a reader would count it. The two *are* separate in a server deployment, so the merge is the
+      thing to look for when `P4-008`/`P4-009` add sharing.
+      **The weight table is capped at a quarter of the total per signal**, which is "no single signal may
+      dominate by accident" as arithmetic: the eight weights sum to 1000, none exceeds 250, and the test
+      asserts the comparison directly — a memory good on several signals outranks one perfect on a single
+      signal. Semantic similarity, active project/task relevance, and relationship overlap are
+      **deliberately absent** from the table rather than present as zeros, because a zero row is the table
+      claiming a signal it has no data to produce.
+      **⭐ A test caught the explanation not explaining.** The first total scaled the whole weighted sum once
+      while each contribution was scaled separately, and **integer division is not distributive** — so they
+      disagreed by up to one per term (521 vs 522). The total now *is* the sum of the contributions, which
+      makes an operator's displayed breakdown the arithmetic that produced the total rather than a parallel
+      calculation. Integer rather than float for the same reason the weights are one table: a float score
+      would make the ranking depend on platform rounding, so a stored score would be unreproducible.
+      **⭐ The reason precedence was decided by an array literal.** `max_by_key` returns the **last** maximum
+      on a tie, and a tie is the common case — a question naming a memory's entity usually also shares its
+      words, scoring full on all three matching signals — so the reported reason depended on the order the
+      arms were written. Now explicit: identifier, then overlap, then keyword.
+      **A shared scaling helper, because the obvious integer form is always zero.** `numerator /
+      denominator` truncates to nothing for every partial case, so a memory matching two of three words
+      would score as if it matched none — and the same shape appears in four signals. One `scaled` helper
+      multiplies before dividing, so eight call sites cannot each forget it.
+      **Diversification is a prefix of the ranking, and a drop is not a refusal.** Caps applied in rank
+      order; selecting by category first would override the ranking with a category order the scoring never
+      expressed, and a category order imposed afterwards is a signal by another name. A capped and an
+      excluded memory are **separate lists** because the actions differ — collapsing them would report "you
+      have seen enough preferences" as "this preference is not available to you". A zero cap is refused
+      because "none of this category" and "no limit" are opposite readings and the silent one is restrictive.
+      **Falsified, one guard each:** disabling the destination-sensitivity rule failed
+      `a_memory_above_the_destination_is_excluded`; raising a weight above the cap failed
+      `no_single_signal_can_dominate` (on both the sum and the domination comparison). Both restored, green.
+      **Recorded as limits:** no semantic similarity (that is `P4-005`), no project/task relevance, no
+      relationship-graph traversal; the recency window is a constant rather than a per-query parameter; the
+      **weights are reasoned and not calibrated** against a real result set (`P4-006`'s evaluation is where a
+      measurement belongs, and the weights are one table so it is a single edit); **no function here issues a
+      query**, so nothing yet turns a `MemoryQuery` into a candidate set; and nothing calls the module —
+      `P4-007` is the integration and until then it is a complete, tested, uninvoked component.
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
+      (1135 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 196 tests.
 - [ ] `P4-005` Research and implement a provider-neutral embedding adapter with dimension/version metadata.
 - [ ] `P4-006` Add hybrid retrieval and explainable scoring; embeddings are an index, not canonical truth.
 - [ ] `P4-007` Integrate memory retrieval into context budgets with provenance and injection-resistant quoting.

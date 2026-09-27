@@ -21,6 +21,7 @@ mod transport;
 mod approval;
 mod candidate;
 mod memory;
+mod retrieval;
 mod secretbytes;
 mod tool_outcome;
 
@@ -64,6 +65,15 @@ pub use memory::{
 };
 pub use message::{
     InvalidMessage, MAX_MESSAGE_CONTENT_BYTES, MessageRole, MessageSource, NewMessage,
+};
+pub use retrieval::{
+    DEFAULT_DIVERSITY_BUDGET, DiversityBudget, DiversityReason, DroppedMemory, ExcludedMemory,
+    Ineligibility, MAX_SIGNAL_WEIGHT, MemoryQuery, MemorySelection, MemorySignals,
+    RECENCY_WINDOW_NANOS, REINFORCEMENT_SATURATION, SIGNAL_SCALE, SIGNAL_WEIGHTS, ScoredMemory,
+    SelectionReason, SignalScore, SignalWeights, TOTAL_WEIGHT, diversify, entity_overlap_signal,
+    exact_identifier_signal, importance_signal, keyword_signal, may_be_offered_as_fact, rank,
+    reason_for, recency_signal, reinforcement_signal, score, signals_for,
+    source_reliability_signal, temporal_signal,
 };
 pub use run::{
     ExpectedRunState, InvalidRunErrorCode, InvalidRunState, MAX_RUN_ERROR_CODE_CHARS, RunErrorCode,
