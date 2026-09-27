@@ -651,3 +651,186 @@ async fn the_recorded_outcome_is_the_adapters_and_is_not_replaceable() {
         "a terminal outcome must not be replaceable, got {refused:?}"
     );
 }
+
+/// An adapter that declares the risk a hold needs, and panics if it is ever reached.
+///
+/// A **panicking** adapter rather than a returning one, because the property under test is that a held
+/// call reaches no adapter at all. An adapter that answered would satisfy an outcome-shaped assertion
+/// whether or not the hold worked, which is the same reasoning the MCP refusal test uses.
+struct UnreachableAdapter;
+
+#[async_trait::async_trait]
+impl jarvis_tools::ToolExecutor for UnreachableAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "unreachable"
+    }
+
+    async fn execute(
+        &self,
+        _request: &jarvis_tools::ToolExecutionRequest,
+    ) -> Result<jarvis_tools::ToolCallResult, jarvis_tools::AdapterError> {
+        panic!("an adapter must not be reached for a call held for approval");
+    }
+}
+
+/// A definition that policy holds: a write-shaped tool at risk 2.
+///
+/// Built by hand rather than through the MCP translation, because the property under test is about the
+/// **policy threshold** rather than about any one server's posture: `WorkspacePolicy::default()` requires
+/// approval from risk 2 up, so a risk-2 tool in the default workspace is held whatever namespace it lives
+/// in. Its effects declare a write, which is what makes the risk honest — `P3-001` refuses a risk below an
+/// effect's floor at construction, so this definition could not claim to be risk-2 otherwise.
+///
+/// `source` is derived from the identifier rather than stated, because `ToolDefinition::new` refuses a
+/// definition whose declared source disagrees with its namespace — the same rule that stops a server from
+/// claiming a native prefix.
+fn held_definition() -> jarvis_tools::ToolDefinition {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"],
+        "additionalProperties": false
+    });
+    let effects = jarvis_tools::EffectSet::new([jarvis_tools::ToolEffect::Write])
+        .unwrap_or_else(|| panic!("Write is a non-empty effect set"));
+    let definition = jarvis_tools::ToolDefinition::new(jarvis_tools::ToolDefinitionParts {
+        id: must(ToolId::new("mcp.test.write")),
+        version: "schema-00000000".to_owned(),
+        title: "Write a file".to_owned(),
+        description: "A write-shaped tool that policy holds for approval.".to_owned(),
+        input_schema: must(jarvis_tools::ToolSchema::from_value(schema)),
+        // The dialect keyword is **required** rather than defaulted: `jarvis-tools` refuses to infer
+        // 2020-12 from an omission, because `exclusiveMinimum` is a boolean in earlier drafts and a
+        // number here, so defaulting would silently reinterpret an older document (`P3-008b`).
+        output_schema: must(jarvis_tools::ToolSchema::from_value(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object"
+        }))),
+        effects,
+        // The number, because that is the manifest shape: `ToolDefinition::new` validates it against
+        // the effects and turns it into a `Risk`.
+        risk: 2,
+        required_scopes: jarvis_tools::ScopeSet::none(),
+        approval: jarvis_tools::ApprovalPolicy::Auto,
+        idempotency: jarvis_tools::Idempotency::Unsupported,
+        retry: jarvis_tools::RetryDeclaration::none(),
+        source: jarvis_tools::ToolSource::from_namespace("mcp.test"),
+        availability: jarvis_tools::Availability::Available,
+        sensitivity: jarvis_tools::ToolSensitivity::default(),
+        timeout_seconds: 30,
+    });
+    must(definition)
+}
+
+/// **The seam this slice adds: a held call writes the durable approval it is waiting on.**
+///
+/// Before this, `AwaitingApproval` returned a `call_id` and a strength and persisted **nothing** — the
+/// long-recorded limit every tool slice restated. The call row stayed truthfully `requested` forever, and
+/// the documented resume path (`security.md`'s "a trusted desktop/mobile/CLI approval may resume a
+/// voice-originated run") had no record to resume against.
+///
+/// Three properties, and each is a way the write could be wrong rather than a way it could pass:
+/// no adapter ran; the row's intent is the **call's** canonical intent, so a decision binds to the action
+/// rather than to the request; and the requester is the **run**, which is what makes the domain's
+/// self-approval refusal do work in a single-owner profile.
+#[tokio::test]
+async fn a_held_call_writes_the_approval_it_is_waiting_on() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let definition = held_definition();
+    let (_root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![definition.clone()],
+        Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let arguments = json!({ "path": "notes/todo.txt" });
+    let correlation = CorrelationId::new();
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                correlation,
+            )
+            .await,
+    );
+
+    let ToolPipelineOutcome::AwaitingApproval {
+        call_id,
+        approval_id,
+        required_strength,
+        reason_code,
+    } = outcome
+    else {
+        panic!("a risk-2 write must be held, got {outcome:?}");
+    };
+
+    // The reason code is the engine's own, asserted against the literal the engine emits rather than
+    // against what the decision "should" be called: `P3-003` owns the code, and a hand-written
+    // expectation would drift from it silently.
+    assert_eq!(reason_code, "approval_required");
+    // Risk 2 asks for `Credential`, not `Present`: `P3-003`'s table maps `Moderate` to a verified
+    // credential and reserves user presence for `High`. Asserting the value the engine computed also
+    // pins the **risk** the definition produced, which is what this fixture exists to hold.
+    assert_eq!(required_strength, AuthenticationStrength::Credential);
+
+    // **The row exists, and a decision can name it.** Read back with the `approval_id` the outcome
+    // carried, so the assertion is about the value a caller receives rather than about a lookup that
+    // could find any row.
+    let approval = must(jarvis_storage::find_approval(&database, &approval_id).await);
+    assert_eq!(approval.id().to_string(), approval_id);
+    assert_eq!(approval.tool(), "mcp.test.write");
+    assert_eq!(approval.tool_version(), "schema-00000000");
+    assert_eq!(
+        approval.preview().as_str(),
+        "mcp.test.write schema-00000000",
+        "the preview names the tool and version, and carries no argument text"
+    );
+
+    // **The intent is the call's own canonical intent**, recomputed here from the same three inputs the
+    // pipeline hashed. A decision therefore binds to the action, and the check is not vacuous: the
+    // control below proves a different argument set hashes differently.
+    let expected = must(jarvis_core::CanonicalIntentHash::compute(
+        "mcp.test.write",
+        "schema-00000000",
+        &arguments,
+    ));
+    assert_eq!(approval.intent().to_hex(), expected.to_hex());
+    let other = must(jarvis_core::CanonicalIntentHash::compute(
+        "mcp.test.write",
+        "schema-00000000",
+        &json!({ "path": "elsewhere.txt" }),
+    ));
+    assert_ne!(
+        expected.to_hex(),
+        other.to_hex(),
+        "the control: different arguments must not produce the same intent"
+    );
+
+    // **The requester is the run, so the human is eligible to approve and the agent is not.** This is the
+    // identity decision the slice turns on, asserted on the stored row rather than on the value that was
+    // passed in, so the pipeline cannot record one identity while claiming another.
+    assert_eq!(
+        approval.actor_id(),
+        RUN,
+        "the requester must be the run that asked for the action, not the person"
+    );
+    assert_ne!(
+        approval.actor_id(),
+        LOCAL_USER_ID,
+        "the requester must not be the only identity eligible to approve it"
+    );
+
+    // The call row is `requested` and holds no receipt, which is the honest state of a call that has not
+    // been authorized: a receipt is what an adapter treats as permission (`P3-006a`). The binding records
+    // the call's **own** identifier for both fields — a call that is never authorized cannot cite a
+    // receipt, and inventing one would be the fabricated authority `P3-006a` removed.
+    let stored = must(pipeline.call(&call_id).await);
+    assert_eq!(stored.outcome(), ToolOutcome::Requested);
+    assert_eq!(stored.receipt(), call_id);
+    assert_eq!(stored.approval_id(), None);
+}

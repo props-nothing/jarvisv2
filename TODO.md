@@ -1814,6 +1814,61 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       workspace step runs in — 0 skips), both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, and `cargo deny check`
       all green.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.
+  - [x] `P3-012a` A held call persists the durable approval it is waiting on.
+        **The limit every tool slice restated, closed.** `P3-005`, `P3-006`, `P3-006d`, and each of
+        `P3-008a`..`P3-009c-b` recorded a version of "nothing persists an `ApprovalRequest`": an
+        `AwaitingApproval` outcome returned a call id and a strength and wrote **nothing**, so the call row
+        stayed truthfully `requested` forever and the documented resume path (`security.md`: "a trusted
+        desktop/mobile/CLI approval may resume a voice-originated run") had no record to resume against.
+        `ToolPipeline::authorize_and_admit` now returns an `Admission::{Runnable,Held}` and a held decision
+        writes an `ApprovalRequest` bound to the **call's own canonical intent**, so a decision binds to the
+        action rather than to a description of it. `AwaitingApproval` carries the `approval_id`, and the
+        gateway replies with it beside the call id.
+        **A held call has no receipt, and that is why the value types differ.** `AuthorizationReceipt::new`
+        refuses a `RequireApproval` with no citation (`P3-006a`), because a receipt is what an adapter treats
+        as **permission** and none exists yet — so a hold could only produce one by inventing a citation for a
+        decision nobody made. `Admission` is therefore two variants rather than `Option<PreparedCall>`: the two
+        cases carry different values, and filling a hold's facts into the runnable type would mean writing
+        placeholders for fields only the runnable case has.
+        **⚠ The call is now admitted BEFORE the receipt is built, and that reordering is safe for a stated
+        reason.** `CallBinding` takes the receipt identifier as a parameter, and the pipeline passes the
+        call's own id for both fields. That is not a fabrication: a call that is never authorized cannot cite
+        a receipt, and the ledger key is `(run_id, idempotency_key)` rather than the receipt, so the binding
+        value is not part of any uniqueness constraint. The alternative — keeping the old order — meant
+        building a receipt whose constructor refuses exactly this decision.
+        **The identity decision, which is the security content of the slice.** The domain refuses an approval
+        whose approver equals its requester, and `security.md` names the threat as **model self-approval /
+        confused deputy**. For that refusal to do any work in a single-owner profile the requester must be the
+        **agent acting for the run**, because the person is the only identity eligible to approve anything
+        here — recording the user as the requester would make the two equal by construction and turn the guard
+        into a check that can only refuse real work, the shape `ADR-0022` removed from cancellation. So the
+        requester is the run, which the call's own origin already records for the same reason, and the
+        approver is chosen by the decide path and never travels in a request body.
+        **The preview names the tool and version, not its arguments** — deliberately, and the reason is the
+        bound rather than tidiness. The arguments are already bound by the intent digest, so a preview is
+        *additional* context; rendering arbitrary model-authored arguments into a field `P3-004` caps at 512
+        characters would fail the hold for a tool whose arguments are simply large. A rich, effect-shaped
+        preview is `A11`'s job, where the content is a message or an event this layer can summarize.
+        **Falsified, one property each.** Removing the `create_approval` call fails with `ApprovalNotFound`
+        (the test reads the row back by the `approval_id` the outcome carried, so it cannot pass on any other
+        row). Replacing the requester with `LOCAL_USER_ID` fails with the run id vs the user id, so the
+        identity assertion is not vacuous. Both mutations were restored and the suite re-run green.
+        **⚠ Two traps hit during this slice, both already recorded and both worth restating.** A
+        PowerShell `-replace` on a multi-line anchor **silently no-opped** because the working copy has LF
+        while the anchor used `r`n`, so the first falsification passed for the wrong reason — the fix is to
+        assert the string actually changed (and prefer a single-line anchor). And `Copy-Item` restoring a
+        `.bak` **restores the older timestamp**, so cargo skipped the rebuild and the restored suite looked
+        red; the working copy was correct and `cargo` was running the mutated artifact. *A falsification that
+        passes is a finding about the harness, not a reprieve.*
+        **Limits, recorded rather than glossed:** nothing decides the approval yet and nothing resumes the
+        call, which is `P3-012b`. A held call has **no durable link to its approval** (the `tool_calls` row's
+        `approval_id` column is a migration away), so the association is carried in an outcome value and a
+        log rather than a join — `P3-012c`. Nothing writes a `run_events` row, and a run does not park in
+        `awaiting_approval`: the hold is a **tool-level** fact until the executor path (`P3-012c`) makes it a
+        run-state change. Gates: fmt, clippy `-D warnings`, 44 suites / `--all-features` / `--locked` green,
+        `cargo deny check` ok.
+  - [ ] `P3-012b` Decide an approval and resume the admitted call.
+  - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
 
 ## P4: Memory And Context
 

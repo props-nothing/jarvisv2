@@ -329,12 +329,14 @@ async fn call_tool(
         }
         Ok(crate::tool_pipeline::ToolPipelineOutcome::AwaitingApproval {
             call_id,
+            approval_id,
             required_strength,
             reason_code,
         }) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
                 "call_id": call_id,
+                "approval_id": approval_id,
                 "state": "awaiting_approval",
                 "required_strength": required_strength.as_str(),
                 "reason_code": reason_code,

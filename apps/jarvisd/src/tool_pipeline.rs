@@ -34,20 +34,25 @@
 //!
 //! - **It decides nothing.** Every refusal is a value a previous slice produced; this module sequences
 //!   them and reports which one fired, by its stable reason code.
-//! - **It does not request or answer an approval.** A held decision returns
-//!   [`ToolPipelineOutcome::AwaitingApproval`] carrying the admitted call and the strength an approval
-//!   must be established with. The approval round-trip — persisting the request, a human deciding,
-//!   resuming the call — is the **next** slice, because resuming needs a run to park in
-//!   `awaiting_approval`, which is a run-state change rather than a tool one.
+//! - **It does not answer an approval.** A held decision returns
+//!   [`ToolPipelineOutcome::AwaitingApproval`] after writing a **durable approval request**, so a
+//!   decision has something to bind to and a caller can name the approval it applies to. Deciding it and
+//!   resuming the call — rebuilding a receipt that cites the decision and re-driving the admitted call —
+//!   is the next slice (`P3-012b`), because resuming past a terminal outcome is where a duplicate
+//!   delivery would become a second effect.
 //! - **It does not write `run_events`.** The call row is the audit record for a tool call; linking calls
 //!   to the event log is `P3-012`.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
+use jarvis_core::{
+    ApprovalId, ApprovalRequest, ApprovalRequestParts, DecisionNonce, RunId, WorkspaceId,
+};
 use jarvis_core::{CanonicalIntentHash, CorrelationId, SystemClock, UtcTimestamp};
 use jarvis_storage::{
     CallBinding, CallOrigin, CallTarget, DatabaseError, NewToolCall, SqliteDatabase,
-    admit_tool_call, advance_tool_call, record_tool_outcome,
+    admit_tool_call, advance_tool_call, create_approval, record_tool_outcome,
 };
 #[cfg(test)]
 use jarvis_storage::{StoredToolCall, find_tool_call};
@@ -85,12 +90,19 @@ pub enum ToolPipelineOutcome {
     Executed(Box<ToolCallResult>),
     /// The call was **authorized and recorded** but not run, because a human must decide first.
     ///
-    /// Carries the two things a caller needs to act: the admitted call the approval would authorize,
-    /// and the strength the approval must be established with — which `P3-003` computed and which a
-    /// caller must not be free to lower.
+    /// Carries the three things a caller needs to act: the admitted call the approval would authorize,
+    /// the durable approval that was written so a decision has something to bind to, and the strength
+    /// the approval must be established with — which `P3-003` computed and which a caller must not be
+    /// free to lower.
     AwaitingApproval {
         /// The admitted call, which is what an approval would bind to.
         call_id: String,
+        /// The durable approval request that was persisted for this hold.
+        ///
+        /// Present rather than implied: a caller must be able to **name** the approval a decision
+        /// applies to, and reading it back out of the database by run would be guesswork when a run
+        /// has held more than one call.
+        approval_id: String,
         /// The authentication strength an approval must carry.
         required_strength: AuthenticationStrength,
         /// The stable reason code the decision was held at.
@@ -181,6 +193,32 @@ pub enum ToolPipelineError {
     /// The adapter could not establish an outcome.
     #[error(transparent)]
     AdapterCall(#[from] AdapterError),
+    /// A stored identifier an approval needs could not be rebuilt.
+    ///
+    /// An approval records its workspace and run as typed identifiers, and a pipeline holds them as
+    /// the strings its call rows use. A string that is not a `UUIDv7` is an authoring or corruption
+    /// fault rather than a decision, so it is reported rather than substituted — a substituted
+    /// identifier would write an approval against a workspace that does not exist.
+    #[error("the {field} on a held call is not a valid identifier")]
+    ApprovalIdentity {
+        /// Which identifier was refused.
+        field: &'static str,
+    },
+    /// A decision nonce could not be generated.
+    ///
+    /// Propagated rather than replaced with a placeholder: the nonce is the control against a forged
+    /// decision, and a fixed value would be a secret every process shares.
+    #[error("a decision nonce could not be generated")]
+    ApprovalSecret,
+    /// The domain refused a field of the approval request.
+    ///
+    /// Carried as the domain's own field-naming error so a reader learns **which** invariant failed
+    /// without the message forwarding a preview or a length, which `P3-004` deliberately keeps out.
+    #[error("the approval request was refused: {field}")]
+    Approval {
+        /// The domain error naming the offending field.
+        field: jarvis_core::InvalidApprovalField,
+    },
     /// A schema validator was rejected, which is an authoring error.
     #[error(transparent)]
     Schema(#[from] SchemaError),
@@ -225,6 +263,137 @@ struct PreparedCall {
     arguments: Value,
     /// When the call was admitted, from which the deadline is computed.
     issued_at: UtcTimestamp,
+}
+
+/// What admitting a call produced.
+///
+/// Two variants rather than `Option`, because the two cases carry **different** values: a runnable call
+/// has a receipt and an idempotency key, and a held call has neither — it has the approval that was
+/// written and the intent that approval binds to. An `Option<PreparedCall>` would force the hold's own
+/// facts into a type that describes something else.
+enum Admission {
+    /// The call may run now.
+    Runnable(Box<PreparedCall>),
+    /// The call waits on a durable approval.
+    Held(Box<PreparedHold>),
+}
+
+/// An admitted call whose policy decision requires a human approval.
+///
+/// # Why this is a distinct type rather than a `PreparedCall` with a flag
+///
+/// A held call has no `receipt` and cannot produce one: `AuthorizationReceipt::new` refuses a
+/// `RequireApproval` decision with no approval cited (`P3-006a`), because a receipt is what an adapter
+/// treats as permission and no decision has been taken yet. So the value a hold produces carries
+/// **less** than a runnable call — the admitted call, the intent an approval must bind to, and the
+/// strength it must be established with — and giving it the runnable type would mean filling in fields
+/// only the runnable case has.
+struct PreparedHold {
+    /// The durable call identifier, which is what a resumption re-reads.
+    call_id: String,
+    /// The durable approval that was written for this hold, and which a decision names.
+    approval_id: String,
+    /// The workspace the run belongs to, taken from the actor rather than from the request.
+    workspace_id: String,
+    /// The run that asked for the action, which is the approval's **requester**.
+    run_id: String,
+    /// The tool identifier the approval binds to.
+    tool: String,
+    /// The tool version the approval binds to, because an authority for one version is not an
+    /// authority for a later one.
+    tool_version: String,
+    /// The intent an approval must bind to, computed over the same tool, version, and arguments the
+    /// receipt would have covered, so a decision binds to the action rather than to a description of it.
+    intent: CanonicalIntentHash,
+    /// The risk the decision was taken at, which is what a stored approval records.
+    risk: jarvis_tools::Risk,
+    /// The strength a decision must be supplied with.
+    required_strength: AuthenticationStrength,
+    /// A human-readable preview of what is being authorized.
+    preview: String,
+    /// The correlation identity shared with the originating request.
+    correlation_id: CorrelationId,
+    /// When the call was admitted.
+    issued_at: UtcTimestamp,
+}
+
+/// Converts the **ceiling** a channel can establish into the **observation** an approval records.
+///
+/// # Why this conversion has to exist, and why it is a conversion rather than one shared type
+///
+/// `jarvis-tools::AuthenticationStrength` is what a channel *can* establish; the ordering is the
+/// mechanism behind the voice rule. `jarvis_core::AuthenticationStrength` is what the channel that
+/// answered *did* establish, and `P3-004` says why they are one type apart: "Sharing one type would let
+/// a caller record a ceiling as if it were an observation." So an approval's `required_strength` — what
+/// a decision must **prove** — is the ceiling the channel would have to reach, and that is the only
+/// direction that is true. `required_strength` is a demand, not a measurement.
+///
+/// The match is deliberately exhaustive over all four variants rather than a default arm: a future
+/// channel ceiling that this build did not account for should be a compile error rather than a silent
+/// mapping onto the weakest strength.
+const fn approval_strength(
+    ceiling: jarvis_tools::AuthenticationStrength,
+) -> jarvis_core::AuthenticationStrength {
+    use jarvis_core::AuthenticationStrength as Strength;
+    match ceiling {
+        jarvis_tools::AuthenticationStrength::Absent => Strength::Absent,
+        jarvis_tools::AuthenticationStrength::ChannelEvidence => Strength::ChannelEvidence,
+        jarvis_tools::AuthenticationStrength::Credential => Strength::Credential,
+        jarvis_tools::AuthenticationStrength::Present => Strength::Present,
+    }
+}
+
+/// Records the durable approval a held call is waiting on.
+///
+/// # The requester is the run, not the human, and that is the security decision
+///
+/// The domain refuses an approval whose approver equals its requester, and
+/// `docs/architecture/security.md` names the threat this defeats as **model self-approval / confused
+/// deputy**. For that refusal to do any work in a single-owner profile, the requester must be the
+/// **agent acting for the run** rather than the person, because the person is the only identity
+/// eligible to approve anything here. Recording the user as the requester would make the two
+/// identifiers equal by construction and turn the guard into a check that can only refuse real work —
+/// exactly the shape `ADR-0022` removed from cancellation.
+///
+/// So the requester is the run: the tool call reaches this pipeline *because a run is executing*, and a
+/// tool call's own origin already records the run for the same reason. The approver identity is chosen
+/// by the caller of the decide path and never travels in a request body.
+///
+/// # Errors
+///
+/// Returns [`ToolPipelineError::Storage`] when the row cannot be written, and
+/// [`ToolPipelineError::Approval`] when the domain refuses a field — both faults rather than decisions.
+fn new_approval_request(
+    hold: &PreparedHold,
+    actor_id: &str,
+    id: ApprovalId,
+    expires_at: UtcTimestamp,
+) -> Result<ApprovalRequest, ToolPipelineError> {
+    let workspace_id = WorkspaceId::from_str(&hold.workspace_id).map_err(|_| {
+        ToolPipelineError::ApprovalIdentity {
+            field: "workspace_id",
+        }
+    })?;
+    let run_id = RunId::from_str(&hold.run_id)
+        .map_err(|_| ToolPipelineError::ApprovalIdentity { field: "run_id" })?;
+
+    ApprovalRequest::new(ApprovalRequestParts {
+        id,
+        workspace_id,
+        run_id,
+        actor_id: actor_id.to_owned(),
+        tool: hold.tool.clone(),
+        tool_version: hold.tool_version.clone(),
+        intent: hold.intent,
+        preview: hold.preview.clone(),
+        risk_level: hold.risk.level(),
+        required_strength: approval_strength(hold.required_strength),
+        nonce: DecisionNonce::generate().map_err(|_| ToolPipelineError::ApprovalSecret)?,
+        correlation_id: hold.correlation_id,
+        created_at: hold.issued_at,
+        expires_at,
+    })
+    .map_err(|field| ToolPipelineError::Approval { field })
 }
 
 /// Renders schema violations as one bounded, reader-facing line.
@@ -450,7 +619,7 @@ impl ToolPipeline {
         }
 
         // 3-5. Bind the authority, admit the call, and stop if a human must decide first.
-        let Some(prepared) = self
+        let prepared = self
             .authorize_and_admit(
                 tool,
                 &definition,
@@ -459,20 +628,24 @@ impl ToolPipeline {
                 &decision,
                 correlation_id,
             )
-            .await?
-        else {
-            // A held decision: the call is admitted and the caller learns what an approval would need.
-            return Ok(ToolPipelineOutcome::AwaitingApproval {
-                call_id: correlation_id.to_string(),
-                required_strength: decision
-                    .required_strength()
-                    .unwrap_or(AuthenticationStrength::Absent),
-                reason_code: decision.reason_code(),
-            });
+            .await?;
+
+        let prepared = match prepared {
+            Admission::Runnable(prepared) => prepared,
+            // A held decision: the call is admitted, a **durable approval** is written, and the caller
+            // learns what an approval would need and which approval to decide.
+            Admission::Held(hold) => {
+                return Ok(ToolPipelineOutcome::AwaitingApproval {
+                    call_id: hold.call_id,
+                    approval_id: hold.approval_id,
+                    required_strength: hold.required_strength,
+                    reason_code: decision.reason_code(),
+                });
+            }
         };
 
         // 6-7. Execute through the adapter and record what it established.
-        self.execute_and_record(prepared, tool, &definition, correlation_id)
+        self.execute_and_record(*prepared, tool, &definition, correlation_id)
             .await
     }
 
@@ -661,14 +834,25 @@ impl ToolPipeline {
 
     /// Builds the authority, admits the call, and reports whether it may run.
     ///
-    /// Returns `Ok(None)` for a **held** decision, which is not an error: the call is admitted and
-    /// recorded as `requested` so an approval has something to bind to, and running it would be the
-    /// confused-deputy shape `docs/architecture/security.md` refuses.
+    /// Returns [`Admission::Held`] for a decision that requires a human, which is not an error: the
+    /// call is admitted and recorded as `requested` and a **durable approval request is written**, so a
+    /// decision has something to bind to. Running it instead would be the confused-deputy shape
+    /// `docs/architecture/security.md` refuses.
+    ///
+    /// # Why the call is admitted before the receipt is built
+    ///
+    /// A held call produces no receipt at all. The receipt's own constructor refuses a
+    /// `RequireApproval` decision with nothing cited (`P3-006a`), because a receipt is what an adapter
+    /// treats as **permission** and no permission exists yet — so building one here would require
+    /// inventing a citation for a decision nobody has made, which is the shape that guard exists to
+    /// prevent. The call row therefore records the call's own identifier as its receipt binding (the
+    /// two are the same value for a call that goes on to run), which is why `CallBinding` takes the
+    /// identifier as a parameter rather than reading it off a receipt.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolPipelineError`] for a fault: an uncomputable intent, a rejected receipt, a
-    /// failed key generation, or a durable write that did not succeed.
+    /// Returns [`ToolPipelineError`] for a fault: an uncomputable intent, a rejected receipt, a failed
+    /// key or nonce generation, or a durable write that did not succeed.
     async fn authorize_and_admit(
         &self,
         tool: &str,
@@ -677,7 +861,7 @@ impl ToolPipeline {
         actor: &ToolActor,
         decision: &jarvis_tools::PolicyDecision,
         correlation_id: CorrelationId,
-    ) -> Result<Option<PreparedCall>, ToolPipelineError> {
+    ) -> Result<Admission, ToolPipelineError> {
         // The receipt's risk and intent are DERIVED from the decision and the arguments, so the
         // authority an adapter acts on cannot disagree with the decision (`P3-006a`).
         let intent =
@@ -686,23 +870,8 @@ impl ToolPipeline {
                     tool: tool.to_owned(),
                 }
             })?;
-        let id = ToolId::new(tool)?;
         let now = UtcTimestamp::now(&SystemClock);
         let call_id = correlation_id.to_string();
-        let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
-            receipt_id: call_id.clone(),
-            tool: id,
-            tool_version: definition.version().to_owned(),
-            arguments: arguments.clone(),
-            intent_hash: intent,
-            policy_version: actor.policy_version().to_owned(),
-            decision: decision.clone(),
-            // No approval: a held decision returns before this receipt is used for anything but the
-            // call row, and fabricating a citation would be inventing authority.
-            approval: None,
-            correlation_id,
-            issued_at: now,
-        })?;
 
         // The key is generated here rather than derived from the intent: the digest must be
         // deterministic because the receipt binds to it, while the key must be unique per logical
@@ -711,13 +880,13 @@ impl ToolPipeline {
         let admitted = admit_tool_call(
             &self.database,
             &NewToolCall::new(
-                call_id,
+                call_id.clone(),
                 CallOrigin::new(actor.workspace_id(), actor.run_id(), None),
                 CallTarget::new(tool, definition.version()),
                 CallBinding::new(
                     intent.to_hex(),
                     key.as_str(),
-                    receipt.receipt_id(),
+                    &call_id,
                     actor.policy_version(),
                     None,
                 ),
@@ -736,15 +905,95 @@ impl ToolPipeline {
         };
 
         if decision.is_held() {
-            return Ok(None);
+            // The hold is assembled here and `record_hold` takes it as one value, rather than the
+            // function taking nine arguments. That is the remedy `P3-005` and `P3-008b` both applied
+            // for this lint: adjacent opaque arguments a caller could transpose are better grouped into
+            // the value that already describes them.
+            let hold = PreparedHold {
+                call_id,
+                approval_id: String::new(),
+                workspace_id: actor.workspace_id().to_owned(),
+                run_id: actor.run_id().to_owned(),
+                tool: tool.to_owned(),
+                tool_version: definition.version().to_owned(),
+                intent,
+                risk: decision.effective_risk(),
+                // `required_strength` is present whenever the outcome is `RequireApproval` (`P3-003`),
+                // so a hold always has one. `Present` is the fallback for the unreachable case, and it
+                // is the **strongest** requirement, so a fallback reached by a bug tightens.
+                required_strength: decision
+                    .required_strength()
+                    .unwrap_or(AuthenticationStrength::Present),
+                preview: format!("{tool} {}", definition.version()),
+                correlation_id,
+                issued_at: now,
+            };
+            return self
+                .record_hold(hold)
+                .await
+                .map(|hold| Admission::Held(Box::new(hold)));
         }
-        Ok(Some(PreparedCall {
+
+        let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
+            receipt_id: call_id.clone(),
+            tool: ToolId::new(tool)?,
+            tool_version: definition.version().to_owned(),
+            arguments: arguments.clone(),
+            intent_hash: intent,
+            policy_version: actor.policy_version().to_owned(),
+            decision: decision.clone(),
+            // No approval: this is the path a decision allowed directly, so there is nothing to cite.
+            approval: None,
+            correlation_id,
+            issued_at: now,
+        })?;
+
+        Ok(Admission::Runnable(Box::new(PreparedCall {
             call_id,
             receipt,
             key,
             arguments: arguments.clone(),
             issued_at: now,
-        }))
+        })))
+    }
+
+    /// Writes the durable approval a held call is waiting on.
+    ///
+    /// # The approval's requester is the run, and the approver is not
+    ///
+    /// `new_approval_request` carries the argument for using the run as the requester. The consequence
+    /// worth stating at the call site is that a decision naming the run as its approver is **refused by
+    /// the domain**, which is what stops the agent that asked for an action from answering for it.
+    ///
+    /// # The preview names the tool and not its arguments, deliberately
+    ///
+    /// The arguments are bound by the intent digest, which is what a decision is checked against, so a
+    /// preview is **additional** context rather than the binding. Rendering arbitrary arguments into
+    /// it would put unbounded model-authored text into a record `P3-004` bounds at 512 characters and
+    /// could fail the hold for a tool whose arguments are simply large. Naming the tool, its version,
+    /// and the requesting run is what an operator needs to find the call; a rich preview is the
+    /// connector slice's job (`A11`), where the content is a message or an event this layer can
+    /// summarize meaningfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError::ApprovalIdentity`] for an identifier that will not parse,
+    /// [`ToolPipelineError::ApprovalSecret`] when a nonce cannot be generated,
+    /// [`ToolPipelineError::Approval`] when the domain refuses a field, and
+    /// [`ToolPipelineError::Storage`] when the row cannot be written.
+    async fn record_hold(&self, mut hold: PreparedHold) -> Result<PreparedHold, ToolPipelineError> {
+        // The requester is the hold's own run, and that is the identity decision this slice turns on:
+        // `new_approval_request` carries the argument. Reading it from the hold rather than taking it as
+        // a second argument is deliberate — a caller that could pass a *different* identity here would
+        // be able to record one requester while the row's run says another.
+        let requester = hold.run_id.clone();
+
+        let expiry = jarvis_core::ApprovalRequest::default_expiry(&SystemClock);
+        let approval = ApprovalId::new();
+        let request = new_approval_request(&hold, &requester, approval, expiry)?;
+        create_approval(&self.database, &request).await?;
+        hold.approval_id = approval.to_string();
+        Ok(hold)
     }
 
     /// Moves the call to `authorized` then `submitted`, runs the adapter, and records the outcome.
