@@ -55,11 +55,9 @@ use jarvis_core::{
 };
 use jarvis_storage::{
     CallBinding, CallOrigin, CallTarget, DatabaseError, NewRunEvent, NewToolCall, SecretStore,
-    SqliteDatabase, admit_tool_call, advance_tool_call, append_run_event, create_approval,
-    link_tool_call_approval, record_tool_outcome,
+    SqliteDatabase, StoredToolCall, admit_tool_call, advance_tool_call, append_run_event,
+    create_approval, find_approval, find_tool_call, link_tool_call_approval, record_tool_outcome,
 };
-#[cfg(test)]
-use jarvis_storage::{StoredToolCall, find_tool_call};
 use serde_json::Value;
 
 use crate::tool_actor::ToolActor;
@@ -197,6 +195,31 @@ pub enum ToolPipelineError {
     /// The adapter could not establish an outcome.
     #[error(transparent)]
     AdapterCall(#[from] AdapterError),
+    /// No call has the identifier a resume named.
+    ///
+    /// Distinct from [`Self::Storage`] because the caller's next step is different: an unknown call is a
+    /// wrong identifier, while a storage fault is a broken database. Reported as its own variant so a
+    /// caller is not told the database failed when it named a call that does not exist.
+    #[error("no tool call exists for the requested identifier: {call_id}")]
+    UnknownCall {
+        /// The identifier that was named.
+        call_id: String,
+    },
+    /// A resume was refused, and the reason names the check that fired.
+    ///
+    /// # Why one variant with a reason rather than five variants
+    ///
+    /// Unlike a policy refusal — where the reason code is a **stable contract** a client switches on — these
+    /// are programming-level answers whose full text is an internal explanation, not a wire value. One
+    /// variant keeps the arm count in a match low while the reason still names which check fired, and it is
+    /// deliberately not a stable code because nothing outside this crate branches on it.
+    #[error("the call {call_id} cannot be resumed: {reason}")]
+    ResumeRefused {
+        /// The call the resume named.
+        call_id: String,
+        /// Which check refused it, in words an operator can act on.
+        reason: &'static str,
+    },
     /// A stored identifier an approval needs could not be rebuilt.
     ///
     /// An approval records its workspace and run as typed identifiers, and a pipeline holds them as
@@ -419,6 +442,31 @@ const fn approval_strength(
         jarvis_tools::AuthenticationStrength::ChannelEvidence => Strength::ChannelEvidence,
         jarvis_tools::AuthenticationStrength::Credential => Strength::Credential,
         jarvis_tools::AuthenticationStrength::Present => Strength::Present,
+    }
+}
+
+/// Converts a stored approval's **demand** back into the tool vocabulary a receipt records.
+///
+/// # Why this is not `approval_strength` reversed by convention
+///
+/// `approval_strength` converts a channel's **ceiling** into the **observation** an approval records, which
+/// is the direction a hold travels. A resume travels the other way: the approval row holds an observation
+/// vocabulary value and the receipt it builds needs the tool vocabulary. The two functions are deliberately
+/// separate and separately exhaustive, because a single bidirectional helper would make it possible to pass
+/// the wrong direction and get a value that type-checks — the failure this pair exists to make impossible.
+///
+/// The wording is worth keeping straight: `P3-004` calls the approval's value a **demand** ("what a decision
+/// must prove") even though it is stored in the observation vocabulary, so the name here says what the
+/// receipt needs rather than reusing "ceiling", which would suggest the hold's direction.
+const fn receipt_strength(
+    required: jarvis_core::AuthenticationStrength,
+) -> jarvis_tools::AuthenticationStrength {
+    use jarvis_core::AuthenticationStrength as Strength;
+    match required {
+        Strength::Absent => jarvis_tools::AuthenticationStrength::Absent,
+        Strength::ChannelEvidence => jarvis_tools::AuthenticationStrength::ChannelEvidence,
+        Strength::Credential => jarvis_tools::AuthenticationStrength::Credential,
+        Strength::Present => jarvis_tools::AuthenticationStrength::Present,
     }
 }
 
@@ -754,6 +802,239 @@ impl ToolPipeline {
         // 6-7. Execute through the adapter and record what it established.
         self.execute_and_record(*prepared, tool, &definition, correlation_id)
             .await
+    }
+
+    /// Runs a **held** call that an approval has since approved, re-checking the decision before it runs.
+    ///
+    /// # What this closes
+    ///
+    /// `P3-012a` recorded a durable approval for a held call; `P3-012b` made that approval decidable and
+    /// `P3-016` linked the call to it. None of them re-drove the call, so an approved action sat at
+    /// `requested` with an authority nothing acted on — an approval that changes a row and nothing else.
+    /// This is the step that turns the decision into the effect the human authorized.
+    ///
+    /// # Why the arguments are supplied by the caller, and why that is not a hole
+    ///
+    /// `tool_calls` deliberately stores **no arguments** (`0007`): the intent digest is the binding and
+    /// storing the payload would put tool arguments into a durable record. So a resume does not read the
+    /// arguments back — it takes them from the caller and re-derives the digest over them, which is then
+    /// compared against the stored call's `intent_hash`. A caller that supplies different arguments is
+    /// **refused**, not run: the digest must match the one the approval was decided against. That makes the
+    /// absence of a stored payload safe rather than merely convenient, and the comparison is the control
+    /// rather than the argument itself.
+    ///
+    /// # The checks, and each one is an authority a caller cannot manufacture
+    ///
+    /// 1. the caller's run owns the call, so a call cannot be resumed by naming its identifier;
+    /// 2. the call is linked to an approval, so an unlinked call is never run under one;
+    /// 3. the approval **authorizes at this instant** — `authorizes_at`, which is false for a denial, a
+    ///    cancellation, a lapsed approval, and an undecided one. A denial therefore cannot be resumed by
+    ///    asking again, which is the confused-deputy refusal rather than a missing check;
+    /// 4. the approval's tool, version, and intent match the call's, so a decision about one action cannot
+    ///    release another;
+    /// 5. the call is **not already past authorization**. This is the duplicate-delivery guard: a resumed
+    ///    call that has reached `submitted` or a terminal outcome is **refused**, because running it again
+    ///    is how one effect becomes two.
+    ///
+    /// # The duplicate guard is two independent refusals, and the falsification run is what showed it
+    ///
+    /// Check 5 refuses a resume whose stored outcome is no longer `requested`. Underneath it,
+    /// `execute_and_record` advances the call to `authorized` and then `submitted` **before** it reaches the
+    /// adapter, and `record_tool_outcome` refuses to replace a terminal outcome — so removing check 5 was
+    /// measured to leave the route test **green**, with the adapter still reached exactly once, because the
+    /// transition table refuses the re-drive on its own.
+    ///
+    /// That is worth stating rather than quietly keeping both. Check 5 is not redundant *in general* — it
+    /// refuses before building a receipt for a call that has already run, which is the cheaper and clearer
+    /// answer — but its removal is **not** observable through the single-effect property, and a test written
+    /// as if it were would be claiming a guarantee two mechanisms are actually providing. The assertion that
+    /// carries the property is the adapter's own call **count**, which is why the route test asserts it
+    /// rather than only the statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError::ResumeRefused`] for any of the five refusals, naming which one fired, so
+    /// a caller learns whether it named a call it does not own, named an unlinked call, resumed a
+    /// non-authorized approval, supplied arguments the decision was not about, or asked twice.
+    ///
+    /// # This does not yet re-evaluate policy, and that is a recorded limit
+    ///
+    /// The approval was decided against the policy in force when the call was held. A resume does not
+    /// re-evaluate, so a policy tightened *after* a decision does not refuse a resume. Whether it should is a
+    /// real question — re-evaluating would make an approval lapse silently, not re-evaluating lets a decided
+    /// action run under a superseded policy — and it is deliberately **not** decided here. What *is* enforced
+    /// is that the approval has not lapsed, which is the time bound `P3-004` already commits to.
+    pub async fn resume(
+        &self,
+        call_id: &str,
+        arguments: Value,
+        actor: &ToolActor,
+        correlation_id: CorrelationId,
+    ) -> Result<ToolPipelineOutcome, ToolPipelineError> {
+        let stored = self.read_call(call_id).await?;
+
+        // 1. The caller's run must own the call. Checked against the **stored** row, so a caller cannot
+        //    resume a call by knowing its identifier.
+        if stored.run_id() != actor.run_id() {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the call belongs to a different run",
+            });
+        }
+
+        // 2. A call with no approval link is never run here. `P3-016` writes the link for every hold, so an
+        //    unlinked `requested` call is one whose hold predates that write — and resuming it would be
+        //    running an action under an authority nothing recorded.
+        let Some(approval_id) = stored.approval_id() else {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the call is not linked to an approval",
+            });
+        };
+        let approval = find_approval(&self.database, approval_id)
+            .await
+            .map_err(ToolPipelineError::Storage)?;
+
+        // 3. The time-and-outcome gate, in the domain. `authorizes_at` is false for a denial, a cancel, an
+        //    expiry, and an undecided approval, so a denial cannot be resumed and neither can a lapsed one.
+        let now = UtcTimestamp::now(&SystemClock);
+        if !approval.authorizes_at(now) {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the approval does not authorize at this instant",
+            });
+        }
+
+        // 4. The decision must be about **this** action. The tool and version are compared as stored text,
+        //    and the intent is recomputed from the supplied arguments so a caller cannot substitute a
+        //    different payload for the one that was decided.
+        if approval.tool() != stored.tool() || approval.tool_version() != stored.tool_version() {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the approval is for a different tool or version",
+            });
+        }
+        let intent = CanonicalIntentHash::compute(stored.tool(), stored.tool_version(), &arguments)
+            .map_err(|_| ToolPipelineError::UnintelligibleIntent {
+                tool: stored.tool().to_owned(),
+            })?;
+        if intent != approval.intent() || intent.to_hex() != stored.intent_hash() {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the arguments do not match the intent the approval decided",
+            });
+        }
+
+        // 5. The duplicate-delivery guard. A call that already passed `authorized` is refused: `requested`
+        //    is the only state a resume may act from, which is what stops a retried decision from becoming a
+        //    second effect. Checked on the **stored** outcome rather than a version, because the state is
+        //    the fact and a version could be bumped by an unrelated write.
+        if stored.outcome() != ToolOutcome::Requested {
+            return Err(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                reason: "the call has already been authorized or run",
+            });
+        }
+
+        // The receipt cites the decision. `AuthorizationReceipt::new` accepts a `RequireApproval` decision
+        // **only** when an approval is cited, which is why the citation is built from the stored row rather
+        // than restated: the approver and the expiry are facts about the decision, so a resume cannot invent
+        // them.
+        let decision = approval
+            .decision()
+            .ok_or(ToolPipelineError::ResumeRefused {
+                call_id: call_id.to_owned(),
+                // Unreachable: `authorizes_at` is false without a decision. Reported rather than unwrapped
+                // so a future change to `authorizes_at` cannot turn this into a panic.
+                reason: "the approval carries no decision",
+            })?;
+        let citation = jarvis_tools::ApprovalCitation {
+            approval_id: approval.id().to_string(),
+            approver_id: decision.approver_id().to_owned(),
+            approved_at: decision.decided_at(),
+            expires_at: approval.expires_at(),
+        };
+
+        let definition = self.definition_for(stored.tool())?;
+
+        // The decision the receipt derives from. It is **reconstructed** from the approval rather than
+        // re-evaluated, and the reason is the honest one: policy is a function of the request, and the
+        // request was evaluated when the call was held. Re-evaluating here would silently turn a policy
+        // edit into a refusal of something an operator already approved — the question this method's own
+        // limits section records as deliberately unsettled.
+        //
+        // The strength is converted through the existing ceiling/observation helper rather than mapped
+        // again here: `P3-004` keeps the two vocabularies one type apart, and a second conversion would be a
+        // second place for them to drift.
+        let decision = jarvis_tools::PolicyDecision::held_by_approval(
+            receipt_strength(approval.required_strength()),
+            approval.risk_level(),
+        );
+
+        let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
+            receipt_id: stored.id().to_owned(),
+            tool: ToolId::new(stored.tool())?,
+            tool_version: stored.tool_version().to_owned(),
+            arguments: arguments.clone(),
+            intent_hash: intent,
+            policy_version: stored.policy_version().to_owned(),
+            decision,
+            // The citation is what makes a `RequireApproval` decision acceptable to the constructor.
+            approval: Some(citation),
+            correlation_id,
+            issued_at: now,
+        })?;
+
+        let prepared = PreparedCall {
+            call_id: stored.id().to_owned(),
+            receipt,
+            // The key is **re-read from the stored row** rather than regenerated, so the adapter forwards
+            // the same key the original admission used. A fresh key would make a provider deduplicate
+            // nothing, which is the one thing the key exists for.
+            key: IdempotencyKey::parse(stored.idempotency_key())?,
+            arguments,
+            issued_at: now,
+        };
+
+        self.execute_and_record(prepared, stored.tool(), &definition, correlation_id)
+            .await
+    }
+
+    /// Reads one stored call, which is what a resume begins from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError::UnknownCall`] when no call has that identifier, so a caller learns it
+    /// named a call that does not exist rather than that something failed.
+    async fn read_call(&self, call_id: &str) -> Result<StoredToolCall, ToolPipelineError> {
+        find_tool_call(&self.database, call_id)
+            .await
+            .map_err(|error| match error {
+                DatabaseError::ToolCallNotFound => ToolPipelineError::UnknownCall {
+                    call_id: call_id.to_owned(),
+                },
+                other => ToolPipelineError::Storage(other),
+            })
+    }
+
+    /// Resolves a definition by identifier, reporting an unknown tool the way `call_tool` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError::UnknownTool`] when the registry does not hold it. Reachable here for a
+    /// call stored by a build that registered a tool this one does not — a profile whose MCP server was
+    /// removed between the hold and the decision — which is refused rather than run on a stale definition.
+    fn definition_for(
+        &self,
+        tool: &str,
+    ) -> Result<jarvis_tools::ToolDefinition, ToolPipelineError> {
+        let id = ToolId::new(tool)?;
+        self.registry
+            .get(&id)
+            .cloned()
+            .map_err(|_| ToolPipelineError::UnknownTool {
+                tool: tool.to_owned(),
+            })
     }
 
     /// Returns every registered definition, in the registry's stable order.

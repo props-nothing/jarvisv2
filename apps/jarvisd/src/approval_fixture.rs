@@ -21,7 +21,18 @@
 
 #![cfg(test)]
 
+use std::sync::Arc;
+
 use jarvis_tools::ToolDefinition;
+
+/// The refusing adapter, boxed as the pipeline takes it.
+///
+/// Offered as a function so a fixture does not have to know the `Arc<dyn ToolExecutor>` coercion, which is a
+/// detail of how the pipeline stores adapters rather than a fact about the fixture.
+#[must_use]
+pub fn approval_adapter() -> Arc<dyn jarvis_tools::ToolExecutor> {
+    Arc::new(ApprovalDeclaringAdapter::default())
+}
 
 /// The identifier the fixture tool registers under.
 ///
@@ -112,5 +123,53 @@ impl jarvis_tools::ToolExecutor for ApprovalDeclaringAdapter {
         Err(jarvis_tools::AdapterError::RefusedBeforeReaching {
             reason: "the approval fixture must never be reached".to_owned(),
         })
+    }
+}
+
+/// An adapter that **succeeds** and counts, for the resumed-call test.
+///
+/// # Why the refusal above is not reused
+///
+/// The hold fixture's adapter deliberately refuses, so a test can observe that a call *did not* run. A test
+/// about resumption needs the opposite: the call must be seen to run **exactly once**, which needs an
+/// adapter that reports success and a count that says how many times it was reached. A refusing adapter
+/// would make "the resume worked" and "the resume never reached the adapter" produce the same shape, so a
+/// test built on it could not tell the difference.
+///
+/// Separate from the other rather than a flag on it, for the same reason: one type that refuses and one that
+/// succeeds is two behaviours a reader can see, while a `succeed: bool` is a second statement of that
+/// distinction that could be set wrongly at a call site.
+#[derive(Default)]
+pub struct RecordingApprovalAdapter {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingApprovalAdapter {
+    /// Returns how many times the adapter was reached, which is the count a resume must leave at one.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl jarvis_tools::ToolExecutor for RecordingApprovalAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "approval-fixture-recording"
+    }
+
+    async fn execute(
+        &self,
+        _request: &jarvis_tools::ToolExecutionRequest,
+    ) -> Result<jarvis_tools::ToolCallResult, jarvis_tools::AdapterError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let record = jarvis_core::ToolOutcomeRecord::confirmed("approval-fixture:mcp/test")
+            .unwrap_or_else(|error| panic!("a confirmation must be constructible: {error}"));
+        Ok(jarvis_tools::ToolCallResult::new(
+            record,
+            jarvis_tools::ProviderEvidence::new("approval-fixture:mcp/test").ok(),
+            Some(jarvis_tools::BoundedOutput::truncating("the tool ran")),
+            jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+        ))
     }
 }

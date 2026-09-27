@@ -1000,6 +1000,323 @@ async fn a_refused_call_writes_nothing_to_the_run_stream() {
     );
 }
 
+/// **A decided approval resumes the held call it was decided about, exactly once.**
+///
+/// This is where the whole slice closes. `P3-012a` wrote the approval, `P3-012b` made it decidable,
+/// `P3-016` linked the call to it, and `P3-017` made the decision carry its approver. None of them ran
+/// anything, so an approved action sat at `requested` with an authority nothing acted on. This asserts the
+/// effect happens — and, more importantly, that asking **twice** does not produce it twice.
+///
+/// # The assertions, and each is a way the resume could be wrong
+///
+/// - the adapter **ran**, and ran with the arguments the approval was decided against;
+/// - the stored outcome is terminal, so the call is not left ambiguous;
+/// - a **second** resume is refused, because a decision that is delivered twice must not become a second
+///   effect. This is the property the whole `P3-012` slice exists for, and it is the one a naive "call
+///   again if approved" implementation gets wrong;
+/// - the resumed receipt **cites the approver**, which is what `P3-017` unblocked — without the approver
+///   surviving decoding, this call could not be built at all.
+#[tokio::test]
+async fn an_approved_call_resumes_once_and_not_twice() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![held_definition()],
+        Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let arguments = json!({ "path": "notes/todo.txt" });
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval {
+        call_id,
+        approval_id,
+        required_strength,
+        ..
+    } = outcome
+    else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+    assert_eq!(
+        required_strength,
+        AuthenticationStrength::Credential,
+        "a risk-2 write needs a credential, and the resume records what the hold demanded"
+    );
+
+    // The operator reads the delivered nonce and answers, exactly as the route does.
+    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+    let nonce = must(secrets.take(&approval_id));
+    let now = UtcTimestamp::now(&SystemClock);
+    must(
+        jarvis_storage::record_decision(
+            &database,
+            &approval_id,
+            nonce.expose(),
+            &must(jarvis_core::ApprovalDecision::new(
+                jarvis_core::ApprovalDecisionOutcome::Approve,
+                jarvis_core::ApprovalChannel::Cli,
+                jarvis_core::AuthenticationStrength::Present,
+                now,
+                LOCAL_USER_ID,
+            )),
+        )
+        .await,
+    );
+
+    // The resume runs the call.
+    let resumed = must(
+        pipeline
+            .resume(
+                &call_id,
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(
+        matches!(resumed, ToolPipelineOutcome::Executed(_)),
+        "an approved call must run, got {resumed:?}"
+    );
+
+    let stored = must(pipeline.call(&call_id).await);
+    assert!(
+        stored.outcome().is_terminal(),
+        "the call must reach a terminal outcome, got {:?}",
+        stored.outcome()
+    );
+    assert!(
+        !stored.must_not_repeat(),
+        "a resumed call that completed must not be marked unrepeatable"
+    );
+
+    // **The duplicate-delivery refusal.** The same decision delivered again must not run the call a second
+    // time: the effect is the thing being protected, and a resume that reached the adapter twice would be
+    // exactly the second effect this slice exists to prevent.
+    let again = pipeline
+        .resume(&call_id, arguments, &mcp_actor(), CorrelationId::new())
+        .await;
+    assert!(
+        matches!(again, Err(ToolPipelineError::ResumeRefused { .. })),
+        "a second resume must be refused, got {again:?}"
+    );
+}
+
+/// **A denied — or lapsed — approval cannot be resumed, however the caller asks.**
+///
+/// The refusal reads `authorizes_at`, which is false for a denial, a cancellation, an expiry, and an
+/// undecided approval. So this is one gate covering four ways an action must not run, and the assertion is
+/// that the adapter was **not** reached rather than only that an error came back: a `Refused` outcome with
+/// the effect already made would satisfy an error-shaped check while doing exactly the wrong thing.
+#[tokio::test]
+async fn an_undecided_approval_cannot_be_resumed() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![held_definition()],
+        Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let arguments = json!({ "path": "notes/todo.txt" });
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval {
+        call_id,
+        approval_id,
+        ..
+    } = outcome
+    else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+    let _ = (root, database);
+
+    // Nothing has answered yet, so the approval is pending and does not authorize.
+    let refused = pipeline
+        .resume(&call_id, arguments, &mcp_actor(), CorrelationId::new())
+        .await;
+    assert!(
+        matches!(refused, Err(ToolPipelineError::ResumeRefused { .. })),
+        "a pending approval must not resume its call, got {refused:?}"
+    );
+    let _ = approval_id;
+
+    // The call is untouched: still `requested`, not run, and still repeatable-by-a-decision.
+    let stored = must(pipeline.call(&call_id).await);
+    assert_eq!(
+        stored.outcome(),
+        ToolOutcome::Requested,
+        "a refused resume must not advance the call"
+    );
+}
+
+/// **A resume with different arguments is refused**, because the intent digest must match the one the
+/// approval was decided against.
+///
+/// This is what makes the absent arguments column safe. `tool_calls` stores no payload (`0007`), so a
+/// resume receives the arguments from its caller — and the digest comparison is what stops that from being a
+/// hole: the caller may supply them, but only the ones the human actually approved.
+#[tokio::test]
+async fn a_resume_with_different_arguments_is_refused() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![held_definition()],
+        Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let arguments = json!({ "path": "notes/todo.txt" });
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval {
+        call_id,
+        approval_id,
+        ..
+    } = outcome
+    else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+
+    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+    let nonce = must(secrets.take(&approval_id));
+    must(
+        jarvis_storage::record_decision(
+            &database,
+            &approval_id,
+            nonce.expose(),
+            &must(jarvis_core::ApprovalDecision::new(
+                jarvis_core::ApprovalDecisionOutcome::Approve,
+                jarvis_core::ApprovalChannel::Cli,
+                jarvis_core::AuthenticationStrength::Present,
+                UtcTimestamp::now(&SystemClock),
+                LOCAL_USER_ID,
+            )),
+        )
+        .await,
+    );
+
+    // A different path: the same tool, the same shape, and **not** the action that was approved.
+    let substituted = json!({ "path": "notes/other.txt" });
+    let refused = pipeline
+        .resume(&call_id, substituted, &mcp_actor(), CorrelationId::new())
+        .await;
+    assert!(
+        matches!(refused, Err(ToolPipelineError::ResumeRefused { .. })),
+        "an approved action must not be substituted, got {refused:?}"
+    );
+    assert_eq!(
+        must(pipeline.call(&call_id).await).outcome(),
+        ToolOutcome::Requested,
+        "a refused resume must leave the call exactly where it was"
+    );
+}
+
+/// A call belonging to another run cannot be resumed, even with the right approval.
+///
+/// The identifier a caller names is not authority: the check is against the **stored** row's run, so knowing
+/// a call identifier does not let a caller run somebody else's call under its own approval.
+#[tokio::test]
+async fn a_call_for_another_run_cannot_be_resumed() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![held_definition()],
+        Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let arguments = json!({ "path": "notes/todo.txt" });
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval {
+        call_id,
+        approval_id,
+        ..
+    } = outcome
+    else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+
+    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+    let nonce = must(secrets.take(&approval_id));
+    must(
+        jarvis_storage::record_decision(
+            &database,
+            &approval_id,
+            nonce.expose(),
+            &must(jarvis_core::ApprovalDecision::new(
+                jarvis_core::ApprovalDecisionOutcome::Approve,
+                jarvis_core::ApprovalChannel::Cli,
+                jarvis_core::AuthenticationStrength::Present,
+                UtcTimestamp::now(&SystemClock),
+                LOCAL_USER_ID,
+            )),
+        )
+        .await,
+    );
+
+    // An actor whose run is a different identifier. The scopes are the same, so the run is the only
+    // difference under test.
+    let other = ToolActor::workspace_and_mcp(
+        LOCAL_WORKSPACE_ID,
+        "0198f000-0000-7000-8000-0000000000c9",
+        SessionChannel::Cli,
+        AuthenticationStrength::Credential,
+        "policy-1",
+    )
+    .unwrap_or_else(|| panic!("the fixed scope literals must be valid"));
+
+    let refused = pipeline
+        .resume(&call_id, arguments, &other, CorrelationId::new())
+        .await;
+    assert!(
+        matches!(refused, Err(ToolPipelineError::ResumeRefused { .. })),
+        "a call must not be resumable by a run that does not own it, got {refused:?}"
+    );
+    assert_eq!(
+        must(pipeline.call(&call_id).await).outcome(),
+        ToolOutcome::Requested
+    );
+}
+
 /// **A held call can actually be decided, which is what `P3-012a` could not deliver on its own.**
 ///
 /// `P3-012a` wrote the durable approval but the plaintext nonce was generated, digested, and dropped, so

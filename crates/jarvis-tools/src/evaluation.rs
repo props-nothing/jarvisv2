@@ -580,6 +580,47 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
+    /// Rebuilds the held decision a **decided** approval corresponds to, for a resumed call.
+    ///
+    /// # Why this exists, and why it is `held` rather than `allow`
+    ///
+    /// A resumed call builds an `AuthorizationReceipt` that cites the approval, and the receipt's own
+    /// constructor accepts a `RequireApproval` decision **only** when an approval is cited. So the decision
+    /// recorded in the receipt is the held one, and the citation is what makes it authorizing — which is
+    /// exactly the shape `P3-006a` established: an authority is not a decision that a human approved, it is
+    /// a decision **plus the approval that released it**.
+    ///
+    /// # Why the risk is taken rather than recomputed
+    ///
+    /// It is the risk the decision was **decided at**, read from the approval row. Recomputing it from the
+    /// tool definition would give the risk in force *now*, which is a different claim: an operator approved
+    /// an action at the risk it presented, and a receipt citing a later risk would be citing a posture
+    /// nobody reviewed.
+    ///
+    /// # Why there is no reason code
+    ///
+    /// The held decision carried one — *why* the call was held. That reason is in the approval's own row and
+    /// in the run event that announced the hold; reproducing it here would be a second copy of a fact the
+    /// caller already has, and this value exists to carry the authority rather than the explanation.
+    ///
+    /// # Why the strength is required rather than optional
+    ///
+    /// A held decision always has one — `evaluate` sets it on every `RequireApproval` — so taking it as an
+    /// `Option` would let a caller build a held decision that says "an approval is needed" while leaving
+    /// unspecified *how strongly it must be proven*, which is the one thing a resume must not lose. The
+    /// stored level is mapped through `Risk::from_level` and falls back to `High`, which is the **strongest**
+    /// posture: a row this build cannot read fails toward more scrutiny rather than less.
+    #[must_use]
+    pub fn held_by_approval(required_strength: AuthenticationStrength, risk_level: u8) -> Self {
+        Self {
+            decision: Decision::RequireApproval,
+            reason: None,
+            effective_risk: Risk::from_level(risk_level).unwrap_or(Risk::High),
+            required_strength: Some(required_strength),
+            escalated_by: Vec::new(),
+        }
+    }
+
     /// Returns the outcome.
     #[must_use]
     pub const fn decision(&self) -> Decision {

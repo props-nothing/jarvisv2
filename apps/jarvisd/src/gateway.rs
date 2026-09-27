@@ -72,7 +72,7 @@ pub struct GatewayState {
     executor: Option<Arc<crate::executor::Executor>>,
     /// The composed tool pipeline, when workspace roots were granted.
     ///
-    /// `None` means no tool is registered at all, so there is nothing to call — which is deliberately
+    /// `None` means no tool is registered at all, so there is nothing to call â€” which is deliberately
     /// different from a pipeline with no roots, because the latter would offer a tool that fails every
     /// call (`docs/adr/0020-filesystem-confinement-is-a-handle.md`).
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
@@ -138,6 +138,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/events", get(read_events))
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
         .route("/tools/{tool}/calls", post(call_tool))
+        .route("/calls/{id}/resume", post(resume_call))
         .route("/approvals/{id}/decision", post(decide_approval));
 
     Router::new()
@@ -252,7 +253,7 @@ async fn start_run(
 /// Only two fields, and both are the caller's to choose: **which stored run** the call is attributed
 /// to, and what to pass the tool. The workspace, the actor's scopes, and the authentication strength
 /// are **not** here, because a client that could name its own workspace or grant could widen its own
-/// authority — `docs/architecture/identity-and-workspaces.md` requires access to follow from
+/// authority â€” `docs/architecture/identity-and-workspaces.md` requires access to follow from
 /// authentication rather than from a client-supplied identifier.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -291,7 +292,7 @@ async fn call_tool(
     };
 
     // The run the call is attributed to. A tool call belongs to a run, and the caller names it rather
-    // than the daemon inventing one — but the *workspace* comes from the run's stored row, so a caller
+    // than the daemon inventing one â€” but the *workspace* comes from the run's stored row, so a caller
     // cannot attribute a call to a workspace the run is not in.
     let run = match state.runs.read(&request.run_id).await {
         Ok(run) => run,
@@ -300,7 +301,7 @@ async fn call_tool(
 
     // The actor holds **both** tool areas' scopes, because this transport serves whichever tools the daemon
     // composed: a filesystem tool when roots are granted, an MCP tool when servers are configured. The scope
-    // set is still derived here rather than accepted from the request, which is the rule that matters — a
+    // set is still derived here rather than accepted from the request, which is the rule that matters â€” a
     // caller cannot name a scope, so it cannot widen its own authority.
     //
     // The construction is checked rather than unwrapped: a rejected literal is an authoring error, and the
@@ -368,6 +369,147 @@ async fn call_tool(
     }
 }
 
+/// Request body for `POST /api/v1/calls/{id}/resume`.
+///
+/// # Why this is a separate document from `ToolCallRequest`
+///
+/// A resume is not a second call. It names an **existing** call rather than a tool, and the arguments it
+/// carries are not a request to run something â€” they are the payload the resumed call must still match,
+/// which is why a different set is refused rather than run. Making it a field on `ToolCallRequest` would
+/// put "call this tool" and "continue the call a human already approved" in one body, and a client that
+/// sent the wrong one would get a refusal whose reason it could not tell from a policy denial.
+///
+/// There is no `run_id` field, and that is deliberate: the call row already records its run, and the resume
+/// checks the caller's run against the **stored** value, so a caller that could name a run here would be
+/// naming the authority this checks.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeCallRequest {
+    /// The arguments, which must hash to the intent the approval decided.
+    pub arguments: serde_json::Value,
+}
+
+/// `POST /api/v1/calls/{id}/resume`
+///
+/// The route that turns a decided approval into the effect the human authorized. `P3-018` built the
+/// pipeline method and this makes it reachable, which is the same reason `P3-007` added the tool-call
+/// route: a composition nothing can call is a composition nobody has exercised.
+///
+/// # The actor is derived exactly as the tool-call route derives it
+///
+/// Same workspace source, same scope set, same channel. A resume is not a privileged path â€” it runs under
+/// the identical authority a fresh call would, and the only thing it adds is the approval it must cite.
+///
+/// # What comes from the request, and what does not
+///
+/// The **arguments** do, because `tool_calls` deliberately stores no payload (`0007`) and the digest
+/// comparison is what makes supplying them safe. The **run** does not: it comes from the stored run the
+/// path's call belongs to, so a caller cannot attribute a resume to another run. Everything else â€” the
+/// approval, its approver, its expiry, the retry key, the policy version â€” is read from rows the daemon
+/// wrote.
+async fn resume_call(
+    State(state): State<GatewayState>,
+    Path(call_id): Path<String>,
+    Json(body): Json<ResumeCallRequest>,
+) -> Response {
+    let Some(tools) = state.tools() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no tool is registered, so no call can be resumed",
+        );
+    };
+
+    // The run comes from the **call's own row**, not from the request. Reading it first also makes an
+    // unknown call a `404` before any authority is derived, so a caller cannot probe for call identifiers
+    // by watching which ones produce a policy answer.
+    let stored = match jarvis_storage::find_tool_call(state.database(), &call_id).await {
+        Ok(stored) => stored,
+        Err(jarvis_storage::DatabaseError::ToolCallNotFound) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                ErrorCode::Validation,
+                "no tool call exists for the requested identifier",
+            );
+        }
+        Err(error) => {
+            // The source is not echoed: a database error's text can name a path.
+            let _ = error;
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Internal,
+                "the local database is not available",
+            );
+        }
+    };
+
+    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+        stored.workspace_id().to_owned(),
+        stored.run_id().to_owned(),
+        jarvis_core::SessionChannel::Cli,
+        jarvis_tools::AuthenticationStrength::Credential,
+        "policy-1",
+    ) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "the tool actor could not be built: a fixed scope literal was rejected",
+        );
+    };
+
+    match tools
+        .resume(
+            &call_id,
+            body.arguments,
+            &actor,
+            jarvis_core::CorrelationId::new(),
+        )
+        .await
+    {
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::Executed(result)) => {
+            (StatusCode::OK, Json(tool_call_reply(&result))).into_response()
+        }
+        // A resumed call cannot be held again: the approval is what released it. Reaching `AwaitingApproval`
+        // here would mean a second approval for one action, so it is reported as a fault rather than
+        // dressed up as `202`.
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::AwaitingApproval { .. }) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "a resumed call was held again, which is not a state a resume can produce",
+        ),
+        Ok(crate::tool_pipeline::ToolPipelineOutcome::Refused { reason_code }) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "state": "refused",
+                "reason_code": reason_code,
+            })),
+        )
+            .into_response(),
+        // Every refusal here is about **whether this call may run**, not about how the request is shaped.
+        // The database source is never echoed, so the message is a fixed phrase: the reasons name which
+        // check fired, and none of them can be manufactured into an oracle about another run's call.
+        Err(crate::tool_pipeline::ToolPipelineError::ResumeRefused { reason, .. }) => {
+            error_response(StatusCode::CONFLICT, ErrorCode::Conflict, reason)
+        }
+        Err(crate::tool_pipeline::ToolPipelineError::UnknownCall { .. }) => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no tool call exists for the requested identifier",
+        ),
+        Err(error) => {
+            // Not `Display`ed to the client: a storage fault's text can name a path, and a receipt fault can
+            // carry a digest. It is **logged** though, because a fixed phrase with nothing behind it makes a
+            // real failure indistinguishable from a misconfiguration on the operator's side.
+            tracing::warn!(call_id = %call_id, error = %error, "a call could not be resumed");
+            error_response(
+                StatusCode::CONFLICT,
+                ErrorCode::Validation,
+                "the call could not be resumed",
+            )
+        }
+    }
+}
+
 /// `POST /api/v1/approvals/{id}/decision`
 ///
 /// # The three things this handler deliberately does not take from the request
@@ -381,7 +523,7 @@ async fn call_tool(
 ///
 /// # The order, and why the nonce is taken last
 ///
-/// The approval is read first so an unknown identifier is a `404` that never reaches the nonce file —
+/// The approval is read first so an unknown identifier is a `404` that never reaches the nonce file â€”
 /// otherwise a caller could distinguish "no such approval" from "wrong nonce" only by whether a file was
 /// consumed. Then the nonce is taken, then the decision is recorded. A failure between the take and the
 /// record leaves the approval undecidable, which is `ADR-0042`'s chosen failure direction and is
@@ -425,7 +567,7 @@ async fn read_run(State(state): State<GatewayState>, Path(id): Path<String>) -> 
 /// `POST /api/v1/runs/{id}/cancel`
 ///
 /// Takes no body. Cancellation is operator intent and carries no expectation, so there is no version to
-/// supply — see `RunService::cancel`.
+/// supply â€” see `RunService::cancel`.
 async fn cancel_run(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
     match state.runs.cancel(&id).await {
         Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
@@ -861,7 +1003,7 @@ mod tests {
     ///
     /// This replaces a test that asserted a stale version was refused. That field is gone: the
     /// executor advances a running run's version as it walks the state machine, so a client's version
-    /// is stale almost immediately and the request was refused with a conflict it could not resolve —
+    /// is stale almost immediately and the request was refused with a conflict it could not resolve â€”
     /// the user asked to stop a run and was told the run had changed. See
     /// `jarvis_storage::request_run_cancellation`.
     ///
@@ -927,7 +1069,7 @@ mod tests {
 
     /// Cancelling a run that has already settled is refused.
     ///
-    /// **Proved at the storage layer, not here**, because the gateway has no route that settles a run —
+    /// **Proved at the storage layer, not here**, because the gateway has no route that settles a run â€”
     /// settlement is the executor's `settle_run` and there is no HTTP path to it, so a gateway test
     /// would have to fabricate one. `jarvis_storage::run_repository`'s
     /// `cancelling_a_settled_run_is_refused` covers the guard where it lives, which is where a stale
@@ -1135,8 +1277,8 @@ mod tests {
     /// run to attribute tool calls to.
     ///
     /// A **real** `ToolPipeline` over a real temporary directory, not a stand-in: the claims under
-    /// test are about what the route does with a request — which workspace it uses and which fields
-    /// it accepts — and a double would decide those itself, which is the thing to be checked.
+    /// test are about what the route does with a request â€” which workspace it uses and which fields
+    /// it accepts â€” and a double would decide those itself, which is the thing to be checked.
     async fn tool_router() -> (Router, String, TempProfile, String) {
         let profile = TempProfile::new();
         let root = profile.0.join("workspace");
@@ -1242,7 +1384,7 @@ mod tests {
         );
 
         // Widening attempt one: name a workspace of the caller's choosing. `deny_unknown_fields` means
-        // this is refused by the decoder rather than silently ignored — an ignored field reads as an
+        // this is refused by the decoder rather than silently ignored â€” an ignored field reads as an
         // accepted one, which is how a client comes to believe it set something.
         let named = Request::builder()
             .uri(format!("/api/v1/tools/{}/calls", jarvis_tools::READ_TOOL))
@@ -1288,7 +1430,7 @@ mod tests {
         );
 
         // Widening attempt three: escape the granted root. The status is `200`, because a `Failed`
-        // outcome is a **correct answer** to a request that was understood — ADR-0020's fifth rule puts
+        // outcome is a **correct answer** to a request that was understood â€” ADR-0020's fifth rule puts
         // a refused path in the outcome rather than in a transport error. So the assertion is on the
         // outcome and on the absence of content, NOT on the status: asserting "not 2xx" here would pass
         // for a route that returned a body, which is the confusion `P3-005` exists to remove.
@@ -1379,7 +1521,34 @@ mod tests {
     ///
     /// The nonce is read straight out of the profile's private store, because that is what an operator's
     /// client does. Nothing in this fixture can obtain it from a response, which is `ADR-0042`'s point.
-    async fn approval_router() -> (Router, String, TempProfile, String, String) {
+    async fn approval_router() -> (
+        Router,
+        String,
+        TempProfile,
+        String,
+        String,
+        Arc<SqliteDatabase>,
+    ) {
+        approval_router_with(crate::approval_fixture::approval_adapter()).await
+    }
+
+    /// The same fixture over a chosen adapter, so a test about **resumption** can observe the call running.
+    ///
+    /// The default fixture's adapter refuses, which is what makes "the held call did not run" observable.
+    /// A resume test needs the opposite observation, so it supplies an adapter that succeeds and counts —
+    /// and the choice is a parameter rather than a second fixture, because everything else about the setup
+    /// (the profile, the root grant, the pipeline, the held call, the delivered nonce) has to be **identical**
+    /// for the two tests to be about the same thing.
+    async fn approval_router_with(
+        adapter: Arc<dyn jarvis_tools::ToolExecutor>,
+    ) -> (
+        Router,
+        String,
+        TempProfile,
+        String,
+        String,
+        Arc<SqliteDatabase>,
+    ) {
         let profile = TempProfile::new();
         let directory = profile.0.join("workspace");
         std::fs::create_dir_all(&directory)
@@ -1401,7 +1570,7 @@ mod tests {
         // The hold is produced by a tool that **declares** `ApprovalPolicy::Ask` at risk 0, so the hold
         // comes from the tool's own declaration rather than from a workspace threshold the fixture
         // invented. That is a posture a real MCP server can carry, and it holds regardless of the default
-        // workspace policy — which is what makes this fixture's hold stable rather than a coincidence of
+        // workspace policy â€” which is what makes this fixture's hold stable rather than a coincidence of
         // the policy defaults.
         let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
             Arc::clone(&database),
@@ -1409,8 +1578,7 @@ mod tests {
             jarvis_tools::WorkspacePolicy::default(),
             vec![(
                 vec![crate::approval_fixture::approval_declaring_definition()],
-                Arc::new(crate::approval_fixture::ApprovalDeclaringAdapter::default())
-                    as Arc<dyn jarvis_tools::ToolExecutor>,
+                adapter,
             )],
             secrets.clone(),
         )
@@ -1435,7 +1603,7 @@ mod tests {
 
         // A held call needs a tool that declares an approval. The filesystem adapter is read-only and
         // auto-allowed, so the hold is produced by an MCP-namespaced tool declaring `ApprovalPolicy::Ask`
-        // — a posture an operator can genuinely configure.
+        // â€” a posture an operator can genuinely configure.
         let held = app
             .clone()
             .oneshot(tool_call_request(
@@ -1459,7 +1627,7 @@ mod tests {
             .unwrap_or_else(|| panic!("a hold must carry its approval id: {held_body}"))
             .to_owned();
 
-        // The nonce is read the way an operator's client reads it — straight from the file — and
+        // The nonce is read the way an operator's client reads it â€” straight from the file â€” and
         // **deliberately not** through `SecretStore::take`, because `take` is the daemon's consuming read.
         // A fixture that took it would leave nothing for the route to consume, which is a property of the
         // store working rather than of the route failing.
@@ -1467,7 +1635,7 @@ mod tests {
             std::fs::read_to_string(profile.0.join("state").join("approvals").join(&approval_id))
                 .unwrap_or_else(|error| panic!("read the delivered nonce: {error}"));
 
-        (app, presented, profile, approval_id, nonce)
+        (app, presented, profile, approval_id, nonce, database)
     }
 
     /// Posts an approval decision.
@@ -1483,6 +1651,15 @@ mod tests {
         )
     }
 
+    /// Posts a call resumption.
+    fn resume_request(presented: &str, call_id: &str, body: &serde_json::Value) -> Request<Body> {
+        post_json(
+            &format!("/api/v1/calls/{call_id}/resume"),
+            presented,
+            &body.to_string(),
+        )
+    }
+
     /// **The route that makes a delivered nonce usable: an operator decides a held approval.**
     ///
     /// `P3-012a` wrote the approval and `P3-012b` delivered its nonce, and neither made the decision
@@ -1491,11 +1668,11 @@ mod tests {
     /// of the identical request is refused rather than recording a second decision.
     ///
     /// The replay is the important one. Without a consumed nonce, the second request would be accepted
-    /// and — depending on the store — could overwrite the first decision. `record_decision` already
+    /// and â€” depending on the store â€” could overwrite the first decision. `record_decision` already
     /// refuses an already-decided row; this asserts the *route* does not defeat it.
     #[tokio::test]
     async fn an_operator_can_decide_a_held_approval_exactly_once() {
-        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
 
         let approved = app
             .clone()
@@ -1538,7 +1715,7 @@ mod tests {
     /// only the second one cannot be filled in by a caller that misreads the documentation.
     #[tokio::test]
     async fn a_decision_cannot_name_its_own_approver() {
-        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
 
         let response = app
             .oneshot(decision_request(
@@ -1558,6 +1735,117 @@ mod tests {
             "an unknown field must be refused rather than ignored, because an ignored field reads as an \
              accepted one"
         );
+    }
+
+    /// **The whole path over the wire: hold, decide, resume â€” and resume only once.**
+    ///
+    /// This is the end-to-end property `P3-012` exists for, exercised through the real routes rather than
+    /// through the pipeline: a client asks for an action, a human answers, and the effect happens **exactly
+    /// once** however many times the resumption is delivered.
+    ///
+    /// The duplicate is the important half. A resumed call that reached the adapter twice would be the
+    /// second effect a duplicate decision must never produce, and the refusal has to be observable as a
+    /// status rather than only as an internal state change â€” a client that cannot tell "already done" from
+    /// "done now" will retry, which is how a duplicate delivery becomes a duplicate effect.
+    #[tokio::test]
+    async fn an_approved_call_resumes_exactly_once_over_the_wire() {
+        // The recording adapter, because this test must observe the call **run**: the refusing fixture
+        // adapter would make "the resume worked" and "the resume never reached an adapter" produce the same
+        // shape, so a duplicate-delivery assertion built on it could not tell the difference.
+        //
+        // The handle is kept so the count can be asserted, which is the claim that actually matters: the
+        // statuses show the *route* refused the second attempt, while the counter shows the **effect**
+        // happened once.
+        let adapter =
+            std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let (app, presented, _profile, approval_id, nonce, database) =
+            approval_router_with(adapter.clone()).await;
+
+        // The held call, decided by an operator.
+        let decided = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(decided.status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&body_text(decided).await)
+            .unwrap_or_else(|error| panic!("decode decision: {error}"));
+        let run_id = reply["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a decision must name its run: {reply}"))
+            .to_owned();
+
+        // The call held for that run, read from the database rather than from a response, because the
+        // resume route names a call and the hold's reply is what a client would have kept.
+        let calls = jarvis_storage::read_run_tool_calls(&database, &run_id)
+            .await
+            .unwrap_or_else(|error| panic!("read the run's calls: {error}"));
+        let call_id = calls.first().map_or_else(
+            || panic!("the fixture must have held one call"),
+            |call| call.id().to_owned(),
+        );
+
+        let resumed = app
+            .clone()
+            .oneshot(resume_request(
+                &presented,
+                &call_id,
+                &serde_json::json!({ "arguments": { "path": "notes.txt" } }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            resumed.status(),
+            StatusCode::OK,
+            "an approved call must run: {}",
+            body_text(resumed).await
+        );
+
+        // The same resumption again. `409`, because the call has already been authorized â€” the answer a
+        // client needs in order to know the effect is not repeated.
+        let again = app
+            .oneshot(resume_request(
+                &presented,
+                &call_id,
+                &serde_json::json!({ "arguments": { "path": "notes.txt" } }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            again.status(),
+            StatusCode::CONFLICT,
+            "a second resume must be refused: {}",
+            body_text(again).await
+        );
+
+        // **The effect happened once**, asserted on the adapter's own counter rather than on the statuses.
+        // A route that returned `409` after already re-running the call would satisfy every assertion above
+        // while producing exactly the second effect this exists to prevent.
+        assert_eq!(
+            adapter.calls(),
+            1,
+            "the tool must be reached exactly once across both resumptions"
+        );
+    }
+
+    /// A resume for an identifier that is not a call is a `404`.
+    #[tokio::test]
+    async fn a_resume_for_an_unknown_call_is_not_found() {
+        let (app, presented, _profile) = test_router().await;
+
+        let response = app
+            .oneshot(resume_request(
+                &presented,
+                "0198f000-0000-7000-8000-0000000000ff",
+                &serde_json::json!({ "arguments": {} }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A decision for an identifier that is not an approval is a `404` **before** the nonce store is
@@ -1584,17 +1872,17 @@ mod tests {
     ///
     /// This is the property that separates "the nonce is a credential" from "the nonce is a one-shot
     /// token the daemon burns on contact". The domain refuses *after* the digest matches, so a mistyped or
-    /// copied-wrong value must not cost the operator the approval — otherwise a typo becomes a fresh tool
+    /// copied-wrong value must not cost the operator the approval â€” otherwise a typo becomes a fresh tool
     /// call, which is exactly how an approval flow gets routed around.
     ///
     /// It also pins the delivery-channel decision: the daemon verifies what the **caller presents** rather
     /// than consuming the file it delivered. If the route took the nonce from the file, the first request
     /// below would *succeed* and this assertion could not tell the difference between "verified" and
-    /// "took whatever was on disk" — the two would be indistinguishable because the file's value is
+    /// "took whatever was on disk" â€” the two would be indistinguishable because the file's value is
     /// always the right one.
     #[tokio::test]
     async fn a_wrong_nonce_is_refused_and_the_delivered_nonce_still_decides() {
-        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
 
         let forged = app
             .clone()
