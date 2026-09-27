@@ -3,6 +3,7 @@
 mod config;
 mod credential;
 mod database;
+mod embedding_repository;
 mod identity_repository;
 mod inspect;
 mod memory_repository;
@@ -29,6 +30,10 @@ pub use credential::{CREDENTIAL_FILE_NAME, CredentialStore, CredentialStoreError
 pub use database::{
     CURRENT_SCHEMA_VERSION, DEFAULT_DATABASE_FILENAME, DaemonInstanceStart, DaemonStopReason,
     DatabaseError, SqliteDatabase,
+};
+pub use embedding_repository::{
+    DEFAULT_INDEXED_DIMENSIONS, EmbeddingError, MAX_SIMILARITY_RESULTS, NewMemoryEmbedding,
+    SimilarMemory, SimilarityQuery, index_ddl, record_memory_embedding, search_similar,
 };
 pub use identity_repository::{
     LOCAL_USER_ID, LOCAL_WORKSPACE_ID, LocalIdentity, load_local_identity,

@@ -20,7 +20,7 @@ toml.workspace = true
 [dev-dependencies]
 jarvis-protocol.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "rt-multi-thread"] }
 
 [lints]
 workspace = true

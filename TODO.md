@@ -2557,57 +2557,104 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings` over the workspace, 45 suites with the application binaries present and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1` (**1210 tests, 0 failed, 0 ignored**), all three phase gates with
       `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
-- [ ] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.
-      **PARTIAL — the pgvector boundary is built and tested; the backend is not. `P4-009` is not complete.**
-      `crates/jarvis-storage/src/pgvector.rs` (10 tests) + `docs/research/integrations/postgres-pgvector.md` +
-      `ADR-0051`. `jarvis-storage` 177 tests (up from 167).
-      **What is done:** the pgvector text codec with a bit-exact round trip, the three distance metrics paired
-      with their index operator classes, the distance-to-similarity conversion `jarvis_core::retrieval`
-      scores, `is_indexable`, and a named refusal for an embedding above the indexed dimension cap.
-      **What is NOT done, and why "parity" is not claimed:** no `memory_embeddings` table; no repository
-      function that reads or writes a vector; no `CREATE EXTENSION` or `CREATE INDEX` DDL; no Postgres
-      migration; no SQLx `postgres` feature; no server-mode composition; **no test against a live server.**
-      **⭐ The research record decided the code, and four findings are load-bearing.**
-      (1) **SQLx 0.9.0 has no `vector` type mapping** — verified against the driver's own type table, which
-      lists `bool`, the integers, `f32`/`f64`, strings, `BYTEA`, `UUID`, `JSON`/`JSONB`, `TIMESTAMPTZ` and no
-      vector type of any kind. A hand-written text codec is therefore unavoidable, and it is the part that can
-      be wrong without a server noticing.
-      (2) **pgvector indexes a `vector` column only up to 2,000 dimensions** while *storing* up to 16,000, and
-      JARVIS's own `EmbeddingDimensions::MAX` is **16,384** — eight times the indexed cap. So a
-      JARVIS-valid embedding can be storable-but-unindexable, which is a retrieval that silently stops being
-      a search. Refused by name, with the documented alternatives (`halfvec` to 4,000, binary quantization,
-      subvector indexing, dimensionality reduction) in the message.
-      (3) **The query shape decides whether the index is used at all.** "The `ORDER BY` must be the result of a
-      distance operator (not an expression) in ascending order", and the README's own counter-example is
-      `ORDER BY 1 - (embedding <=> q) DESC` — which is exactly how a caller naturally writes cosine
-      *similarity*. So the module names the operator and the operator class **together**, because the README
-      also requires an index per distance function and a metric without its index is an exact scan that looks
-      like a working search.
-      (4) **`<#>` is the negative inner product**, "since Postgres only supports `ASC` order index scans on
-      operators" — so a caller reading a stored value as a similarity would rank **backwards** while every
-      type checked. `ascending_is_closer` is a named predicate for that reason, even though it is currently
-      constant for all three metrics.
-      **⭐ The codec crosses an adapter boundary as plain data, and that is forced rather than chosen.**
-      `repository-layout.md`'s graph allows adapters to depend on `jarvis-core` and `jarvis-protocol` and
-      **not on each other**; `jarvis-storage` and `jarvis-models` are both adapters, so the codec takes
-      `&[f32]` and returns `Vec<f32>` instead of `EmbeddingVector`. The composition root maps between them —
-      the same rule `ADR-0047` applied inside the provider boundary.
-      **⭐ The round trip is asserted by bit pattern, and the documented form is asserted literally.**
-      `-0.0 == 0.0`, so a value comparison cannot see a sign lost by the text form; `1.0 / 3.0` and
-      `f32::MIN_POSITIVE` are what a fixed-decimal formatter fails. And a round trip alone cannot distinguish
-      a correct form from a self-consistent wrong one, so `encode(&[1.0, 2.0, 3.0]) == "[1,2,3]"` is asserted
-      against the README's own example.
-      **Falsified, one guard each:** with the dimension cap check removed, `encode` accepted 2,001 dimensions
-      and the guard failed (two tests); with the **encode-side** finite check removed,
-      `encode(&[1.0, f32::NAN])` returned `Ok("[1,NaN]")` — because `NaN` **formats successfully**, so a
-      read-only guard would let this platform write a row it cannot read and the write would look like it
-      worked. Both restored, green.
-      **Recorded as limits:** the extension is never installed or detected, so the failure a migration sees
-      when it is missing is an unresolved question; no `hnsw.ef_search` tuning, so a filtered query returns
-      fewer rows than requested by documented default; no iterative index scans; no workspace partitioning, so
-      the README's cross-tenant recall note applies to a multi-workspace deployment; and the codec's
-      `DistanceMetric::Euclidean` conversion is documented as an **ordering** rather than a similarity, because
-      Euclidean distance has no similarity in the ranking's units.
+- [x] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.
+      **DONE. The backend exists, was measured against a live server, and its limits are recorded.**
+      `crates/jarvis-storage/migrations/postgres/0001_memory_embeddings.sql` +
+      `crates/jarvis-storage/src/embedding_repository.rs` (+`embedding_tests.rs`, 9 tests) +
+      `crates/jarvis-storage/tests/postgres_embeddings.rs` (14 live tests) + the SQLx `postgres` feature +
+      `docs/research/integrations/postgres-pgvector.md`'s "Live-Server Findings". `ADR-0053` (the backend) and
+      `ADR-0051` (the text codec, which this slice reuses unchanged).
+      **`jarvis-storage` 191 tests** (up from 182), **47 suites, 1252 workspace tests, 0 failed, 0 ignored.**
+      **The codec's own findings, from `ADR-0051` and unchanged here.** SQLx 0.9.0 has **no `vector` type
+      mapping** — verified against the driver's own type table — so the value crosses as a text literal and
+      `pgvector.rs` is the code that has to be right. The round trip is asserted **by bit pattern** (`-0.0 ==
+      0.0` is true, so a value comparison cannot see a sign lost in the text form) **and** against the
+      documented form literally (`encode(&[1.0, 2.0, 3.0]) == "[1,2,3]"`), because a round trip alone cannot
+      tell a correct form from a self-consistent wrong one. **Falsified:** with the dimension cap removed
+      `encode` accepted 2,001 dimensions; with the **encode-side** finite check removed
+      `encode(&[1.0, f32::NAN])` returned `Ok("[1,NaN]")`, because `NaN` **formats successfully** and
+      `"NaN".parse::<f32>()` **succeeds** — so a read-only guard would let this platform **write a row it
+      cannot read**. **A guard on one side of a codec is not a guard on the pair.** The codec takes `&[f32]`
+      rather than `EmbeddingVector` because `repository-layout.md` forbids an adapter-to-adapter edge and
+      `jarvis-storage` and `jarvis-models` are both adapters.
+      **⭐ This slice closed because the ENVIRONMENT changed, and the change is worth recording.** `P4-009`
+      was partial because Docker Desktop was installed but **its daemon was not running** and no `psql` or
+      Postgres service existed — so the live-server tests could not run and the slice honestly stayed open.
+      Starting the daemon (`Docker Desktop.exe`, ~45 s) made `pgvector/pgvector:pg17` available:
+      **PostgreSQL 17.11, vector 0.8.6** — the exact version the research record had selected. **A blocked
+      slice can be blocked by a daemon, not by a decision**, and the fix was to try the thing that was
+      assumed unavailable.
+      **⭐ The README does not mention the finding the schema depends on.** A cast-expression HNSW index
+      **without a predicate** over an unconstrained `vector` column creates successfully and then **refuses
+      every insert at any other dimension** (`expected 1536 dimensions, not 3`). Measured: a table of
+      1536-dimension rows became **entirely uninsertable**. Adding `WHERE vector_dims(embedding) = 1536`
+      fixes it, because a partial index only covers rows matching its predicate: **3-, 4-, 1536-, 2000- and
+      16001-dimension vectors then all stored in one column**, and the query still produced
+      `Index Scan using ...` — the plan a fixed `vector(1536)` column gets. So the predicate is load-bearing
+      in the index **and** in the query, and the control test shows what it earns: the same query without the
+      predicate does not name the index at all.
+      **⭐ Three more measured facts the documentation does not state plainly.** (1) `vector(n) <=> other(m)`
+      across widths is an **error** (`different vector dimensions 1536 and 3`), not an empty result, so the
+      cast in the query is not an optimisation. (2) All three distance operators return **`double
+      precision`**, not `real` — binding the distance as `f32` **rounds rather than failing**, so
+      `SimilarMemory::distance` is `f64` and the one narrowing happens at the retrieval boundary. (3) A row
+      declaring `dimensions = 1536` while holding a 3-component vector **inserted cleanly**, and adding the
+      constraint afterwards failed *on that row*; `vector_dims` is `IMMUTABLE` (verified in `pg_proc`), which
+      is what makes it legal in the CHECK and in the index predicate.
+      **⭐ A defect this slice found in ITSELF, via a live test.** The first migration bounded `dimensions` to
+      **16,000** (pgvector's *storage* cap) while `pgvector::encode` refuses above **2,000** (the *index*
+      cap) — so the schema allowed 2,001..16,000, a range **no code path can produce**, and a direct insert
+      there would create a row the partial index cannot cover. The live test that tried to store a
+      2,001-dimension vector is what surfaced it. Both bounds are now 2,000, and an offline test asserts the
+      migration does not contain the storage-cap clause. **A bound nothing can reach reads as capability
+      while being an unverified claim — and the two caps belong to different things, so "the server accepts
+      it" was never the question.**
+      **⭐ The live tests skip without a server and can be made to fail.** `ACCEPTANCE_POSTGRES_URL` supplies
+      the connection; **`ACCEPTANCE_REQUIRE_POSTGRES=1`** turns the absence into a failure naming the
+      `docker run` that fixes it — the same shape as `ACCEPTANCE_REQUIRE_FIXTURE_PEER` and
+      `ACCEPTANCE_REQUIRE_BINARIES`. **Both directions falsified:** no server and no variable → 14 tests pass
+      by skipping; no server and the variable set → the run fails with an actionable message. Each live test
+      gets **its own schema** (cargo runs integration tests in parallel) and **keeps `public` on the search
+      path** — measured: a path holding only the scratch schema made the migration fail with
+      `type "vector" does not exist` while the extension was installed in `public`, because an extension
+      lives in a schema.
+      **⭐ The migration is verified by executing it, not by reading it.** The live test applies the embedded
+      file and then reads `pg_indexes` for the index definition, asserting `USING hnsw`, `vector_cosine_ops`
+      and the `WHERE (vector_dims(embedding) = 1536)` clause. **What the server built is the evidence, not the
+      text that asked for it.**
+      **Metadata guard, asserted with a positive control:** four rows identical as vectors and differing in
+      exactly one metadata field each (model, normalization, workspace, dimension). The comparable row must be
+      found, or the refusals prove nothing.
+      **⭐ The SQLx `postgres` feature cost, measured before enabling.** `sqlx-postgres` was **already in the
+      lock file**; the feature adds `hmac 0.13`, `md-5 0.11`, `stringprep 0.1.5`, `whoami 2.1.3` and a
+      **second `sha2` (0.11.0)** beside the pinned 0.10.9 — `cargo tree --invert sha2@0.11.0` names
+      `sqlx-postgres` as the only consumer. `cargo deny` → advisories, bans, licenses, sources **all ok**; the
+      duplicate is policy `warn`, as the pre-existing eight are. `tls-*` stays **off** deliberately: a
+      networked TLS server mode is `requirements.md`'s multi-device story and no record covers its
+      authentication, so a plaintext **loopback** connection is the only one this slice can justify.
+      **Every `sqlx` statement that must interpolate is `AssertSqlSafe`-wrapped, and the compiler refuses it
+      otherwise.** An operator is a token and `vector(1536)` is a *type* in a cast, so neither can be a
+      placeholder; `sqlx` 0.9 rejects a `format!`-built statement with "dynamic SQL strings should be audited"
+      and `AssertSqlSafe` is the assertion that gets past it. The audit: `operator()` returns one of three
+      fixed tokens from an enum match and `dimensions` is an `i64` from a shared helper, so neither can carry
+      a quote or a statement separator, and every caller-supplied value is bound.
+      **Recorded as limits:** the extension is **not trusted** (`pg_available_extension_versions.trusted =
+      false`), so `CREATE EXTENSION` needs a superuser and an incapable role fails there — with the downstream
+      symptom `type "vector" does not exist`, which does not say an extension is missing, and no pre-flight
+      check gives a better message. **No server-mode composition**: nothing in `apps/jarvisd` opens a
+      `PgPool`, so this repository has **no production caller**. No migration of existing SQLite data, no
+      `memories`/`entities` tables in PostgreSQL, and **no foreign key** from `memory_embeddings.memory_id`
+      (a `REFERENCES` naming a table nobody creates would fail for a reason unrelated to embeddings).
+      **`hnsw.ef_search` is left at its default (40)** and measured as a real recall bound: a 10%-selective
+      filter over 400 rows returned at most 40. **One index per width is hand-managed** — `index_ddl` makes
+      the second correct-by-construction, but nothing calls it when a new model appears and nothing detects a
+      width whose rows are unindexed. **`Normalization` is not recomputed**, only stored and required to
+      match. **No `halfvec`, binary quantization, subvector indexing or dimensionality reduction**, so a
+      model returning more than 2,000 dimensions cannot be used at all — the refusal names all four.
+      Gates: fmt, clippy `-D warnings` over the workspace `--all-targets --all-features --locked`, 47 suites
+      with the application binaries present and `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, the Postgres suite with
+      `ACCEPTANCE_POSTGRES_URL` and `ACCEPTANCE_REQUIRE_POSTGRES=1`, all four phase gates with
+      `ACCEPTANCE_REQUIRE_BINARIES=1`, and `cargo deny check` ok.
 - [x] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.
       `tests/e2e/tests/phase4_gate.rs` (2 process-level cases) + `crates/jarvis-storage/src/workspace_repository.rs`
       (+`workspace_tests.rs`, 5 tests) + `jarvis_storage::record_workspace` + the entity guards in

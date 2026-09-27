@@ -130,14 +130,21 @@ where the knowledge lives.
   the feature would enable code no test exercises and no binary calls — a dependency present without a
   measured requirement, which `AGENTS.md` forbids. The `sqlx` workspace dependency carries only
   `macros`, `migrate`, `runtime-tokio`, and `sqlite-bundled`.
-- **No test verifies against a live server.** Docker is installed on this machine but its daemon is not
-  running, and no PostgreSQL service or `psql` client exists. The verification plan in the research record
-  names the server-backed tests; they are **not run**, and no test claims a server it did not have. This is
-  the honest limit of the slice and is recorded in `TODO.md` as such.
-- **The `pgvector` extension is not installed or detected by any migration**, because no Postgres migration
-  exists. The research record lists the failure a migration sees when the extension is missing as an
-  unresolved question.
-- **Recorded limits.** No `memory_embeddings` table. No repository function for a vector read or write. No
-  `CREATE EXTENSION` or `CREATE INDEX` DDL. No `hnsw.ef_search` tuning, so a filtered query returns fewer
-  rows than requested and that is the documented default rather than a defect. No iterative index scans. No
-  workspace partitioning, so the README's cross-tenant recall note applies to a multi-workspace deployment.
+- ~~**No test verifies against a live server.**~~ **CLOSED by `ADR-0053`.** The reason given here was that
+  Docker was installed but its daemon was not running. That was true, and the daemon was what blocked the
+  slice: starting it made `pgvector/pgvector:pg17` available (PostgreSQL 17.11, vector 0.8.6 — the version
+  this record selected), and `crates/jarvis-storage/tests/postgres_embeddings.rs` now runs 14 tests against
+  it. **A slice can be blocked by a daemon rather than by a decision**, and this limit was recorded as
+  environmental rather than as unavailable work — which is why it was the first thing to retry.
+- ~~**The `pgvector` extension is not installed or detected by any migration**, because no Postgres migration
+  exists.~~ **CLOSED by `ADR-0053`**, with a measured refinement: the migration runs
+  `CREATE EXTENSION IF NOT EXISTS vector`, and the extension is **not trusted**
+  (`pg_available_extension_versions.trusted = false`), so a role without superuser fails there — and the
+  downstream symptom is `type "vector" does not exist`, which does not name the extension. `CREATE EXTENSION`
+  **inside a transaction** was verified to work, which is what lets `sqlx::migrate!` carry it.
+- **Recorded limits**, with what `ADR-0053` closed: ~~No `memory_embeddings` table. No repository function for
+  a vector read or write. No `CREATE EXTENSION` or `CREATE INDEX` DDL.~~ **all three now exist and are
+  measured against a live server.** Still open: **no `hnsw.ef_search` tuning**, so a filtered query returns
+  fewer rows than requested — now *measured* rather than quoted, since a 10%-selective filter over 400 rows
+  returned at most 40. No iterative index scans. No workspace partitioning, so the README's cross-tenant
+  recall note applies to a multi-workspace deployment — and the index is created per width, not per workspace.

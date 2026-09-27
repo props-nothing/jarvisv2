@@ -111,7 +111,15 @@ serde_json = "1.0.151"
 # assembly optimizations nor `oid`, `zeroize`, or `sha2-asm`.
 # See docs/research/integrations/sha2-intent-hashing.md.
 sha2 = { version = "=0.10.9", default-features = false }
-sqlx = { version = "=0.9.0", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite-bundled"] }
+# `postgres` is enabled for `P4-009`: the server-backed backend needs the driver, and it now has a
+# **measured requirement** rather than a planned one, because the memory-embedding repository and its
+# tests run against a real pgvector server (the probes recorded in
+# docs/research/integrations/postgres-pgvector.md were run against `pgvector/pgvector:pg17`, extension
+# 0.8.6). `sqlx-postgres` was already in the lock file, so nothing new is *pinned* — the feature only
+# compiles what was already resolved. Note `tls-*` stays off: a server mode that talks TLS is
+# `docs/product/requirements.md`'s multi-device story, which no record covers yet, so a plaintext
+# loopback connection is the only one this slice can justify.
+sqlx = { version = "=0.9.0", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite-bundled", "postgres"] }
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["serde", "serde-well-known"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt"] }

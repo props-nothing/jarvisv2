@@ -1,9 +1,9 @@
 ---
 integration: postgres-pgvector
-status: researched
+status: implemented
 last_verified: 2026-09-27
 owners: [storage]
-selected_spec_version: pgvector 0.8.6; PostgreSQL 13+ (pgvector's supported range)
+selected_spec_version: pgvector 0.8.6; PostgreSQL 13+ (pgvector's supported range), verified on 17
 selected_sdk: SQLx 0.9.0 (feature `postgres`)
 ---
 
@@ -252,3 +252,137 @@ is the Postgres host's, not the extension's; pgvector is open source and free.
 | Date | Versions checked | Relevant change or no-change evidence | Researcher |
 | --- | --- | --- | --- |
 | 2026-09-27 | pgvector 0.8.6 (2026-07-29); SQLx 0.9.0; Postgres 13-18 per Docker tags | First record. pgvector 0.8.7 is unreleased. **SQLx 0.9.0 has no `vector` type mapping** (verified against the driver's type table), so a text encoder is required. Indexed `vector` capped at 2,000 dimensions while JARVIS allows 16,384. `ORDER BY 1 - (v <=> q) DESC` does not use the index. | storage |
+| 2026-09-27 | **Live: `pgvector/pgvector:pg17`, PostgreSQL 17.11, vector `0.8.6`** | **Implementation-time probes; several corrected or sharpened the claims above. See "Live-Server Findings" below.** | storage |
+
+## Live-Server Findings
+
+Everything below was **executed** against `pgvector/pgvector:pg17` (PostgreSQL 17.11, vector 0.8.6) while
+implementing `P4-009`. The record above is what the documentation says; this section is what the server does.
+Four of these changed the implementation, and two could not have been learned from the README.
+
+### 1. A cast-expression index WITHOUT a predicate makes the column uninsertable at any other width
+
+This is the finding the schema depends on, and the README does not mention it.
+
+```sql
+CREATE TABLE t (embedding vector);                                    -- no fixed width
+CREATE INDEX ON t USING hnsw ((embedding::vector(1536)) vector_cosine_ops);  -- NO predicate
+INSERT INTO t VALUES ('[1,2,3]');
+--> ERROR:  expected 1536 dimensions, not 3
+```
+
+The cast is evaluated on **write**, so the index claims every row regardless of its dimension. Measured
+consequence: a table of 1,536-dimension rows became **entirely uninsertable** at any other width. Adding a
+predicate fixes it:
+
+```sql
+CREATE INDEX ON t USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
+  WHERE vector_dims(embedding) = 1536;
+```
+
+A partial index covers only rows matching its predicate, so a row of another dimension is not a row this
+index has an opinion about. Measured afterwards: **3-, 4-, 1536-, 2001- and 16000-dimension vectors all
+inserted into the same column**, and the nearest-neighbour query still produced
+`Index Scan using ...` — the same plan a fixed `vector(1536)` column gets. The query must state the predicate
+too, because a planner can only use a partial index when it can prove the query's rows satisfy it.
+
+### 2. `vector(n)` ERRORS on a foreign-dimension query rather than returning nothing
+
+`SELECT ... ORDER BY embedding <=> '[0.5,0.5,0.5]'` against a column holding 1,536-dimension vectors:
+
+```
+ERROR:  different vector dimensions 1536 and 3
+```
+
+So the query must cast to a fixed width, and the cast is not an optimisation: without it a search at a width
+nobody stored fails at the server rather than returning no neighbours. (With the cast
+`embedding::vector(1536) <=> $1::vector(1536)`, and the `vector_dims` predicate, a differently-sized query
+vector is a well-formed query that finds nothing — which is the correct outcome.)
+
+### 3. The three distance operators return `double precision`, not `real`
+
+```
+cosine_type      | ip_type          | l2_type
+-----------------+------------------+------------------
+double precision | double precision | double precision
+```
+
+The stored *components* are `real` (that is what a `vector` column holds), but the **distance** is computed
+in double precision. Binding it as `f32` does not fail — it rounds — which is the class of defect that reads
+as a slightly different number rather than as an error. `SimilarMemory::distance` is therefore `f64`, and the
+single narrowing to `f32` happens at the retrieval boundary in the composition root.
+
+### 4. `dimensions` and `vector_dims(embedding)` can disagree, and `vector_dims` is valid in a CHECK
+
+A row declaring `dimensions = 1536` while holding a 3-component vector **inserted cleanly**; adding
+`CHECK (vector_dims(embedding) = dimensions)` afterwards failed *on that row*. `vector_dims` is
+`IMMUTABLE` (`pg_proc.provolatile = 'i'`), which is why it is legal in a CHECK and in a partial-index
+predicate. `migrations/postgres/0001_memory_embeddings.sql` therefore ties the two columns, so a reader that
+compares them to decide comparability is not reading a column that can lie.
+
+### 5. Both dimension caps, measured
+
+| Declaration | Result |
+| --- | --- |
+| `vector(16000)` | accepted |
+| `vector(16001)` | `ERROR: dimensions for type vector cannot exceed 16000` |
+| `vector(16384)` (the domain's `EmbeddingDimensions::MAX`) | refused by the same error |
+| inserting a 16,001-value vector | `ERROR: vector cannot have more than 16000 dimensions` |
+| `hnsw` over `vector(2000)` | accepted |
+| `hnsw` over `vector(2001)` | `ERROR: column cannot have more than 2000 dimensions for hnsw index` |
+
+So the domain's 16,384 maximum is **above pgvector's storage cap as well as its index cap** — the gap is
+wider than the record first stated. The table's `dimensions` CHECK bounds to **2,000** (the index cap) rather
+than 16,000 (the storage cap), because `jarvis_storage::pgvector::encode` already refuses to write a vector
+the index cannot cover: a bound of 16,000 would describe a capability no code path can exercise.
+
+### 6. The extension is not trusted, and `CREATE EXTENSION` works inside a transaction
+
+`pg_available_extension_versions`: `superuser = true`, **`trusted = false`**. So `CREATE EXTENSION vector`
+needs a superuser or a preinstalled extension, and a deployment whose role cannot install it fails there.
+Downstream the symptom is `type "vector" does not exist` for every `vector` column, which does **not** say an
+extension is missing — answering open question 5 partially: the failure is visible but not self-explanatory.
+
+`BEGIN; CREATE EXTENSION IF NOT EXISTS vector; COMMIT` **succeeded**, so `sqlx::migrate!` (which wraps each
+migration in a transaction) can carry the statement. `IF NOT EXISTS` makes a repeat a `NOTICE`.
+
+Also measured, and it shaped the test harness rather than the product: with `search_path` set to a scratch
+schema only, the migration failed with `type "vector" does not exist at line 270` **while the extension was
+installed in `public`**. An extension lives in a schema, so a scratch schema's search path must retain
+`public`.
+
+### 7. The metadata-guarded query uses the index, and the filters appear as `Filter:`
+
+```
+Limit
+  ->  Index Scan using memory_embeddings_embedding_hnsw on memory_embeddings
+        Order By: ((embedding)::vector(1536) <=> $1::vector(1536))
+        Filter: ((workspace_id = 'workspace-a'::text) AND (provider = 'openai'::text) AND
+                 (model = 'text-embedding-3-small'::text) AND (model_version = '2024-02-01'::text) AND
+                 (normalization = 'normalized'::text))
+```
+
+All six guards — workspace, provider, model, model_version, normalization and the dimension predicate —
+leave the index in use. The `Filter:` line **is** the documented post-scan filtering, and it is why a
+selective filter returns fewer rows than `LIMIT`. A B-tree index on
+`(workspace_id, provider, model, model_version)` is created alongside, which is the README's own remedy for
+low-selectivity filter conditions.
+
+### 8. The control that shows where the index comes from
+
+The same query **without** the `vector_dims` predicate does not name the index in its plan at all, while the
+predicated form produces `Index Scan`. That is the measurement behind "the predicate is load-bearing in the
+index *and* in the query", and it is asserted by `the_query_uses_the_index_because_of_the_predicate`.
+
+### Effect on the record's unresolved questions
+
+- **Q1 (a JARVIS-valid dimension between 2,001 and 16,384)** — *answered for now*: refused by
+  `pgvector::encode`, and the table's CHECK agrees. Storing one would be a row that is never indexed.
+- **Q2 (which Postgres major)** — still open; the probes used 17.
+- **Q3 (`hnsw.ef_search`) — still open**, and measured as a real effect: a 10%-selective filter on 400 rows
+  returned at most 40. Nothing sets it.
+- **Q4 (server-mode authentication over a network)** — still open, and the reason the SQLx `tls-*` features
+  stay off; the implementation was verified over loopback only.
+- **Q5 (how is a missing extension detected)** — *partially answered*: the migration installs it, and the
+  extension is not trusted, so a non-superuser deployment fails at `CREATE EXTENSION` rather than later. A
+  pre-flight check that produces a better message is still unbuilt.
