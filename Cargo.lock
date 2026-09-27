@@ -1185,6 +1185,7 @@ dependencies = [
 name = "jarvis-cli"
 version = "0.1.0"
 dependencies = [
+ "jarvis-connectors",
  "jarvis-core",
  "jarvis-diagnostics",
  "jarvis-observability",

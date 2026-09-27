@@ -1307,7 +1307,15 @@ fn validate_secret_fields(fields: &[SecretField]) -> Result<(), ConnectorError> 
 }
 
 /// Validates the compatibility declaration.
-fn validate_compatibility(compatibility: &CompatibilityStatus) -> Result<(), ConnectorError> {
+/// Validates a compatibility claim.
+///
+/// `pub(crate)` rather than private because the scaffold generator checks a proposed minimum version through
+/// it, so the `major.minor.patch` rule and the floor against [`MIN_SUPPORTED_JARVIS_VERSION`] exist in one
+/// place. A scaffold that re-implemented the parse would be the second implementation of a rule a manifest is
+/// actually built with.
+pub(crate) fn validate_compatibility(
+    compatibility: &CompatibilityStatus,
+) -> Result<(), ConnectorError> {
     let minimum = &compatibility.minimum_jarvis_version;
     let parts: Vec<&str> = minimum.split('.').collect();
     if parts.len() != 3

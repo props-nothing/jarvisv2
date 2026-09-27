@@ -61,6 +61,8 @@ mod diagnostics;
 mod health;
 mod manifest;
 mod ratelimit;
+mod readiness;
+mod scaffold;
 mod token;
 mod webhook;
 
@@ -90,15 +92,26 @@ pub use health::{
     ProbeOutcome, ReauthReason,
 };
 pub use manifest::{
-    AuthMethodDeclaration, Classification, CompatibilityStatus, ConnectorError, ConnectorId,
-    ConnectorManifest, ConnectorOperation, ConnectorVersion, DataResidency, DocumentationLinks,
-    LinkKind, MAX_CONNECTOR_OPERATION_ID_CHARS, MAX_CONNECTOR_OPERATIONS, MAX_CONNECTOR_SCOPES,
-    MAX_CONNECTOR_SECRET_FIELDS, MAX_MANIFEST_LINKS, MIN_SUPPORTED_JARVIS_VERSION, ResearchRecord,
-    SecretField, ToolEffect, WebhookSupport,
+    AuthMethodDeclaration, Classification, CompatibilityStatus, CompatibilityVerdict,
+    ConnectorError, ConnectorId, ConnectorManifest, ConnectorOperation, ConnectorVersion,
+    DataResidency, DocumentationLinks, LinkKind, MAX_CONNECTOR_OPERATION_ID_CHARS,
+    MAX_CONNECTOR_OPERATIONS, MAX_CONNECTOR_SCOPES, MAX_CONNECTOR_SECRET_FIELDS,
+    MAX_MANIFEST_LINKS, MIN_SUPPORTED_JARVIS_VERSION, ProviderIdempotency, ResearchRecord,
+    ResidencyVerification, SecretField, SecretKind, ToolEffect, WebhookSupport,
 };
 pub use ratelimit::{
     BudgetOutcome, MAX_RATE_LIMIT_BURST, MAX_RATE_LIMIT_PER_WINDOW, MAX_RETRY_AFTER_SECONDS,
     RateLimit, RateLimitError, RateLimitScope, RetryClass, RetryDecision, RetryGuidance,
+};
+pub use readiness::{
+    ALL_ITEMS, Attestation, EvidencePath, EvidenceStrength, LiveSmokeTest,
+    MAX_ATTESTATION_PURPOSE_CHARS, MAX_ATTESTED_TESTS, MAX_EVIDENCE_PATH_CHARS,
+    ReadinessAssessment, ReadinessError, ReadinessGap, ReadinessItem, ReadinessReview,
+    describe_live_smoke,
+};
+pub use scaffold::{
+    MAX_SCAFFOLD_NAME_CHARS, SCAFFOLD_VERSION, Scaffold, ScaffoldError, ScaffoldRequest,
+    proposed_research_path,
 };
 pub use token::{
     BEARER_TOKEN_TYPE, MAX_ACCESS_TOKEN_SECONDS, MAX_TOKEN_TYPE_CHARS, RefreshExchange,
@@ -107,6 +120,6 @@ pub use token::{
 };
 pub use webhook::{
     MAX_REPLAY_WINDOW_SECONDS, MAX_SIGNATURE_HEADER_CHARS, MAX_TIMESTAMP_SKEW_SECONDS,
-    ReplayWindow, SignatureAlgorithm, SignatureError, SignatureScheme, WebhookBinding,
-    WebhookDelivery, WebhookRejection,
+    ReplayWindow, SignatureAlgorithm, SignatureEncoding, SignatureError, SignatureScheme,
+    WebhookBinding, WebhookDelivery, WebhookRejection,
 };

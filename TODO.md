@@ -2872,7 +2872,96 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       is on the roadmap. No automatic token-request retry, by design. No `localhost`, and no flag to enable it.
       `AuthError::RandomUnavailable`'s branch is **untestable here** (the platform source does not fail on
       demand), so it is verified by reading.
-- [ ] `P5-003` Create connector quality checklist and scaffold generator modeled on manifest-driven integration projects.
+- [x] `P5-003` Create connector quality checklist and scaffold generator modeled on manifest-driven integration projects.
+      **New modules `readiness` + `scaffold`** in `jarvis-connectors` (24 tests, so **140 in the crate**), and a
+      **`jarvis connector` verb group** in `jarvis-cli` (`new`, `check`, `items`). `ADR-0056`.
+      **49 suites, 1393 tests, 0 failed, 0 ignored** (was 49/1368). The lock delta is one line — `jarvis-cli`
+      depending on a crate already in the workspace — so **no package joined the tree**.
+      - **The checklist is a program, not a Markdown file, and the reason is `AGENTS.md`'s hardest-won rule:** a
+        recorded claim is read downstream as *verified evidence* with nothing distinguishing "checked" from
+        "assumed". A prose gate is read once and then trusted. `docs/architecture/tools-and-connectors.md`'s
+        "Connector Completion Gate" is the checklist; this evaluates it.
+      - **Every item is one of four evidence kinds, and the kind is reported.** 3 `Derived` (inside the manifest,
+        so it cannot be asserted falsely), 3 `DeclaredArtifact` (a path, shape-checked), 5 `DeclaredCount` (a
+        number), 1 `Conditional` (refusable, with a reason). A gate that printed a uniform "ok" would hide that
+        **nine of twelve rest on the author's word and three on the manifest** — so the counts are asserted in a
+        test and `jarvis connector items` prints the kind beside each item.
+      - **⭐ THE SLICE'S CENTRAL DEFECT: the two webhook items were classified as `Derived` from the manifest.**
+        That conflates **applicability** with **evidence**: *does this connector need webhook tests* is a
+        manifest fact, but *does it have them* is not, and a manifest declaring `hmac_sha256` proves nothing was
+        tested. The gate would have reported a push connector **complete** with no signature or replay test —
+        exactly the condition `WebhookRejection` exists to make visible. The test asserting a push connector
+        without those suites still reports them as gaps is what caught it (`got []` for the two expected).
+        `applies_to` and `evidence` are now separate questions with separate answers.
+      - **⭐ A SECOND DEFECT ONLY RUNNING THE COMMAND COULD FIND: the sidecar path.** The first version used
+        `Path::with_extension("readiness.json")`, which replaces only the **last** extension, so
+        `vendor.manifest.json` gave `vendor.manifest.readiness.json` while `connector new` writes
+        `vendor.readiness.json`. The documented workflow produced a connector whose every declared item silently
+        became a gap. **No unit test could have caught it** — both sides were "correct" against the same wrong
+        assumption and disagreed only when the two verbs ran in sequence. Now one `sidecar_path` function with
+        a regression test, so the writer and the reader share a rule.
+      - **⭐ A THIRD: an unreachable refusal inside `EvidencePath`.** A separate `chars().nth(1) == Some(':')`
+        drive-prefix branch, commented "a colon is legal later in a path on unix", **could never fire** because
+        the next check refuses a colon *anywhere*. An unreachable refusal reads as protection while enforcing
+        nothing — the defect `P5-001` recorded for an unreachable bound, found here **by mutation** rather than
+        by reading. Removed.
+      - **Applicability is derived and a wrong attestation is REFUSED, not dropped.** `applies_to(&WebhookSupport)`
+        omits a non-applying item from the review *and* refuses an attestation naming it
+        (`NotApplicable`), because a silent drop hides that the author is working from a template rather than
+        from their own connector.
+      - **A `ReadinessReview` exists only when the items are satisfied**, so "is this complete" is answered by
+        whether the value exists (`ADR-0037`'s and `ADR-0055`'s move). `gaps` is the complement and names
+        **every** outstanding item at once rather than refusing at the first.
+      - **Each declared kind has a shape, and the wrong shape is an error.** Artifact ⇒ path, no count; suite ⇒
+        count ≥1, no path (`None` and `Some(0)` are different claims — "not reported" vs "there are none");
+        every item ⇒ a purpose; `covers_failure` ⇒ meaningful for **one** item and refused elsewhere, because a
+        caller that set it believed it said something; onboarding **must** report failure coverage, since the
+        document says "successful **and** failed".
+      - **`EvidencePath` checks shape, not existence, and its doc says so.** It refuses empty/whitespace-padded,
+        absolute, home-relative, `..`, a colon, an unknown extension, and >512 chars — and **cannot** prove a
+        file exists, because this crate has no filesystem. The honest claim is "a path that *could* name a
+        repository artifact", and that limitation is in the type's own docs.
+      - **The conditionally-refused item carries its reason in the type.** `LiveSmokeTest` is
+        `Present { path, gate }` or `Absent { reason }` and **both** constructors refuse a blank string, so the
+        rule lives where the value is built. `ReadinessAssessment` carries the **strength explicitly** rather
+        than letting a reader infer it from `declared_by.is_some()` — the conditional item's `declared_by` is
+        `None`, so the first version made a stated *reason* indistinguishable from a manifest fact.
+      - **The scaffold is generated from the manifest's own constructor**, so it **cannot be stale** — a
+        committed template drifts the moment `ConnectorManifest` gains a field, and the failure surfaces far
+        from the template. It refuses to invent three things: operations (empty, because `ConnectorManifest::new`
+        refuses an empty list, so the skeleton is **deliberately invalid**), auth methods/secret fields/links
+        (vendor facts), and the research date (**`--research-date` is required**, because defaulting it would put
+        a real date in `last_verified` on a record whose every section is blank — a stub that looks verified).
+      - **The skeleton is provably not a manifest**: it carries `_comment` keys and
+        `deny_unknown_fields` refuses it. The test asserts the refusal, every field name, the emptiness of the
+        four collections, the classification's starting level (`confidential`, since `ADR-0054` refuses below it
+        for an outward operation), and that **every non-field key starts with `_comment` and is non-trivial**.
+      - **The skeleton is built with `serde_json::json!`, and the first version was a `format!` template that
+        produced invalid JSON** — its comments quote JSON examples, so their quotes needed escaping and were not.
+        A hand-written template that must quote a document inside itself is a defect waiting for an edit.
+      - **The two verbs are local, and that is a property of the subject**: a manifest and a research record are
+        repository artifacts reviewed in a pull request, so putting them behind the daemon would mean starting a
+        service to write a file the service must read back. `check` exits `DoctorWarnings` (6) rather than a
+        failure code, because an unfinished connector is normal work in progress.
+      - The attestations live in a **sidecar** (`<connector>.readiness.json`), not in the manifest, because
+        `deny_unknown_fields` would make a readiness section part of the document an operator reads to decide
+        whether to grant access — and evidence about tests is not a fact about authority.
+      **All 21 guards falsified A-B-A.** Three findings beyond the defects above: **two tests were insensitive to
+      their mutation and the fix was the assertion, not the mutant** (the skeleton test accepted *any*
+      unknown-field refusal, so renaming a `_comment` key to `note` still failed to deserialize and the test
+      passed); **two probes were written from a guess** rather than read from the file (a four-line formatted
+      refusal; the JSON `"_comment"` string); and **a harness bug produced a uniform false negative** —
+      `cargo test -p a -p b <filter>` treats `<filter>` as another `-p` pattern, so the first run reported
+      "vacuous" for all 21 cases because **no test ran**. A harness that runs nothing reports success-shaped
+      output, which is precisely what the A-B-A design exposed.
+      **A `--force` flag the usage string promised but the program did not have was found while writing the ADR
+      and fixed rather than recorded** — a one-line correction is cheaper than a documented inconsistency.
+      **Limits:** **nothing consumes the review** — no connector exists, no daemon reads a sidecar, and no CI job
+      runs `connector check`. `EvidencePath` **cannot prove a file exists**, so a connector can pass while
+      naming three artifacts that do not. **Nine of twelve items rest on the author's word**, and the counts are
+      **not compared against anything** — nothing runs a suite and checks the number. The scaffold writes two
+      documents and nothing else (no crate, no test scaffolding, no registry entry). `check` reads one manifest
+      at a time and has no notion of a connector repository.
 - [ ] `P5-004` Research Google identity, Gmail, Calendar, push notifications, quotas, and restricted scopes; record findings.
 - [ ] `P5-005` Implement Google connection setup and Gmail/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.

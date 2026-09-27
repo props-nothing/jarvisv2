@@ -73,3 +73,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0053](0053-pgvector-indexes-a-partial-cast-expression.md) | pgvector indexes a partial cast expression, and the vector's width is a capability | Accepted |
 | [0054](0054-a-connector-is-described-before-it-is-trusted.md) | A connector is described before it is trusted, and its declarations are checked against each other | Accepted |
 | [0055](0055-the-authorization-transaction-is-consumable-once.md) | The authorization transaction is consumable once, and the redirect cannot be anywhere but loopback | Accepted |
+| [0056](0056-a-checklist-is-evidence-of-a-kind.md) | A checklist item is evidence of a kind, and a scaffold refuses to invent what it cannot know | Accepted |

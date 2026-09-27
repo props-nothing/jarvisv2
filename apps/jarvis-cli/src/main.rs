@@ -11,6 +11,7 @@
 
 mod api_client;
 mod chat;
+mod connector;
 mod memory;
 mod output;
 
@@ -47,6 +48,7 @@ async fn main() -> ExitCode {
         Some("chat") => chat(&arguments).await,
         Some("logs") => logs(&arguments),
         Some("memory") => memory_command(&arguments).await,
+        Some("connector") => connector::run(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
         Some(other) => {
@@ -63,7 +65,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
