@@ -3074,6 +3074,55 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     received but unverified; nothing is callable, because no `ToolDefinition` is derived from the operation ids;
     and **no token has been exchanged**, so `token_endpoint` and `revocation_endpoint` are transcribed and
     asserted but never used.
+  - **This round added the provider's decisions and the documented directory shape.**
+    `crates/jarvis-connectors/src/google/` is now `mod.rs` (the contract), `client.rs` (the provider's
+    decisions), `tests.rs` and `client_tests.rs` (16 new tests, so **181 in the crate**), which is
+    `repository-layout.md`'s integration shape. **`ADR-0058`.**
+  - **The decisions are pure functions of a response, because this crate has no HTTP stack** — and that is the
+    point rather than an accident. `classify` maps a status and reason to a `RetryDecision`; `next_page` bounds
+    a page token; `advance_gmail_history` and `advance_calendar_sync` map a response to a successor or to a
+    resync. Nothing here can send a request, so every branch is testable without one, and the transport binding
+    stays a named step instead of becoming the shape the rules are written against. `jarvis-models`' injected
+    `Transport` is the precedent, and the Google transport binding is now a bounded piece of work.
+  - **The classification table is a function of Google's own error vocabulary, not of its status codes.**
+    `GmailErrorReason` is the closed set the error page names, and a **403 is classified by its `reason`**
+    because four documented reasons share that status with three different remedies. The case that justifies the
+    table is **`domainPolicy`** — "the domain administrators have disabled Gmail apps" — which arrives as a
+    `403` exactly like the two throttling reasons and whose remedy is a conversation with an administrator, not
+    a retry. A status-only classifier retries an administrator's decision forever.
+  - **An unknown reason is representable and classified conservatively.** `GmailErrorReason::Unrecognised`
+    exists because Google adds reasons and refusing to parse one would turn "a new error code" into "a
+    connector that cannot read its own errors"; its classification is the **status's**, so it can never loosen a
+    decision. For a 403 that means `Permanent`/`DoNotRetry`, argued in the code: a 403 is a refusal with **no
+    effect**, so `Unknown`/`Reconcile` would send a caller to establish whether an effect happened when the
+    status already says it did not. A new *throttling* reason appearing as a 403 is the cost, and it fails in
+    the direction that cannot cause a second effect.
+  - **`GmailErrorBody` has no field for the error message**, so the classification cannot be derived from message
+    text even by accident — the structural form of `P3-008c`'s "do not derive a safety flag from message text".
+    `jarvis-models`' `McpToolListing` uses the same technique for a server's annotations.
+  - **Two guards that encode provider-specific judgement, both falsified A-B-A with compiling mutants:**
+    the 403-permanent arm (mutated to throttled: intact `PASS`, mutant `FAIL`, restored `PASS`), and
+    `gmail_history_status_is_pruned` (mutated `status == 404` → `status < 404`: same shape). A **third** guard,
+    the backwards-`historyId` refusal (`next_id < previous_id` → `false`), was also falsified. **The first
+    attempt at two of the three was worthless and the record says why**: one mutant did not compile (so the
+    verdict was `VACUOUS`, not a weak guard) and one multi-line probe matched nothing because PowerShell
+    here-strings are CRLF while these files are LF — both traps this workspace has recorded before, hit again.
+  - **A monotonic cursor may not move backwards, and an opaque one may not be compared at all.**
+    `advance_gmail_history` refuses a smaller `historyId` because `historyId` increases, so a smaller value is a
+    stale or foreign response and storing it would re-walk processed history — a repeat, for a connector that
+    acts on changes. `advance_calendar_sync` performs **no** ordering check, because `nextSyncToken` is opaque
+    and comparing two would invent a property the provider never offered.
+  - **Google's numbers are constants with tests around their relationship**, not prose:
+    `GMAIL_BATCH_LIMIT` (50) and `GMAIL_MAX_RESULTS_CAP` (500) with an assertion that the first is below the
+    second, because batching is what makes a full sync affordable *and* is itself a rate-limit trigger —
+    confusing the two would ask for 500 sub-requests at once.
+  - **Limits:** no request has been sent and **no response has ever been parsed**, so the tests prove the code
+    implements the *record* and nothing about the record matching Google; there is no transport, no token
+    source, and no operation, so nothing builds an authorization request or calls `users.messages.list`;
+    `GOOGLE_MAX_BACKOFF_SECONDS` has **no caller and is carried by no decision**, because
+    `RetryGuidance::BackoffSeconds` states a starting delay and a ceiling would need a field the shared type does
+    not have; and `SyncAdvance::Refused` is **never constructed**, which by `P5-001`'s standard is a variant that
+    reads as a live condition.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

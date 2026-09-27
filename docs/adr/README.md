@@ -75,3 +75,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0055](0055-the-authorization-transaction-is-consumable-once.md) | The authorization transaction is consumable once, and the redirect cannot be anywhere but loopback | Accepted |
 | [0056](0056-a-checklist-is-evidence-of-a-kind.md) | A checklist item is evidence of a kind, and a scaffold refuses to invent what it cannot know | Accepted |
 | [0057](0057-a-declaration-that-cannot-be-made-honestly-is-a-missing-variant.md) | A declaration that cannot be made honestly is a missing variant, not a default value | Accepted |
+| [0058](0058-a-provider-decision-belongs-in-the-crate-that-does-not-own-a-socket.md) | A provider decision belongs in the crate that does not own a socket | Accepted |

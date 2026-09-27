@@ -13,11 +13,11 @@
 //!
 //! # What this module is, and is not
 //!
-//! It is a `ConnectorManifest` — the document an operator reads before granting a connector access. It is
-//! **not** an HTTP client, a token flow, or an operation implementation. `P5-005` continues with the client
-//! and the recorded wire fixtures; this slice settles the contract those will be built against, because the
-//! manifest is checkable *before* provider code is loaded and is therefore the right place to discover that
-//! a declaration cannot be made honestly.
+//! [`GoogleConnector`] is the **declared contract**: a `ConnectorManifest`, the auth flow, and the endpoints.
+//! [`client`] is the provider's **decisions without a socket** — how a response is classified, how a page is
+//! followed, how a stale cursor is recognised. What is *not* here is a transport binding: this crate has no
+//! HTTP stack, by design, so the code that actually sends a request is a later step that an injected
+//! transport will make possible.
 //!
 //! # The two declarations a reader should scrutinise
 //!
@@ -33,6 +33,8 @@
 //!   back to `history.list` "after a period with no notifications" and states no floor. `PollingInterval`
 //!   exists so that this can be said rather than fabricated — `Documented(60)` here would be a claim about
 //!   Google that no source supports.
+
+pub mod client;
 
 use crate::auth::{AuthError, AuthFlow, AuthMethod, PkceMethod};
 use crate::authorization::{LoopbackHost, LoopbackRedirect, RedirectError};
@@ -428,5 +430,5 @@ fn links() -> Result<DocumentationLinks, ConnectorError> {
 pub struct GoogleConnector;
 
 #[cfg(test)]
-#[path = "google_tests.rs"]
+#[path = "tests.rs"]
 mod tests;
