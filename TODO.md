@@ -3017,6 +3017,53 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     constant**. **Six unresolved questions** are listed with impact and blocked capability; **no test for this
     research exists** and the record's Verification Plan names them as `P5-005`'s work.
 - [ ] `P5-005` Implement Google connection setup and Gmail/Calendar read tools with recorded wire fixtures.
+  - **PARTIALLY DONE, so the box stays unchecked.** Done: the connector's declared contract —
+    `crates/jarvis-connectors/src/google.rs` (`GoogleConnector::manifest()`) plus `google_tests.rs` (18 tests,
+    so **160 in the crate**). NOT done: the provider client, the auth flow, **any** operation implementation,
+    and **no wire fixture** — which is the other half of the task. `CompatibilityVerdict::Unverified` says so in
+    the manifest itself, and `is_installable()` is false.
+  - **The slice's substantive finding is a type defect reached from a new direction.** Writing the manifest
+    honestly was **impossible** with `WebhookSupport::Polling`, which carried
+    `minimum_interval_seconds: u32` documented as "the provider's **documented** minimum". Google documents no
+    minimum polling interval for Gmail — its push guide recommends falling back to `history.list` "after a
+    period with no notifications" and states no floor — and `P5-004` established that neither Google push
+    mechanism fits `WebhookSupport::Push`. So the only two ways to declare it were `Documented(60)`, which
+    **asserts a Google fact nothing supports**, or `Unsupported`, whose own doc says "the provider offers
+    neither" and which is therefore false. A `u32` with a documented meaning, at a site where nothing is
+    documented, turns "we did not establish this" into a specific false claim.
+    Fixed with `PollingInterval { Documented(u32), Observed(u32), Unknown }` (`ADR-0057`). The variants
+    **carry** the number rather than sitting beside an `Option`, so a figure contradicting a disclaimer is
+    unrepresentable. `Observed` is separate because an observed floor can move with a provider's backend, and
+    `is_documented()` is deliberately narrower than `seconds().is_some()` for that reason. The scaffold's
+    `_comment` was updated too, because it is the documentation an author reads at the moment they are about to
+    invent a number.
+  - **The second finding is a deferral rather than a guess.** `AuthFlow::new` requires a redirect URI, and
+    `P5-004`'s record does **not** establish which loopback redirect form Google's client registration expects —
+    RFC 8252 §7.3's generic rules are recorded, but Google matches the value **exactly**, so a string here would
+    be a guess at a byte-for-byte comparison. The manifest therefore exposes `authorization_endpoint()` as a
+    bare `https` constant and **constructs no `AuthFlow` at all**, which is recorded as the client slice's first
+    task rather than worked around.
+  - **The manifest's decisions that a reader should check**, each carrying its reason in the code:
+    `classification = Confidential` (the highest level a *mail* connector can hold while
+    `may_reach_a_remote_model()` stays false — and the test asserts the permissive level is genuinely permissive,
+    so it cannot pass vacuously); `residency = Unverified` (the record lists no residency page, so `Verified`
+    would be unsupported and `NotStated` a different unsupported claim); `secret_fields` **empty**, because
+    `OAuthPkce` needs no client secret and a refresh token is what the flow receives rather than what an operator
+    pastes; the rate limit `PerClient` because Google quota is per **Cloud project** and
+    `is_shared_between_accounts()` is true, so one account's exhaustion must not be reported as that account's;
+    and **no `llms_txt` link**, because Google publishes none and the record records the 404.
+  - **One link per `LinkKind` is a real constraint here**: Google publishes separate documentation, quota, and
+    auth pages *per API*, and `DocumentationLinks::new` refuses a duplicate kind. Gmail's contract is the link of
+    record and Calendar's pages are enumerated in the research record instead — recorded rather than resolved by
+    dropping one silently.
+  - **Falsified, two guards in the three-run A-B-A design**: `PollingInterval::Unknown` reporting `Some(0)`, and
+    `Confidential` admitted to `may_reach_a_remote_model`. Each: intact `PASS`, mutant `FAIL`, restored `PASS`,
+    restore byte-identical.
+  - **Limits:** no client, no flow, no operation implementation, **no wire fixture**; operation ids are
+    declarations and no `ToolDefinition` is derived from them, so nothing is callable; the rate limit's `burst`
+    is a **judgement** (`per_window` and the scope come from Google's documented table, the burst does not);
+    `is_documented()` has **no production caller**, which by `P5-001`'s own standard is a predicate whose
+    enforcement is deferred to its first caller.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

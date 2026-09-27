@@ -696,13 +696,65 @@ pub enum WebhookSupport {
         /// How the connector binds a delivery to one account and one endpoint.
         binding: crate::webhook::WebhookBinding,
     },
-    /// The connector polls, and the manifest says what the smallest useful interval is.
+    /// The connector polls, and the manifest states the interval as far as the provider documents it.
     Polling {
-        /// The provider's documented minimum polling interval, in seconds.
-        minimum_interval_seconds: u32,
+        /// The minimum polling interval, and whether the provider actually states one.
+        ///
+        /// Three-valued because a number here is a **claim about the provider**, and a bare `u32` forces a
+        /// connector to either invent a figure or drop the capability. Google is the case that exposed it:
+        /// the Gmail push guide recommends falling back to `history.list` after a quiet period and states no
+        /// floor at all, so no honest `u32` exists. Same reasoning as `RateLimitEvidence`, where a limit
+        /// "read as documented when it was guessed is a budget the deployment may plan around incorrectly".
+        interval: PollingInterval,
     },
     /// The provider offers neither, so the connector is pull-only on demand.
     Unsupported,
+}
+
+/// The minimum polling interval a connector may use, and how well it is established.
+///
+/// The variants carry the number rather than sitting beside an `Option`, because a separate evidence field
+/// would make `Some(3600)` beside `Unknown` representable — a figure and a disclaimer that contradict each
+/// other, with nothing choosing between them. Attaching the number to the variant that has one makes the
+/// contradiction unrepresentable, which is the move this crate makes everywhere else.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollingInterval {
+    /// The provider's own documentation states a minimum, and the manifest links that page.
+    Documented(u32),
+    /// A minimum established by observation, with nothing documented.
+    ///
+    /// Distinct from [`Self::Documented`] because the two carry different confidence: an observed floor can
+    /// move with the provider's backend, and an operator planning a schedule needs to know which they have.
+    Observed(u32),
+    /// Nobody has established a minimum.
+    ///
+    /// **Not a refusal**, and the variant exists for a provider that genuinely has none to state. A connector
+    /// declaring this is saying "I poll, and I will not claim a floor the provider never set" — which is more
+    /// honest than either an invented number or dropping to [`WebhookSupport::Unsupported`], whose own doc
+    /// says the provider offers neither.
+    Unknown,
+}
+
+impl PollingInterval {
+    /// Returns the interval in seconds, when one is established.
+    #[must_use]
+    pub const fn seconds(self) -> Option<u32> {
+        match self {
+            Self::Documented(seconds) | Self::Observed(seconds) => Some(seconds),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Returns whether the provider's own documentation states the interval.
+    ///
+    /// The predicate a scheduler wants, and deliberately narrower than
+    /// `seconds().is_some()`: a schedule built on an observed floor is a guess with evidence, not a
+    /// documented limit, and a caller that cannot tell them apart will treat one as the other.
+    #[must_use]
+    pub const fn is_documented(self) -> bool {
+        matches!(self, Self::Documented(_))
+    }
 }
 
 /// One operation a connector can perform, with the effects it declares.

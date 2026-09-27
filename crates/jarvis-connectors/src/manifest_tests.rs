@@ -1119,7 +1119,7 @@ fn a_push_declaration_that_verifies_something_is_accepted() {
             vec![operation("list_messages", vec![ToolEffect::ReadOnly], 0)],
             auth_methods(),
             WebhookSupport::Polling {
-                minimum_interval_seconds: 60
+                interval: PollingInterval::Documented(60),
             },
             Vec::new(),
             Classification::Confidential,
@@ -1131,4 +1131,21 @@ fn a_push_declaration_that_verifies_something_is_accepted() {
         .is_ok(),
         "polling carries no scheme, so it must not be dragged into the refusal"
     );
+}
+
+#[test]
+fn an_unestablished_polling_interval_is_representable_and_distinguishable() {
+    // `PollingInterval` exists because a bare `u32` forced a connector to invent a figure: Google documents
+    // no minimum polling interval for Gmail, so no honest number existed and the alternatives were a
+    // fabricated `Documented(n)` or dropping the polling capability entirely. The property worth pinning is
+    // that `Unknown` is **distinguishable** from a documented figure — a type where every variant reports
+    // `Some(n)` would satisfy a construction test while being exactly the type the fix removed.
+    assert_eq!(PollingInterval::Unknown.seconds(), None);
+    assert!(!PollingInterval::Unknown.is_documented());
+    assert_eq!(PollingInterval::Documented(60).seconds(), Some(60));
+    assert!(PollingInterval::Documented(60).is_documented());
+    // And `Observed` is the middle case that must not be read as documented: an observed floor can move with
+    // a provider's backend, so a scheduler treating it as a documented limit plans against the wrong value.
+    assert_eq!(PollingInterval::Observed(30).seconds(), Some(30));
+    assert!(!PollingInterval::Observed(30).is_documented());
 }

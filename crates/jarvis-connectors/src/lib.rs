@@ -66,6 +66,15 @@ mod scaffold;
 mod token;
 mod webhook;
 
+/// A provider connector's declared contract.
+///
+/// Exported as a **namespace per provider** rather than re-exported into the crate root, and that is forced
+/// by the second connector: `jarvis_connectors::CONNECTOR_ID` would be ambiguous the moment Microsoft
+/// arrives, and a crate root holding one provider's scope constants would make the others' hard to find.
+/// `repository-layout.md`'s integration shape is one module per connector, so the path mirrors it —
+/// `jarvis_connectors::google::GoogleConnector::manifest()`.
+pub mod google;
+
 pub use account::{
     AccountReference, AccountStatus, MAX_ACCOUNT_DISPLAY_NAME_CHARS, MAX_PROVIDER_ACCOUNT_ID_CHARS,
     VerifiedAccount,
@@ -96,8 +105,8 @@ pub use manifest::{
     ConnectorError, ConnectorId, ConnectorManifest, ConnectorOperation, ConnectorVersion,
     DataResidency, DocumentationLinks, LinkKind, MAX_CONNECTOR_OPERATION_ID_CHARS,
     MAX_CONNECTOR_OPERATIONS, MAX_CONNECTOR_SCOPES, MAX_CONNECTOR_SECRET_FIELDS,
-    MAX_MANIFEST_LINKS, MIN_SUPPORTED_JARVIS_VERSION, ProviderIdempotency, ResearchRecord,
-    ResidencyVerification, SecretField, SecretKind, ToolEffect, WebhookSupport,
+    MAX_MANIFEST_LINKS, MIN_SUPPORTED_JARVIS_VERSION, PollingInterval, ProviderIdempotency,
+    ResearchRecord, ResidencyVerification, SecretField, SecretKind, ToolEffect, WebhookSupport,
 };
 pub use ratelimit::{
     BudgetOutcome, MAX_RATE_LIMIT_BURST, MAX_RATE_LIMIT_PER_WINDOW, MAX_RETRY_AFTER_SECONDS,

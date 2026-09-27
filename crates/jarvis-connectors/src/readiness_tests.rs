@@ -13,8 +13,8 @@ use crate::auth::AuthMethod;
 use crate::manifest::{
     AuthMethodDeclaration, Classification, CompatibilityStatus, CompatibilityVerdict, ConnectorId,
     ConnectorManifest, ConnectorOperation, ConnectorVersion, DataResidency, DocumentationLink,
-    DocumentationLinks, LinkKind, ProviderIdempotency, ResearchRecord, ResidencyVerification,
-    WebhookSupport,
+    DocumentationLinks, LinkKind, PollingInterval, ProviderIdempotency, ResearchRecord,
+    ResidencyVerification, WebhookSupport,
 };
 use crate::readiness::{
     ALL_ITEMS, Attestation, EvidencePath, EvidenceStrength, LiveSmokeTest, MAX_ATTESTED_TESTS,
@@ -279,7 +279,7 @@ fn only_a_push_connector_needs_the_two_webhook_items() {
 
     for not_push in [
         WebhookSupport::Polling {
-            minimum_interval_seconds: 60,
+            interval: PollingInterval::Documented(60),
         },
         WebhookSupport::Unsupported,
     ] {

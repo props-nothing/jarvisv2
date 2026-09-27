@@ -235,7 +235,7 @@ impl Scaffold {
             "_comment_auth_methods": "The auth methods the provider supports, each with the scopes it needs and whether it is required. At least one must be required. `method` values are `o_auth_pkce`, `o_auth_confidential`, `personal_access_token`, `api_key`, `service_account`, `pairing_code`.",
             "auth_methods": [],
             "webhook": {
-                "_comment": "Exactly one of: {\"kind\": \"push\", \"scheme\": {...}, \"binding\": {...}} | {\"kind\": \"polling\", \"minimum_interval_seconds\": N} | {\"kind\": \"unsupported\"}. A push connector must also pass the two webhook readiness items.",
+                "_comment": "Exactly one of: {\"kind\": \"push\", \"scheme\": {...}, \"binding\": {...}} | {\"kind\": \"polling\", \"interval\": {\"documented\": N} | {\"observed\": N} | \"unknown\"} | {\"kind\": \"unsupported\"}. A push connector must also pass the two webhook readiness items. Use \"unknown\" rather than inventing an interval: a number here is a claim about the provider.",
                 "kind": "unsupported"
             },
             "_comment_secret_fields": "Field NAMES only, never values. Each becomes an environment variable, so a name must be lowercase with underscores. `kind` values are `client_secret`, `personal_access_token`, `api_key`, `refresh_token`, `signing_secret`, `private_key`, `pairing_code`.",
