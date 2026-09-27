@@ -246,6 +246,112 @@ fn a_final_calendar_page_carries_a_sync_token_and_no_page_token() {
     assert_eq!(fields["next_sync_token"], "sync-1");
 }
 
+/// Validates a rendered output against the schema the definition declares for that tool.
+///
+/// The schema is **derived from the manifest and not restated**, so this joins the two halves that were only
+/// ever asserted separately: the rendering in this module and the contract `ADR-0059` derives. Nothing did,
+/// which is why a divergence between them would have been found by a reader rather than by a test.
+fn assert_output_matches_declared_schema(tool: &str, output: &str) {
+    let manifest = must(
+        super::super::GoogleConnector::manifest(),
+        "the manifest must be built",
+    );
+    let definition = must(
+        crate::google::definitions::definitions(&manifest),
+        "the manifest must derive its definitions",
+    )
+    .into_iter()
+    .find(|candidate| candidate.id().to_string() == tool)
+    .unwrap_or_else(|| panic!("the manifest must declare {tool}"));
+    let value: serde_json::Value = must(
+        serde_json::from_str(output),
+        "a rendered output must be JSON",
+    );
+    let report = must(
+        definition.output_schema().validate(&value),
+        "the declared schema must be usable",
+    );
+    assert!(
+        report.is_valid(),
+        "the rendering of {tool} must satisfy its own declared schema, violations: {:?}",
+        report.violations()
+    );
+}
+
+#[test]
+fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
+    // The claim `ADR-0059` makes is that the tool's declared output is what this module renders, and until now
+    // that was a comment rather than a check. Three cases, one per operation, so a field renamed on one side
+    // fails here — the "two values that must agree, with nothing holding both" defect this repository keeps
+    // recording.
+    let list = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(response(
+                200,
+                r#"{"messages":[{"id":"m1"}],"nextPageToken":"more"}"#,
+            )),
+            now(),
+        ),
+        "a list must be a result",
+    );
+    assert_output_matches_declared_schema(
+        "google.gmail_messages_list",
+        list.output()
+            .unwrap_or_else(|| panic!("a confirmed read carries output"))
+            .content(),
+    );
+
+    let single = must(
+        interpret(
+            "google.gmail_messages_read",
+            Ok(response(200, r#"{"id":"m1"}"#)),
+            now(),
+        ),
+        "a read must be a result",
+    );
+    assert_output_matches_declared_schema(
+        "google.gmail_messages_read",
+        single
+            .output()
+            .unwrap_or_else(|| panic!("a confirmed read carries output"))
+            .content(),
+    );
+
+    let calendar = must(
+        interpret(
+            "google.calendar_events_read",
+            Ok(response(
+                200,
+                r#"{"items":[{"id":"e1"}],"nextSyncToken":"s"}"#,
+            )),
+            now(),
+        ),
+        "an events read must be a result",
+    );
+    assert_output_matches_declared_schema(
+        "google.calendar_events_read",
+        calendar
+            .output()
+            .unwrap_or_else(|| panic!("a confirmed read carries output"))
+            .content(),
+    );
+
+    // And the empty-page case, which is where a rendering that omitted a required array would appear: an
+    // omitted `message_ids` and an empty `message_ids` are different documents, and only the second satisfies
+    // the schema's `required`.
+    let empty = must(
+        interpret("google.gmail_messages_list", Ok(response(200, "{}")), now()),
+        "an empty page is still a result",
+    );
+    let rendered = empty
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_output_matches_declared_schema("google.gmail_messages_list", rendered);
+    assert!(rendered.contains("\"message_ids\":[]"), "{rendered}");
+}
+
 #[test]
 fn an_unimplemented_tool_is_refused_before_any_request_is_built() {
     // `NotImplemented` rather than a default, because a fallback would make a mistyped name silently read a

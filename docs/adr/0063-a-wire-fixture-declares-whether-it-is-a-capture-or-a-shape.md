@@ -84,6 +84,21 @@ marks each item **WRITTEN** or **Not written**, names the one that is written, a
 exist and **none is a capture**. A plan where every line is unmarked reads as done; a plan where every line is
 marked is auditable.
 
+**7. A hand-built fixture is one half of a claim, so the other half is asserted too.**
+
+`ADR-0059` says the tool's declared output schema is what the operation layer renders. The fixtures exercise
+the parser; the *rendering* is a second document that must satisfy that schema, and until this slice **nothing
+compared them** — the same "two values that must agree, with nothing holding both" defect this repository keeps
+recording, and one that had been listed as a limit in three separate rounds. `read_output`'s result is now
+validated against `ToolDefinition::output_schema()` for all three operations, with the schema taken from the
+manifest rather than restated.
+
+That this limit recurred three times without being closed is itself the finding: **a limit that is recorded
+repeatedly and never addressed is a todo in a limit's clothing**, and repeating it made it feel accounted for.
+The empty-page case is the one that carries weight here, because an omitted `message_ids` and an empty
+`message_ids` are different documents and only the second satisfies the schema's `required` — so the test
+distinguishes "rendered nothing" from "rendered an empty result".
+
 ## Consequences
 
 - **"We have fixtures" can no longer be read as "we have a recording".** The distinction is in the file, checked
@@ -106,9 +121,11 @@ marked is auditable.
 - **The fixtures do not cover every operation the connector declares.** `gmail_messages_read` is covered by the
   `Message` resource, but the response *envelope* for a `format=metadata` request, the batch endpoint, and
   `history.list` — the operation Finding 2 most depends on — have no fixture at all.
-- **The sweep checks provenance and not shape.** It asserts every fixture is JSON and declares itself; nothing
-  validates a fixture against the tool's declared output schema, so a fixture could drift from the schema
-  `ADR-0059` derives and only a reading would catch it.
+- **The sweep checks provenance and not shape.** It asserts every fixture is JSON and declares itself; it does
+  **not** validate a fixture against the tool's declared output schema. A fixture and a schema could therefore
+  drift apart and only a reading would catch it. (**The rendering** is now validated against the schema — see
+  decision 7 — which is a different join: that one covers what this crate *produces*, not what a fixture
+  *supplies*.)
 - **`_shape_documented_at` is a URL a maintainer must re-check.** Nothing verifies the page still says what the
   fixture assumes, and nothing records *when* it was checked. A dated verification entry in the research record
   is the existing mechanism, and it is a convention rather than an assertion.

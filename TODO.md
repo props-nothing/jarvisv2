@@ -3372,8 +3372,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     is a requirement on an implementation that does not exist; **`Retry-After` is carried and never
     interpreted**, so a transport could report it and a caller could ignore it with no test failing;
     **`evidence_from` has no caller in this crate** (provider evidence locates an *effect* and a read produces
-    none, so it exists for `P5-009`); **the output rendering is not validated back through the schemas it claims
-    to match**; and **nothing constructs the adapter in a binary** — no registry, executor, or route offers
+    none, so it exists for `P5-009`); ~~the output rendering is not validated back through the schemas it claims
+    to match~~ (**closed this round** — see below); and **nothing constructs the adapter in a binary** — no
+    registry, executor, or route offers
     `google.gmail_messages_list`, so the adapter is reachable from a test and not from a run.
   - **This round added the wire fixtures — and the interesting part is what they are NOT.** Six files under
     `crates/jarvis-connectors/tests/fixtures/google/` plus `tests/google_fixtures.rs` (9 new tests, so **262 in
@@ -3413,6 +3414,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     detected**; deleting `nextPageToken` from the mid-walk page → **3 tests detected**. The second is the
     important one: it shows the mutual-exclusion property is genuinely load-bearing rather than incidentally
     true. Tree verified clean with `git diff --stat` afterwards.
+  - **⭐ ONE RECORDED LIMIT WAS CLOSED RATHER THAN REPEATED.** Three different rounds had listed "the output
+    rendering is not validated back through the schemas it claims to match" as a limit. A limit that is recorded
+    three times and never closed is a **todo wearing a limit's clothes**, so it was fixed:
+    `every_rendered_output_satisfies_the_schema_the_definition_declares` renders a page through `read_output`
+    for **all three** operations and validates the result against `ToolDefinition::output_schema()`, which is
+    **derived from the manifest and not restated**. The empty-page case is included, because an omitted
+    `message_ids` and an empty `message_ids` are different documents and only the second satisfies the schema's
+    `required`. Falsified with two compiling mutants — renaming a rendered field and omitting a required array —
+    each detected by the new test **and** by the existing shape test.
   - **The research record's Verification Plan is now auditable.** It had eleven items and said "none exist yet";
     each is now marked **WRITTEN** or **Not written**, with the one written item named and the six fixtures
     listed as hand-built. A plan where every line is unmarked reads as done; a plan where every line is marked
@@ -3422,9 +3432,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     documented**, so a rule Google enforces but does not write down would still be invisible; **the fixtures do
     not cover every declared operation** — `history.list` (the operation Finding 2 most depends on), the batch
     endpoint, and the `format=metadata` envelope have **no** fixture at all; **the sweep checks provenance and
-    not shape**, so nothing validates a fixture against the output schema `ADR-0059` derives; and
-    **`_shape_documented_at` is a URL nothing re-checks**, so a fixture can drift from the page it cites with no
-    assertion failing.
+    not shape**, so a fixture is not validated against the schema it feeds (the *rendering* now is, which is a
+    different join); and **`_shape_documented_at` is a URL nothing re-checks**, so a fixture can drift from the
+    page it cites with no assertion failing.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
