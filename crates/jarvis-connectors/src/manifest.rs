@@ -45,7 +45,7 @@ use jarvis_tools::EffectSet;
 pub use jarvis_tools::ToolEffect;
 
 use crate::auth::AuthMethod;
-use crate::ratelimit::RateLimit;
+use crate::ratelimit::{QuotaCost, RateLimit};
 
 /// The longest connector identifier.
 ///
@@ -792,6 +792,15 @@ pub struct ConnectorOperation {
     /// "safe to retry".
     #[serde(default)]
     pub idempotency: ProviderIdempotency,
+    /// What one call costs against a cost-unit rate limit.
+    ///
+    /// **Not part of [`Self::rate_limit`], because it is a property of the operation rather than of the
+    /// provider's ceiling.** Google's cost table is per method — `messages.get` 20 units, `history.list` 2,
+    /// `getProfile` 1 — while the ceiling those costs draw from is one figure for the whole project. Putting
+    /// the cost on the limit would force one limit per method for one provider ceiling, which is exactly the
+    /// duplicate this field replaced.
+    #[serde(default)]
+    pub quota_cost: QuotaCost,
     /// What the connector knows about the provider's rate limits, if anything.
     #[serde(default)]
     pub rate_limit: Option<RateLimit>,
@@ -890,6 +899,7 @@ pub struct ValidatedOperation {
     required_scopes: Vec<String>,
     idempotency: ProviderIdempotency,
     rate_limit: Option<RateLimit>,
+    quota_cost: QuotaCost,
 }
 
 impl ValidatedOperation {
@@ -933,6 +943,12 @@ impl ValidatedOperation {
     #[must_use]
     pub fn rate_limit(&self) -> Option<RateLimit> {
         self.rate_limit
+    }
+
+    /// Returns what one call costs against a cost-unit rate limit.
+    #[must_use]
+    pub fn quota_cost(&self) -> QuotaCost {
+        self.quota_cost
     }
 }
 
@@ -1223,6 +1239,7 @@ fn validate_operations(
             required_scopes: operation.required_scopes,
             idempotency: operation.idempotency,
             rate_limit: operation.rate_limit,
+            quota_cost: operation.quota_cost,
         });
     }
     Ok(validated)

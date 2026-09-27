@@ -27,17 +27,24 @@
 //!   the caller reaches the bytes through the closure-based [`Secret`] on the token endpoint's own answer
 //!   shape if it needs them. An earlier draft of this file read it into a `String` "and dropped it", which
 //!   satisfies the letter of the rule and breaks its purpose — a copy existed, with a lifetime.
-//!
 //! # What is not built
 //!
-//! No request is sent. There is no transport for a form `POST`, so the caller owns the exchange and this module
-//! owns only what is verifiable without a socket.
+//! Nothing performs the request: `reqwest` is used by the **read** path's transport and a token request is a
+//! form `POST`, which that port does not express (`HttpMethod` has one variant). So the caller drives the
+//! exchange — but every piece it needs is here and tested: the endpoint, the parameter lists, the body
+//! encoding, and the answer reader. [`body`] is the seam a transport will call.
 
 use serde_json::Value;
 
-use crate::auth::{AuthError, RefreshOutcome, ScopeSetChange};
+// `RefreshOutcome` is used by this module's tests and by the doc prose above; the production path reaches it
+// only through `RefreshExchange::classify`, which is why the import is `cfg(test)`-free but the compiler
+// needed a real use — the tests supply it.
+#[cfg(test)]
+use crate::auth::RefreshOutcome;
+use crate::auth::{AuthError, ScopeSetChange};
 use crate::token::{
-    MAX_ACCESS_TOKEN_SECONDS, TokenEndpointFailure, TokenResponse, TokenSet, split_scope,
+    MAX_ACCESS_TOKEN_SECONDS, TokenEndpointFailure, TokenRequestOutcome, TokenResponse, TokenSet,
+    split_scope,
 };
 
 /// The `grant_type` for an authorization-code exchange.
@@ -320,6 +327,19 @@ impl TokenEndpointAnswer {
     /// Exists so the rotation rule is expressed once. The classification itself is
     /// [`crate::token::RefreshExchange::classify`]'s — this only supplies the two inputs a transport cannot
     /// supply from a socket: the stored reference, and the connector's vendor knowledge about revocation.
+    ///
+    /// # The doc used to claim a delegation the code did not make
+    ///
+    /// That sentence was **false** until this function was reduced to it: the body called a private
+    /// `refresh_outcome` helper which restated the rotation test and the ordering — including the same comment
+    /// about the transient check coming first. Two implementations of one rule, with a doc naming the other as
+    /// the authority. It surfaced when a mutation to the **shared** classifier survived every test in this
+    /// crate, because no path here called it. Removing the copy also removes the two inputs it restated: the
+    /// accessors below are exactly the pair `classify` takes, and it computes `rotated_reference` itself, so a
+    /// caller cannot disagree with it about whether a rotation happened.
+    ///
+    /// This is `P5-004`'s defect class — **a doc comment saying "the rule lives in X" is a claim about code**,
+    /// and X was the wrong place because the code never went there.
     #[must_use]
     pub fn classify_refresh(
         &self,
@@ -328,68 +348,17 @@ impl TokenEndpointAnswer {
         requested_scopes: &[String],
         vendor_says_revoked: bool,
     ) -> crate::token::RefreshExchange {
-        // Rotation is decided by whether refresh material ARRIVED, never by whether the caller stored it: a
-        // caller that failed to store one has a defect of its own, and reporting `Refreshed` would hide the
-        // half of the exchange that makes replay detectable (RFC 9700 §4.14.2). The clone is of a `SecretRef`,
-        // which is metadata — a locator, not a secret — so copying it is not a credential copy.
-        let rotated_reference = match self.refresh_token() {
-            Some(_) => new_reference.clone(),
-            None => None,
-        };
-        crate::token::RefreshExchange {
-            outcome: refresh_outcome(self, vendor_says_revoked),
-            token_set: self
-                .token_set(new_reference, previous_scopes, requested_scopes)
-                .ok()
-                .flatten(),
-            rotated_reference,
-        }
-    }
-}
-
-/// Maps an answer onto the refresh vocabulary.
-///
-/// A granted response is `Rotated` or `Refreshed` by whether refresh material arrived; a refusal is `Expired`,
-/// `Revoked`, or `Transient` by the rule `RefreshExchange::classify` applies. A function so `classify_refresh`
-/// reads as the decisions it makes rather than as a nested `match` — and so the *ordering* below is visible in
-/// one place.
-fn refresh_outcome(answer: &TokenEndpointAnswer, vendor_says_revoked: bool) -> RefreshOutcome {
-    match answer {
-        TokenEndpointAnswer::Granted(granted) => {
-            if granted.refresh_token.is_some() {
-                RefreshOutcome::Rotated
-            } else {
-                // Google's documented refresh does **not** return a new refresh token, so this is the expected
-                // outcome for this provider rather than a degradation. Rotation is still detected, because a
-                // provider that started rotating would otherwise go unnoticed.
-                RefreshOutcome::Refreshed
-            }
-        }
-        TokenEndpointAnswer::Refused(failure) => {
-            // The transient check is FIRST, and the ordering is load-bearing: a provider behind a proxy can
-            // answer a 503 through the protocol's own error channel, and reading the code first would send a
-            // user to a consent screen during an outage. `RefreshExchange::classify` records the same ordering
-            // for the same reason.
-            if failure.transient {
-                RefreshOutcome::Transient
-            } else if failure.requires_reauth() {
-                if vendor_says_revoked {
-                    RefreshOutcome::Revoked
-                } else {
-                    // `invalid_grant` covers "invalid, expired, revoked, does not match the redirection URI,
-                    // or was issued to another client" (RFC 6749 §5.2), and the protocol does not say which. So
-                    // the caller's vendor knowledge decides, and the default is the one that asks the user to
-                    // authorize again rather than the one that tells them their access was withdrawn.
-                    RefreshOutcome::Expired
-                }
-            } else {
-                // `invalid_client`/`unauthorized_client` mean the *client* is misconfigured, so sending the
-                // user to a consent screen lands on the same failure. Reported as transient so
-                // `is_safe_to_retry` is false and `needs_user` is false: something is wrong that the user
-                // cannot fix.
-                RefreshOutcome::Transient
-            }
-        }
+        crate::token::RefreshExchange::classify(
+            // The disjoint pair `RefreshExchange::classify` takes, which is why `response`/`failure` exist as
+            // separate accessors: exactly one is `Some`, so "the provider granted" and "the provider refused"
+            // cannot be confused at the call site.
+            self.response(),
+            self.failure(),
+            new_reference,
+            previous_scopes,
+            requested_scopes,
+            vendor_says_revoked,
+        )
     }
 }
 
@@ -438,28 +407,48 @@ impl ExchangeIdentity {
         })
     }
 
-    /// Returns the parameters every token request carries.
+    /// Returns the parameters every token request carries, as **raw values**.
     ///
-    /// Both are percent-encoded. Google's own identifiers are URL-safe, so this looks redundant — and it is not:
-    /// the encoding is what makes a value that *is* unusual harmless rather than what makes a typical value
-    /// work. A redirect URI always contains `://` and `/`, so it is never in the unreserved set.
+    /// # Why these are not pre-encoded
+    ///
+    /// They were, via `google::request::percent_encode`, and that was a live trap rather than a redundancy:
+    /// the form body encoder ([`crate::form::encode_body`]) escapes every parameter it is given, so a value
+    /// that arrived already escaped would be escaped **again** — `http://127.0.0.1/` becoming
+    /// `http%253A%252F%252F127.0.0.1%252F` — and Google answers a double-encoded `redirect_uri` with
+    /// `redirect_uri_mismatch`, an error a reader would chase through client registration rather than
+    /// through the encoding.
+    ///
+    /// **The encoding belongs to exactly one layer, and that layer is the one that renders the body.** A list
+    /// of values with an encoding already applied is a half-rendered request: every consumer must know whether
+    /// it has been rendered, and the one that guesses wrong produces this failure. So this returns text, and
+    /// the text is escaped once, by whoever produces the bytes.
+    ///
+    /// A test asserts the whole pipeline for the reason above: the values are raw here, and
+    /// `encode_body(&identity.public_parameters())` contains exactly one level of escaping.
     fn parameters(&self) -> Vec<(String, String)> {
         vec![
-            (
-                CLIENT_ID_PARAMETER.to_owned(),
-                crate::google::request::percent_encode(&self.client_id),
-            ),
-            (
-                REDIRECT_URI_PARAMETER.to_owned(),
-                crate::google::request::percent_encode(&self.redirect_uri),
-            ),
+            (CLIENT_ID_PARAMETER.to_owned(), self.client_id.clone()),
+            (REDIRECT_URI_PARAMETER.to_owned(), self.redirect_uri.clone()),
         ]
     }
 
     /// Returns the identity parameters, for a caller assembling a request of its own.
+    ///
+    /// **Raw values**, and the caller that renders a body must encode them — see [`Self::parameters`].
     #[must_use]
     pub fn public_parameters(&self) -> Vec<(String, String)> {
         self.parameters()
+    }
+
+    /// Returns the endpoint this identity exchanges against.
+    ///
+    /// Taken from the manifest rather than restated, so the exchange cannot be pointed at one host while the
+    /// manifest declares another. `P5-004` recorded the unusual detail this preserves: Google serves the
+    /// consent screen and the token exchange from **different hosts**, so a reader "tidying" them into one
+    /// constant would break every exchange.
+    #[must_use]
+    pub fn endpoint(&self) -> &'static str {
+        crate::google::GoogleConnector::token_endpoint()
     }
 }
 
@@ -527,6 +516,220 @@ pub fn refresh(refresh_token: &Secret, identity: &ExchangeIdentity) -> Vec<(Stri
         refresh_token.with_exposed(str::to_owned),
     ));
     parameters
+}
+
+/// Renders a parameter list as the body RFC 6749 §4.1.3 requires.
+///
+/// The single place the exchange's values become bytes, and therefore the single place they are escaped —
+/// which is why the parameter lists hold **raw** values ([`ExchangeIdentity::parameters`]). A caller pairs this
+/// with [`content_type`] when it builds the request; nothing here sends it, because a form `POST` is a method
+/// [`crate::google::transport::HttpMethod`] does not yet express.
+#[must_use]
+pub fn body(parameters: &[(String, String)]) -> String {
+    crate::form::encode_body(parameters)
+}
+
+/// The `Content-Type` a token request carries.
+///
+/// Delegated to the codec's own constant rather than restated: RFC 6749 §4.1.3 names one media type for this
+/// body, and a second string here is a second thing to keep in step with it.
+#[must_use]
+pub const fn content_type() -> &'static str {
+    crate::form::CONTENT_TYPE
+}
+
+/// Performs one token request and maps the exchange onto [`TokenRequestOutcome`].
+///
+/// # This is what makes `TokenRequestOutcome` reachable
+///
+/// That type separates `NeverSent` (safe to retry — nothing reached the provider) from `SentAnswerUnknown`
+/// (**not** safe — RFC 9700 §4.2.4: a retry of a lost-answer request may get `invalid_grant` *and destroy a
+/// working grant the first attempt issued*). It was written with a doc calling the distinction consequential
+/// and, until this function existed, **nothing produced either variant**: every construction site was a test.
+/// The mapping is one line, and that line is the whole reason the type exists.
+///
+/// The two directions are not symmetric, which is why the mapping is a wildcard-free consequence of
+/// [`TransportFailure::may_have_reached_the_provider`] rather than a `match` on variants here: a `Connect` or a
+/// `Refused` is certain, and a `Send`, a `Timeout`, or an unreadable body may have been written.
+///
+/// # Why an unusable answer is an `Err` and a refusal is an `Ok`
+///
+/// [`parse_answer`] returns `Err` for a body that is not a grant or refusal and for a grant this platform
+/// cannot use. Those are **outcomes that could not be established**, which is a different thing from the
+/// provider answering "no" — and `TokenRequestOutcome::Refused` is the latter. So the split is the same one
+/// `parse_answer` already draws, surfaced rather than collapsed: a caller that treats every non-answer as a
+/// refusal would send a user to a consent screen when the real fault is a body it cannot read.
+///
+/// # Errors
+///
+/// Returns [`TokenRequestError`] as [`parse_answer`] does, plus [`TokenRequestError::Body`] for an answer that
+/// arrived but could not be read. **A transport failure is never an `Err`**: it is the ambiguity
+/// [`TokenRequestOutcome`] exists to express, and returning it here would lose the retry-safety distinction.
+pub async fn exchange(
+    transport: &dyn crate::google::transport::GoogleTransport,
+    request: &crate::google::request::FormRequest,
+    refresh_reference: Option<jarvis_core::SecretRef>,
+    previous_scopes: &[String],
+    requested_scopes: &[String],
+) -> Result<TokenRequestOutcome, TokenRequestError> {
+    let answer = match send_and_parse(transport, request).await {
+        Ok(answer) => answer,
+        // **The retry-safety branch `TokenRequestOutcome` exists for**, and the unreadable-body case beside it:
+        // the first is the ambiguity, the second is a provider answer this client could not understand.
+        Err(ExchangeFailure::Transport(failure)) => {
+            return Ok(classify_transport_failure(failure));
+        }
+        Err(ExchangeFailure::Read(error)) => return Err(error),
+    };
+    match answer {
+        TokenEndpointAnswer::Refused(failure) => Ok(TokenRequestOutcome::Refused(failure)),
+        TokenEndpointAnswer::Granted(granted) => {
+            // The grant was parsed, so a token set exists; `token_set`'s `Err` is the *unusable* case and is
+            // mapped rather than folded into a refusal, because "the provider granted something I cannot use" is
+            // a statement by the server while a refusal is a decision it made — and a caller must not send a
+            // user to a consent screen for the first.
+            let set = TokenEndpointAnswer::Granted(granted)
+                .token_set(refresh_reference, previous_scopes, requested_scopes)
+                .map_err(unusable_grant)?;
+            match set {
+                Some(set) => Ok(TokenRequestOutcome::Answered(Box::new(set))),
+                // Unreachable for a `Granted` answer, since `token_set` is `Some` whenever `response()` is.
+                // Reported rather than panicked on, because `expect` is denied in this crate.
+                None => Err(TokenRequestError::Body {
+                    reason: "a granted answer produced no token set",
+                }),
+            }
+        }
+    }
+}
+
+/// Sends one form `POST` and parses its answer, keeping the two failure kinds apart.
+///
+/// The join both producers share, so the exchange and the refresh cannot diverge in how they send or how they
+/// read — the failure `ADR-0069` records for two halves that were never driven together. The two kinds are kept
+/// separate because each caller maps them into **its own** vocabulary and the mappings differ: a transport
+/// failure becomes `SentAnswerUnknown`/`NeverSent` for a code exchange but `Transient` for a refresh, and a
+/// response that cannot be read is an `Err` in both but for different reasons stated at each call site.
+async fn send_and_parse(
+    transport: &dyn crate::google::transport::GoogleTransport,
+    request: &crate::google::request::FormRequest,
+) -> Result<TokenEndpointAnswer, ExchangeFailure> {
+    let response = transport
+        .send_form(request)
+        .await
+        .map_err(ExchangeFailure::Transport)?;
+    parse_answer(response.status, &response.body).map_err(ExchangeFailure::Read)
+}
+
+/// Why a token request produced no answer to classify.
+///
+/// Two variants rather than one because the remedies differ and **only one of them is about the network**: a
+/// transport failure is a fact about whether the request was written, while an unreadable body means the
+/// provider answered and this client could not understand it. Collapsing them would lose that, and the callers
+/// map them differently — the exchange treats an unreadable body as an error and a transport failure as the
+/// retry-safety distinction the type exists to make.
+enum ExchangeFailure {
+    /// The exchange produced no provider answer.
+    Transport(crate::google::transport::TransportFailure),
+    /// The provider answered and the answer could not be read.
+    Read(TokenRequestError),
+}
+
+/// Classifies a transport failure into the two cases that are indistinguishable from the request side.
+///
+/// **This single branch is what `TokenRequestOutcome` exists for.** RFC 9700 §4.2.4 makes a retry of a
+/// lost-answer request able to get `invalid_grant` and revoke the tokens the first attempt issued, so
+/// "nothing was sent" and "it was sent and nothing came back" must not be one value. The predicate is the
+/// port's own (`may_have_reached_the_provider`) rather than a `match` on variants here, so a new
+/// [`crate::google::transport::TransportFailure`] variant is classified by the port that owns the meaning.
+fn classify_transport_failure(
+    failure: crate::google::transport::TransportFailure,
+) -> TokenRequestOutcome {
+    if failure.may_have_reached_the_provider() {
+        TokenRequestOutcome::SentAnswerUnknown
+    } else {
+        // `NeverSent` holds a `&'static str` so the variant cannot own allocated text, and the failure exposes
+        // its own bounded static reason rather than requiring a `Display` that would allocate.
+        TokenRequestOutcome::NeverSent {
+            reason: failure.reason(),
+        }
+    }
+}
+
+/// Maps `TokenSet::from_response`'s refusal onto this module's own error.
+///
+/// One function rather than a closure at each call site, so the reason text appears once and the two paths
+/// cannot describe the same rejection differently.
+fn unusable_grant(_: crate::auth::AuthError) -> TokenRequestError {
+    TokenRequestError::UnusableGrant {
+        reason: "the grant's token type or lifetime is one this platform will not accept",
+    }
+}
+
+/// Performs one **refresh** and classifies it, which is what finally produces a [`RefreshExchange`] outside a
+/// test.
+///
+/// # Why this exists, and why the outcome type needed it
+///
+/// [`crate::token::RefreshExchange`] and `TokenEndpointAnswer::classify_refresh` were written several rounds
+/// ago with docs describing RFC 9700 §4.14.2's replay detection as the point of the whole thing — and
+/// **nothing produced either**: `refresh` and `classify_refresh` had no caller outside their tests. That is the
+/// same defect `ADR-0073` records for `TokenRequestOutcome`, found one layer over in the same module, and it is
+/// why this function exists rather than waiting for the composition root.
+///
+/// # Why the transport failure is `Transient` and not its own variant
+///
+/// [`crate::auth::RefreshOutcome`] has five variants and **none means "the request may have been written"**.
+/// That is a deliberate difference from the code exchange, and the reason is the consequence: a refresh
+/// presents the **stored** refresh token, so if a rotation silently landed the stored reference is already
+/// invalid and the next attempt fails with `invalid_grant` — which this function then reports as `Expired` or
+/// `Revoked`, i.e. as `needs_user`. So the ambiguous case is **self-correcting**: it costs one extra call and
+/// then asks the user, where retrying a lost *code* exchange could revoke tokens. Reporting it as `Transient`
+/// is honest about the retry being safe.
+///
+/// **The vocabulary gap is a recorded limit, not a claim.** A rotation that arrived unread is invisible here
+/// until the next attempt; a caller that needed to know sooner would need a variant `RefreshOutcome` does not
+/// have, which is a change to a shared type rather than a fix to this function.
+///
+/// # Errors
+///
+/// As [`parse_answer`]. **A transport failure is never an `Err`**: it is classified into an outcome, because
+/// "nothing came back" is a fact about the exchange rather than a fault in reading it.
+///
+/// # What this does not do
+///
+/// It does not mint the refresh token, and it does not store a rotated one. The caller holds the stored material
+/// and owns the secret store, so it supplies the previous scopes and receives the new reference in the outcome —
+/// the division `TokenSet::from_response` already records.
+pub async fn refresh_with(
+    transport: &dyn crate::google::transport::GoogleTransport,
+    request: &crate::google::request::FormRequest,
+    new_reference: Option<jarvis_core::SecretRef>,
+    previous_scopes: &[String],
+    requested_scopes: &[String],
+    vendor_says_revoked: bool,
+) -> Result<crate::token::RefreshExchange, TokenRequestError> {
+    let answer = match send_and_parse(transport, request).await {
+        Ok(answer) => answer,
+        // `Transport` → the transient outcome the doc justifies; `Read` → the error `parse_answer` produced.
+        Err(ExchangeFailure::Transport(_)) => {
+            return Ok(crate::token::RefreshExchange::classify(
+                None,
+                None,
+                new_reference,
+                previous_scopes,
+                requested_scopes,
+                vendor_says_revoked,
+            ));
+        }
+        Err(ExchangeFailure::Read(error)) => return Err(error),
+    };
+    Ok(answer.classify_refresh(
+        new_reference,
+        previous_scopes,
+        requested_scopes,
+        vendor_says_revoked,
+    ))
 }
 
 /// Reads a token endpoint's answer.
@@ -657,3 +860,7 @@ pub fn granted_scopes(scope: &str) -> Vec<String> {
 #[cfg(test)]
 #[path = "token_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "token_exchange_tests.rs"]
+mod exchange_tests;

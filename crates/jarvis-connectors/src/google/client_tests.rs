@@ -8,6 +8,7 @@
 //! The falsification record is in `TODO.md`.
 
 use super::*;
+use crate::google::transport::RetryAfter;
 use crate::manifest::{ConnectorVersion, ProviderIdempotency};
 use crate::ratelimit::{RetryClass, RetryGuidance};
 use crate::{AccountReference, SyncCursorKind};
@@ -97,7 +98,12 @@ fn a_429_honours_a_stated_delay_and_falls_back_to_the_documented_floor() {
     // Google documents three distinct causes behind one 429 and states the remedy is to wait. A stated retry
     // time is the provider's own answer, so it is used; an absent one falls back to the documented floor of at
     // least one second rather than to zero, which is the value the guidance explicitly rules out.
-    let stated = classify(429, GmailErrorReason::Unrecognised, Some(37), None);
+    let stated = classify(
+        429,
+        GmailErrorReason::Unrecognised,
+        Some(RetryAfter::Seconds(37)),
+        None,
+    );
     assert_eq!(stated.class, RetryClass::Throttled);
     assert_eq!(stated.guidance, RetryGuidance::RetryAfterSeconds(37));
 
@@ -106,6 +112,31 @@ fn a_429_honours_a_stated_delay_and_falls_back_to_the_documented_floor() {
     assert_eq!(
         unstated.guidance,
         RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS)
+    );
+
+    // **A stated delay this client could not read is neither of the above.** The wait equals the absent case —
+    // both are the floor — so the guidance variant is what keeps the two apart, and asserting *both* here is
+    // what makes the distinction observable. A `BackoffSeconds` here would tell an operator the provider stated
+    // nothing when it stated a time (`ADR-0076`), and the failure message would name the wrong document.
+    let unreadable = classify(
+        429,
+        GmailErrorReason::Unrecognised,
+        Some(RetryAfter::NotSeconds),
+        None,
+    );
+    assert_eq!(unreadable.class, RetryClass::Throttled);
+    assert_eq!(
+        unreadable.guidance,
+        RetryGuidance::BackoffAfterUnreadableDelay(GOOGLE_RETRY_FLOOR_SECONDS)
+    );
+    assert_ne!(
+        unreadable.guidance, unstated.guidance,
+        "a stated-but-unreadable delay must not be reported as an absent one"
+    );
+    assert_eq!(
+        unreadable.guidance.delay_seconds(),
+        unstated.guidance.delay_seconds(),
+        "the wait is the same floor; only what it says about the provider differs"
     );
     assert_eq!(
         GOOGLE_RETRY_FLOOR_SECONDS, 1,
@@ -274,6 +305,76 @@ fn a_gmail_history_404_carries_no_information_that_could_distinguish_two_causes(
 }
 
 #[test]
+fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
+    // **This is the producer that was missing.** `ADR-0066` made the signal a parameter so the inference from
+    // a 404 would be a caller's explicit act — but nothing could BUILD the signal from a status, so the
+    // `CursorUnusable` remedy (and so `SyncAdvance::HistoryPruned`) was still unreachable outside a fixture.
+    let refused = classify(
+        429,
+        GmailErrorReason::Unrecognised,
+        Some(RetryAfter::Seconds(30)),
+        None,
+    );
+    let not_found = classify(404, GmailErrorReason::Unrecognised, None, None);
+
+    // A 404 is the dead-cursor signal, and it is the SAME status the classifier reads as permanent — so the
+    // two are asserted together, because that coincidence is exactly the ambiguity the predicate names.
+    assert_eq!(
+        gmail_history_signal(404, None, not_found.clone()),
+        SyncSignal::CursorUnusable
+    );
+    assert_eq!(not_found.class, RetryClass::Permanent);
+
+    // A 200 advances, carrying the position the response stated.
+    assert_eq!(
+        gmail_history_signal(200, Some("12347"), refused.clone()),
+        SyncSignal::Advanced {
+            history_id: Some("12347".to_owned())
+        }
+    );
+    // A 200 with no id is an unchanged mailbox — an ordinary outcome that advances nothing, not a refusal.
+    assert_eq!(
+        gmail_history_signal(200, None, refused.clone()),
+        SyncSignal::Advanced { history_id: None }
+    );
+
+    // **The retryable family must not become a dead cursor.** A resync on a 429 or a 5xx discards a working
+    // store — the opposite mistake, and a far more expensive one. Asserted with the control that the same
+    // status carried into `Refused` preserves the classification rather than swallowing it.
+    for status in [400, 403, 429, 500, 502, 503, 504] {
+        let decision = classify(
+            status,
+            GmailErrorReason::Unrecognised,
+            Some(RetryAfter::Seconds(30)),
+            None,
+        );
+        assert_eq!(
+            gmail_history_signal(status, None, decision.clone()),
+            SyncSignal::Refused(decision),
+            "{status} is not a dead cursor"
+        );
+    }
+
+    // And the signal really does drive the decision end to end: the 404 path reaches the resync remedy.
+    let outcome = must(
+        advance_gmail_history(
+            &cursor(),
+            &gmail_history_signal(
+                404,
+                None,
+                classify(404, GmailErrorReason::Unrecognised, None, None),
+            ),
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a 404 must produce an outcome",
+    );
+    assert_eq!(outcome.advance, SyncAdvance::HistoryPruned);
+    assert!(outcome.cursor.is_none());
+}
+
+#[test]
 fn a_calendar_410_requires_a_resync_and_a_400_does_not() {
     // Google's sync guide: a 410 "should trigger a full wipe of the client's store and a new full sync", while
     // 400 is a disallowed query restriction — the caller's mistake. Conflating them would discard a whole
@@ -400,7 +501,12 @@ fn a_gmail_cursor_that_cannot_be_used_requires_a_resync_and_carries_no_cursor() 
 fn a_refused_advance_carries_the_decision_and_no_cursor() {
     // A refusal is neither an advance nor a dead cursor, and the decision is carried so a caller can report
     // *why*. No cursor is returned, so a caller cannot store a new position on the strength of a failure.
-    let decision = classify(429, GmailErrorReason::Unrecognised, Some(30), None);
+    let decision = classify(
+        429,
+        GmailErrorReason::Unrecognised,
+        Some(RetryAfter::Seconds(30)),
+        None,
+    );
     let outcome = must(
         advance_gmail_history(
             &cursor(),

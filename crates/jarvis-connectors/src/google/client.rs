@@ -37,6 +37,7 @@
 
 use serde::Deserialize;
 
+use crate::google::transport::RetryAfter;
 use crate::manifest::ConnectorVersion;
 use crate::ratelimit::{ProviderRequestId, RetryClass, RetryDecision, RetryGuidance};
 use crate::{AccountReference, CursorError, SyncCursor, SyncCursorKind};
@@ -230,8 +231,8 @@ impl GmailErrorReason {
 
 /// Classifies a Google error response.
 ///
-/// `status` is the HTTP status and `reason` the parsed `errors[0].reason`. `retry_after_seconds` is the
-/// provider's stated delay when the response carried one, which a 429 does.
+/// `status` is the HTTP status and `reason` the parsed `errors[0].reason`. `retry_after` is the provider's
+/// stated delay **in the form it was stated in**, which a 429 does.
 ///
 /// # The two decisions worth reading
 ///
@@ -242,11 +243,14 @@ impl GmailErrorReason {
 /// - **An unrecognised status becomes `Unknown`, whose guidance is `Reconcile` and whose class refuses any
 ///   retry.** That is the fail-closed direction: a status this connector has no case for is one whose effect is
 ///   unknown, and `RetryClass::Unknown` already encodes that an unanswered question must not be read as a yes.
+/// - **A stated delay that cannot be read is not the same as no stated delay.** `retry_after` distinguishes
+///   *absent* (`None`) from *stated but unreadable* ([`RetryAfter::NotSeconds`]), and the `429` arm keeps them
+///   apart (`ADR-0076`).
 #[must_use]
 pub fn classify(
     status: u16,
     reason: GmailErrorReason,
-    retry_after_seconds: Option<u32>,
+    retry_after: Option<RetryAfter>,
     provider_request_id: Option<ProviderRequestId>,
 ) -> RetryDecision {
     let (class, guidance) = match status {
@@ -287,10 +291,25 @@ pub fn classify(
         // A 429 conflates three documented causes — the sending limit, the bandwidth limit, and per-user
         // concurrency — and the remedy for all three is the same: wait the stated time. The response carries a
         // retry time for the first two, so a stated delay is honoured and its absence falls back to the floor.
+        //
+        // **The three cases are kept apart.** A `delay-seconds` value is honoured directly; the date form is a
+        // stated delay this client cannot convert without a clock, so it falls back to the floor **but says so**
+        // (`BackoffAfterUnreadableDelay` rather than `BackoffSeconds`); and only a genuinely absent header falls
+        // back silently. Collapsing the middle case into the last would tell an operator the provider stated
+        // nothing when it stated a time — the direction that reads a stated wait as a missing one (`ADR-0076`).
+        //
+        // **A stated delay above `MAX_RETRY_AFTER_SECONDS` becomes `DeferSeconds`, not a clamp.** Google
+        // documents that a daily-limit 429 "might result in these errors for multiple hours", so this is a real
+        // response rather than a hypothetical: the work is deferred, because clamping would retry sooner than
+        // the provider asked and honouring it in the loop would hold a worker for the whole window
+        // (`ADR-0077`).
         429 => (
             RetryClass::Throttled,
-            match retry_after_seconds {
-                Some(seconds) => RetryGuidance::RetryAfterSeconds(seconds),
+            match retry_after {
+                Some(RetryAfter::Seconds(seconds)) => RetryGuidance::for_stated_delay(seconds),
+                Some(RetryAfter::NotSeconds) => {
+                    RetryGuidance::BackoffAfterUnreadableDelay(GOOGLE_RETRY_FLOOR_SECONDS)
+                }
                 None => RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS),
             },
         ),
@@ -600,6 +619,46 @@ pub const fn calendar_status_requires_resync(status: u16) -> bool {
 #[must_use]
 pub const fn gmail_history_status_cannot_prove_usable(status: u16) -> bool {
     status == 404
+}
+
+/// Turns a `history.list` answer into the signal [`advance_gmail_history`] consumes.
+///
+/// **This is what makes [`SyncAdvance::HistoryPruned`] reachable from a real response.** `ADR-0066` made the
+/// signal a parameter so that the inference from a `404` to "history pruned" would be the caller's explicit
+/// act — but the signal then had **no producer**, because there was no `history.list` request to obtain a
+/// status from. A parameter whose only producer is a test fixture is the unreachable-remedy defect one layer
+/// up, so this function is that producer, placed beside the predicate that answers half its question.
+///
+/// # The three outcomes
+///
+/// - **`404`** — the cursor is unusable. The response cannot distinguish pruned history from an absent
+///   mailbox, and both causes begin with a full sync, so the wrong reading is self-correcting. See
+///   [`gmail_history_status_cannot_prove_usable`].
+/// - **`200`** — the read succeeded, so the mailbox's new `historyId` (when the response carried one)
+///   advances the cursor. A `200` with no id means the mailbox was unchanged, which
+///   [`advance_gmail_history`] handles by keeping the previous cursor rather than inventing a position.
+/// - **anything else** — carried with the caller's classification rather than swallowed.
+///
+/// # What is deliberately NOT a dead cursor
+///
+/// A `429` or a `5xx` is **retryable**, not a dead cursor: a resync on a transient failure discards a working
+/// store, which is the opposite mistake and a far more expensive one. The predicate is true for `404` alone,
+/// and the ordering here puts that predicate first so the retryable family can never fall into it.
+#[must_use]
+pub fn gmail_history_signal(
+    status: u16,
+    history_id: Option<&str>,
+    refusal: RetryDecision,
+) -> SyncSignal {
+    if gmail_history_status_cannot_prove_usable(status) {
+        return SyncSignal::CursorUnusable;
+    }
+    if status == 200 {
+        return SyncSignal::Advanced {
+            history_id: history_id.map(str::to_owned),
+        };
+    }
+    SyncSignal::Refused(refusal)
 }
 
 #[cfg(test)]

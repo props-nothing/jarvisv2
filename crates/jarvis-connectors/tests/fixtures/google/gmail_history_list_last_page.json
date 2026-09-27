@@ -1,0 +1,17 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.history.list (the last page)",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented shape of a `history.list` response that has NO further pages.",
+  "_the_point_of_this_fixture": "This is the ONLY kind of response a caller may advance a durable cursor from. The reference says that if you receive NO `nextPageToken` there are no updates to retrieve and 'you can store the returned `historyId` for a future request'. So `historyId` is present on every success while `nextPageToken` appears only mid-walk -- the two are NOT mutually exclusive (unlike Calendar's `nextPageToken`/`nextSyncToken` pair), and a reader that treated them as a pair would take its cursor from the wrong field. This fixture is the second half of that pair.",
+  "_sanitized": "No real message text, request id, or address appears here.",
+  "history": [
+    {
+      "id": "12347",
+      "messages": [{ "id": "18c1f2a3b4d5e6fa", "threadId": "18c1f2a3b4d5e6fb" }]
+    }
+  ],
+  "historyId": "12348"
+}

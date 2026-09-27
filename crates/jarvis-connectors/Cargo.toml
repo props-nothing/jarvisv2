@@ -16,9 +16,17 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
+# The HTTP transport, which `repository-layout.md` names as `client.rs`'s neighbour: "provider HTTP client and
+# normalized errors". Declaring it adds **no package** — `reqwest` resolves to the same `=0.13.5` already in the
+# lock file through `jarvis-cli`, `jarvis-models` and `jarvis-mcp-transport` — and the crate is pinned with
+# `default-features = false` and `rustls`, so no system TLS library is required. The *decisions* in this crate
+# stay pure; this is an implementation of the port at the edge, not a dependency the rules are written against.
+reqwest.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# `net` and `io-util` are for the hand-written HTTP server the transport tests drive, so the transport is
+# exercised against a **real socket** rather than a mocked client.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
 
 [lints]
 workspace = true

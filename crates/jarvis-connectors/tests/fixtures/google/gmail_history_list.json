@@ -1,0 +1,23 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.history.list",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented shape of a `history.list` page: `{ history[], nextPageToken, historyId }`.",
+  "_the_point_of_this_fixture": "This response carries BOTH `nextPageToken` and `historyId`, and they are different fields with different lifetimes. The reference says `nextPageToken` is the token for the NEXT PAGE of results, while `historyId` is 'the ID of the mailbox's current history record' -- and that when no `nextPageToken` is returned there are no further updates, so the returned `historyId` is what you store for a future request. A connector that stored the page token as its sync cursor would store one that expires when the walk ends, which is the defect this fixture makes falsifiable.",
+  "_the_read_field": "Only `messages` is read, and the reference recommends the change-type arrays (`messagesAdded`, `messagesDeleted`, `labelsAdded`, `labelsRemoved`) over it. `messages` is chosen because it is populated on every change while the change-type arrays are per-kind: a record carrying only `messages` would be missed by a reader that looked only at the specific fields, and the two would disagree about what changed.",
+  "_sanitized": "No real message text, request id, or address appears here. The ids are synthetic and sequential on purpose, because history ids increase chronologically.",
+  "history": [
+    {
+      "id": "12345",
+      "messages": [{ "id": "18c1f2a3b4d5e6f7", "threadId": "18c1f2a3b4d5e6f7" }]
+    },
+    {
+      "id": "12346",
+      "messages": [{ "id": "18c1f2a3b4d5e6f8", "threadId": "18c1f2a3b4d5e6f9" }]
+    }
+  ],
+  "nextPageToken": "0987654321",
+  "historyId": "12347"
+}

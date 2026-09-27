@@ -84,3 +84,16 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0064](0064-a-token-answer-is-read-from-its-body-and-its-token-is-never-copied.md) | A token endpoint's answer is read from its body, and the token it grants is never copied into a value | Accepted |
 | [0065](0065-a-protocol-type-stays-correct-when-a-provider-disagrees.md) | A protocol type stays correct when a provider disagrees with it | Accepted |
 | [0066](0066-a-cursor-decision-takes-a-signal-not-a-status.md) | A cursor decision takes a signal, not a status, because only the caller knows the method | Accepted |
+| [0067](0067-a-staleness-signal-needs-a-producer.md) | A staleness signal needs a producer, not only a parameter | Accepted |
+| [0068](0068-a-transport-port-is-enforced-by-an-implementation.md) | A transport port is only enforced by an implementation that exists | Accepted |
+| [0069](0069-two-tested-halves-do-not-test-the-seam.md) | Two tested halves do not test the seam between them | Accepted |
+| [0070](0070-the-callback-decoder-is-not-the-request-encoder.md) | The callback decoder's encoding is the opposite of the request encoder's | Accepted |
+| [0071](0071-one-form-codec-both-directions.md) | One codec, both directions, because the rule is narrower than RFC 3986 | Accepted |
+| [0072](0072-a-value-is-encoded-where-it-is-rendered.md) | A value is encoded where it is rendered, never where it is stored | Accepted |
+| [0073](0073-a-retry-safety-variant-needs-a-producer.md) | A retry-safety variant needs a producer, and the token exchange is it | Accepted |
+| [0074](0074-a-doc-naming-another-module-is-a-claim.md) | A doc naming another module is a claim about code, and the code never went there | Accepted |
+| [0075](0075-a-classification-table-with-no-caller.md) | A classification table with no caller decides nothing | Accepted |
+| [0076](0076-retry-after-is-three-situations-not-two.md) | `Retry-After` is three situations, not two | Accepted |
+| [0077](0077-a-bound-that-is-documented-but-not-applied.md) | A bound that is documented but not applied is not a bound | Accepted |
+| [0078](0078-a-scope-category-is-a-review-burden.md) | A scope's category is a review burden, and an unlisted scope is not a cheap one | Accepted |
+| [0079](0079-a-rate-limit-without-its-unit.md) | A rate limit without its unit is a figure read as the wrong thing | Accepted |

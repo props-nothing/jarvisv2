@@ -10,6 +10,7 @@
 use super::*;
 use crate::authorization::{AuthorizationTransaction, LoopbackRedirect};
 use crate::manifest::{ConnectorManifest, WebhookSupport};
+use crate::ratelimit::{QuotaCost, RateLimit, RateLimitEvidence, RateLimitScope, RateLimitUnit};
 use crate::readiness::{ALL_ITEMS, ReadinessItem};
 use crate::{LoopbackHost, PkceVerifier, SecretValue};
 use jarvis_core::UtcTimestamp;
@@ -377,6 +378,154 @@ fn the_endpoints_match_the_discovery_document() {
         GoogleConnector::authorization_endpoint(),
         GoogleConnector::token_endpoint()
     );
+}
+
+#[test]
+fn the_gmail_limit_is_in_cost_units_and_so_is_not_a_request_rate() {
+    // **The defect this test pins.** Google publishes 1,200,000 and 6,000 as **quota units** per minute, and
+    // the per-method costs range from 1 to 100. The declaration used to hand those figures to a `RateLimit`
+    // whose fields and accessor both said *requests*, so `sustained_per_second()` returned 20,000 for a figure
+    // whose real request meaning is 1,000 `messages.get` calls per second — a scheduler planning from it would
+    // have been 20× over quota, silently, because the connector behaves correctly until the provider refuses.
+    let manifest = manifest();
+    let Some(operation) = manifest
+        .operations()
+        .iter()
+        .find(|operation| operation.id() == "gmail_messages_read")
+    else {
+        panic!("`gmail_messages_read` must exist");
+    };
+    let Some(limit) = operation.rate_limit() else {
+        panic!("the Gmail read path must declare the documented limit");
+    };
+    assert_eq!(
+        limit.unit,
+        RateLimitUnit::CostUnits,
+        "Google's Gmail limits are published in quota units, not requests"
+    );
+    assert!(
+        !limit.unit.counts_requests(),
+        "a cost-unit figure may not be read as a request rate"
+    );
+    // So the direct accessor is **unavailable** for it: a caller must convert with the per-call cost, and a
+    // cost-unit limit has no request rate until one is known.
+    assert_eq!(
+        limit.sustained_requests_per_second(),
+        None,
+        "a cost-unit limit must not report a request rate directly"
+    );
+    // The raw figure is still readable, and it is the unit figure rather than a request count.
+    assert_eq!(limit.sustained_per_second(), 20_000);
+}
+
+#[test]
+fn the_per_call_cost_turns_the_project_ceiling_into_a_request_rate() {
+    // The conversion the distinction exists for, asserted at both documented costs. `messages.get` costs 20
+    // units and `history.list` costs 2 — a **10×** difference, which is why one shared "read limit" could not
+    // carry the cost and a per-operation field had to.
+    let manifest = manifest();
+    let find = |id: &str| {
+        manifest
+            .operations()
+            .iter()
+            .find(|operation| operation.id() == id)
+            .unwrap_or_else(|| panic!("{id} must exist"))
+            .clone()
+    };
+
+    let read = find("gmail_messages_read");
+    assert_eq!(read.quota_cost(), QuotaCost::Documented(20));
+    let limit = read
+        .rate_limit()
+        .unwrap_or_else(|| panic!("the read path declares a limit"));
+    // 1,200,000 units / 20 units per call = 60,000 calls per minute.
+    assert_eq!(read.quota_cost().calls_per_window(&limit), Some(60_000));
+
+    let history = find("gmail_history_list");
+    assert_eq!(history.quota_cost(), QuotaCost::Documented(2));
+    // The same ceiling, a different request allowance: ten times as many calls, because each costs a tenth.
+    let history_limit = history
+        .rate_limit()
+        .unwrap_or_else(|| panic!("the history path declares a limit"));
+    assert_eq!(
+        history.quota_cost().calls_per_window(&history_limit),
+        Some(600_000)
+    );
+    assert_ne!(
+        read.quota_cost().calls_per_window(&limit),
+        history.quota_cost().calls_per_window(&history_limit),
+        "the two reads must not compute the same request allowance from one ceiling"
+    );
+
+    // The listing call is 5 units, so it sits between the two.
+    assert_eq!(
+        find("gmail_messages_list")
+            .quota_cost()
+            .calls_per_window(&limit),
+        Some(240_000)
+    );
+}
+
+#[test]
+fn an_unstated_cost_derives_no_request_rate_rather_than_assuming_one() {
+    // **The fail-closed direction, and the case this connector actually ships.** Google's Gmail quota page
+    // publishes no Calendar cost, so `calendar_events_read` declares `Unstated`. Reading that as 1 would
+    // compute the whole cost-unit allowance as a request rate — over-planning by the operation's real cost,
+    // which is the failure the variant exists to prevent.
+    let manifest = manifest();
+    let calendar = manifest
+        .operations()
+        .iter()
+        .find(|operation| operation.id() == "calendar_events_read")
+        .unwrap_or_else(|| panic!("`calendar_events_read` must exist"));
+    assert_eq!(
+        calendar.quota_cost(),
+        QuotaCost::Unstated,
+        "no Calendar cost is published, so none may be claimed"
+    );
+    assert!(!calendar.quota_cost().is_documented());
+    assert_eq!(calendar.quota_cost().units(), None);
+    // And with no cost there is no request rate, so no request rate is produced.
+    let read_limit = manifest
+        .operations()
+        .iter()
+        .find(|operation| operation.id() == "gmail_messages_read")
+        .and_then(crate::manifest::ValidatedOperation::rate_limit)
+        .unwrap_or_else(|| panic!("the read path declares a limit"));
+    assert_eq!(
+        calendar.quota_cost().calls_per_window(&read_limit),
+        None,
+        "an unstated cost must derive nothing rather than assuming one call per unit"
+    );
+
+    // The control: a documented cost **does** derive a rate, so the `None` above is about the unstated cost
+    // rather than about `calls_per_window` answering `None` for everything.
+    assert!(
+        QuotaCost::Documented(1)
+            .calls_per_window(&read_limit)
+            .is_some()
+    );
+    // A cost of zero derives nothing either: no call costs nothing, so a zero is a defect in the table rather
+    // than a free operation, and dividing by it would be a panic.
+    assert_eq!(QuotaCost::Documented(0).calls_per_window(&read_limit), None);
+    // And a limit already stated in requests needs no conversion at all.
+    let request_limit = must(
+        RateLimit::new(
+            300,
+            60,
+            50,
+            RateLimitUnit::Requests,
+            RateLimitScope::PerAccount,
+            RateLimitEvidence::Documented,
+        ),
+        "a valid request limit",
+    );
+    assert_eq!(
+        QuotaCost::Documented(20).calls_per_window(&request_limit),
+        None,
+        "a request limit needs no per-call cost"
+    );
+    assert_eq!(request_limit.sustained_requests_per_second(), Some(5));
 }
 
 #[test]

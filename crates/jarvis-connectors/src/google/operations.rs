@@ -43,6 +43,7 @@ use crate::google::client::{self, GmailErrorReason};
 use crate::google::credential::AccessToken;
 use crate::google::request::{self, MessageFormat, RequestError};
 use crate::google::transport::{GoogleTransport, HttpMethod, TransportFailure, TransportResponse};
+use crate::ratelimit::{MAX_RETRY_AFTER_SECONDS, RetryGuidance};
 
 /// The longest failure reason this module builds.
 ///
@@ -86,6 +87,11 @@ pub fn request_for(
     match segment_of(tool) {
         "gmail_messages_list" => Ok(request::gmail_messages_list(
             text(arguments, "query")?,
+            page_size(arguments)?,
+            text(arguments, "page_token")?,
+        )?),
+        "gmail_history_list" => Ok(request::gmail_history_list(
+            required(arguments, "start_history_id")?,
             page_size(arguments)?,
             text(arguments, "page_token")?,
         )?),
@@ -237,7 +243,10 @@ fn interpret_response(
     let segment = segment_of(tool);
     if !matches!(
         segment,
-        "gmail_messages_list" | "gmail_messages_read" | "calendar_events_read"
+        "gmail_messages_list"
+            | "gmail_history_list"
+            | "gmail_messages_read"
+            | "calendar_events_read"
     ) {
         return Err(AdapterError::NotImplemented {
             tool: tool.to_owned(),
@@ -287,6 +296,21 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
         "gmail_messages_read" => request::parse_single_id(response.status, &response.body)
             .ok()
             .map(|id| serde_json::json!({ "message_id": id }).to_string()),
+        "gmail_history_list" => request::parse_history_page(response.status, &response.body)
+            .ok()
+            .map(|page| {
+                let mut value = serde_json::json!({ "message_ids": page.ids });
+                if let Some(token) = page.next_page_token {
+                    value["next_page_token"] = serde_json::Value::String(token);
+                }
+                // The history id is the **durable cursor**, rendered separately from the page token for the
+                // same reason the calendar path keeps its sync token separate: one continues this walk, the
+                // other positions a future sync.
+                if let Some(history_id) = page.history_id {
+                    value["history_id"] = serde_json::Value::String(history_id);
+                }
+                value.to_string()
+            }),
         "calendar_events_read" => {
             request::parse_calendar_page(response.status, &response.body)
                 .ok()
@@ -324,10 +348,65 @@ fn refusal(
         .as_ref()
         .and_then(client::GmailErrorBody::reason)
         .map_or(GmailErrorReason::Unrecognised, GmailErrorReason::parse);
-    let detail = reason.as_str().map_or_else(
-        || format!("the provider answered {}", response.status),
-        |code| format!("the provider refused the call: {code}"),
+    // # `classify` is called here, and until now it was not called in production at all
+    //
+    // `client::classify` is the retry table `ADR-0058` was written around — the one whose case for existing is
+    // that four documented reasons share a `403` with three different remedies, so **a status-only classifier
+    // retries an administrator's decision forever**. It had **no production caller**: `refusal` read the reason
+    // code and formatted it, while the class the table computes was never consulted. A `429`'s stated
+    // `Retry-After` was carried by the transport, validated, documented — and then dropped on the floor here.
+    //
+    // Wiring it in is what makes the table observable, and the class is appended to the reason so a reader of a
+    // stored failed call can tell "throttled, retry after 30s" from "an administrator disabled this".
+    let decision = client::classify(
+        response.status,
+        reason,
+        response.retry_after,
+        // **No provider request identifier**, and that is a recorded limit rather than an oversight:
+        // `TransportResponse` carries the status, the delay and the body but **no headers**, so there is
+        // nowhere for one to come from. `RetryDecision::provider_request_id` and `ProviderRequestId` are
+        // therefore still unpopulated in production. Whether Google supplies an identifier at all is
+        // **unverified** — its `handle-errors` guide names the status and a body object but no request-id
+        // header (ADR-0076) — so this is not filled with a value read out of the body.
+        None,
     );
+    let detail = match reason.as_str() {
+        Some(code) => format!(
+            "the provider refused the call: {code} ({})",
+            decision.class.as_str()
+        ),
+        None => format!(
+            "the provider answered {} ({})",
+            response.status,
+            decision.class.as_str()
+        ),
+    };
+    // The delay is appended **only when the guidance states one**, which is exactly the classes that permit a
+    // retry: `DoNotRetry`, `Reauthenticate` and `Reconcile` carry no seconds, so a reader cannot see a delay
+    // beside a refusal that has none. A `Throttled` answer without a stated delay gets the documented floor,
+    // which is why the number is always present for the retryable classes.
+    //
+    // **A delay the provider stated but this client could not read is marked as such.** The number is the same
+    // floor a silent fallback uses, so the only thing that tells the two apart is the words — and without them
+    // an operator would read a JARVIS floor as the provider's own instruction, or conclude the provider stated
+    // nothing when it stated a time (`ADR-0076`).
+    //
+    // **A stated delay above the ceiling says "defer", never "retry after".** The guidance is checked *before*
+    // `delay_seconds`, because `DeferSeconds` deliberately answers `None` there — and the words matter: a reader
+    // who saw "retry after 18000s" would wait for a whole quota window inside a retry loop, which is the thing
+    // the bound exists to prevent (`ADR-0077`).
+    let detail = match decision.guidance {
+        RetryGuidance::BackoffAfterUnreadableDelay(seconds) => format!(
+            "{detail}; retry after {seconds}s (the provider stated a delay this client could not read)"
+        ),
+        RetryGuidance::DeferSeconds(seconds) => format!(
+            "{detail}; defer for {seconds}s (above the {MAX_RETRY_AFTER_SECONDS}s this caller will hold)"
+        ),
+        other => match other.delay_seconds() {
+            Some(seconds) => format!("{detail}; retry after {seconds}s"),
+            None => detail,
+        },
+    };
     let record =
         ToolOutcomeRecord::failed(truncate(&detail, MAX_FAILURE_REASON_CHARS)).map_err(|_| {
             AdapterError::AmbiguousAfterReaching {
@@ -335,7 +414,9 @@ fn refusal(
             }
         })?;
     // No evidence: provider evidence is the locator for an **effect**, and a refusal produced none. The status
-    // and reason live in the outcome's own reason, which is where a refusal belongs.
+    // and reason live in the outcome's own reason, which is where a refusal belongs — and the retry class rides
+    // with them because `jarvis-tools`' `AdapterError` has no field for a connector's own retry vocabulary, so
+    // the bounded reason is the only channel that reaches a caller.
     Ok(ToolCallResult::new(record, None, None, now))
 }
 
@@ -388,6 +469,26 @@ pub fn evidence_from(locator: Option<&str>) -> Option<ProviderEvidence> {
 /// than a caller's mistake — `HttpRequest` builds only `GET`s today, and `P5-009` must extend both together.
 pub fn method_for(request: &request::HttpRequest) -> Result<HttpMethod, TransportFailure> {
     crate::google::transport::method_of(request)
+}
+
+/// Applies the **test** origin override, or changes nothing in a production build.
+///
+/// Two functions rather than one with a branch, so a production build contains no reference to
+/// [`request::HttpRequest::rebase_to`] at all — the seam is `#[cfg(test)]` and this pair keeps it that way.
+/// A single branch would have forced the seam to exist in every build for the sake of a test.
+#[cfg(test)]
+fn apply_origin(request: request::HttpRequest, origin: Option<&str>) -> request::HttpRequest {
+    match origin {
+        Some(origin) => request.rebase_to(origin),
+        None => request,
+    }
+}
+
+/// See the `#[cfg(test)]` sibling: this is the production half, which ignores the seam.
+#[cfg(not(test))]
+fn apply_origin(request: request::HttpRequest, origin: Option<&str>) -> request::HttpRequest {
+    let _ = origin;
+    request
 }
 
 /// A read operation bound to a transport — what makes this module's pieces reachable.
@@ -443,6 +544,42 @@ impl<'a> GoogleReadTool<'a> {
         arguments: &serde_json::Value,
         now: UtcTimestamp,
     ) -> Result<ToolCallResult, AdapterError> {
+        self.dispatch(tool, arguments, now, None).await
+    }
+
+    /// Performs one read against a **test origin** rather than the provider's API base.
+    ///
+    /// A test seam, and it exists because the real request builders are bound to the documented API bases while
+    /// a test must aim at a loopback server. Nothing else changes: the arguments, the percent-encoding, the
+    /// headers and the response handling are the ones [`Self::run`] performs, so a test drives the product's own
+    /// path rather than a reconstruction of it. Available only under `cfg(test)` so it cannot be reached in a
+    /// build.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    #[cfg(test)]
+    pub(crate) async fn run_with_origin(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+        now: UtcTimestamp,
+        origin: &str,
+    ) -> Result<ToolCallResult, AdapterError> {
+        self.dispatch(tool, arguments, now, Some(origin)).await
+    }
+
+    /// Builds the request, sends it, and interprets the answer.
+    ///
+    /// One function for both the production entry point and the test seam, so the two cannot diverge: a seam
+    /// that rebuilt the request would let the encoding or the path drift unobserved.
+    async fn dispatch(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+        now: UtcTimestamp,
+        origin: Option<&str>,
+    ) -> Result<ToolCallResult, AdapterError> {
         let request = match request_for(tool, arguments) {
             Ok(request) => request,
             Err(OperationError::UnknownTool { tool }) => {
@@ -456,6 +593,9 @@ impl<'a> GoogleReadTool<'a> {
                 });
             }
         };
+        // The one place the test seam applies, and it rewrites the **origin alone** — so the path and the
+        // encoded query below are the ones the product builds.
+        let request = apply_origin(request, origin);
         // The method comes from the request rather than being restated, so a request kind added later cannot be
         // sent with the wrong verb. A method the port cannot express is a crate defect rather than a caller's
         // mistake, so it is classified as a failure before writing — nothing was sent, so nothing happened.

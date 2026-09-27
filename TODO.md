@@ -3606,6 +3606,525 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `400`-is-a-query-error path still has no fixture**, so nothing pins which reason code accompanies it; and the
     signal does **not** protect against calling the wrong `advance_*` function — a mismatched cursor is caught by
     `SyncCursorKind`, not by the signal.
+  - **This round added the `history.list` read — the producer the previous round's signal was missing.**
+    `request::{gmail_history_list, parse_history_page, HistoryPage}`, `client::gmail_history_signal`, the
+    `gmail_history_list` manifest operation and tool definition, and two fixtures
+    (`gmail_history_list.json`, `gmail_history_list_last_page.json`). **4 new lib tests + 1 new fixture test,
+    so 295 in the crate and 11 in the fixtures suite.** **`ADR-0067`.** Both new guards were falsified A-B-A
+    with compiling mutants and restored byte-identical.
+  - **⭐⭐ THE FINDING: `ADR-0066` FIXED THE VARIANT FORM OF THE DEFECT AND REPRODUCED IT AS A PARAMETER FORM.**
+    That round widened `advance_gmail_history` to take a `SyncSignal` so the resync remedy became producible —
+    but **nothing could build a signal from a response**, because there was no `history.list` request in the
+    crate. The only construction sites were test fixtures, so the whole enum was fixture-only. Widening a
+    function's signature does not supply the value, and the check `P5-001`/`P5-003` record — *for every variant,
+    grep the constructing sites, not the definition* — applies to a parameter as much as to an enum. Applying it
+    showed `Advanced` and `Refused` had no producer either.
+  - **The asymmetry that carries the weight is the predicate's ORDER.** `gmail_history_signal` checks
+    `gmail_history_status_cannot_prove_usable` **first**, so the retryable family (`429`, `5xx`) can never fall
+    into the dead-cursor arm. A resync on a transient failure discards a working store — the opposite mistake
+    from the one the 404 heuristic tolerates, and the more expensive one. Asserted over `400/403/429/500/502/503/504`.
+  - **⭐ TWO DEFECTS IN MY OWN FIRST DRAFT, both found by fetching the live method reference before writing the
+    code — and both living in field *descriptions* rather than the example**, the `ADR-0063` lesson hit again.
+    (1) I made `history_id` **required** in the output schema, assuming a success always states the new
+    position; the reference says the id "can be stored … for a future request" when no `nextPageToken` is
+    returned, which is about *when it is usable*, not *when it is present*. Requiring it would have made the
+    connector's declaration stricter than the provider's. (2) I nearly treated `historyId` and `nextPageToken`
+    as Calendar's mutually-exclusive pair; they are **not** — `historyId` is present on every success while
+    `nextPageToken` appears only mid-walk, so a reader copying the Calendar pattern would take its durable
+    cursor from the field that expires when the walk ends. The two fixtures are that pair.
+  - **`historyTypes[]` is deliberately not offered.** The parameter filters the change kinds returned, so a sync
+    using it would silently drop the kinds it excluded; the general `messages` field is populated on every
+    change and is read instead. The operation also gets its **own** rate-limit entry, because `history.list`
+    costs **2** quota units against a message read's 20 and reusing the read limit would over-state a sync.
+  - **Falsified, two guards A-B-A with compiling mutants.** `gmail_history_signal`'s 404 arm → `if false`
+    (detected by `a_history_status_becomes_the_signal_the_cursor_decision_consumes`); `parse_history_page`'s
+    status check → `if false` (detected by `a_history_page_keeps_the_cursor_and_the_page_token_apart`). Both
+    restored and verified byte-identical with the mutant string absent from the file.
+  - **NEW LIMITS:** **no request is sent and no response has been parsed from Google** — the transport slice is
+    still unbuilt, so these tests prove the layer implements the *record*; **the operation is registered
+    nowhere**, so no model can reach it; **the signal producer has no caller** — a sync loop would be the
+    consumer, and no sync loop exists; the fixtures are hand-built, so a shape Google sends but does not
+    document is still invisible; and **`history_types` filtering and the `labelId` parameter are unimplemented**
+    rather than absent-as-a-decision.
+  - **This round built the transport implementation — the limit every previous slice of `P5-005` recorded.**
+    `crates/jarvis-connectors/src/google/http.rs` + `http_tests.rs` (6 new tests, so **301 in the crate**),
+    `reqwest` declared on the crate (resolving to the already-locked `=0.13.5`, so **no new package**), and a
+    `#[cfg(test)]` `HttpRequest::rebase_to` seam so a transport test drives a **real product request** against a
+    loopback server. **`ADR-0068`.** **50 suites / 1566 workspace tests, 0 failed, 0 ignored.** Both new guards
+    falsified A-B-A with compiling mutants and restored byte-identical.
+  - **⭐⭐ THE FINDING: `ADR-0062`'s PORT REQUIREMENTS WERE UNENFORCEABLE AND READ AS SATISFIED.** The port listed
+    four things an implementation "must not do" — follow a redirect, retry, read a proxy from the environment,
+    return an error for a non-2xx — and the only implementations were **test doubles**, which have no redirect
+    policy, no proxy configuration and no retry to disable. So all four were true **by construction** and none
+    was tested. The crate's own limits admitted this ("they become testable only when a real transport is
+    written"), which is the honest form — but a requirement that *reads* as met is worse than one nobody wrote
+    down. `ADR-0067`'s lesson (a parameter with no producer) applies to a **constraint with no implementation**.
+  - **The ordering in the failure map is the substance, and it is not the obvious order.** `classify_error`
+    checks `is_timeout()` **before** `is_connect()`, although `is_connect()` is the more specific answer where
+    both apply. The reason is the *failure direction*: a timeout is **ambiguous** (the request may have been
+    written), so choosing it where the certain variant might also fit can only make a caller *less* willing to
+    retry — whereas the reverse mistake would let a non-idempotent effect repeat. A pure connect failure is not
+    a timeout, so DNS and refused-connection failures still report `Connect` and the specific case is not lost.
+    `Send` is the final arm, because an unrecognised failure is exactly where certainty is unwarranted.
+  - **A branch was deliberately NOT written, and the reason is a recorded defect class.** There is no
+    `error.is_redirect()` arm: with `Policy::none()` no redirect produces an error, so the arm could never fire
+    — the unreachable refusal `P5-001` and `P5-003` each recorded. The redirect is instead classified by the
+    caller from the `302` the transport now *returns*, which is also the control that proves nothing was
+    followed: **the redirect target server is asserted to have received zero connections**.
+  - **Four port requirements became controls with tests**, each against a hand-written HTTP/1.1 server (the
+    `jarvis-mcp-transport` precedent — a framework would share assumptions with the client under test): no
+    redirect followed; no retry (exactly one request per `send`); no environment proxy (`no_proxy()` explicit,
+    because `reqwest`'s `system-proxy` default is ON); and a `403` arriving as a `TransportResponse` rather than
+    an error. The timeout case is driven by a server that accepts and **never answers**, so the client's own
+    deadline is what ends it rather than an error the test invented.
+  - **The dependency was measured before it was declared.** `reqwest` resolves to the `=0.13.5` already in the
+    lock file through `jarvis-cli`, `jarvis-models` and `jarvis-mcp-transport`, so `cargo tree` shows one new
+    edge and `Cargo.lock` gained **one line** — no package joined the tree, and `cargo deny check` is
+    advisories/bans/licenses/sources **all ok**. `default-features = false` with `rustls` keeps the
+    bundled-TLS policy.
+  - **Falsified, two guards A-B-A with compiling mutants.** The timeout-first ordering → `if false`, detected
+    by `a_refused_connection_is_certain_and_a_timeout_is_not` (`left: Send, right: Timeout`); the redirect
+    policy → `Policy::limited(10)`, detected by
+    `a_redirect_is_not_followed_and_the_target_is_never_contacted` (`left: 200, right: 302`). Both restored and
+    verified byte-identical.
+  - **NEW LIMITS:** **no request has been sent to Google and no Google response has been parsed** — every
+    response is written by the test file, so these tests prove the transport's own controls rather than the
+    record; **the transport has no production caller**, because no composition root constructs the connector
+    (the daemon owns that); **no body-size bound**, since `TransportFailure` has no "too large" variant and a
+    streaming cap needs `P5-009`'s output policy; **no token refresh**, so a stale token becomes a provider
+    refusal; **no `Retry-After` interpretation** (it is carried and never acted on); and the timeout/connect
+    pair is a **JARVIS choice**, because the port requires a bound while Google publishes no deadline.
+  - **⚠ AND THE DEPENDENCY COST A LOCAL CHECK, WHICH IS RECORDED RATHER THAN WORKED AROUND.** `reqwest`'s `rustls`
+    backend pulls `aws-lc-sys`, so `cargo clippy -p jarvis-connectors --target x86_64-unknown-linux-gnu` now
+    fails with `ToolNotFound` even with the zig linker shim — the crate joins `jarvis-models` in the set that
+    **cannot be cross-linted locally**. Native CI still lints it on all three OSes, so this narrows local
+    verification rather than the gate; a `#[cfg(unix)]`-only defect would now surface only on CI.
+  - **This round tested the SEAM — the join that had no test in either half.** `http_tests.rs` gained 4 tests (so
+    **305 in the crate**) driving `GoogleReadTool` against a real `ReqwestTransport` over a socket, plus two
+    recorded `#[cfg(test)]` seams: `HttpRequest::rebase_to` and `GoogleReadTool::run_with_origin`. **`ADR-0069`.**
+    **50 suites / 1570 workspace tests, 0 failed, 0 ignored.**
+  - **⭐⭐ THE FINDING: EVERY PART HAD A GREEN TEST AND THE JOINT HAD NONE.** The adapter was tested against a
+    **`Scripted`** transport; the transport was tested against a **hand-written request** it was handed. Neither
+    had ever met the other, so a URL the adapter builds that the transport sends to the wrong place — or a
+    header one sets and the other drops — was invisible to both suites. This is `P3-006a`'s shape (each slice
+    self-consistent; the defect lives between two correct modules) and the third variant of the same class this
+    phase has found: `ADR-0067` a variant with no producer, `ADR-0068` a constraint with no implementation,
+    `ADR-0069` a **joint with no test**. **Rule: for every pair that must agree, ask which test drives them
+    TOGETHER.**
+  - **⭐ THE CROSS-OPERATION TEST IS THE ONE WITH THE TEETH, and the single-operation seam tests would not have
+    caught a mis-route.** Those assert that the expected data came back — and an operation wrongly routed to
+    another endpoint that still answered with a parseable body would satisfy them. So one test drives **all
+    four** operations and compares a **path per operation**. Verified rather than asserted: mutating the history
+    builder's path to `/users/me/messages` failed with
+    `google.gmail_history_list must address /gmail/v1/users/me/history, got /gmail/v1/users/me/messages?startHistoryId=12345`.
+  - **⭐ TWO ROUTING MUTANTS WERE `VACUOUS`, NOT `FAIL`, AND THAT IS ITSELF A FINDING.** Pointing
+    `gmail_history_list` at the messages *builder* failed to compile twice (`?` has incompatible types; 3
+    arguments vs 4), because changing a builder's identity changes its argument types. So a routing mistake
+    **inside** one module is largely unrepresentable — which is exactly why the seam (where the routing is
+    *selected* and the request is *sent*) is where the defect can live. The `VACUOUS`/`FAIL` distinction kept the
+    reading honest rather than counting a compile error as a detection.
+  - **Both seams are `#[cfg(test)]` on BOTH sides**: `apply_origin` has a `#[cfg(not(test))]` sibling, so a
+    shipped build contains no reference to the test origin at all — a single branch would have forced the seam
+    to exist in every build for a test's sake.
+  - **`HttpRequest`/`GoogleReadTool` assertions on the wire**: method, the encoded query (`q=is%3Aunread`,
+    `maxResults=10`), the `Accept` header, a `Bearer ` authorization header, and no credential in the URL. The
+    request **target** includes the query, so paths are compared with `split('?').next()` — the same split
+    `url()`/`url_with_query()` makes; my first assertion compared the whole target and was wrong, not the code.
+  - **NEW LIMITS:** still **no request to Google** — every response is written by the test file, so this proves
+    the seam and not the record; the transport still has **no production caller** (no composition root builds
+    the connector); the live smoke test remains unwritten.
+  - **This round built the callback reader — the listener half of the flow had no implementation.**
+    `Callback::from_request_target` in `authorization.rs`, plus `FormParameters` and `form_decode`, and two new
+    `AuthRefusal` variants (so **310 in the crate**, 5 new tests). **`ADR-0070`.** **50 suites / 1575 workspace
+    tests, 0 failed, 0 ignored.** Two guards falsified A-B-A with compiling mutants and restored byte-identical.
+  - **⭐⭐ THE FINDING: THE CALLBACK DECODING IS THE OPPOSITE OF THE REQUEST ENCODING, AND THE MISTAKE LOOKS
+    LIKE AN ATTACK.** RFC 6749 §4.1.2 says the response parameters are added "using the
+    `application/x-www-form-urlencoded` format, per Appendix B" — where a space is **`+`**. The request side
+    (`ADR-0060`) encodes a space as `%20` **and a literal `+` as `%2B`**, deliberately, because RFC 3986 has no
+    form semantics. So the same crate holds both rules and they disagree about one character. A `state` of
+    `a b` arrives as `state=a+b`, and a decoder that kept the `+` would compare `a+b` against `a b` and refuse
+    a **legitimate** response — surfacing as `StateMismatch`, i.e. as a possible forgery, while the cause is one
+    character of decoding. **The worst shape a security refusal can take is a false one that reads as an
+    attack.**
+  - **⭐ A TEST FORCED A VARIANT SPLIT, and the failure was the finding.** `CallbackUnparsable` was one variant
+    for both "the bytes could not be read" and "a parameter was repeated", and the codetable test failed on
+    `indicates_forgery` (`left: true, right: false`) because one variant had to answer for both. They are now
+    `CallbackMalformed { reason }` (a listener defect — a truncated escape, invalid UTF-8, or a target that
+    names no loopback redirect) and `ParameterRepeated` (the shape an appended value takes). `indicates_forgery`
+    is `true` only for the four mismatch/repeat variants. **`clippy::struct_excessive_bools`' lesson again: two
+    values standing for more than two situations must be an enum.**
+  - **A repeated parameter is REFUSED, not last-wins.** RFC 6749 §3.1 and §3.2 both require a parameter "MUST
+    NOT be included more than once", and taking the last value is exactly how a `state` check is defeated —
+    the server's own value comes first and an appended one second. A malformed escape or invalid UTF-8 is
+    **refused rather than lossily decoded**, because a lossy decode turns a corrupted `state` into a *different*
+    string that merely fails to match, hiding a transport fault behind a security refusal.
+  - **`Callback`'s own doc claimed the decode lived elsewhere — and that division left it UNWRITTEN.** Every
+    `Callback` in the tree was hand-assembled in a test, so no code here had ever read a request target. That is
+    `ADR-0068`'s shape (a requirement with no implementation) and `ADR-0069`'s (a joint nobody drives) one layer
+    further out: the *listener* had no reader. The `received_on` value is recovered **portless**, because an
+    origin-form target carries no port — the `Host` header does — and `consume` still compares it against the
+    transaction's ported registration with `matches_except_port`, so the port check is not lost, only moved to
+    where both values exist.
+  - **⚠ ONE OF MY OWN TEST PREMISES WAS WRONG AND THE FAILURE SURFACED IT.** I asserted a non-loopback target
+    (`https://evil.example/cb?state=x`) would be refused; it is **accepted**, because the prefix check strips
+    `http://` and the rest parses as a *path*. The claim was too strong; it was replaced by the accurate one
+    (a target naming no loopback redirect is refused, asserted through the absolute-form case that genuinely
+    fails) rather than by weakening the code.
+  - **NEW LIMITS:** **no listener is bound**, so a callback has still never arrived over HTTP — what is closed
+    is that the decode exists and is tested; the **form-POST transport for the token exchange** is still
+    unbuilt, so `token.rs`'s exchange remains caller-driven; and nothing wires `from_request_target` into a
+    server, because a loopback listener belongs to the composition root.
+  - **This round moved the codec to one module and finished the rule — the encoder half was still missing.**
+    New `crate::form` (`encode_component`, `decode_component`, `encode_body`, `CONTENT_TYPE`) with
+    `form_tests.rs` (7 tests, so **318 in the crate**), and `authorization.rs`'s local `form_decode` deleted in
+    favour of the shared decoder. **`ADR-0071`.** **50 suites / 1583 workspace tests, 0 failed, 0 ignored.**
+    Two guards falsified A-B-A with compiling mutants and restored byte-identical.
+  - **⭐⭐ THE FINDING: THE ENCODING RULE IS NARROWER THAN `ADR-0070` RECORDED — the alphabet is
+    ALPHANUMERICS ONLY.** `ADR-0070` established that a space is `+` rather than `%20`, and stopped there.
+    HTML 4.01 §17.13.4 (which RFC 6749 Appendix B points at) actually says: "Space characters are replaced by
+    `+', and then reserved characters are escaped ... **Non-alphanumeric characters are replaced by `%HH`'"**.
+    So `~ - . _` are escaped too (`%7E %2D %2E %5F`), where RFC 3986's unreserved set — and this crate's
+    `percent_encode` — leave them alone. The **decoder** accepted them either way, so round one could not see
+    it; the gap appears only when an encoder exists. Escaping *more* is interoperable in both directions, while
+    escaping less produces a value the server reads differently, so the wider escape is the safe one.
+  - **TWO IMPLEMENTATIONS OF THE SAME ONE-CHARACTER RULE WERE ABOUT TO EXIST.** The token endpoint's form
+    `POST` body needs this encoding in the **opposite direction** from the callback, so writing the encoder
+    inside `token.rs` would have put a second copy of the space rule where the callback already had one —
+    `P3-006a`'s "two values that must agree, with nothing holding both", for a codec rather than a struct. One
+    module now holds both directions, and a test asserts the form encoder and `percent_encode` produce
+    **different** output for the same input, so a refactor that merged them fails.
+  - **⚠ MY OWN NEW TEST PREMISE WAS WRONG AND THE FAILURE SURFACED IT, exactly as in `ADR-0070`.** I wrote
+    `encode_body`'s expectation as `"grant_type=authorization_code&code=a+b"` — with the parameter **names
+    unescaped**. The code produced `"grant%5Ftype=authorization%5Fcode"`, and the code was right: the rule is
+    stated about "control names **and** values". A named test now covers a name holding `&` and `=`
+    (`"a&b=c"` → `"a%26b%3Dc"`) and fails if only values are encoded. **The reasonable-looking expectation is
+    the one to check.**
+  - **⭐ THE MODULE IS EXPORTED BECAUSE THE ENCODER HAS NO CALLER YET, AND CLIPPY SAID SO.** `pub` items inside
+    a private module are unreachable and therefore dead code — the defect `P5-001` recorded and this crate hit
+    when `google.rs` was private. Marking the encoder `#[cfg(test)]` instead would have hidden a function the
+    next slice is meant to use, so the module is `pub` with the reason in its own doc.
+  - **Falsified, two guards A-B-A with compiling mutants.** The space rule → a literal space (detected by
+    **three** tests, incl. `left: "code=a b", right: "code=a+b"`); the name escaping → the raw name
+    (detected by **two**, incl. `left: "a&b=c=v"`). One attempt printed `NOCHANGE` because the formatting had
+    been refactored — the string-changed probe caught that rather than reporting a false pass.
+  - **NEW LIMITS:** the **encoder has no caller** — `encode_body` is exercised only by its tests, because the
+    token endpoint's form `POST` transport is unbuilt; HTML 4.01's line-break normalisation is deliberately
+    **not** performed (a codec that rewrote the bytes would make a caller's refusal unobservable, and no OAuth
+    parameter admits CR or LF anyway); and the codec does not validate what it encodes, so a value that is
+    invalid for OAuth (a line break, an over-long token) encodes faithfully and is refused — or not — by the
+    caller that owns the rule.
+  - **This round found and fixed a LATENT double-encoding defect in the token exchange, one round after the
+    encoder that would have exposed it was written.** `ExchangeIdentity::parameters()` no longer pre-encodes;
+    `token::{body, content_type}` and `ExchangeIdentity::endpoint()` are added, and the test that asserted the
+    pre-encoded form is **reversed** (3 new tests, so **320 in the crate**). **`ADR-0072`.** **50 suites /
+    1585 workspace tests, 0 failed, 0 ignored.** One guard falsified A-B-A with a compiling mutant.
+  - **⭐⭐ THE FINDING: THE TOKEN EXCHANGE WAS ESCAPING ITS VALUES WHERE THEY WERE STORED, NOT WHERE THEY WERE
+    RENDERED — a double-encoding trap with no caller.** `ExchangeIdentity::parameters()` ran
+    `percent_encode` over `client_id` and `redirect_uri`, and a test asserted `redirect_uri ==
+    "http%3A%2F%2F127.0.0.1%2F"`. `ADR-0071`'s `encode_body` escapes everything it is given, so the two together
+    produce `http%253A%252F%252F127.0.0.1%252F` — and Google answers a double-encoded `redirect_uri` with
+    **`redirect_uri_mismatch`**, which names **client registration** rather than the encoding. **A fault whose
+    symptom is one layer away from its cause is the one that costs a day.**
+  - **⭐ THE DEFECT WAS LATENT UNTIL THE ENCODER EXISTED, AND THAT IS THE ARGUMENT FOR BUILDING THE RENDERER
+    BEFORE THE TRANSPORT.** Nothing built a body, so the wrong-encoding path had no caller and the crate was
+    green for several rounds. The moment `encode_body` landed, the two layers disagreed. Same family as
+    `ADR-0068` (a requirement with no implementation) and `ADR-0069` (a joint nobody drives) — here the two
+    halves are the *producer* and the *renderer* of one value, and **only a pipeline test covers them.**
+  - **The rule this makes explicit: a value is encoded where it is RENDERED, never where it is STORED.** A list
+    of values with an encoding already applied is a *half-rendered request*: every consumer must know whether
+    it has been rendered, and the one that guesses wrong produces this failure. The general assertion is now
+    part of the tests — **a `%25` anywhere in a rendered form body means some value was escaped where it was
+    stored** — and it is checked for both the identity parameters and the whole exchange.
+  - Two accessors make the rendering layer reachable without a socket: `token::body(&[(String, String)])` and
+    `token::content_type()`, plus `ExchangeIdentity::endpoint()`, which takes the host **from the manifest**
+    rather than restating it. That preserves `P5-004`'s recorded oddity — the consent screen and the exchange
+    are on **different hosts** (`accounts.google.com` vs `oauth2.googleapis.com`), so a reader "tidying" them
+    into one constant would break every exchange — and a test asserts the literal.
+  - **Falsified, one guard A-B-A with a compiling mutant.** Restoring the pre-encoding was detected by **two**
+    tests, and the failure printed the whole doubled body (`redirect%5Furi=http%253A%252F%252F127%2E0%2E0%2E1%252F`)
+    so the message names its own cause. Restored byte-identical.
+  - **NEW LIMITS:** nothing sends the request — `HttpMethod` has one variant, so a form `POST` is not
+    expressible by the read transport and the caller still drives the exchange; the endpoint, parameter lists,
+    body and answer reader are all present and tested, so the transport slice is now a thin binding; and the
+    `client_id` is still only checked for non-emptiness, so a pasted URL is accepted here and fails at the
+    provider.
+  - **This round built the exchange over a transport — and `TokenRequestOutcome` finally has a producer.**
+    `request::FormRequest`, `GoogleTransport::send_form` with its `reqwest` arm, `token::exchange`, and
+    `TransportFailure::reason` (a `const fn`, because `NeverSent` holds a static reason); a new
+    `token_exchange_tests.rs` (6 tests, so **326 in the crate**). **`ADR-0073`.** **50 suites / 1591 workspace
+    tests, 0 failed, 0 ignored.** Two guards falsified A-B-A with compiling mutants and restored byte-identical.
+  - **⭐⭐ THE FINDING: `TokenRequestOutcome` WAS DEAD CODE WEARING A CONTRACT, AND TWO THINGS BLOCKED IT.** Its
+    own doc called the `NeverSent`/`SentAnswerUnknown` distinction consequential (RFC 9700 §4.2.4: a retry of a
+    lost-answer request may consume the code **and destroy a working grant the first attempt issued**), and
+    **every construction site was in `token_tests.rs`** — the `P5-001` defect, and the third instance this
+    phase of *a declaration nothing produces* (`ADR-0067` the variant form, `ADR-0068` the constraint form,
+    this the **outcome** form). The second blocker was structural: the exchange is a form `POST` and
+    `HttpMethod` deliberately has one variant, so the port could not express the method — the type had neither
+    a producer nor the **ability** to have one.
+  - **⭐ A SEPARATE `FormRequest` TYPE, because the two request shapes have OPPOSITE credential boundaries.**
+    `HttpRequest` exists so it **cannot** hold a credential in its URL (`ADR-0060`); a token request's body
+    **is** the credential-bearing text. A union would either give `HttpRequest` a field a credential goes in or
+    force every caller to prove which kind it holds. `FormRequest` takes the **already-rendered** body, so it
+    cannot encode and therefore cannot double-encode (`ADR-0072`), and its `Debug` is hand-written to
+    `[REDACTED]` + a character count with **no `Display`** — `ADR-0061`'s rule, since a derived `Debug` would
+    render the body through any `{:?}`. A test asserts the rendering and the count.
+  - **⭐ `send_form` IS A SECOND PORT METHOD, NOT A THIRD `HttpMethod` VARIANT.** `HttpMethod`'s own doc says
+    adding a write is `P5-009`'s decision; this is not that — it is the token endpoint's *framing*, which
+    authenticates by its body's `client_id` and has **no bearer token**. Folding it into `send` would give the
+    read path a body it does not have and the token path a credential parameter it does not use: one method
+    with two disjoint modes. Both test doubles gained a `send_form` arm that **panics** when the wrong path
+    calls it, so a mistake is a test failure rather than a silent success.
+  - **⭐ `reqwest`'s `form` FEATURE IS DELIBERATELY NOT ENABLED.** `.form()` exists but is feature-gated, and
+    enabling it would add the dependency's form encoder beside `crate::form` — two implementations of the one
+    character `ADR-0071`/`ADR-0072` exist to keep single, disagreeing **invisibly** because both produce a
+    plausible body. So the request is built with `.body(rendered)` and an explicit `Content-Type`, and a test
+    asserts the recorded body contains no `%25`.
+  - **The retry-safety cases are asserted AGAINST `may_have_reached_the_provider`, not against a hand-written
+    list of which failures are ambiguous.** A new `TransportFailure` variant therefore cannot be classified by
+    omission: the fixture fails first if the predicate and the expectation disagree. And an unreadable body is
+    an **`Err`**, not `Refused` — folding it in would send a user to a consent screen when the fault is a body
+    this client cannot parse, which is a different thing from the provider answering "no".
+  - **Falsified, two guards A-B-A with compiling mutants.** Collapsing the ambiguity to `NeverSent` was caught
+    with `Send may have been written, so a retry could repeat an effect` (`left: NeverSent` / `right:
+    SentAnswerUnknown`); turning an unreadable body into a refusal was caught by the exchange test. Restored
+    byte-identical.
+  - **NEW LIMITS:** **the exchange has no caller** — nothing constructs a `FormRequest` outside a test, because
+    no composition root builds the connector, so a live call needs credentials and a composition root rather
+    than more code here; the `refresh` path is not yet driven through `exchange` (only the code exchange is);
+    and the request carries no deadline of its own, so it relies on the client's configured timeout.
+  - **This round gave the refresh path a producer — and found a doc claiming a delegation the code never made.**
+    `token::refresh_with` (so `RefreshExchange` has a caller outside a test), the shared `send_and_parse` join
+    plus an `ExchangeFailure` enum keeping transport-failure and unreadable-body apart, and `classify_refresh`
+    reduced to a one-line delegation; the private `refresh_outcome` copy deleted. 4 new tests, so **330 in the
+    crate**. **`ADR-0074`.** **50 suites / 1595 workspace tests, 0 failed, 0 ignored.** Two guards falsified
+    A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING, AND IT WAS FOUND BY A MUTATION SURVIVING: `classify_refresh`'s DOC NAMED THE SHARED
+    CLASSIFIER AS THE AUTHORITY AND ITS BODY CALLED A PRIVATE COPY.** Its own text said "The classification
+    itself is [`RefreshExchange::classify`]'s", while the code called `refresh_outcome(&self, ..)` — a local
+    `match` restating **both** rules the shared module owns: the rotation test, *with its own copy of the
+    "arrival, not storage" comment*, and the transient-first ordering, *with its own copy of the "a 503 can
+    carry `invalid_grant`" comment*. Two implementations of an ordering whose whole content IS the ordering,
+    and a doc naming the other as the authority. This is `P5-004`'s class: **a doc saying "the rule lives in
+    X" is a claim about code, and X has to be read.**
+  - **⭐⭐ A SURVIVING MUTATION IS NOT ALWAYS A WEAK TEST — it can be a ROUTING signal, and the two are told
+    apart by checking REACHABILITY.** The mutant was `if failure.transient` → `if false` **in `token.rs`**, and
+    it survived every test including the one written to assert that ordering. A weak test and a wrong path look
+    identical from the result; the way to distinguish them is to ask whether the mutated code is reachable from
+    the assertion — **grep its CALLERS, not its definition**. After the dedup the same mutant fails with
+    `left: Expired, right: Transient`. So the test was sound and only blind while production took another path.
+  - **⚠ A FALSIFICATION CAN REPORT A MISLEADING RESTORE, AND MINE DID.** One probe printed `RESTORED=True`
+    while a **second** mutant was still in the file: the `.bak` had been captured after the first mutation was
+    applied, so the "byte-identical" check compared against a corrupted baseline. It surfaced as three failing
+    tests **after** the refactor. **Verify the mutant TEXT is absent (`Select-String`) rather than trusting a
+    restore flag that compares to a snapshot you may have taken at the wrong moment.**
+  - **The `#[cfg(test)]` import is now a compile-time witness.** `RefreshOutcome` is needed by this module only
+    through the shared classifier, so its import is test-only; if a future edit reintroduces a local
+    classification the import becomes unused and the build fails. Clippy caught the first version either way.
+  - **⭐ THE TRANSPORT-FAILURE ASYMMETRY, asserted through the producer rather than the classifier.** A refresh's
+    ambiguous transport failure is `Transient` — and that is **safe** because a refresh presents the *stored*
+    token: if a rotation silently landed, the stored reference is invalid and the next attempt answers
+    `invalid_grant` → `Expired`/`Revoked` → `needs_user`. So it **self-corrects over one extra call**, where
+    retrying a lost *code* exchange could revoke tokens. The test drives both steps rather than arguing the
+    point, and records that a rotation arriving unread is a limit of `RefreshOutcome`'s vocabulary.
+  - **Falsified, two guards A-B-A with compiling mutants.** The rotation rule, mutated to read the caller's
+    storage (`response.has_refresh_token && new_reference.is_some()`), caught with `left: Refreshed, right:
+    Rotated`; the transient ordering, caught as above. The first attempt at each targeted the wrong FILE
+    (`google/token.rs`, where the copy lived) — which is itself the evidence for the finding.
+  - **NEW LIMITS:** **`refresh_with` has no caller outside its tests** — the composition root owns the secret
+    store, so minting and storing a rotated reference is still unbuilt; a **rotation that arrives unread** is
+    invisible until the next attempt (a `RefreshOutcome` vocabulary gap, not a defect in this function); and
+    the refresh branch is reachable only through the producer, so `exchange`'s own refresh handling is
+    untouched by these tests.
+  - **This round wired the retry-classification table into the refusal path — it had no production caller.**
+    `google::operations::refusal` now calls `client::classify` and appends the class and the stated delay to the
+    bounded reason; 2 new tests (so **332 in the crate**). **`ADR-0075`.** **50 suites / 1597 workspace tests,
+    0 failed, 0 ignored.** Two guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE TABLE `ADR-0058` EXISTS FOR DECIDED NOTHING.** `client::classify`'s own doc states
+    the case for its existence — "**a 403's meaning comes from its `reason`, never from the status** … a
+    classifier switching on the status alone would retry an administrator's decision" — and **nothing in
+    production called it**. `refusal` read the machine-readable reason code and formatted it, so `RetryClass`
+    and `RetryGuidance` reached nothing, and **`TransportResponse::retry_after_seconds` was carried, validated,
+    documented as "whether a stated delay is honoured is `client::classify`'s decision", and then dropped**. A
+    `429` with `Retry-After: 37` produced a reason naming neither the class nor the delay. This is the fourth
+    form of *a declaration nothing produces* this phase: the variant (`ADR-0067`), the constraint (`ADR-0068`),
+    the outcome (`ADR-0073`) and now the **policy table**.
+  - **⭐ THE DELAY IS APPENDED ONLY WHEN `guidance.delay_seconds()` IS `Some`, and the test proves it with a
+    CONTROLLED case.** The permanent/authentication/reconcile arms carry no seconds, so a refusal that must not
+    be retried cannot show a delay **even when the wire carried one** — a caller seeing "retry after 60s"
+    beside `domainPolicy` would back off and retry an administrator's decision. The test sends a
+    `403 domainPolicy` **with** `Retry-After: 60` and asserts the absence, which is the case a naive
+    "append the header" implementation gets wrong.
+  - **The class rides in the reason because `jarvis-tools`' `AdapterError` has no field for a connector's own
+    retry vocabulary** — a real constraint rather than a preference, and the reason `ToolOutcomeRecord`'s
+    bounded reason is the one channel that reaches a caller. Verified shape:
+    `the provider refused the call: rateLimitExceeded (throttled); retry after 37s`.
+  - **An unreadable body is still classified by its status**, so a `503` with HTML stays `provider_fault` and an
+    unrecognised `418` says `unknown` **and carries no delay** (`Reconcile` offers none, because a retry is not
+    the action). That extends "we know little versus we know nothing" to the retry decision.
+  - **Falsified, two guards A-B-A with compiling mutants.** Dropping the stated delay (caught, and the failure
+    printed the fallback floor `retry after 1s`, so the mutation was a genuine loss); removing the class from
+    the reason (caught, printing `rateLimitExceeded ()`).
+  - **NEW LIMITS:** **`RetryDecision::provider_request_id` is still unpopulated in production**, and that is a
+    real gap rather than an oversight: `TransportResponse` carries no headers at all. (A previous version of
+    this limit asserted that Google "returns it in a response **header**"; Gmail's `handle-errors` guide, read
+    2026-09-15, names **no request-id header**, so that was an assumption stated as a finding — corrected in
+    `ADR-0076`. Whether Google supplies one is **unverified**.) A `TransportResponse` change with its own
+    falsifying test is what it needs, not a fix here; the reason is a
+    **rendering** of the decision rather than the decision itself, because `ToolExecutor`'s contract has no
+    place for a connector's vocabulary (ADR-0047's boundary); and `GOOGLE_RETRY_FLOOR_SECONDS` is a JARVIS
+    choice where Google publishes a range, so a delay of that value is indistinguishable in the reason from a
+    provider-stated one.
+- [ ] `P5-005` **(continued — `Retry-After` is three situations, not two)**: `TransportResponse::retry_after` is
+    `Option<RetryAfter>` (`Seconds(u32)` | `NotSeconds`) instead of `Option<u32>`, both `reqwest` sites use the
+    new `google::transport::parse_retry_after`, and `client::classify`'s `429` arm keeps *absent*, *stated as
+    seconds*, and *stated but unreadable* apart, rendering the third as
+    `… (throttled); retry after 1s (the provider stated a delay this client could not read)`. `RetryGuidance`
+    gained `BackoffAfterUnreadableDelay`. **1 new test (so 333 in the crate).** **`ADR-0076`.** Two guards
+    falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE DEFECT: TWO VALUES STANDING FOR THREE SITUATIONS.** `RFC 9110` §10.2.3 defines
+    `Retry-After = HTTP-date / delay-seconds`, and `Option<u32>` cannot tell *the header was absent* from
+    *the header was present in the date form*. The transport parsed digits only, so a conforming `HTTP-date`
+    became `None` — **the same value as no header at all** — and both fell to the floor. That is the direction
+    that retries **too soon**, and §5.6.7 makes the date form one a recipient **MUST accept**. The old test had
+    already recorded the shape of the gap in the words chosen for it — "an unreadable value is **absent**, not
+    zero" — which was true of the old type and is exactly the conflation the new type removes. Fifth form of
+    *a declaration whose values do not cover its situations* this phase, and the first **value** form.
+  - **⭐ THE VARIANT IS NAMED FOR WHAT IS READABLE, NOT FOR THE CONCLUSION.** `HttpDate` was the obvious name
+    and would be a **lie**: `delay-seconds = 1*DIGIT` has **no upper bound**, so
+    `Retry-After: 99999999999999999999` is `delay-seconds` by grammar and does not fit a `u32` — a plain
+    `parse::<u32>().ok()` returns `None` for it, which reads as "retry now". Both land in `NotSeconds`, because
+    the only distinction a retry decision needs is *"can this client express the stated delay in seconds"*;
+    naming it after the diagnosis would have hidden the case where the diagnosis is wrong.
+  - **The wait is the floor for both non-numeric cases; the WORDS are what distinguish them.** A `RetryGuidance`
+    variant rather than a different number, because honouring the date form needs a clock and a transport that
+    read its own clock would make the retry decision the port's own doc says it must not. **Refusing** to retry
+    was rejected (throttling is the most retryable class); a **silent** fallback was rejected because it presents
+    a JARVIS floor as the provider's instruction.
+  - **The correction that makes this slice's record honest.** `ADR-0075` asserted Google "returns the identifier
+    in a response **header**". Re-fetching the source it was written from (Gmail `handle-errors`, via
+    `developers.google.com`): the page names **no request-id header**, so that was an **assumption stated as a
+    finding**. Corrected in `ADR-0075`, here, and in the code comment; **whether Google supplies one is now
+    recorded as unverified** rather than as a premise. No reader was built — settling an unverified name first
+    is the point.
+  - **An empty value is absent.** Both grammars require content (`1*DIGIT`, `HTTP-date`), so a present-but-empty
+    value carries nothing to interpret. The one case where "present" and "absent" legitimately coincide.
+  - **NEW LIMITS:** the date form is **recognised but not converted to a delay** — the conversion needs a clock
+    and a policy for a skewed or hostile one (RFC 9110 §8.8.1 is explicit that a validator is not a trust
+    mechanism), so it is a separate decision with its own falsifying test. `provider_request_id` remains
+    unpopulated **and unverified** as above. `parse_retry_after` accepts exactly `1*DIGIT` — not `+30`, not
+    `30.5` — which matches the grammar but means a provider that sent a signed or fractional value lands in
+    `NotSeconds` rather than being coerced.
+- [ ] `P5-005` **(continued — a bound that is documented but not applied is not a bound)**: `RetryGuidance`
+    gained `DeferSeconds(u32)` plus a `deferred_seconds()` accessor, and `RetryGuidance::for_stated_delay` is the
+    **one** path from a provider's stated number to retry guidance, applying `MAX_RETRY_AFTER_SECONDS`. The dead
+    `RateLimitError::RetryAfterTooLong` variant was removed. `classify`'s `429` arm uses the constructor, and the
+    reason renders the over-ceiling case as `defer for 18000s (above the 3600s this caller will hold)`. **2 new
+    tests (so 334 in the crate).** **`ADR-0077`.** Two guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: `MAX_RETRY_AFTER_SECONDS` WAS A RULE NOTHING APPLIED.** Its doc states a *rule*, not a
+    figure — "a longer value is **refused** rather than clamped: a clamp would silently retry **sooner** than the
+    provider asked" — and a repository search found the identifier in exactly **three** places: its definition,
+    a `pub use`, and a doc link. **No code read it.** The companion `RateLimitError::RetryAfterTooLong` made the
+    same claim ("enforced by the constructor a caller would use") and had **no constructor**; its only
+    construction in the tree was inside a test that asserted the message **formatting**, which passed for as long
+    as the type existed and proved nothing. **A construction that exists only in a test is the signature: the
+    type can hold the value, no code produces it.**
+  - **⭐ `ADR-0076` made the gap load-bearing.** Routing the provider's stated delay into `RetryAfterSeconds`
+    *without* the bound meant a `429` answering `Retry-After: 18000` produced `retry after 18000s` — a **five-hour
+    wait presented as an ordinary retry delay**. Google documents exactly this: a daily-limit `429` "might result
+    in these errors for multiple hours". So this is a new form of the phase's recurring defect: not a *type* that
+    can hold a value nothing produces (`0067`/`0068`/`0073`/`0075`/`0076`), but a **constant whose stated rule
+    nothing applied** — declaration and behaviour one comment apart, the comment the only thing that knew.
+  - **`DeferSeconds` answers `None` from `delay_seconds()` — and that is the load-bearing choice.** That accessor
+    answers "how long before the automatic retry", and this guidance **forbids** the automatic retry; a number
+    there would make `delay_seconds().is_some()` mean "retryable" and reintroduce the hazard. The provider's
+    number moves to a separate `deferred_seconds()`, and a test asserts the two accessors are **disjoint for
+    every variant**.
+  - **The refusal is a VARIANT, not an error.** A provider asking to wait five hours is a real response meaning
+    *defer the work* — a state this vocabulary already names (`BudgetOutcome::Exhausted` is the budget-side twin).
+    A `Result` every caller immediately converted into `DeferSeconds` would be ceremony, and a caller could `?` a
+    plan to wait into a hard failure, so `for_stated_delay` is **total**.
+  - **The dead error variant was removed with the reason recorded in place**, because keeping it would leave a
+    second declaration of the same rule that nothing constructs — the defect this slice is about.
+  - **NEW LIMITS:** no consumer reads `RetryDecision` outside `jarvis-connectors` yet, so nothing *schedules* the
+    deferred work — the deferral reaches an operator's eyes through the bounded reason, and the pipeline half is
+    the same run-record gap `ADR-0075` recorded for `provider_request_id`. The ceiling is a **platform constant**
+    rather than a per-provider or policy value, so it cannot be tuned without a code change.
+- [ ] `P5-005` **(continued — a scope's category is a review burden)**: `google::scopes` adds `ScopeCategory`,
+  `VerificationBurden`, `AssessmentRequirement`, `ScopeAccounting` and the pure `account` function, plus
+  `google::gmail_scope_categories()` as the dated table transcribed from the scopes page. **8 new tests (so 342
+  in the crate).** **`ADR-0078`.** Two guards falsified A-B-A with compiling mutants. **This writes the research
+  record's own "scope-category tests" item, which was open.**
+  - **⭐⭐ THE FINDING: THE CATEGORY DECIDES A SECURITY ASSESSMENT, AND IT LIVED ONLY IN A DOC COMMENT.** The
+    scopes page states that a restricted scope requires "restricted scope OAuth App Verification" **and** that
+    "**if you store restricted scope data on servers (or transmit), then you must go through a security
+    assessment**". `SCOPE_GMAIL_READONLY`'s comment said "**Restricted** rather than sensitive, which is the fact
+    that governs what deploying this connector costs" — correct, and the **only** place the fact existed. Nothing
+    could check it, and a new scope could be added without anyone deciding its category. Re-fetched the page: the
+    recorded categories were **correct**, and are now a dated table.
+  - **⭐ THE ACCOUNTING IS OVER THE REAL MANIFEST, NOT A FIXTURE LIST — and it reports a partial reading honestly.**
+    The record's own item asked for scopes "all *accounted for* … so adding a scope forces a decision", which is
+    **not** the same as "assert these three are restricted" (that passes when a fourth is added). Two of the four
+    declared scopes — `openid` and `calendar.readonly` — have **no recorded category**, so the deployment's
+    burden is `Unestablished` rather than "restricted" inferred from the two that are known. A partial maximum
+    would present a partial reading as a complete one.
+  - **⭐ AN UNLISTED SCOPE IS NOT A CHEAP SCOPE.** `Unknown`'s burden is `Unestablished`, **not** `BasicReview`.
+    Under-reporting is the direction that harms: an operator told "basic review" who ships a restricted scope has
+    skipped an assessment Google requires, and nothing would have said so. The assessment is therefore a
+    **three-valued** `AssessmentRequirement`, because a `bool` would make `NotRequired` and `NotEstablished` the
+    same value — the same conflation as `RateLimitEvidence`'s `Documented` vs `Observed`.
+  - **The scope match is EXACT.** A scope string goes into an authorization request, so a prefix match would let
+    a longer scope inherit a **cheaper** category from a scope that is its prefix — under-reporting again.
+  - **A defect in this slice's own first draft, caught by its own test.** `AssessmentRequirement` originally had
+    `is_required_regardless`, whose comment claimed "both answer `false`" while the code returned `true`; once
+    fixed to match the comment, the predicate was **false for every value** — Google's rule is conditional for
+    the only category that requires an assessment, so nothing is ever required *regardless*. Replaced by
+    `may_require_an_assessment`, which fails closed and a caller can branch on. **Same class as `0067`–`0077`: a
+    declaration no input can exercise** — found in the slice that was writing about that class.
+  - **A date inconsistency corrected.** `ADR-0076` and two research-log rows were dated **2026-09-28** while the
+    current date and every other record in the session are 2026-09-27. Corrected.
+  - **NEW LIMITS:** the Calendar and `openid` scope categories are **not established** (the pages read do not
+    state one), recorded as Unresolved Question 2 and surfaced by the accounting rather than assumed away. The
+    **internal-app exemption** is deliberately **not** modelled — it is a property of the consent screen's
+    audience setting, not of the scope set, so a field for it could only be set wrongly.
+- [ ] `P5-005` **(continued — a rate limit without its unit)**: `RateLimit` gains a required `unit`
+  (`RateLimitUnit::{Requests, CostUnits}`) and a `sustained_requests_per_second()` that answers `None` for a
+  cost-unit limit; `ConnectorOperation` gains `quota_cost` (`QuotaCost::{Documented(u32), Unstated}`) with a
+  `calls_per_window` conversion; the four operations declare their published costs. The two byte-identical
+  `gmail_read_rate_limit`/`gmail_history_rate_limit` functions collapse to one `gmail_rate_limit()`. **3 new
+  tests (so 345 in the crate).** **`ADR-0079`.** Two guards falsified A-B-A with compiling mutants. **This writes
+  the research record's own "quota-cost test" item**, and it fixed two more defects found against the docs.
+  - **⭐⭐ THE FINDING: A QUOTA-UNIT FIGURE WAS BEING READ AS A REQUEST RATE, 20× OVER.** `RateLimit`'s fields and
+    `sustained_per_second()` both said **requests**; Google publishes 1,200,000 and 6,000 as **quota units**,
+    defining them as "an abstract unit of measurement representing Gmail resource usage", with per-method costs
+    from 1 to 100. So the read path reported **20,000/s** where the true `messages.get` rate is **1,000/s** — and
+    the error is **silent**: the connector behaves correctly until the provider starts refusing calls. The
+    divergence is per operation, not per connector: the same ceiling is 60,000 `messages.get`/min and 600,000
+    `history.list`/min, a **10× spread**.
+  - **⭐ THE DUPLICATE THAT NAMED A REAL DISTINCTION IN THE WRONG PLACE.** Two rate-limit functions were
+    **byte-identical**, and the second's doc justified itself by "the two calls have different documented costs".
+    The costs *do* differ (20 vs 2) — the reason was **true** — but a per-call cost is not a property of a rate
+    limit, and `RateLimit` had no field for it. So two identical limits carried a distinction that belonged to
+    the operation. Moving it there is what lets one ceiling be declared once.
+  - **`sustained_requests_per_second()` answers `None` for a cost-unit limit.** A cost-unit limit has **no**
+    request rate until an operation's cost is known, so the value a scheduler would most easily mistake is not
+    offered at all. `sustained_per_second` survives with its doc corrected to say the result is **in the limit's
+    own unit**.
+  - **`QuotaCost::Unstated` is not `Documented(1)` — and it is the `Default`.** Reading an unstated cost as 1
+    computes the whole allowance as a request rate and over-plans by the real cost. `calendar_events_read`
+    **ships** `Unstated`, because this page publishes no Calendar cost; claiming 1 would invent a figure the
+    provider never stated.
+  - **Two further defects found by reading code against its own docs.** (a) `SCOPE_OPENID`'s doc said
+    `users.getProfile` "is the operation declared below" — **no profile operation exists**; the doc now says the
+    scope is requested and the operation is not yet declared. (b) `RateLimit::new`'s error message said "1 to
+    1000000 **requests** per window" while the figure may be cost units; corrected to "per window".
+  - **NEW LIMITS:** `RateLimit` has **no daily window**, so Google's 80,000,000-unit daily threshold (which
+    **cannot be raised**) stays in the research record rather than in a declaration — a window kind is a
+    separate decision with its own falsifying test. The cost-unit conversion is only tested as arithmetic; no
+    run has planned against a real provider yet, so a conversion that still over-plans because the *per-user*
+    ceiling binds is not observable here. And `sustained_requests_per_second()`, `QuotaCost::units()` and
+    `QuotaCost::is_documented()` have **test-only consumers** — the same shape `ADR-0057` already records for
+    `PollingInterval::is_documented`, since nothing schedules yet. Stated rather than left for a reader to
+    discover: their callers appear when a scheduler consumes the conversion, not before.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

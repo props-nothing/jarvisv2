@@ -651,12 +651,138 @@ fn a_refusal_maps_to_a_stable_code_and_a_forgery_verdict() {
             true,
         ),
         (AuthRefusal::CodeMissing, "code_missing", false),
+        (
+            AuthRefusal::CallbackMalformed {
+                reason: "a percent escape in the callback was truncated",
+            },
+            "callback_malformed",
+            // The target could not be read at all, so there is no claim to treat as a forgery — this is a
+            // defect in the listener, not a hostile response. The remedy differs, which is why the variant is
+            // separate and reported rather than folded into a mismatch.
+            false,
+        ),
+        (
+            AuthRefusal::ParameterRepeated,
+            "parameter_repeated",
+            // A repeat is the shape an appended value takes, so it IS treated as a possible forgery — which is
+            // why it is a variant of its own rather than sharing one with a truncated escape.
+            true,
+        ),
     ];
     for (refusal, code, forgery) in cases {
         assert_eq!(refusal.as_str(), code);
         assert_eq!(refusal.indicates_forgery(), forgery, "for {code}");
         assert!(!refusal.to_string().is_empty(), "for {code}");
     }
+}
+
+#[test]
+fn a_callback_target_is_parsed_with_form_decoding_and_not_rfc_3986_decoding() {
+    // **The finding this parser exists for.** RFC 6749 §4.1.2 says the parameters are added to the redirect
+    // URI's query "using the `application/x-www-form-urlencoded` format, per Appendix B" — and that format
+    // encodes a space as `+`, the opposite of the request side's RFC 3986 encoding, where a space is `%20` and
+    // a literal `+` is `%2B` (`google::request::percent_encode`).
+    //
+    // So a `state` of `a b` arrives as `state=a+b`. A decoder that kept the `+` would compare `a+b` against
+    // `a b` and refuse a legitimate response — and the failure would look like a state mismatch, i.e. like an
+    // attack, while the real cause is one character of decoding.
+    let callback = must(
+        Callback::from_request_target("/cb?code=SplxlOBeZQQYbYS6WxSbIA&state=a+b"),
+        "the documented callback shape must parse",
+    );
+    assert_eq!(callback.state.as_deref(), Some("a b"));
+    assert_eq!(callback.code.as_deref(), Some("SplxlOBeZQQYbYS6WxSbIA"));
+    assert_eq!(callback.error, None);
+    // The received-on URI is recovered from the target with the **portless** form, because an origin-form
+    // target carries no port — the `Host` header does, and this function is not given one. `consume` is what
+    // compares it against the transaction's ported registration with `matches_except_port`.
+    assert_eq!(
+        callback.received_on,
+        must(
+            LoopbackRedirect::registered(LoopbackHost::V4, "/cb"),
+            "a registration"
+        )
+    );
+
+    // And a literal `+` that the client itself put in its state is escaped by the provider as `%2B`, so the
+    // two are distinguishable rather than both becoming a space.
+    let plus = must(
+        Callback::from_request_target("/cb?state=a%2Bb"),
+        "a percent-escaped plus must parse",
+    );
+    assert_eq!(plus.state.as_deref(), Some("a+b"));
+}
+
+#[test]
+fn a_callback_carries_an_error_and_a_description_without_a_code() {
+    // RFC 6749 §4.1.2.1: a denial arrives as `error` with a `state`, and the code is absent. Both are read, so
+    // the transaction can tell "the provider refused" from "the response was malformed".
+    let callback = must(
+        Callback::from_request_target(
+            "/cb?error=access_denied&state=xyz&iss=https%3A%2F%2Faccounts.example",
+        ),
+        "a denial must parse",
+    );
+    assert_eq!(callback.error.as_deref(), Some("access_denied"));
+    assert_eq!(callback.code, None);
+    // RFC 9207's `iss` is read too, so the mix-up defence has something to compare, and a percent-encoded URI
+    // decodes with its colons and slashes intact.
+    assert_eq!(callback.issuer.as_deref(), Some("https://accounts.example"));
+}
+
+#[test]
+fn a_repeated_callback_parameter_is_refused_rather_than_last_wins() {
+    // RFC 6749 §3.1 and §3.2 require that request and response parameters "MUST NOT be included more than
+    // once". Taking the last value is exactly how a `state` check is defeated: a client that compared the
+    // provider's own first value while an attacker appended a second would accept the forged one.
+    let error = must_err(Callback::from_request_target("/cb?state=good&state=evil"));
+    assert_eq!(
+        error,
+        AuthRefusal::ParameterRepeated,
+        "a repeated parameter must be refused as its own shape"
+    );
+}
+
+#[test]
+fn a_malformed_escape_or_invalid_utf8_is_refused_rather_than_lossily_decoded() {
+    // Appendix B says a parsed value is "an octet sequence, to be decoded using the UTF-8 character encoding
+    // scheme". A lossy decode would turn a corrupted `state` into a *different* string, which then simply fails
+    // to match — hiding a transport fault behind what looks like a security refusal.
+    for target in [
+        "/cb?state=%2",
+        "/cb?state=%zz",
+        "/cb?state=%FF%FE",
+        // A target with no loopback path — here an absolute-form URL — is refused for the same reason: this
+        // listener could not have been registered for it.
+        "https://evil.example/cb?state=x",
+    ] {
+        let error = must_err(Callback::from_request_target(target));
+        assert!(
+            matches!(error, AuthRefusal::CallbackMalformed { .. }),
+            "{target} must be refused: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_callback_parameter_is_read_at_most_once_so_a_later_read_cannot_resurrect_it() {
+    // `take` consumes, so the value cannot reappear — which is what makes "read once" a property of the type
+    // rather than a convention at each call site.
+    let callback = must(
+        Callback::from_request_target("/cb?code=c1&state=s1"),
+        "a success must parse",
+    );
+    assert_eq!(callback.code.as_deref(), Some("c1"));
+    // The struct holds owned values, so a second read is a fresh field access and cannot be a second decode of
+    // the same bytes; the point is asserted by checking that a name absent from the target is absent here.
+    assert_eq!(callback.error, None);
+    assert_eq!(callback.error_description, None);
+    // A parameter with no `=` at all is a name with an empty value, which is what a form decoder does with it.
+    let bare = must(
+        Callback::from_request_target("/cb?state"),
+        "a valueless parameter must parse",
+    );
+    assert_eq!(bare.state.as_deref(), Some(""));
 }
 
 /// Returns the error from a result that must be an error.

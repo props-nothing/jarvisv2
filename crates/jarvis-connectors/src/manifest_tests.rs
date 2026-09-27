@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::manifest::{AuthMethodDeclaration, ConnectorOperation};
-use crate::ratelimit::{RateLimitEvidence, RateLimitScope};
+use crate::ratelimit::{RateLimitEvidence, RateLimitScope, RateLimitUnit};
 
 fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {
@@ -32,6 +32,7 @@ fn operation(id: &str, effects: Vec<ToolEffect>, risk: u8) -> ConnectorOperation
         risk,
         required_scopes: Vec::new(),
         idempotency: ProviderIdempotency::Declared,
+        quota_cost: crate::ratelimit::QuotaCost::Unstated,
         rate_limit: None,
     }
 }
@@ -901,11 +902,13 @@ fn a_connector_may_declare_a_rate_limit_and_it_must_be_usable() {
         risk: 0,
         required_scopes: Vec::new(),
         idempotency: ProviderIdempotency::Declared,
+        quota_cost: crate::ratelimit::QuotaCost::Unstated,
         rate_limit: Some(must(
             RateLimit::new(
                 250,
                 60,
                 50,
+                RateLimitUnit::Requests,
                 RateLimitScope::PerUser,
                 RateLimitEvidence::Documented,
             ),

@@ -91,7 +91,7 @@ pub enum RequestError {
 /// A request to perform: a method, a URL, and ordered query parameters.
 ///
 /// **There is no field for a credential**, and that absence is documented in the module. There is also no
-/// body: all three declared operations are `GET`s, so a request type that could carry a body would be a shape
+/// body: every declared operation is a `GET`, so a request type that could carry a body would be a shape
 /// nothing uses — and the first caller to put arguments in a body would be writing a request Google rejects
 /// for a `GET` rather than one this module refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +164,23 @@ impl fmt::Display for HttpRequest {
             self.url,
             names.join(", ")
         )
+    }
+}
+
+#[cfg(test)]
+impl HttpRequest {
+    /// Retargets a request at a test origin, keeping the path and the encoded parameters.
+    ///
+    /// A **test seam**, and it is the only way a transport test can drive this crate's real requests: the
+    /// builders are bound to the documented API bases, and a test must point at a loopback server instead. It
+    /// rewrites the **origin alone**, so the path and the percent-encoded query a test asserts on are the ones
+    /// the product builds — a seam that rebuilt the request would let the encoding drift unobserved.
+    pub(crate) fn rebase_to(mut self, origin: &str) -> Self {
+        const API_ORIGIN: &str = "https://www.googleapis.com";
+        if let Some(rest) = self.url.strip_prefix(API_ORIGIN) {
+            self.url = format!("{origin}{rest}");
+        }
+        self
     }
 }
 
@@ -413,10 +430,138 @@ pub fn calendar_events_list(
     })
 }
 
+/// Builds the `users.history.list` request.
+///
+/// The incremental-sync read: it returns the changes since `start_history_id` and, with them, the mailbox's
+/// new `historyId`. Gmail charges 2 quota units here against `messages.list`'s 5, which is what makes an
+/// incremental sync cheaper than a full one — and the reason a connector falls back to [`gmail_messages_list`]
+/// when this answers a `404`.
+///
+/// `history_types` is deliberately **not offered**: the parameter would return only some change types, and a
+/// sync that filtered would silently drop the changes it excluded. The general `messages` field is read
+/// instead, so the walk sees every record the provider returned.
+///
+/// # Errors
+///
+/// Returns [`RequestError`] for an unusable `start_history_id`, `max_results`, or page token.
+pub fn gmail_history_list(
+    start_history_id: &str,
+    max_results_value: Option<u32>,
+    page_token: Option<&str>,
+) -> Result<HttpRequest, RequestError> {
+    // The starting position is validated as a resource identifier: it becomes a query parameter and a log
+    // field, and an empty or control-bearing value would address a different position than the cursor records.
+    let start = resource_id("start_history_id", start_history_id)?;
+    let mut parameters = vec![("startHistoryId".to_owned(), percent_encode(start))];
+    if let Some(value) = max_results_value {
+        push(
+            &mut parameters,
+            "maxResults",
+            Some(max_results(value, GMAIL_MAX_RESULTS_CAP)?),
+        );
+    }
+    push(
+        &mut parameters,
+        "pageToken",
+        client::next_page(page_token)?.map(|token| percent_encode(&token)),
+    );
+    Ok(HttpRequest {
+        method: "GET",
+        url: format!("{GMAIL_API_BASE}/users/me/history"),
+        query: parameters,
+        accept: JSON_ACCEPT,
+    })
+}
+
+/// A `POST` whose body is a form, which is what the token endpoint requires.
+///
+/// # Why this is a separate type from [`HttpRequest`], and why it has no credential
+///
+/// [`HttpRequest`] exists around one property: it takes its query from the connector's own constants, so it
+/// can never be given a *credential* to put in a URL (`ADR-0060`). A token request is the opposite case — its
+/// body carries the `code` and the `refresh_token`, which are exactly the values that must not be printable —
+/// so it **cannot** be the same type. A union would either give `HttpRequest` a field a credential goes in
+/// (undoing `ADR-0060`) or force a caller to prove which kind it holds.
+///
+/// What this type does **not** have is a header map, for the same reason `HttpRequest` has none: the one header
+/// a form `POST` needs is `content_type`, which is a field, and the token endpoint authenticates by the body's
+/// `client_id` rather than by a bearer header. So there is no header a credential could reach either.
+///
+/// # The body is already rendered
+///
+/// `body` holds the bytes [`crate::form::encode_body`] produced, so the encoding happens once and at the layer
+/// that renders it (`ADR-0072`). This type does not encode, and a caller cannot ask it to: it takes the
+/// rendered text, which is what makes double-encoding unrepresentable rather than merely discouraged.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FormRequest {
+    url: String,
+    body: String,
+    content_type: &'static str,
+}
+
+impl FormRequest {
+    /// Builds a form `POST` whose body has already been rendered.
+    ///
+    /// `content_type` is supplied by the caller from its own constant rather than defaulted here, because the
+    /// media type belongs to the protocol the caller implements — a token request and, later, a revocation are
+    /// both form `POST`s to the same host with the same type, and a default in this module would be a fact
+    /// about one of them stated in a module that knows neither.
+    #[must_use]
+    pub fn new(
+        url: impl Into<String>,
+        body: impl Into<String>,
+        content_type: &'static str,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            body: body.into(),
+            content_type,
+        }
+    }
+
+    /// Returns the absolute URL.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the rendered body.
+    ///
+    /// **This returns credential-bearing text.** It is named for what it is rather than `body` alone so a call
+    /// site that renders it is visible, and the type has no `Display` for that reason.
+    #[must_use]
+    pub fn rendered_body(&self) -> &str {
+        &self.body
+    }
+
+    /// Returns the `Content-Type` the body is sent as.
+    #[must_use]
+    pub const fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+}
+
+impl fmt::Debug for FormRequest {
+    /// Reports the shape and **not the body**, for the reason [`crate::google::credential::AccessToken`] has a
+    /// hand-written `Debug`: a derived one would render whatever the struct holds, and this struct holds a
+    /// credential-bearing form. The body's **length** is printed because it is not the value and it is what
+    /// distinguishes two requests in a diagnostic.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FormRequest {{ method: POST, url: {}, content_type: {}, body: [REDACTED], chars: {} }}",
+            self.url,
+            self.content_type,
+            self.body.chars().count()
+        )
+    }
+}
+
 /// The bearer scheme a Google API request authenticates with.
 ///
 /// A constant so the header's *name* and scheme appear once. The token itself is supplied by the transport
-/// binding, which does not exist — so this module states the shape and holds no value.
+/// binding — so this module states the shape and holds no value. Present on the **read** path only: a form
+/// `POST` authenticates by its body's `client_id` and has no bearer header (see [`FormRequest`]).
 pub const AUTHORIZATION_HEADER: &str = "Authorization";
 
 /// The scheme prefix the authorization header uses.
@@ -465,6 +610,50 @@ struct EventsListBody {
 #[derive(Clone, Debug, Deserialize)]
 struct EventIdEntry {
     id: String,
+}
+
+/// The `history.list` response body.
+///
+/// The `historyId` field is the mailbox's **new position**. Google's method reference says that when the
+/// response carries no `nextPageToken` there are no further updates, "and you can store the returned
+/// `historyId` for a future request" — so this field, not the page token, is what a sync cursor advances to.
+#[derive(Clone, Debug, Deserialize)]
+struct HistoryListBody {
+    #[serde(default)]
+    history: Vec<HistoryEntry>,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(default, rename = "historyId")]
+    history_id: Option<String>,
+}
+
+/// One entry of a `history.list` response.
+///
+/// Only `messages` is read. The reference documents `messagesAdded`/`messagesDeleted`/`labelsAdded`/
+/// `labelsRemoved` as the specific change-type fields and recommends them over the general `messages` list —
+/// but *recommends*, not requires, and `messages` is the field populated on every change. So a connector that
+/// read only the change-type arrays would miss a record that carried just `messages`, and the two would
+/// disagree about what changed.
+#[derive(Clone, Debug, Deserialize)]
+struct HistoryEntry {
+    #[serde(default)]
+    messages: Vec<MessageIdEntry>,
+}
+
+/// A parsed history page.
+///
+/// Carries the **new `historyId`** alongside the message ids the change set touched. The page token and the
+/// history id are **different fields with different lifetimes** and are kept apart for the same reason
+/// `CalendarPage` keeps its two tokens apart: the page token continues *this* walk (and expires when it ends),
+/// while the history id is the durable position a *future* sync starts from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    /// The message identifiers the change set touched.
+    pub ids: Vec<String>,
+    /// The token for the next page, when the change set was larger than one page.
+    pub next_page_token: Option<String>,
+    /// The mailbox's **new** position, which is the next sync cursor.
+    pub history_id: Option<String>,
 }
 
 /// A parsed Calendar page, which carries **two** continuation tokens and they are not interchangeable.
@@ -541,6 +730,48 @@ pub fn parse_calendar_page(status: u16, body: &str) -> Result<CalendarPage, Requ
         ids: parsed.items.into_iter().map(|entry| entry.id).collect(),
         next_page_token,
         next_sync_token,
+    })
+}
+
+/// Parses a `history.list` response.
+///
+/// `status` is checked first, for the reason every parser here records: an error document parsed as a page
+/// reports "no changes", and a caller cannot then tell a mailbox with nothing new from a refused request.
+///
+/// **A `404` is deliberately not resolved here.** It is the cursor's staleness signal, and turning it into a
+/// dead-cursor decision belongs to the caller through [`client::gmail_history_signal`] — a parser that decided
+/// it would be inferring which method was called, which only the caller knows.
+///
+/// # Errors
+///
+/// Returns [`RequestError`] when the status is not a success, the body is not the documented shape, or a page
+/// token is unusable.
+pub fn parse_history_page(status: u16, body: &str) -> Result<HistoryPage, RequestError> {
+    if status != 200 {
+        return Err(RequestError::Argument {
+            field: "status",
+            reason: "a history response may only be parsed from a 200; every other status is an outcome \
+                     for `client::classify` rather than an empty change set",
+        });
+    }
+    let parsed: HistoryListBody =
+        serde_json::from_str(body).map_err(|_| RequestError::Argument {
+            field: "body",
+            reason: "a history response body must be JSON with a `history` array",
+        })?;
+    // The page token is bounded here because it becomes the next request's parameter. The `historyId` is
+    // **not** bounded here: it becomes a cursor through `SyncCursor::new`, which applies its own bound, and a
+    // second check would be a bound enforced in two places.
+    let next_page_token = client::next_page(parsed.next_page_token.as_deref())?;
+    Ok(HistoryPage {
+        ids: parsed
+            .history
+            .into_iter()
+            .flat_map(|entry| entry.messages)
+            .map(|message| message.id)
+            .collect(),
+        next_page_token,
+        history_id: parsed.history_id,
     })
 }
 

@@ -236,6 +236,26 @@ fn a_403_whose_reason_is_throttling_is_retryable_and_shares_the_status() {
         retryable.guidance.permits_retry(),
         "a throttling limit may be retried"
     );
+    // And a stated delay that cannot be read is **not** the same as no delay: RFC 9110 §10.2.3 allows the
+    // `Retry-After` field to be an `HTTP-date`, and a response that carries one must not be reported as a
+    // response that carried none (`ADR-0076`). This is the case the fixture suite can assert without a
+    // socket, because the distinction lives entirely in the classifier's input.
+    let unreadable = client::classify(
+        429,
+        GmailErrorReason::Unrecognised,
+        Some(jarvis_connectors::google::transport::RetryAfter::NotSeconds),
+        None,
+    );
+    let absent = client::classify(429, GmailErrorReason::Unrecognised, None, None);
+    assert_eq!(unreadable.class, jarvis_connectors::RetryClass::Throttled);
+    assert!(
+        unreadable.guidance.permits_retry(),
+        "an unreadable delay is still a throttling answer, which is retryable"
+    );
+    assert_ne!(
+        unreadable.guidance, absent.guidance,
+        "a stated delay this client could not read must not be reported as an absent one"
+    );
     assert!(
         !permanent.guidance.permits_retry(),
         "a disabled app may not"
@@ -311,6 +331,50 @@ fn the_gmail_history_404_fixture_carries_no_reason_code() {
     assert!(
         !decision.guidance.permits_retry(),
         "a 404 is not retryable; the remedy is a resync, which is a different action"
+    );
+}
+
+#[test]
+fn the_history_fixture_pair_separates_the_page_token_from_the_durable_cursor() {
+    // The pair that makes "which token is the cursor" falsifiable. Unlike Calendar's `nextPageToken`/
+    // `nextSyncToken` -- which the reference documents as mutually exclusive -- the history response carries
+    // `historyId` on **every** success while `nextPageToken` appears only mid-walk. So a reader that treated
+    // them as a pair would take its cursor from whichever field it happened to read first, and a sync resumed
+    // from a page token would fail the moment the walk it belonged to ended.
+    let mid_walk = fixture("gmail_history_list.json");
+    let last_page = fixture("gmail_history_list_last_page.json");
+    assert_declared_shape(&mid_walk);
+    assert_declared_shape(&last_page);
+
+    let mid = match request::parse_history_page(200, &mid_walk) {
+        Ok(page) => page,
+        Err(error) => panic!("the documented history shape must parse: {error}"),
+    };
+    let last = match request::parse_history_page(200, &last_page) {
+        Ok(page) => page,
+        Err(error) => panic!("the documented history shape must parse: {error}"),
+    };
+
+    // Mid-walk: both a page token and a history id, and they are different values.
+    assert_eq!(mid.next_page_token.as_deref(), Some("0987654321"));
+    assert_eq!(mid.history_id.as_deref(), Some("12347"));
+    assert_ne!(
+        mid.history_id, mid.next_page_token,
+        "the two are distinct fields and must never be interchanged"
+    );
+    // Last page: NO page token, and the history id is still present -- which is the whole reason a caller may
+    // advance a durable cursor from the response at all.
+    assert_eq!(
+        last.next_page_token, None,
+        "the last page carries no page token"
+    );
+    assert_eq!(last.history_id.as_deref(), Some("12348"));
+
+    // And the consequence is asserted rather than described: only the last page's history id is a position a
+    // caller could store, because the page token is absent there and present mid-walk.
+    assert!(
+        last.next_page_token.is_none() && last.history_id.is_some(),
+        "a durable cursor comes from the field that survives the end of the walk"
     );
 }
 

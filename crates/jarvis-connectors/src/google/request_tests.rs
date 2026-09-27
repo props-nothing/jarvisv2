@@ -413,6 +413,72 @@ fn the_urls_are_the_documented_api_bases_and_paths() {
 }
 
 #[test]
+fn a_history_request_names_the_starting_position_and_is_bounded() {
+    // The incremental-sync read. The starting position is REQUIRED, because the method reference says so:
+    // "startHistoryId — Required. Returns history records after the specified startHistoryId."
+    let request = must(
+        gmail_history_list("12345", Some(50), None),
+        "a history request",
+    );
+    assert_eq!(
+        request.url(),
+        "https://www.googleapis.com/gmail/v1/users/me/history"
+    );
+    assert_eq!(request.method(), "GET");
+    assert_eq!(
+        request.query()[0],
+        ("startHistoryId".to_owned(), "12345".to_owned())
+    );
+    // The credential boundary holds on this path too: no field of the request can hold a token, and the
+    // rendered URL proves a caller cannot have put one there.
+    assert!(
+        !request.url_with_query().contains("access_token"),
+        "a token must not be representable in a URL"
+    );
+    // An empty position addresses nothing, and an oversized or control-bearing one becomes a different
+    // request, so all three are refused rather than sent.
+    assert!(gmail_history_list("", None, None).is_err());
+    assert!(gmail_history_list("   ", None, None).is_err());
+    assert!(gmail_history_list("a\nb", None, None).is_err());
+    // The cap is the API's own 500, exercised AT its limit so the bound is not unreachable.
+    assert!(gmail_history_list("1", Some(GMAIL_MAX_RESULTS_CAP), None).is_ok());
+    assert!(gmail_history_list("1", Some(GMAIL_MAX_RESULTS_CAP + 1), None).is_err());
+    assert!(gmail_history_list("1", Some(0), None).is_err());
+}
+
+#[test]
+fn a_history_page_keeps_the_cursor_and_the_page_token_apart() {
+    // The fixture carries BOTH `nextPageToken` and `historyId`, which is the shape the reference documents: the
+    // page token is "the token for the NEXT PAGE of results", while the history id is "the ID of the mailbox's
+    // current history record". They are not a mutually-exclusive pair like Calendar's two tokens, so a reader
+    // that treated them as one would take its cursor from whichever field it happened to read.
+    let text = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("google")
+            .join("gmail_history_list.json"),
+    )
+    .unwrap_or_else(|_| panic!("the history fixture must be readable"));
+    let page = must(parse_history_page(200, &text), "the documented shape");
+    assert_eq!(page.history_id.as_deref(), Some("12347"));
+    assert_eq!(page.next_page_token.as_deref(), Some("0987654321"));
+    assert_ne!(
+        page.history_id, page.next_page_token,
+        "the page token and the history id are different fields"
+    );
+    // Both history records contributed their messages, so the change set is flat rather than one id per record.
+    assert_eq!(page.ids.len(), 2);
+    assert_eq!(page.ids[0], "18c1f2a3b4d5e6f7");
+
+    // A status other than 200 is refused rather than read as an empty change set -- an error document parsed
+    // as a page would report "no changes" and a caller could not tell that from a quiet mailbox.
+    assert!(parse_history_page(404, &text).is_err());
+    assert!(parse_history_page(500, &text).is_err());
+    assert!(parse_history_page(200, "not json").is_err());
+}
+
+#[test]
 fn a_time_bound_is_encoded_like_any_other_value() {
     // An RFC 3339 instant contains `:` and `+`, both of which would change the request if sent raw — `+` in
     // particular, because a receiver applying the form-urlencoded rule would read it as a space and the

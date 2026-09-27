@@ -83,6 +83,7 @@ fn operation(operation_id: &str) -> ConnectorOperation {
         risk: 0,
         required_scopes: vec!["vendor.read".to_owned()],
         idempotency: ProviderIdempotency::Declared,
+        quota_cost: crate::ratelimit::QuotaCost::Unstated,
         rate_limit: None,
     }
 }

@@ -91,6 +91,7 @@ pub const TOOL_BACKOFF_CEILING_SECONDS: u32 = 32;
 fn input_schema(operation: &str) -> Option<&'static str> {
     match operation {
         "gmail_messages_list" => Some(GMAIL_LIST_INPUT),
+        "gmail_history_list" => Some(GMAIL_HISTORY_INPUT),
         "gmail_messages_read" => Some(GMAIL_READ_INPUT),
         "calendar_events_read" => Some(CALENDAR_READ_INPUT),
         _ => None,
@@ -101,6 +102,7 @@ fn input_schema(operation: &str) -> Option<&'static str> {
 fn output_schema(operation: &str) -> Option<&'static str> {
     match operation {
         "gmail_messages_list" => Some(GMAIL_LIST_OUTPUT),
+        "gmail_history_list" => Some(GMAIL_HISTORY_OUTPUT),
         "gmail_messages_read" => Some(GMAIL_READ_OUTPUT),
         "calendar_events_read" => Some(CALENDAR_READ_OUTPUT),
         _ => None,
@@ -111,6 +113,7 @@ fn output_schema(operation: &str) -> Option<&'static str> {
 fn title(operation: &str) -> Option<&'static str> {
     match operation {
         "gmail_messages_list" => Some("List Gmail messages"),
+        "gmail_history_list" => Some("List Gmail changes since a position"),
         "gmail_messages_read" => Some("Read a Gmail message"),
         "calendar_events_read" => Some("Read calendar events"),
         _ => None,
@@ -334,6 +337,40 @@ const GMAIL_LIST_OUTPUT: &str = r#"{
   "properties": {
     "message_ids": { "type": "array", "items": { "type": "string" } },
     "next_page_token": { "type": ["string", "null"] }
+  },
+  "required": ["message_ids"],
+  "additionalProperties": false
+}"#;
+
+/// The input schema of `gmail_history_list`.
+const GMAIL_HISTORY_INPUT: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "start_history_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "The mailbox position to list changes since. A value outside the retained range produces HTTP 404, which requires a full resync."
+    },
+    "max_results": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "page_token": { "type": "string", "maxLength": 4096 }
+  },
+  "required": ["start_history_id"],
+  "additionalProperties": false
+}"#;
+
+/// The output schema of `gmail_history_list`.
+const GMAIL_HISTORY_OUTPUT: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "message_ids": { "type": "array", "items": { "type": "string" } },
+    "next_page_token": { "type": ["string", "null"] },
+    "history_id": {
+      "type": ["string", "null"],
+      "description": "The mailbox's new position. This is the next sync cursor, and it is NOT the same field as next_page_token."
+    }
   },
   "required": ["message_ids"],
   "additionalProperties": false

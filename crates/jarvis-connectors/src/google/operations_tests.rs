@@ -26,7 +26,7 @@ fn now() -> UtcTimestamp {
 fn response(status: u16, body: &str) -> TransportResponse {
     TransportResponse {
         status,
-        retry_after_seconds: None,
+        retry_after: None,
         body: body.to_owned(),
     }
 }
@@ -140,6 +140,177 @@ fn a_refusal_with_an_unreadable_body_still_names_the_status() {
     assert!(
         !reason.contains("html"),
         "the body must not be carried: {reason}"
+    );
+}
+
+#[test]
+fn a_refusal_carries_the_retry_class_and_the_stated_delay() {
+    // **`client::classify` had no production caller until this test's subject was wired in.** The table is the
+    // one `ADR-0058` exists for — four reasons share a `403` with three remedies, so a status-only classifier
+    // retries an administrator's decision forever — and its output went nowhere: `refusal` read the reason code,
+    // formatted it, and dropped the class. A `429`'s `Retry-After` was carried by the transport and then ignored
+    // here. So these cases assert the two facts a caller needs and could not previously see.
+    let throttled = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(TransportResponse {
+                status: 429,
+                // The provider's own stated delay, which the transport carries and never interprets.
+                retry_after: Some(crate::google::transport::RetryAfter::Seconds(37)),
+                body: r#"{"error":{"code":429,"errors":[{"reason":"rateLimitExceeded"}]}}"#
+                    .to_owned(),
+            }),
+            now(),
+        ),
+        "a 429 must be a result",
+    );
+    let reason = throttled.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("throttled"),
+        "the class must be readable, not only the code: {reason}"
+    );
+    assert!(
+        reason.contains("retry after 37s"),
+        "a stated delay must reach the reason: {reason}"
+    );
+
+    // A `domainPolicy` 403 is the case the whole table exists for: the same status as the two throttling
+    // reasons, and a remedy that is a conversation rather than a retry. It must be `permanent` and carry **no**
+    // delay — a caller that saw seconds here would back off and retry an administrator's decision.
+    let disabled = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(TransportResponse {
+                status: 403,
+                // Even a `Retry-After` present on the wire must not produce a delay for a permanent class:
+                // `RetryGuidance`'s permanent arms carry no seconds, so there is nothing to append.
+                retry_after: Some(crate::google::transport::RetryAfter::Seconds(60)),
+                body: r#"{"error":{"code":403,"errors":[{"reason":"domainPolicy"}]}}"#.to_owned(),
+            }),
+            now(),
+        ),
+        "a 403 must be a result",
+    );
+    let reason = disabled.record().reason().unwrap_or_default();
+    assert!(reason.contains("domainPolicy"), "{reason}");
+    assert!(
+        reason.contains("permanent"),
+        "the class must say the refusal is not retryable: {reason}"
+    );
+    assert!(
+        !reason.contains("retry after"),
+        "a permanent refusal must not carry a delay, even when the wire had one: {reason}"
+    );
+
+    // And a 5xx is a provider fault with a backoff floor, which is the third remedy among the three.
+    let fault = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(response(503, r#"{"error":{"code":503}}"#)),
+            now(),
+        ),
+        "a 503 must be a result",
+    );
+    let reason = fault.record().reason().unwrap_or_default();
+    assert!(reason.contains("provider_fault"), "{reason}");
+    assert!(reason.contains("retry after"), "{reason}");
+}
+
+#[test]
+fn a_stated_delay_above_the_ceiling_reaches_the_reason_as_a_deferral() {
+    // **The bound `MAX_RETRY_AFTER_SECONDS` documents, asserted through the production path.** Its doc says a
+    // longer value is "refused rather than clamped", and until this test the only thing that knew that was the
+    // comment: `classify` passed the provider's number straight into `RetryAfterSeconds`, so a `429` stating
+    // `Retry-After: 18000` produced a reason reading "retry after 18000s" — a five-hour wait presented as an
+    // ordinary retry delay, which is precisely the loop the bound exists to prevent. Google documents that a
+    // daily-limit 429 "might result in these errors for multiple hours", so the input is realistic.
+    let deferred = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(TransportResponse {
+                status: 429,
+                retry_after: Some(crate::google::transport::RetryAfter::Seconds(18_000)),
+                body: r#"{"error":{"code":429}}"#.to_owned(),
+            }),
+            now(),
+        ),
+        "a 429 must be a result",
+    );
+    let reason = deferred.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("defer for 18000s"),
+        "an over-ceiling delay must read as a deferral: {reason}"
+    );
+    assert!(
+        !reason.contains("retry after"),
+        "a deferral must not read as an automatic retry: {reason}"
+    );
+    // The class is still `Throttled`, because it is — the *remedy* is what changes, not the diagnosis. A
+    // reader who saw `unknown` or `permanent` here would reach for the wrong recovery action.
+    assert!(
+        reason.contains("throttled"),
+        "the diagnosis must survive the deferral: {reason}"
+    );
+
+    // The control: the same status one second **inside** the ceiling stays an ordinary stated delay. Without
+    // it, a `classify` that deferred every 429 would pass the assertions above.
+    let inside = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(TransportResponse {
+                status: 429,
+                retry_after: Some(crate::google::transport::RetryAfter::Seconds(
+                    MAX_RETRY_AFTER_SECONDS,
+                )),
+                body: r#"{"error":{"code":429}}"#.to_owned(),
+            }),
+            now(),
+        ),
+        "a 429 must be a result",
+    );
+    let reason = inside.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains(&format!("retry after {MAX_RETRY_AFTER_SECONDS}s")),
+        "a delay within the ceiling must retry: {reason}"
+    );
+    assert!(
+        !reason.contains("defer"),
+        "the control must not defer: {reason}"
+    );
+}
+
+#[test]
+fn an_unreadable_refusal_is_classified_by_its_status_and_not_guessed() {
+    // A body that cannot be parsed still has a status, and the status is what `classify` switches on when there
+    // is no reason. So the class is present either way — the difference between knowing little and knowing
+    // nothing, applied to the retry decision rather than to the fact of the refusal.
+    let result = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(response(503, "<html>a proxy</html>")),
+            now(),
+        ),
+        "an unreadable refusal is still a result",
+    );
+    let reason = result.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("provider_fault"),
+        "a 5xx stays a provider fault without a reason code: {reason}"
+    );
+    // The unclassified status is the fail-closed direction: `Unknown` refuses a retry whatever the idempotency,
+    // so an unrecognised status must not read as transient.
+    let odd = must(
+        interpret("google.gmail_messages_list", Ok(response(418, "{}")), now()),
+        "an unrecognised status is still a result",
+    );
+    let reason = odd.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("unknown"),
+        "an unclassified status must say so: {reason}"
+    );
+    assert!(
+        !reason.contains("retry after"),
+        "`Reconcile` carries no delay, because a retry is not the action: {reason}"
     );
 }
 
@@ -281,7 +452,7 @@ fn assert_output_matches_declared_schema(tool: &str, output: &str) {
 #[test]
 fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
     // The claim `ADR-0059` makes is that the tool's declared output is what this module renders, and until now
-    // that was a comment rather than a check. Three cases, one per operation, so a field renamed on one side
+    // that was a comment rather than a check. One case per operation, so a field renamed on one side
     // fails here — the "two values that must agree, with nothing holding both" defect this repository keeps
     // recording.
     let list = must(
@@ -335,6 +506,30 @@ fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
             .output()
             .unwrap_or_else(|| panic!("a confirmed read carries output"))
             .content(),
+    );
+
+    // The history read renders **two** tokens, and the declared schema must accept both together: the page
+    // token continues this walk while the history id is the durable position, so a rendering that dropped one
+    // would lose half of what a sync needs.
+    let history = must(
+        interpret(
+            "google.gmail_history_list",
+            Ok(response(
+                200,
+                r#"{"history":[{"messages":[{"id":"m1"}]}],"nextPageToken":"p","historyId":"12347"}"#,
+            )),
+            now(),
+        ),
+        "a history read must be a result",
+    );
+    let history_output = history
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_output_matches_declared_schema("google.gmail_history_list", history_output);
+    assert!(
+        history_output.contains("\"history_id\":\"12347\""),
+        "the durable cursor must be rendered as its own field: {history_output}"
     );
 
     // And the empty-page case, which is where a rendering that omitted a required array would appear: an
@@ -406,9 +601,63 @@ fn a_read_that_names_a_resource_requires_it() {
     assert!(request_for("google.gmail_messages_read", &json!({})).is_err());
     assert!(request_for("google.gmail_messages_read", &json!({ "message_id": "" })).is_err());
     assert!(request_for("google.calendar_events_read", &json!({})).is_err());
+    // The history read names the position it starts from, and the reference marks it Required — so an absent
+    // `start_history_id` is refused by argument rather than defaulting to "from the beginning of time".
+    assert!(request_for("google.gmail_history_list", &json!({})).is_err());
+    assert!(
+        request_for(
+            "google.gmail_history_list",
+            &json!({ "start_history_id": "  " })
+        )
+        .is_err(),
+        "a blank position addresses nothing"
+    );
     // The positive control: with the identifier present the request builds, so the refusal above is about the
     // missing name rather than about the operation being refused outright.
     assert!(request_for("google.gmail_messages_read", &json!({ "message_id": "m1" })).is_ok());
+    assert!(
+        request_for(
+            "google.gmail_history_list",
+            &json!({ "start_history_id": "12345" })
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn the_history_read_builds_its_request_and_reads_its_cursor_from_a_success() {
+    // The operation is wired end to end: an argument object becomes a request, and a 200 becomes the declared
+    // output with the durable cursor rendered separately from the page token.
+    let request = must(
+        request_for(
+            "google.gmail_history_list",
+            &json!({ "start_history_id": "12345", "max_results": 100 }),
+        ),
+        "a valid history request",
+    );
+    assert_eq!(
+        request.url(),
+        "https://www.googleapis.com/gmail/v1/users/me/history"
+    );
+    assert!(
+        request.url_with_query().contains("startHistoryId=12345"),
+        "the starting position must be sent: {}",
+        request.url_with_query()
+    );
+
+    // A 404 is a RESULT, not an error: the provider answered and refused, and the caller turns that status
+    // into `SyncSignal::CursorUnusable` through `client::gmail_history_signal`. Reporting it as a transport
+    // failure would lose the status, which is the only fact the decision has.
+    let refused = must(
+        interpret(
+            "google.gmail_history_list",
+            Ok(response(404, r#"{"error":{"code":404}}"#)),
+            now(),
+        ),
+        "a refusal is a result, not an error",
+    );
+    assert_eq!(refused.outcome(), ToolOutcome::Failed);
+    assert!(refused.output().is_none());
 }
 
 #[test]
@@ -455,6 +704,15 @@ impl GoogleTransport for Scripted {
         _token: &AccessToken,
     ) -> Result<TransportResponse, TransportFailure> {
         self.result.clone()
+    }
+
+    async fn send_form(
+        &self,
+        _request: &crate::google::request::FormRequest,
+    ) -> Result<TransportResponse, TransportFailure> {
+        // This double scripts the **read** path, so a form `POST` reaching it is a mistake in the test rather
+        // than a provider condition — the same reasoning the exchange tests record in the other direction.
+        panic!("the read path must not use `send_form`");
     }
 }
 
@@ -704,7 +962,7 @@ fn evidence_is_optional_for_a_read_so_a_bad_locator_does_not_fail_a_good_read() 
 
 #[test]
 fn the_method_comes_from_the_request_and_the_port_expresses_only_a_get() {
-    // All three declared operations are reads, so the port's method set has one member. `P5-009` must extend
+    // Every declared operation is a read, so the port's method set has one member. `P5-009` must extend
     // both together, which is what makes a write a deliberate edit rather than a convenience.
     let request = must(
         request_for("google.gmail_messages_list", &json!({})),

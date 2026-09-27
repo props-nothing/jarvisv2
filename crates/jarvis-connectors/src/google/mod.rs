@@ -37,9 +37,11 @@
 pub mod client;
 pub mod credential;
 pub mod definitions;
+pub mod http;
 pub mod operations;
 pub mod request;
 pub mod revocation;
+pub mod scopes;
 pub mod token;
 pub mod transport;
 
@@ -52,7 +54,7 @@ use crate::manifest::{
     PollingInterval, ProviderIdempotency, ResearchRecord, ResidencyVerification, SecretField,
     WebhookSupport,
 };
-use crate::ratelimit::{RateLimit, RateLimitEvidence, RateLimitScope};
+use crate::ratelimit::{QuotaCost, RateLimit, RateLimitEvidence, RateLimitScope, RateLimitUnit};
 use jarvis_tools::ToolEffect;
 
 /// The connector identifier, which is also the first segment of every tool namespace it registers.
@@ -91,9 +93,63 @@ pub const SCOPE_CALENDAR_READONLY: &str = "https://www.googleapis.com/auth/calen
 /// The `OpenID` Connect identity scope, used to verify the account from the provider.
 ///
 /// `tools-and-connectors.md` requires "account identity verified from the provider, not user-entered
-/// labels". `users.getProfile` returns an `emailAddress` and is the operation declared below; this scope is
-/// what makes the *identity* of the granting account available rather than only its mailbox content.
+/// labels". The `users.getProfile` response carries an `emailAddress`, and that is the operation this scope
+/// exists for — **but that operation is not declared here yet**: the four operations below are the mail and
+/// calendar reads, and the profile read that would consume this scope is a later addition. The scope is
+/// requested now because it is what makes the granting account's *identity* available alongside its content,
+/// and the research record's cost table already carries its `1` unit cost.
 pub const SCOPE_OPENID: &str = "openid";
+
+/// Gmail's published scope categories, transcribed from the scopes page read on
+/// [`SCOPE_CATEGORIES_RECORDED_ON`](scopes::SCOPE_CATEGORIES_RECORDED_ON).
+///
+/// # Why a table rather than a category per constant
+///
+/// The page publishes three lists — non-sensitive, sensitive, restricted — and the **list a scope is in** is
+/// the fact, so a table keyed by scope string is the transcription and a category stored beside each constant
+/// would be a second copy of it. It also makes the accounting check meaningful: a scope the manifest declares
+/// but this table does not list is visible as a gap rather than silently defaulting to a category.
+///
+/// # The three entries that carry the surprises
+///
+/// - **`gmail.labels` is the only generally useful non-sensitive Gmail scope.**
+/// - **`gmail.send` is sensitive, not restricted.** A send is the one operation `P5-009` must declare as
+///   `ProviderIdempotency::Unknown`, and its category is a *review* fact rather than a write-privilege one.
+/// - **`gmail.metadata` is restricted**, which matters because it is the least privileged way to read a
+///   mailbox and an author would reasonably assume it is the cheap option. It is not.
+///
+/// Only the six Gmail scopes this project has a use for are listed. A partial table is deliberate: it is
+/// honest about what has been read, and every omitted scope becomes
+/// [`ScopeCategory::Unknown`](scopes::ScopeCategory::Unknown) in the accounting rather than being
+/// guessed at.
+#[must_use]
+pub fn gmail_scope_categories() -> Vec<(&'static str, scopes::ScopeCategory)> {
+    use scopes::ScopeCategory;
+    vec![
+        // ---- Non-sensitive ----
+        (
+            "https://www.googleapis.com/auth/gmail.labels",
+            ScopeCategory::NonSensitive,
+        ),
+        // ---- Sensitive ----
+        (
+            "https://www.googleapis.com/auth/gmail.send",
+            ScopeCategory::Sensitive,
+        ),
+        // ---- Restricted ----
+        // The scope this connector actually requests for mail.
+        (SCOPE_GMAIL_READONLY, ScopeCategory::Restricted),
+        (
+            "https://www.googleapis.com/auth/gmail.metadata",
+            ScopeCategory::Restricted,
+        ),
+        (
+            "https://www.googleapis.com/auth/gmail.modify",
+            ScopeCategory::Restricted,
+        ),
+        ("https://mail.google.com/", ScopeCategory::Restricted),
+    ]
+}
 
 impl GoogleConnector {
     /// Builds the Google connector manifest.
@@ -128,7 +184,7 @@ impl GoogleConnector {
 
     /// Returns the operations this connector declares.
     ///
-    /// Three read operations, each mapped from a documented Gmail or Calendar method. The `id` is a
+    /// Four read operations, each mapped from a documented Gmail or Calendar method. The `id` is a
     /// **JARVIS name segment** and not the provider's method name, because policy binds to the canonical
     /// identifier; the provider's method is named in the description so a reader can find it.
     ///
@@ -150,7 +206,10 @@ impl GoogleConnector {
                 risk: 0,
                 required_scopes: vec!["mail.read".to_owned()],
                 idempotency: ProviderIdempotency::Declared,
-                rate_limit: Some(gmail_read_rate_limit()),
+                // 20 units: the most expensive read this connector declares, and the figure the research
+                // record uses to derive the `5 + 20N` full-sync estimate.
+                quota_cost: QuotaCost::Documented(20),
+                rate_limit: Some(gmail_rate_limit()),
             },
             ConnectorOperation {
                 id: "gmail_messages_list".to_owned(),
@@ -163,7 +222,25 @@ impl GoogleConnector {
                 risk: 0,
                 required_scopes: vec!["mail.read".to_owned()],
                 idempotency: ProviderIdempotency::Declared,
-                rate_limit: Some(gmail_read_rate_limit()),
+                quota_cost: QuotaCost::Documented(5),
+                rate_limit: Some(gmail_rate_limit()),
+            },
+            ConnectorOperation {
+                id: "gmail_history_list".to_owned(),
+                description: "List the changes to a mailbox since a history position. Wraps \
+                              `users.history.list`; costs 2 quota units per call and returns the mailbox's \
+                              new `historyId`. A `startHistoryId` outside the retained range answers HTTP \
+                              404, which requires a full sync rather than a retry."
+                    .to_owned(),
+                effects: vec![ToolEffect::ReadOnly],
+                risk: 0,
+                required_scopes: vec!["mail.read".to_owned()],
+                idempotency: ProviderIdempotency::Declared,
+                // 2 units, not 20: the per-call cost is 10× a message read, which is exactly the kind of
+                // difference a single shared "read limit" would erase. The **limit** is shared because it is
+                // one provider ceiling; the **cost** is per operation because it is a property of the method.
+                quota_cost: QuotaCost::Documented(2),
+                rate_limit: Some(gmail_rate_limit()),
             },
             ConnectorOperation {
                 id: "calendar_events_read".to_owned(),
@@ -174,6 +251,11 @@ impl GoogleConnector {
                 risk: 0,
                 required_scopes: vec!["calendar.read".to_owned()],
                 idempotency: ProviderIdempotency::Declared,
+                // **Unstated, and that is the honest value.** Google's Gmail quota page publishes no
+                // Calendar cost ("not published on this page" in the research record), and defaulting to 1
+                // would invent a figure the provider never stated — the over-planning failure `QuotaCost`
+                // exists to prevent.
+                quota_cost: QuotaCost::Unstated,
                 rate_limit: None,
             },
         ]
@@ -309,15 +391,25 @@ impl GoogleConnector {
 /// true for `PerClient`, so a scheduler will not report one account's exhaustion as that account's own
 /// problem. A future per-account limit would be a second entry rather than a correction to this one.
 ///
-/// `per_window` is the **per-minute project allowance** and `burst` is deliberately lower than it: Google
-/// also caps a single user at 6,000 units/minute, and a burst that ignored the tighter of the two would
-/// plan against the wrong ceiling. The daily threshold of 80,000,000 units — which **cannot be raised** —
-/// is recorded in the research record rather than here, because `RateLimit` has no daily window.
-fn gmail_read_rate_limit() -> RateLimit {
+/// # One limit for every Gmail read, and `CostUnits` is why that is correct
+///
+/// `per_window` is the **per-minute project allowance** and `burst` is the tighter **per-user** ceiling.
+/// Both are published in **quota units**, which is what [`RateLimitUnit::CostUnits`] records — so this is
+/// deliberately **one** limit shared by every Gmail operation rather than one per method. A previous version
+/// had two functions, `gmail_read_rate_limit` and `gmail_history_rate_limit`, that were byte-identical while
+/// the second's doc claimed its existence rested on "different documented costs". The costs do differ (20
+/// against 2), but a per-call cost is not a property of a *rate limit* at all: it belongs to the operation,
+/// which is where [`QuotaCost`] now carries it. Two limits for one provider ceiling was a duplicate wearing
+/// the name of a distinction, and the distinction it named was real but lived in the wrong place.
+///
+/// The daily threshold of 80,000,000 units — which **cannot be raised** — is recorded in the research record
+/// rather than here, because `RateLimit` has no daily window.
+fn gmail_rate_limit() -> RateLimit {
     RateLimit {
         per_window: 1_200_000,
         window_seconds: 60,
         burst: 6_000,
+        unit: RateLimitUnit::CostUnits,
         scope: RateLimitScope::PerClient,
         evidence: RateLimitEvidence::Documented,
     }

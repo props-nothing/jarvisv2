@@ -859,6 +859,126 @@ pub struct Callback {
     pub received_on: LoopbackRedirect,
 }
 
+impl Callback {
+    /// Parses the **request target** a loopback listener received into the answer it carries.
+    ///
+    /// # Why this exists, and why it takes a request target rather than a URL
+    ///
+    /// [`Callback`]'s own doc says parameters arrive "already decoded, because this crate has no URL decoder"
+    /// — and that division then had no implementation, so every `Callback` was assembled by hand and the
+    /// decoding step was never written or tested. A listener that parses a request target badly turns a
+    /// perfectly good authorization into a refusal, and its failure mode is not a crash: a `+` left as a `+`
+    /// produces a `state` that is *slightly* wrong, which is the silent shape.
+    ///
+    /// `request_target` is what an HTTP listener has: an origin-form target such as
+    /// `/callback?code=4/0A&state=abc`. Taking a target rather than a full URL means the caller cannot
+    /// accidentally pass a request for a **different origin** that would then be treated as this listener's —
+    /// [`LoopbackRedirect::parse`] still recovers the received-on URI, and the transaction's
+    /// `matches_except_port` check is what refuses a mismatch.
+    ///
+    /// # The encoding is `application/x-www-form-urlencoded`, and it is NOT the request side's encoding
+    ///
+    /// RFC 6749 §4.1.2 says the authorization server adds the parameters "to the query component of the
+    /// redirection URI using the `application/x-www-form-urlencoded` format, per Appendix B". That format
+    /// encodes a space as **`+`**, which is the opposite of
+    /// [`crate::google::request::percent_encode`], where a space is `%20` and a literal `+` is `%2B` because
+    /// RFC 3986 has no form semantics. So the decoder here treats `+` as a space and this is deliberate, not
+    /// an oversight: a `state` of `a b` arrives as `state=a+b`, and a decoder that kept the `+` would compare
+    /// `a+b` against `a b` and refuse a legitimate response. RFC 9253 later registered a `+`-free form for
+    /// this reason, but §4.1.2 is what the provider implements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthRefusal::CallbackUnparsable`] when the target has no loopback origin, when a percent
+    /// escape is malformed or is not valid UTF-8, or when a parameter name repeats.
+    pub fn from_request_target(request_target: &str) -> Result<Self, AuthRefusal> {
+        let (path, query) = request_target
+            .split_once('?')
+            .map_or((request_target, ""), |(path, query)| (path, query));
+        // The received-on URI is recovered from the target, so `matches_except_port` has something real to
+        // compare. A target with no path is `/` by RFC 3986's normalisation, which `LoopbackRedirect::parse`
+        // already applies.
+        let received_on = LoopbackRedirect::parse(&format!("http://{LOOPBACK_AUTHORITY}{path}"))
+            .map_err(|_| AuthRefusal::CallbackMalformed {
+                reason: "the callback target does not name a loopback redirect this client could have \
+                         registered",
+            })?;
+        let mut parameters = FormParameters::new();
+        if !query.is_empty() {
+            for pair in query.split('&') {
+                parameters.push(pair)?;
+            }
+        }
+        Ok(Self {
+            state: parameters.take("state"),
+            code: parameters.take("code"),
+            error: parameters.take("error"),
+            error_description: parameters.take("error_description"),
+            issuer: parameters.take("iss"),
+            received_on,
+        })
+    }
+}
+
+/// The loopback authority a callback target is reconstructed against.
+///
+/// The port is not carried here because a callback target an HTTP listener sees is **origin-form** — the
+/// `Host` header holds the port, and this function is not given one. What the target must supply is the
+/// path, and that is what [`LoopbackRedirect::parse`] checks; the port comparison happens later, against the
+/// transaction's own registration, in [`AuthorizationTransaction::consume`].
+const LOOPBACK_AUTHORITY: &str = "127.0.0.1";
+
+/// The query parameters of a callback, decoded and checked for repetition.
+///
+/// A small type rather than a `HashMap` because two properties matter and a map has neither: a **repeated
+/// name is refused** (RFC 6749 §3.1 and §3.2 both require that request and response parameters "MUST NOT be
+/// included more than once", and `take` on a map would silently keep the last), and a value is consumed
+/// exactly once so a later `take` of the same name cannot resurrect it.
+struct FormParameters {
+    values: Vec<(String, String)>,
+}
+
+impl FormParameters {
+    fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    /// Decodes one `name=value` pair and records it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthRefusal::CallbackUnparsable`] for a malformed escape, invalid UTF-8, or a repeated name.
+    fn push(&mut self, pair: &str) -> Result<(), AuthRefusal> {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = crate::form::decode_component(name).map_err(callback_malformed)?;
+        let value = crate::form::decode_component(value).map_err(callback_malformed)?;
+        if self.values.iter().any(|(existing, _)| existing == &name) {
+            // Refused rather than last-wins. A repeated parameter is either an attack or a broken server, and
+            // picking one of the two values is exactly how a `state` check is defeated: the server's first
+            // value is the one a client would compare while the second is what an attacker appended.
+            return Err(AuthRefusal::ParameterRepeated);
+        }
+        self.values.push((name, value));
+        Ok(())
+    }
+
+    /// Removes and returns a parameter, so a name is read at most once.
+    fn take(&mut self, name: &str) -> Option<String> {
+        let position = self.values.iter().position(|(key, _)| key == name)?;
+        Some(self.values.remove(position).1)
+    }
+}
+
+/// Maps a codec refusal onto this module's vocabulary, carrying the codec's own bounded reason.
+///
+/// The codec reports a **cause class**, not a message, so the reason text lives in one place and a new
+/// `FormError` variant is a compile error here rather than an unhandled string.
+fn callback_malformed(error: crate::form::FormError) -> AuthRefusal {
+    AuthRefusal::CallbackMalformed {
+        reason: error.reason(),
+    }
+}
+
 /// Why an authorization response was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthRefusal {
@@ -888,6 +1008,25 @@ pub enum AuthRefusal {
     },
     /// The response carried no usable code.
     CodeMissing,
+    /// The request target the listener received could not be read as a callback at all.
+    ///
+    /// About the **bytes**, not about a decision: a malformed percent escape, invalid UTF-8, or a target that
+    /// does not name a loopback redirect. Separating it from a mismatch matters because the remedy differs — a
+    /// mismatch means "do not trust this response", while this means "the listener is not reading its own
+    /// requests", which a developer fixes.
+    CallbackMalformed {
+        /// A bounded explanation, safe to show an operator and never echoing the value.
+        reason: &'static str,
+    },
+    /// A callback parameter appeared more than once.
+    ///
+    /// A **separate variant from [`Self::CallbackMalformed`]** even though both are produced while reading the
+    /// target, because the two mean different things and have different verdicts: RFC 6749 §3.1 and §3.2
+    /// require a parameter to appear at most once, so a repeat is the shape an appended value takes — a
+    /// possible attack — while a truncated escape is a fault. One variant carrying both would make
+    /// [`Self::indicates_forgery`] unable to answer honestly, which is this repository's "two values standing
+    /// for more than two situations" defect.
+    ParameterRepeated,
 }
 
 impl AuthRefusal {
@@ -901,6 +1040,8 @@ impl AuthRefusal {
             Self::RedirectMismatch => "redirect_mismatch",
             Self::IssuerMismatch { .. } => "issuer_mismatch",
             Self::CodeMissing => "code_missing",
+            Self::CallbackMalformed { .. } => "callback_malformed",
+            Self::ParameterRepeated => "parameter_repeated",
         }
     }
 
@@ -918,6 +1059,7 @@ impl AuthRefusal {
                 | Self::StateMismatch
                 | Self::RedirectMismatch
                 | Self::IssuerMismatch { .. }
+                | Self::ParameterRepeated
         )
     }
 }
@@ -944,6 +1086,12 @@ impl fmt::Display for AuthRefusal {
             Self::CodeMissing => {
                 formatter.write_str("the authorization response carried no usable authorization code")
             }
+            Self::CallbackMalformed { reason } => {
+                write!(formatter, "the callback could not be read: {reason}")
+            }
+            Self::ParameterRepeated => formatter.write_str(
+                "the callback repeated a parameter, which RFC 6749 requires a server to send at most once",
+            ),
         }
     }
 }

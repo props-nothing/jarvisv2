@@ -278,6 +278,16 @@ fn the_schemas_are_the_2020_12_dialect_and_refuse_unknown_arguments() {
                     "listing without a query is a meaningful request, so nothing may be required"
                 );
             }
+            "gmail_history_list" => {
+                // Required, and the reference says so: "startHistoryId — Required. Returns history records
+                // after the specified startHistoryId." Unlike the message list, there is no meaningful
+                // "newest changes" default, so an absent position must be refused by the schema.
+                assert_eq!(
+                    required,
+                    Some(vec!["start_history_id"]),
+                    "an incremental sync must name the position it starts from"
+                );
+            }
             other => panic!("`{other}` has no declared argument contract"),
         }
     }

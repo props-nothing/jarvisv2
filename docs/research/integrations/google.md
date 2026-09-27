@@ -42,6 +42,7 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | Cloud Pub/Sub push subscriptions | https://cloud.google.com/pubsub/docs/push | 2026-09-27 | the envelope and the acknowledgement rule |
 | Google OIDC discovery document | https://accounts.google.com/.well-known/openid-configuration | 2026-09-27 | **machine-readable**: every endpoint, the PKCE methods, and whether the `iss` response parameter is supported |
 | Google OAuth 2.0 for native apps | https://developers.google.com/identity/protocols/oauth2/native-app (last updated **2026-09-14**) | 2026-09-27 | the installed-app flow: the loopback method, the token and refresh exchanges, the response fields, DPoP, revocation |
+| Gmail `users.history.list` method reference | https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list (page footer: last updated **2026-04-15**) | 2026-09-27 | the incremental-sync read: **the query parameters, the required `startHistoryId`, and the response body `{ history[], nextPageToken, historyId }`** — the shape the `gmail_history_list` fixtures reproduce |
 
 The shared OAuth protocol facts — PKCE, loopback redirects, rotation, revocation — are recorded once in
 [oauth2-pkce-native-apps.md](oauth2-pkce-native-apps.md) and are not restated here.
@@ -272,6 +273,12 @@ part most likely to be stale in any secondary source:
   JARVIS will not be spreading one account's work over several.
 - **Backoff guidance is explicit**: start at ≥1 second, `min(2^n + random(0..1000ms), max_backoff)`, with
   `max_backoff` "typically 32 or 64 seconds", and stop retrying at some point.
+- **A `429` can state a delay of hours, and that is documented rather than hypothetical.** The error page says a
+  daily-limit `429` "might result in these errors for multiple hours" (recorded above), and the quota page notes
+  that after an account reaches its quota "there can be a delay of several minutes before the API begins
+  returning 429 error responses". So a stated `Retry-After` above one hour is a **real response** meaning *defer
+  the work*, not a malformed one: `RetryGuidance::DeferSeconds` represents it and `MAX_RETRY_AFTER_SECONDS`
+  bounds what a caller will hold inside a retry loop (`ADR-0077`). **WRITTEN.**
 
 ### Data And Compliance
 
@@ -466,10 +473,18 @@ where every line looks equally done is a plan nobody can audit.
 
 - **Scope-category tests.** A test that a Gmail connector's declared scopes are all *accounted for* against a
   table of Google's categories, so adding a scope forces a decision about the verification burden. The table is
-  a fixture with a date, because Google can recategorise. **Not written.**
+  a fixture with a date, because Google can recategorise. **WRITTEN.** `google::scopes` carries the category,
+  burden and assessment types plus `account`, and `gmail_scope_categories()` is the dated table. The check runs
+  against the **connector's real manifest scopes**, so adding a scope is what makes it speak — and it reports
+  `openid` and `calendar.readonly` as **unaccounted**, which is the honest result rather than a default. The
+  table's date is asserted equal to this record's `last_verified`. See `ADR-0078`.
 - **A quota-cost test.** `users.getProfile` = 1 and `messages.get` = 20 as fixtures, and a computed estimate for
   a full sync of *N* messages (`5 + 20N`) — the cheapest test that would catch a connector that planned its
-  budget from message counts alone. **Not written.**
+  budget from message counts alone. **WRITTEN.** The per-call cost is now a declared `QuotaCost` on each
+  operation rather than prose inside a `description`, and the test asserts `1,200,000 / 20 = 60,000` calls per
+  window for `messages.get` against `600,000` for `history.list` — the 10× spread a single shared limit erased.
+  `calendar_events_read` declares `Unstated`, because this page publishes no Calendar cost. See `ADR-0079`,
+  which also found that the ceiling figures were being read as **requests** when they are quota units.
 - **A full-sync budget test that asserts batching.** A full sync must batch (≤50 per batch) *and* must respect
   that batches trigger rate limiting, so the test asserts both the batch size and the delay. **Not written.**
 - **The 404-is-staleness test.** A `history.list` fixture returning 404 must produce "resync from scratch", not
@@ -486,6 +501,36 @@ where every line looks equally done is a plan nobody can audit.
   classification is tested (`client::calendar_status_requires_resync`, `advance_calendar_sync`) and the
   unreachable `TokenInvalidated` variant is now reachable, but no 410 fixture exists and no 400-is-a-query-error
   fixture exists.
+- **A `history.list` producer for the staleness signal.** The item `ADR-0066` left open: it made the signal a
+  caller's parameter but nothing could *build* one from a response, so the resync remedy was still unreachable
+  outside a fixture. **WRITTEN.** `client::gmail_history_signal(status, history_id, refusal)` produces all
+  three `SyncSignal` cases from a status, and `gmail_history_list.json` /
+  `gmail_history_list_last_page.json` supply the two shapes. The signal is asserted in both directions: a `404`
+  becomes `CursorUnusable` (reaching `SyncAdvance::HistoryPruned`), and the retryable family (`429`, `5xx`)
+  becomes `Refused` with its classification — because a resync on a transient failure discards a working store.
+- **The `Retry-After` field has two forms, and only one is a number.** Fetched from the specification rather than
+  a Google page, because the field is defined by HTTP and not by Google: **RFC 9110 §10.2.3** states
+  `Retry-After = HTTP-date / delay-seconds` with `delay-seconds = 1*DIGIT`, and §5.6.7 makes the date form one a
+  recipient **MUST accept** (three formats, with `IMF-fixdate` preferred). A connector that parsed digits only
+  therefore read a conforming `HTTP-date` as **no `Retry-After` at all** — the direction that retries too soon,
+  since the field exists to say *do not ask again before this time*. **WRITTEN** as `google::transport::RetryAfter`
+  plus `parse_retry_after`, with the classifier keeping *absent*, *stated as seconds*, and *stated but unreadable*
+  apart (`ADR-0076`). The date form is **recognised but not converted to a delay**, which remains a recorded
+  limit because the conversion needs a clock.
+- **The `history.list` response shape.** The method reference documents  `{ "history": [ { object (History) } ], "nextPageToken": string, "historyId": string }` where `historyId` is
+  "The ID of the mailbox's current history record", and it states that when **no** `nextPageToken` is returned
+  "there are no updates to retrieve and you can store the returned `historyId` for a future request". Two
+  consequences are now pinned by the fixtures: (a) `historyId` is present on **every** success while
+  `nextPageToken` appears only mid-walk — so they are **not** a mutually-exclusive pair the way Calendar's
+  `nextPageToken`/`nextSyncToken` are, and a reader may not treat them as one; and (b) `startHistoryId` is
+  **Required**, so unlike `messages.list` an incremental sync has no meaningful empty-argument form.
+- **A correction my own draft carried, found by reading the field descriptions rather than the example.** My
+  first `gmail_history_list` output schema made `history_id` **required**, on the assumption that the response
+  always carries the mailbox's new position. The reference does not say that: it says the id may be stored when
+  no page token is returned, which is a statement about *when it is usable* rather than about *when it is
+  present*. Requiring it would have made the connector's own declaration stricter than the provider's, so the
+  field is optional and absent-with-a-page-token is representable. Same family as the Calendar
+  `nextPageToken`/`nextSyncToken` finding: **the constraint lives in the field description, not the sample.**
 - **A `domainPolicy` test.** A 403 with `reason: domainPolicy` must be `Permanent` and must not be retried,
   which a status-code-only classifier cannot distinguish from `rateLimitExceeded`. **WRITTEN** — see below.
 - **A recording fixture for the Pub/Sub envelope** — a sanitized delivery with `message.data` Base64URL-decoded
@@ -502,7 +547,7 @@ where every line looks equally done is a plan nobody can audit.
 
 ### Fixtures present, and what they are not
 
-`crates/jarvis-connectors/tests/fixtures/google/` holds six files, tested by `tests/google_fixtures.rs`:
+`crates/jarvis-connectors/tests/fixtures/google/` holds **nine** files, tested by `tests/google_fixtures.rs`:
 
 | Fixture | Shape source |
 | --- | --- |
@@ -512,6 +557,13 @@ where every line looks equally done is a plan nobody can audit.
 | `calendar_events_list_last_page.json` | `events.list`, the **last** page |
 | `gmail_error_403_domain_policy.json` | the error resource, 403 + `domainPolicy` |
 | `gmail_error_403_rate_limit.json` | the error resource, 403 + `rateLimitExceeded` |
+| `gmail_history_404_no_reason.json` | `users.history.list`, the 404 (no `reason` code) |
+| `gmail_history_list.json` | `users.history.list`, a **mid-walk** page (both tokens present) |
+| `gmail_history_list_last_page.json` | `users.history.list`, the **last** page (no page token) |
+
+The last three were added after the six-file count was first written, and the count is corrected here rather
+than left to drift: a fixture directory whose stated size is stale reads as "nothing changed" to the next
+reader.
 
 **Every one is hand-built, not captured**, and each file says so twice: in `_not_a_capture: true` and in prose.
 The test suite **asserts the marker**, so a file that dropped it fails rather than passing as an apparent
@@ -530,6 +582,37 @@ lives in the field description ("omitted if…"), not in the sample JSON.
 
 **No live test was run for this slice and none is claimed.** No credentials were used, no Google API was called,
 and no Cloud project was created.
+
+### The transport, and what it does and does not add
+
+The port `GoogleTransport` had only test doubles until now. `crate::google::http` implements it against
+`reqwest` 0.13.5, pinned by the workspace with `default-features = false` and `rustls` — the same version and
+feature set `jarvis-models` and `jarvis-mcp-transport` already resolve, so declaring it added **no package** to
+the lock file (one dependency edge, verified with `cargo tree`). `repository-layout.md` names `client.rs` as the
+"provider HTTP client", and the decision layer in this crate still names no `reqwest` type, so the split between
+*decisions* and *transport* is preserved.
+
+**Four port requirements became enforceable controls, each with a test against a hand-written HTTP server**
+(the `jarvis-mcp-transport` precedent: a framework would share assumptions with the client under test):
+
+| Requirement | Control |
+| --- | --- |
+| Do not follow a redirect | `redirect(Policy::none())`; a `302` arrives as a `TransportResponse`, and the redirect *target* server is asserted to have received **zero** connections |
+| Do not retry | exactly one request per `send`; there is no retry branch to disable |
+| Do not read a proxy from the environment | `no_proxy()` called explicitly (the `system-proxy` default is on) |
+| Return a non-2xx as a response, not an error | a `403` fixture is asserted to be a `TransportResponse` carrying its status and reason |
+
+**What this does NOT close.** No request has been sent to Google and no Google response has been parsed. The
+server every transport test uses is written by the test file, so these tests prove the *transport's own
+controls*; the live smoke test below is still the only thing that would prove the record matches Google. The
+transport also has **no production caller** — nothing constructs a `ReqwestTransport` outside a test, because
+no composition root builds the connector.
+
+**Recorded limits of the implementation** (each stated rather than implied): **no body-size bound**, because
+`TransportFailure` has no variant meaning "too large" and a streaming cap needs a policy that belongs with
+`P5-009`'s output handling; **no token refresh**, so a stale token becomes a provider refusal; **no `Retry-After`
+interpretation**, since honouring a delay is a retry decision; and the timeout/connect-timeout pair is a
+**JARVIS choice** (the port requires a bound; Google publishes no per-request deadline).
 
 ## Unresolved Questions
 
@@ -585,8 +668,12 @@ and no Cloud project was created.
 | 2026-09-27 | Gmail push guide fetched and read in full | `users.watch` request/response shapes; the immediate notification on a successful watch; the **7-day renewal bound** with daily recommended; the `PubsubMessage` envelope with `message.data` as **Base64URL-encoded JSON** decoding to `{"emailAddress","historyId"}`; the **1 event/second/user cap with excess dropped**; "notifications might be delayed or dropped"; the polling fallback. |
 | 2026-09-27 | Gmail sync guide fetched | Full vs partial sync; `startHistoryId`; history available "at least one week"; **a `startHistoryId` out of range returns HTTP 404 and requires a full sync**. |
 | 2026-09-27 | Gmail quota page fetched | The **May 2026 model change** and its grandfathering; 1,200,000/min/project, 6,000/min/user/project, 80,000,000/day/project; the **full per-method cost table**; 500 recipients/message; the batch ceiling of 50; the daily threshold cannot be raised; per-user limits cannot be increased; a service account is one user for quota. |
+| 2026-09-27 | Gmail quota page **re-fetched**, specifically for the per-method table and the unit | The page defines quota units as "an abstract unit of measurement representing Gmail resource usage" and publishes the per-method table — `messages.get` **20**, `messages.list` **5**, `history.list` **2**, `getProfile` **1**, `messages.send` **100**, `threads.get` **40**, `watch` **100**. **All recorded costs confirmed correct.** The re-read established the fact the declaration was missing: **the 1,200,000 and 6,000 ceilings are quota units, not requests** — so a request rate needs the per-call cost. Corrected in `ADR-0079`. The page still publishes **no Calendar cost**, so `calendar_events_read` declares `Unstated`. |
 | 2026-09-27 | Gmail scopes page fetched | The non-sensitive/sensitive/restricted split, with **`gmail.readonly` and `gmail.metadata` both restricted** and `gmail.send` sensitive; the rule that storing or transmitting restricted-scope data requires a security assessment; the internal-app exemption. |
 | 2026-09-27 | Gmail error page fetched | The 401/403/429/5xx taxonomy by `reason`; the four 403 reasons; the three distinct causes behind a 429; the exponential-backoff recipe with `max_backoff` 32–64 s; **"You can't assume that a 200 response means the email was successfully sent."** |
+| 2026-09-27 | Gmail error page re-fetched, specifically for a request-id header | The page describes "two levels of error information: HTTP error codes and messages **in the header**; A JSON object in the response body". **No request-id header is named anywhere on it.** This **corrects** a limit recorded in `ADR-0075`/`TODO.md` that asserted Google "returns the identifier in a response **header**" — that was an assumption stated as a finding, and whether Google supplies one at all is **unverified** (`ADR-0076`). |
+| 2026-09-27 | RFC 9110 §10.2.3 and §5.6.7 fetched from `https://www.rfc-editor.org/rfc/rfc9110.html` | `Retry-After = HTTP-date / delay-seconds`, `delay-seconds = 1*DIGIT`; a 503 "MAY send a `Retry-After` header field"; `HTTP-date` accepts all three formats and a recipient **MUST accept** them. Grounds `RetryAfter`/`parse_retry_after` and `ADR-0076`. |
+| 2026-09-27 | Gmail scopes page **re-fetched** for the category tables | The three lists re-read verbatim: **non-sensitive** = `gmail.addons.current.action.compose`, `gmail.addons.current.message.action`, `gmail.labels`; **sensitive** = `gmail.addons.current.message.metadata`, `gmail.addons.current.message.readonly`, `gmail.send`; **restricted** = `mail.google.com/`, `gmail.readonly`, `gmail.compose`, `gmail.insert`, `gmail.modify`, `gmail.metadata`, `gmail.settings.basic`, `gmail.settings.sharing`. The page's own definitions and the rule "**If you store restricted scope data on servers (or transmit), then you must go through a security assessment**" confirmed word-for-word. **The recorded categories were correct**; now enforced as a dated table in `google::scopes` (`ADR-0078`). The page still lists **no category for a Calendar or OpenID scope**, so those remain unaccounted rather than assumed. |
 | 2026-09-27 | Calendar push guide fetched | Channel creation with `id`/`type: web_hook`/`address`/`token`/`expiration`; the full `X-Goog-*` header table; **`X-Goog-Channel-Token` as the anti-spoofing control**; the **zero-length body**; the `sync` message that can arrive before the watch response; success codes `200/201/202/204/102`; 5xx retried; **"no automatic way to renew"** with an expected overlap; "Not 100% reliable. Expect a small percentage of messages to get dropped"; per-calendar vs per-user subscription granularity. |
 | 2026-09-27 | Calendar sync guide fetched | `nextSyncToken`; incremental sync with `syncToken`; **HTTP 410 Gone for an invalidated token** requiring a full wipe; **HTTP 400 for disallowed query restrictions**; the pagination rule of repeating the exact same query with `pageToken`; `modifiedSince` recorded as deprecated in favour of sync tokens. |
 | 2026-09-27 | Pub/Sub push authentication page fetched | **JWT (RS256) in `Authorization: Bearer`**; the claim set (`aud`, `azp`, `email`, `sub`, `iss`, `exp`, `iat`); validation = signature + **email and audience claims matching the subscription configuration**; tokens "may be up to an hour old"; no body signature. This is the finding that `WebhookSupport::Push` cannot express. |

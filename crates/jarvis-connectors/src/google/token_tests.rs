@@ -106,21 +106,66 @@ fn the_refresh_carries_a_grant_type_and_the_previous_token() {
 }
 
 #[test]
-fn every_parameter_value_is_percent_encoded() {
-    // The redirect URI is the case that proves the encoding is applied rather than assumed: it always contains
-    // `:` and `/`, so a request that did not encode it would be the one that breaks in practice.
-    let map = as_map(&refresh(
-        &must(
-            Secret::new("refresh_token", "abc", MAX_REFRESH_TOKEN_CHARS),
-            "valid",
-        ),
-        &identity(),
-    ));
-    assert_eq!(
-        map["redirect_uri"], "http%3A%2F%2F127.0.0.1%2F",
-        "a redirect URI must be encoded"
-    );
+fn the_identity_holds_raw_values_and_the_encoding_happens_once() {
+    // **This test used to assert the opposite, and the reversal is the finding.** It asserted
+    // `map["redirect_uri"] == "http%3A%2F%2F127.0.0.1%2F"` — that the identity's parameters arrive
+    // pre-encoded by `percent_encode`. That was a live trap: the form body encoder escapes every parameter it
+    // is given, so feeding it a pre-encoded value escapes it **twice**
+    // (`http%253A%252F%252F127.0.0.1%252F`), and Google answers a double-encoded `redirect_uri` with
+    // `redirect_uri_mismatch` — an error a reader would chase through client registration rather than
+    // through the encoding.
+    //
+    // The encoding belongs to exactly one layer, the one that renders the body. So the identity returns text.
+    let identity = identity();
+    let map = as_map(&identity.public_parameters());
+    assert_eq!(map["redirect_uri"], "http://127.0.0.1/");
     assert_eq!(map["client_id"], "123456789.apps.googleusercontent.invalid");
+
+    // And the body escapes it exactly once: the `://` becomes `%3A%2F%2F`, not `%253A%252F%252F`.
+    let body = body(&identity.public_parameters());
+    assert!(
+        body.contains("redirect%5Furi=http%3A%2F%2F127%2E0%2E0%2E1%2F"),
+        "the body must escape the redirect URI once: {body}"
+    );
+    assert!(
+        !body.contains("%25"),
+        "no value may be double-encoded: {body}"
+    );
+}
+
+#[test]
+fn the_exchange_body_escapes_each_value_exactly_once() {
+    // The whole pipeline for the exchange: raw values in, one level of escaping out. A `%25` in the result would
+    // mean a value was escaped where it was stored rather than where it was rendered.
+    let code = must(
+        Secret::new("code", "4/0Axyz", MAX_AUTHORIZATION_CODE_CHARS),
+        "valid",
+    );
+    let parameters = must(
+        exchange_code(&code, &verifier(), &identity()),
+        "the exchange must build",
+    );
+    let rendered = body(&parameters);
+    assert!(!rendered.contains("%25"), "double-encoded: {rendered}");
+    // A `/` in the code is escaped once, which is what makes the value unambiguous in the body.
+    assert!(
+        rendered.contains("code=4%2F0Axyz"),
+        "the code must be escaped once: {rendered}"
+    );
+    // And the grant type is a plain alphanumeric value, so it passes through unchanged.
+    assert!(
+        rendered.contains("grant%5Ftype=authorization%5Fcode"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn the_identity_names_the_endpoint_the_manifest_declares() {
+    // Taken from the manifest rather than restated, so the exchange cannot be aimed at one host while the
+    // manifest declares another. Google's consent screen and token exchange are on **different hosts**, which
+    // a reader might "tidy" into one constant.
+    assert_eq!(identity().endpoint(), "https://oauth2.googleapis.com/token");
+    assert_eq!(content_type(), "application/x-www-form-urlencoded");
 }
 
 #[test]

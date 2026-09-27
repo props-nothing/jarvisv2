@@ -1,0 +1,59 @@
+{
+  "id": "vendor",
+  "version": "1.0.0",
+  "display_name": "Vendor",
+  "provider": "Vendor Incorporated",
+  "operations": [
+    {
+      "id": "list_messages",
+      "description": "reads the account's message list",
+      "effects": ["read_only"],
+      "risk": 0,
+      "required_scopes": ["vendor.read"],
+      "idempotency": "declared"
+    }
+  ],
+  "auth_methods": [
+    {
+      "method": "o_auth_pkce",
+      "purpose": "connects the user's own account through the browser",
+      "scopes": ["vendor.read"],
+      "required": true
+    }
+  ],
+  "webhook": { "kind": "polling", "minimum_interval_seconds": 60 },
+  "secret_fields": [
+    {
+      "name": "vendor_client_id",
+      "kind": "client_secret",
+      "required": true,
+      "purpose": "the OAuth client identifier the deployment registered"
+    }
+  ],
+  "classification": "confidential",
+  "residency": {
+    "note": "the vendor's terms do not state a processing region",
+    "verification": "not_stated"
+  },
+  "links": [
+    {
+      "kind": "llms_txt",
+      "url": "https://vendor.example/llms.txt",
+      "purpose": "the index the research process checks first"
+    },
+    {
+      "kind": "documentation",
+      "url": "https://vendor.example/docs",
+      "purpose": "the endpoint reference"
+    }
+  ],
+  "research": {
+    "path": "docs/research/integrations/vendor.md",
+    "last_verified": "2026-09-27"
+  },
+  "compatibility": {
+    "minimum_jarvis_version": "0.5.0",
+    "status": "unverified",
+    "note": "no connector has been built against this vendor yet"
+  }
+}

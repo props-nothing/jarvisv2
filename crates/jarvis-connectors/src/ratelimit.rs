@@ -83,6 +83,51 @@ impl RateLimitScope {
     }
 }
 
+/// What a provider's rate-limit figure counts.
+///
+/// # Why this is not a `bool` and not inferred
+///
+/// Providers publish their limits in the unit their own accounting uses, and the unit decides whether a
+/// figure may be compared against a **request** count. Google's Gmail limits are published in **quota units**
+/// ("an abstract unit of measurement representing Gmail resource usage"), and its per-method costs range from
+/// 1 to 100 units — so treating 1,200,000 quota units per minute as 1,200,000 *requests* per minute
+/// over-states the request allowance by whatever the per-call cost is, and a scheduler planning from it would
+/// exceed the real quota. The failure is silent: the connector behaves correctly and the provider starts
+/// refusing calls.
+///
+/// A boolean `counts_units` would leave a reader having to remember which polarity meant which, and the
+/// name would read as an implementation detail rather than as the fact that makes the figure unusable as a
+/// request rate. An enum makes the conversion a **type decision** instead.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitUnit {
+    /// The figure counts requests, so it is directly a request rate.
+    Requests,
+    /// The figure counts the provider's own **cost** units, so a request rate needs the per-call cost.
+    CostUnits,
+}
+
+impl RateLimitUnit {
+    /// Returns the stable snake-case code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requests => "requests",
+            Self::CostUnits => "cost_units",
+        }
+    }
+
+    /// Returns whether the figure may be read directly as a request allowance.
+    ///
+    /// The predicate a scheduler asks. `false` for [`Self::CostUnits`], and that is the whole point: a
+    /// caller holding a cost-unit limit must divide by the operation's per-call cost, and one that treats
+    /// the figure as requests will over-plan.
+    #[must_use]
+    pub const fn counts_requests(self) -> bool {
+        matches!(self, Self::Requests)
+    }
+}
+
 /// A provider rate limit, as the connector declared it.
 ///
 /// Both the sustained rate and the burst are required, because a limit with only one of them is unusable: a
@@ -90,12 +135,18 @@ impl RateLimitScope {
 /// unbounded average. This is the same reasoning as a token bucket needing both a refill rate and a capacity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RateLimit {
-    /// The requests allowed per window, sustained.
+    /// The allowance per window, sustained, **in the unit [`Self::unit`] names**.
     pub per_window: u32,
     /// The length of that window, in seconds.
     pub window_seconds: u32,
-    /// The most requests allowed in one burst.
+    /// The most allowed in one burst, in the same unit as [`Self::per_window`].
     pub burst: u32,
+    /// What [`Self::per_window`] and [`Self::burst`] count.
+    ///
+    /// **Required, and the reason it is a field rather than a comment**: a figure without its unit is the
+    /// value most likely to be read as the wrong thing, and Google's published Gmail limits are cost units
+    /// while a consumer naturally reads a rate limit as requests.
+    pub unit: RateLimitUnit,
     /// Whose budget is spent.
     pub scope: RateLimitScope,
     /// Whether the limit is documented by the provider or inferred.
@@ -105,6 +156,74 @@ pub struct RateLimit {
     /// different confidence. A limit that an operator reads as documented when it was guessed is a budget the
     /// deployment may plan around incorrectly.
     pub evidence: RateLimitEvidence,
+}
+
+/// What one call costs against a provider's **cost-unit** rate limit.
+///
+/// # Why this is a type rather than a `u32` beside the operation
+///
+/// Google publishes a per-method table — `messages.get` costs 20 units, `history.list` 2, `getProfile` 1 —
+/// and the research record calls the per-method figure *"the single most important number for sizing a first
+/// sync"*. Without it, a cost-unit rate limit cannot be turned into a request rate at all: 1,200,000 units per
+/// minute is 60,000 `messages.get` calls per minute and 600,000 `history.list` calls per minute, and the two
+/// differ by 10×. A `u32` would also make "this operation's cost is unstated" unrepresentable, which is the
+/// value an author most needs to be able to write.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaCost {
+    /// The provider's own documentation states this operation's cost.
+    Documented(u32),
+    /// No cost is stated, so no request rate can be derived for this operation.
+    ///
+    /// **Not the same as a cost of one.** A caller that read an unstated cost as `1` would compute the full
+    /// cost-unit allowance as a request rate and over-plan by the operation's real cost — the exact failure
+    /// this type exists to prevent, and the reason the variant carries no number.
+    ///
+    /// The default, because an author who did not consult a cost table has not established anything, and
+    /// defaulting to `Documented(1)` would silently make every operation look cheap.
+    #[default]
+    Unstated,
+}
+
+impl QuotaCost {
+    /// Returns the cost in provider units, when one is documented.
+    ///
+    /// `None` for [`Self::Unstated`], deliberately: a caller that needs a number must decide what an
+    /// unstated cost means, rather than silently receiving `1`.
+    #[must_use]
+    pub const fn units(self) -> Option<u32> {
+        match self {
+            Self::Documented(units) => Some(units),
+            Self::Unstated => None,
+        }
+    }
+
+    /// Returns whether the cost is documented.
+    #[must_use]
+    pub const fn is_documented(self) -> bool {
+        matches!(self, Self::Documented(_))
+    }
+
+    /// Returns the number of calls that fit in a cost-unit allowance per window.
+    ///
+    /// `None` when either the cost is unstated or the limit is not stated in cost units — the two reasons a
+    /// request rate cannot be derived, and they are different enough that collapsing them would hide which
+    /// input was missing. The division is **floor** rather than rounding up, for the reason
+    /// [`RateLimit::sustained_per_second`] records: under-estimating keeps the caller inside the limit.
+    ///
+    /// A documented cost of **zero** also answers `None`: no call costs nothing, so a zero is a defect in the
+    /// table rather than a free operation, and dividing by it would be a panic.
+    #[must_use]
+    pub const fn calls_per_window(self, limit: &RateLimit) -> Option<u32> {
+        let cost = match self {
+            Self::Documented(units) => units,
+            Self::Unstated => return None,
+        };
+        if cost == 0 || limit.unit.counts_requests() {
+            return None;
+        }
+        Some(limit.per_window / cost)
+    }
 }
 
 /// Where a declared rate limit came from.
@@ -152,13 +271,13 @@ impl RateLimit {
         per_window: u32,
         window_seconds: u32,
         burst: u32,
+        unit: RateLimitUnit,
         scope: RateLimitScope,
         evidence: RateLimitEvidence,
     ) -> Result<Self, RateLimitError> {
         if per_window == 0 || per_window > MAX_RATE_LIMIT_PER_WINDOW {
             return Err(RateLimitError::Shape {
-                reason: "a rate limit must allow 1 to 1000000 requests per window; zero would read as \
-                         `unlimited`",
+                reason: "a rate limit must allow 1 to 1000000 per window; zero would read as `unlimited`",
             });
         }
         if window_seconds == 0 {
@@ -176,23 +295,43 @@ impl RateLimit {
             per_window,
             window_seconds,
             burst,
+            unit,
             scope,
             evidence,
         })
     }
 
-    /// Returns the sustained requests per second, rounded down.
+    /// Returns the sustained allowance per second, **rounded down, in this limit's own unit**.
     ///
     /// Used by a scheduler, and the rounding direction is deliberate: a rate that **under**-estimates keeps
     /// the caller inside the provider's limit, while rounding up would exceed it by a fraction on every
     /// window. `P3-002`'s `MAX_SCOPE_CHARS` lesson applies — a bound that cannot be reached enforces
     /// nothing, so the arithmetic has to be the one that binds.
+    ///
+    /// **The result is in [`Self::unit`], not necessarily requests.** A cost-unit limit's value may not be
+    /// compared against a request budget, which is why [`Self::sustained_requests_per_second`] is separate
+    /// rather than this function being renamed.
     #[must_use]
     pub const fn sustained_per_second(&self) -> u32 {
         self.per_window / self.window_seconds
     }
 
-    /// Returns whether a burst of `count` requests is within the limit.
+    /// Returns the sustained **request** allowance per second, when the limit is stated in requests.
+    ///
+    /// `None` for a cost-unit limit, and the caller must then convert using the operation's per-call cost —
+    /// which is [`QuotaCost`]'s job. Returning the raw figure here would be the value a scheduler most easily
+    /// mistakes for a request rate, so it is not available at all: a cost-unit limit has **no** request rate
+    /// until an operation's cost is known, and inventing one would be the over-planning this distinction
+    /// exists to prevent.
+    #[must_use]
+    pub const fn sustained_requests_per_second(&self) -> Option<u32> {
+        match self.unit {
+            RateLimitUnit::Requests => Some(self.per_window / self.window_seconds),
+            RateLimitUnit::CostUnits => None,
+        }
+    }
+
+    /// Returns whether a burst of `count` is within the limit, in the limit's own unit.
     #[must_use]
     pub const fn admits_burst(&self, count: u32) -> bool {
         count <= self.burst
@@ -297,6 +436,38 @@ pub enum RetryGuidance {
     RetryAfterSeconds(u32),
     /// Retry with exponential backoff, starting from the stated number of seconds.
     BackoffSeconds(u32),
+    /// Retry with exponential backoff from the stated number of seconds, used when the provider **stated** a
+    /// delay that this client could not read as a number of seconds.
+    ///
+    /// # Why this is separate from [`Self::BackoffSeconds`]
+    ///
+    /// The wait is identical — both back off from a stated base — so the two differ **only** in what they say
+    /// about the provider, and that is exactly the fact a caller must not lose. `BackoffSeconds` means *the
+    /// provider stated no delay*; this means *the provider stated one and it could not be read*. Rendering both
+    /// as `BackoffSeconds` would tell an operator "the provider said nothing" when it did, and would let a
+    /// reader conclude the wait was the provider's instruction rather than a JARVIS floor.
+    ///
+    /// The number is the same floor [`Self::BackoffSeconds`] uses, because without a clock neither form can be
+    /// converted to a wait. Refusing to retry instead was rejected: throttling is the single most retryable
+    /// class, and a `429` whose delay is unreadable is still transient.
+    BackoffAfterUnreadableDelay(u32),
+    /// Do **not** retry in this loop: the provider asked for a wait longer than a caller may hold, so the work
+    /// is deferred rather than attempted.
+    ///
+    /// Carries the provider's stated delay, because it is what an operator or scheduler needs to plan the
+    /// deferral — and it is deliberately **not** the same accessor as [`Self::delay_seconds`], because that
+    /// value answers "how long before the automatic retry" and this guidance forbids the automatic retry
+    /// outright.
+    ///
+    /// # Why this exists rather than a clamp
+    ///
+    /// [`MAX_RETRY_AFTER_SECONDS`] documents that a longer value is "refused rather than clamped", and this is
+    /// the refusal: clamping would silently retry **sooner** than the provider asked, which is the direction
+    /// that gets a caller blocked, while honouring it inside a loop would hold a worker for a whole quota
+    /// window. The remedy is the one [`BudgetOutcome::Exhausted`] already names — *defer the work* — and this
+    /// is the retry-decision vocabulary's way of saying the same thing. Google documents exactly this case: a
+    /// daily-limit `429` "might result in these errors for multiple hours".
+    DeferSeconds(u32),
     /// Do not retry; the request is permanently unusable as sent.
     DoNotRetry,
     /// Do not retry; a user must reconnect.
@@ -313,16 +484,73 @@ impl RetryGuidance {
     /// Returns whether the guidance permits a retry at all.
     #[must_use]
     pub const fn permits_retry(self) -> bool {
-        matches!(self, Self::RetryAfterSeconds(_) | Self::BackoffSeconds(_))
+        matches!(
+            self,
+            Self::RetryAfterSeconds(_)
+                | Self::BackoffSeconds(_)
+                | Self::BackoffAfterUnreadableDelay(_)
+        )
     }
 
     /// Returns the delay, when the guidance states one.
     #[must_use]
     pub const fn delay_seconds(self) -> Option<u32> {
         match self {
-            Self::RetryAfterSeconds(seconds) | Self::BackoffSeconds(seconds) => Some(seconds),
-            Self::DoNotRetry | Self::Reauthenticate | Self::Reconcile => None,
+            Self::RetryAfterSeconds(seconds)
+            | Self::BackoffSeconds(seconds)
+            | Self::BackoffAfterUnreadableDelay(seconds) => Some(seconds),
+            // `DeferSeconds` is deliberately **absent**: this accessor answers "how long before the automatic
+            // retry", and the deferral guidance forbids the automatic retry. Returning the number here would
+            // make `delay_seconds().is_some()` mean "retryable", which is the reading this variant exists to
+            // prevent. The stated delay is still readable — through `deferred_seconds`.
+            Self::DeferSeconds(_) | Self::DoNotRetry | Self::Reauthenticate | Self::Reconcile => {
+                None
+            }
         }
+    }
+
+    /// Returns the provider's stated delay when the guidance defers the work instead of retrying it.
+    ///
+    /// The counterpart to [`Self::delay_seconds`] for [`Self::DeferSeconds`]: a caller deciding **when to
+    /// schedule the deferred work** reads this, while the retry loop itself reads `permits_retry` and stops.
+    #[must_use]
+    pub const fn deferred_seconds(self) -> Option<u32> {
+        match self {
+            Self::DeferSeconds(seconds) => Some(seconds),
+            Self::RetryAfterSeconds(_)
+            | Self::BackoffSeconds(_)
+            | Self::BackoffAfterUnreadableDelay(_)
+            | Self::DoNotRetry
+            | Self::Reauthenticate
+            | Self::Reconcile => None,
+        }
+    }
+
+    /// Builds the guidance for a delay the **provider** stated, applying [`MAX_RETRY_AFTER_SECONDS`].
+    ///
+    /// This is the constructor that makes the bound a rule rather than a comment. A stated delay within the
+    /// ceiling becomes [`Self::RetryAfterSeconds`]; a longer one becomes [`Self::DeferSeconds`] — refused rather
+    /// than clamped, because clamping would retry **sooner** than the provider asked, which is the direction that
+    /// gets a caller blocked.
+    ///
+    /// # Why this is total rather than fallible
+    ///
+    /// A provider asking to wait five hours is not an error in this crate: it is a real response that means
+    /// *defer the work*, which is a value this type already has. A `Result` whose `Err` every caller immediately
+    /// converted into `DeferSeconds` would be ceremony, and — worse — an `Err` that a caller could `?` out of
+    /// would turn a plan to wait into a hard failure. The refusal is expressed as a **variant**, not as an error.
+    ///
+    /// # Why this is the only way a provider's stated delay becomes guidance
+    ///
+    /// [`Self::RetryAfterSeconds`] takes any `u32`, so nothing stops a constructed value from exceeding the
+    /// ceiling. Routing every provider-stated delay through one function means the bound is applied at exactly
+    /// one place, and the tests assert both sides of it.
+    #[must_use]
+    pub const fn for_stated_delay(seconds: u32) -> Self {
+        if seconds > MAX_RETRY_AFTER_SECONDS {
+            return Self::DeferSeconds(seconds);
+        }
+        Self::RetryAfterSeconds(seconds)
     }
 }
 
@@ -421,15 +649,13 @@ pub enum RateLimitError {
     /// A provider request identifier is unusable.
     #[error("a provider request identifier must be 1 to 256 characters with no control characters")]
     RequestId,
-    /// A retry-after value is longer than the caller may hold.
-    #[error("a provider asked to wait {requested} seconds, above the {maximum} a caller may hold")]
-    RetryAfterTooLong {
-        /// What the provider asked for.
-        requested: u32,
-        /// [`MAX_RETRY_AFTER_SECONDS`].
-        maximum: u32,
-    },
 }
+
+// **A `RetryAfterTooLong { requested, maximum }` variant was removed here.** Its doc claimed the bound was
+// "enforced by the constructor a caller would use" — and no caller existed. The only construction in the
+// tree was in a test, which is the tell: a variant a test builds by hand proves the type can hold the value,
+// not that any production path produces it. `RetryGuidance::for_stated_delay` now expresses the same refusal
+// as `DeferSeconds`, a variant that *is* produced, so the error had nothing left to mean.
 
 #[cfg(test)]
 #[path = "ratelimit_tests.rs"]

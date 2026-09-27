@@ -67,13 +67,19 @@ mod token;
 mod webhook;
 
 /// A provider connector's declared contract.
-///
 /// Exported as a **namespace per provider** rather than re-exported into the crate root, and that is forced
 /// by the second connector: `jarvis_connectors::CONNECTOR_ID` would be ambiguous the moment Microsoft
 /// arrives, and a crate root holding one provider's scope constants would make the others' hard to find.
 /// `repository-layout.md`'s integration shape is one module per connector, so the path mirrors it —
 /// `jarvis_connectors::google::GoogleConnector::manifest()`.
 pub mod google;
+
+/// `application/x-www-form-urlencoded`, in both directions.
+///
+/// Exported rather than private because the encoder has **no caller yet** — it is what the token endpoint's
+/// form `POST` body needs — and a `pub` item inside a private module is unreachable and therefore dead code.
+/// `authorization` uses the decoder today; the encoder is the next slice's.
+pub mod form;
 
 pub use account::{
     AccountReference, AccountStatus, MAX_ACCOUNT_DISPLAY_NAME_CHARS, MAX_PROVIDER_ACCOUNT_ID_CHARS,

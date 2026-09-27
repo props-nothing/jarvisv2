@@ -19,6 +19,7 @@ fn limit(per_window: u32, window_seconds: u32, burst: u32) -> RateLimit {
             per_window,
             window_seconds,
             burst,
+            RateLimitUnit::Requests,
             RateLimitScope::PerAccount,
             RateLimitEvidence::Documented,
         ),
@@ -68,6 +69,7 @@ fn a_rate_limit_refuses_a_zero_or_unbounded_shape() {
                     per_window,
                     window_seconds,
                     burst,
+                    RateLimitUnit::Requests,
                     RateLimitScope::Global,
                     RateLimitEvidence::Observed
                 ),
@@ -82,6 +84,7 @@ fn a_rate_limit_refuses_a_zero_or_unbounded_shape() {
             MAX_RATE_LIMIT_PER_WINDOW,
             1,
             MAX_RATE_LIMIT_BURST,
+            RateLimitUnit::Requests,
             RateLimitScope::PerUser,
             RateLimitEvidence::Documented
         )
@@ -92,6 +95,7 @@ fn a_rate_limit_refuses_a_zero_or_unbounded_shape() {
             1,
             1,
             1,
+            RateLimitUnit::Requests,
             RateLimitScope::PerClient,
             RateLimitEvidence::Documented
         )
@@ -249,10 +253,13 @@ fn the_guidance_and_the_class_travel_together_so_a_delay_cannot_be_missed() {
             .permits_automatic_retry(crate::manifest::ProviderIdempotency::Declared)
     );
     // Every guidance either states a delay or refuses, and the two sets are complements — so a guidance
-    // cannot be one that permits a retry without saying when.
+    // cannot be one that permits a retry without saying when. The variants are listed explicitly because a
+    // property asserted over an incomplete set of variants is a property about the list, not about the type.
     for guidance in [
         RetryGuidance::RetryAfterSeconds(1),
         RetryGuidance::BackoffSeconds(1),
+        RetryGuidance::BackoffAfterUnreadableDelay(1),
+        RetryGuidance::DeferSeconds(1),
         RetryGuidance::DoNotRetry,
         RetryGuidance::Reauthenticate,
         RetryGuidance::Reconcile,
@@ -261,6 +268,22 @@ fn the_guidance_and_the_class_travel_together_so_a_delay_cannot_be_missed() {
             guidance.permits_retry(),
             guidance.delay_seconds().is_some(),
             "{guidance:?} must state a delay exactly when it permits a retry"
+        );
+    }
+    // And every variant's two accessors are disjoint except where the retry itself states the delay, so no
+    // caller can read a "when" without knowing whether it is a retry or a deferral.
+    for guidance in [
+        RetryGuidance::RetryAfterSeconds(1),
+        RetryGuidance::BackoffSeconds(1),
+        RetryGuidance::BackoffAfterUnreadableDelay(1),
+        RetryGuidance::DeferSeconds(1),
+        RetryGuidance::DoNotRetry,
+        RetryGuidance::Reauthenticate,
+        RetryGuidance::Reconcile,
+    ] {
+        assert!(
+            !(guidance.delay_seconds().is_some() && guidance.deferred_seconds().is_some()),
+            "{guidance:?} must not answer both accessors"
         );
     }
 }
@@ -290,24 +313,49 @@ fn a_provider_request_identifier_may_not_carry_a_control_character() {
 }
 
 #[test]
-fn a_retry_delay_longer_than_a_caller_may_hold_is_refused_rather_than_clamped() {
-    // A provider asking for longer than an hour is describing a quota window rather than a transient limit,
-    // and clamping would silently retry sooner than the provider asked — the direction that gets a caller
-    // blocked.
-    let outcome = RetryGuidance::RetryAfterSeconds(MAX_RETRY_AFTER_SECONDS + 1);
-    assert_eq!(outcome.delay_seconds(), Some(MAX_RETRY_AFTER_SECONDS + 1));
-    // The bound is enforced by the constructor a caller would use, which is asserted here so the ceiling is
-    // not merely a constant nobody reads.
-    let error = RateLimitError::RetryAfterTooLong {
-        requested: MAX_RETRY_AFTER_SECONDS + 1,
-        maximum: MAX_RETRY_AFTER_SECONDS,
-    };
-    let message = error.to_string();
-    assert!(message.contains("3601"), "got {message}");
-    assert!(message.contains("3600"), "got {message}");
-    // And the ceiling itself is a value a caller may hold.
+fn a_retry_delay_longer_than_a_caller_may_hold_is_deferred_rather_than_clamped() {
+    // A provider asking for longer than an hour is describing a quota window rather than a transient limit, and
+    // clamping would silently retry sooner than the provider asked — the direction that gets a caller blocked.
+    // So the refusal is a **variant**, and this test asserts both sides of the bound, because a bound asserted
+    // on one side only would pass for a constructor that never applied it at all.
+    let at_the_ceiling = RetryGuidance::for_stated_delay(MAX_RETRY_AFTER_SECONDS);
     assert_eq!(
-        RetryGuidance::RetryAfterSeconds(MAX_RETRY_AFTER_SECONDS).delay_seconds(),
-        Some(MAX_RETRY_AFTER_SECONDS)
+        at_the_ceiling,
+        RetryGuidance::RetryAfterSeconds(MAX_RETRY_AFTER_SECONDS),
+        "a delay the caller may hold is an ordinary stated delay"
+    );
+    assert!(at_the_ceiling.permits_retry());
+
+    let above = RetryGuidance::for_stated_delay(MAX_RETRY_AFTER_SECONDS + 1);
+    assert_eq!(
+        above,
+        RetryGuidance::DeferSeconds(MAX_RETRY_AFTER_SECONDS + 1),
+        "one second above the ceiling must defer, not retry"
+    );
+    // **The load-bearing assertion.** `delay_seconds()` answers "how long before the automatic retry", so it
+    // must be `None` for a deferral — a caller that read a number here would wait out a whole quota window
+    // inside a retry loop. The provider's number is not lost; it moves to `deferred_seconds`.
+    assert!(
+        !above.permits_retry(),
+        "a deferral is not an automatic retry"
+    );
+    assert_eq!(above.delay_seconds(), None);
+    assert_eq!(
+        above.deferred_seconds(),
+        Some(MAX_RETRY_AFTER_SECONDS + 1),
+        "the stated delay must remain readable for whoever schedules the deferral"
+    );
+    // And the two accessors are complements in the direction that matters: a deferral states a delay through
+    // exactly one of them, so a scheduler cannot miss it by reading the wrong one.
+    assert_eq!(above.delay_seconds().is_some(), above.permits_retry());
+    assert_eq!(
+        above.deferred_seconds().is_some(),
+        !above.permits_retry() && above != RetryGuidance::DoNotRetry,
+        "only the deferral states a delay while refusing the retry"
+    );
+    // A value far above the ceiling is still a deferral rather than a clamp or an overflow.
+    assert_eq!(
+        RetryGuidance::for_stated_delay(u32::MAX),
+        RetryGuidance::DeferSeconds(u32::MAX)
     );
 }
