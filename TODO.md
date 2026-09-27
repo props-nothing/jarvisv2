@@ -3185,6 +3185,60 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `GoogleToolError::NoSchema` **cannot be reached from a test** because the operation it would be built from
     cannot be constructed — verified by construction rather than by exercise, which is stated rather than
     implied.
+  - **This round built the requests, which is the other half of the client that needs no socket.**
+    `crates/jarvis-connectors/src/google/request.rs` + `request_tests.rs` (18 new tests, so **213 in the crate**).
+    **`ADR-0060`.** A request is a **value** here — method, URL, ordered parameters — and nothing sends it, the
+    same split `client.rs` makes. Three request builders (`gmail_messages_list`, `gmail_messages_get`,
+    `calendar_events_list`) and three response parsers.
+  - **⭐ THE ENCODING IS A SECURITY CONTROL, NOT TIDINESS.** A Gmail query is model-chosen text, and each
+    hazardous character changes the **request** rather than the query: `&` starts a new parameter, so
+    `is:unread&maxResults=999` **replaces the connector's own bound with the model's**; `=` reads as an
+    assignment; `#` ends the query; `%` starts an escape of the value's choosing; `?` starts a second query
+    string. Every value goes through `percent_encode` (RFC 3986 unreserved set, **uppercase** hex per §6.2.2.1
+    normalisation), and the falsification mutated the unreserved set to admit `& = # %` and the injection test
+    failed. **A space is `%20` and a literal `+` is `%2B`**, because the form-urlencoded convention is
+    ambiguous in both directions and `%20` is correct in every query position.
+  - **⭐ `HttpRequest` HAS NO FIELD A CREDENTIAL COULD GO IN — the absence is the control.** Google's own page
+    offers `?access_token=` and adds that "query strings tend to be visible in server logs", so the parameter
+    is a supported way to do the one thing that leaks a token into every artifact a debugging session
+    produces. The type is a method, a URL, ordered parameters and an `Accept` value: no header map, no token,
+    and **no body** (all three operations are `GET`s, so a body field would be a shape nothing uses). The
+    header's *name* and scheme are constants so a transport knows where a credential belongs; the value is not
+    in this crate. Asserted on every request by searching each rendered URL for `access_token`/`token=`/`key=`.
+  - **`Display` reports parameter NAMES and never a value**, because a rendering reaches a log line and a
+    value is model-chosen text. That is why `url()` (path only) and `url_with_query()` are split: a diagnostic
+    can render the shape while the transport builds the target.
+  - **`status` is checked BEFORE the body is parsed, in every parser.** The failure mode is specific: an error
+    document parsed as a page reports "no results", and a caller cannot then tell a successful empty mailbox
+    from a refused request. The refusal names `client::classify` as where the outcome belongs. Falsified by
+    making the status check `if false`.
+  - **`nextSyncToken` and `nextPageToken` are separate fields and are not interchangeable.** Google's sync
+    guide says the sync token "is present only on the very last page" while the page token continues the
+    current walk, so a caller storing the page token as a cursor would store something that expires with the
+    walk.
+  - **`format=raw` is not representable.** `MessageFormat` has no `Raw` variant, because that format returns
+    the unparsed MIME message including attachments and nothing in this connector parses it — a type that
+    cannot express the value is stronger than a check that refuses it.
+  - **`maxResults` is bounded per API** (500 Gmail, 2 500 Calendar), because one shared bound would be wrong
+    for one of them; zero is refused rather than read as "unlimited"; and the value **at** each cap is
+    accepted so neither bound is unreachable. Falsified by dropping the zero check.
+  - **⭐ MY OWN TEST'S PREMISE WAS WRONG AND THE FAILURE SURFACED IT.** The injection test asserted that a
+    hazardous character "must not survive encoding" — which is **false for `%`**, whose escape is `%25` and
+    therefore *contains* `%` as the escape marker. The property happened to hold for `&`, `=`, `#` and `?`,
+    which is why it looked right. Replaced with the **exact** expected encoding per character plus the real
+    property (`%` only as the marker). **A property that holds for every case you tried is not yet a rule.**
+  - **Three guards falsified A-B-A with compiling mutants:** the encoding's unreserved set, the status-first
+    check, and the zero-`maxResults` refusal. **Two probes needed a second attempt** — both were multi-line and
+    hit the CRLF here-string trap (4th and 5th occurrences in this workspace), retried with **LF-joined
+    anchors**.
+  - **Limits:** **no request has been sent and nothing performs one**, so `HttpRequest` has **no production
+    caller**; the response parsers have never seen a real response, so they prove the code reads the *record's*
+    shape; `parse_id_page` accepts a body with no `messages` array as an empty page — correct for
+    `{"resultSizeEstimate": 0}` and indistinguishable from a *successful* wrong-shaped document, recorded
+    rather than fixed because the fix would be a stricter schema nobody has observed; **no retry, pacing or
+    budget accounting happens here**, so nothing connects a request to a `classify` decision; and only `Accept`
+    is stated, so a transport still has to supply `Authorization` and whatever else a live call needs — a
+    coverage gap rather than a decision.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

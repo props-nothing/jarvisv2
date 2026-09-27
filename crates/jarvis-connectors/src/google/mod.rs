@@ -36,6 +36,7 @@
 
 pub mod client;
 pub mod definitions;
+pub mod request;
 
 use crate::auth::{AuthError, AuthFlow, AuthMethod, PkceMethod};
 use crate::authorization::{LoopbackHost, LoopbackRedirect, RedirectError};
