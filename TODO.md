@@ -1950,6 +1950,52 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         `tool_requires_approval = false` returns `Decision::Allow` and the new test fails.
         **The lesson recorded here:** a fixture that shares the bug's assumption cannot catch the bug, and
         a threshold in front of a check can hide that the check is absent.
+  - [x] `P3-016` Link a held call to its approval and to the run's event stream.
+        **The gap was a column with no writer.** `tool_calls.approval_id` existed since `0007`, nullable and
+        with its foreign key, and **nothing ever set it**: `admit_tool_call` runs before `create_approval`
+        (the write order `P3-012a` fixed so a crash leaves an undecidable approval rather than a dangling
+        secret), so the identifier did not exist at insert time and no second statement set it either. The
+        consequence was that a decision moved the approval to `approved` and nothing could find the call
+        waiting on it — the two rows shared no column, so there was **no join from a decision back to its
+        subject**. `link_tool_call_approval` is that join, written by `ToolPipeline::record_hold` after the
+        row and the secret.
+        **⭐ Write-once, and the falsification is what made that worth asserting.** The `UPDATE` requires
+        `approval_id IS NULL`, so a link cannot be **moved**. A re-pointable link would let a call
+        authorized under one approval be resumed under another — a way to obtain an effect the operator
+        never decided, because their decision was about a *different* action. Linking again to the **same**
+        approval is a no-op, following `record_tool_outcome`'s rule that a retried write of one fact is not
+        an error while a changed fact is.
+        **⚠ The falsification found a coverage gap, which is the point of running it.** Deleting the
+        `AND approval_id IS NULL` guard left **every one of the 149 tests green** — no test linked a call
+        twice, so the guard was unprotected. Two tests were added (`a_call_links_to_its_approval_exactly_once`,
+        `a_link_requires_both_ends_to_exist`) and the same mutation then **failed** with
+        `ToolCallApprovalLinkConflict` expected. *A guard with no test is a guard the next person deletes.*
+        **The event stream now shows a call, in order.** `ToolPipeline` appends `tool_requested` before
+        admitting a call and `approval_requested` when a hold is recorded, so a client replaying the stream
+        sees the run ask for something and then block on a human, without reading a second table. The
+        `P3-012` limit "no `run_events` row is written for a tool call" is closed for this path.
+        **A refusal writes nothing, deliberately.** The event is emitted after the policy decision allows,
+        so a `Deny` produces no row — otherwise a caller could fill the run's log by asking for tools it may
+        not use, making a refusal a write primitive. Asserted separately
+        (`a_refused_call_writes_nothing_to_the_run_stream`) so a future change that emits on refusal fails
+        there.
+        **Migration `0008` adds an index and nothing else, after a first attempt was withdrawn.** The first
+        version rebuilt the whole table to "tidy" the column, which re-stated every `CHECK` by hand and
+        **silently widened two byte bounds into character bounds** — `evidence` 256→512 and `output` from
+        bytes to chars, in the column holding untrusted provider text. Those bounds are written in **bytes**
+        on purpose, so a multi-byte payload cannot smuggle past a character count. The column was already
+        correct; only a partial index (`WHERE approval_id IS NOT NULL`) was missing. *Re-typing a constraint
+        is how a bound changes.* No backfill: a guessed link could connect a call to a decision that was
+        never about it, and an unlinked call (visible, never resumes) is the safe direction.
+        Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero skips**,
+        both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok. 151 storage tests, 83 daemon
+        tests.
+        **Recorded as a limit:** the link makes a held call **findable**, and nothing yet **resumes** it. A
+        decision moves the approval to `approved` and the call stays `requested`; the resumption needs the
+        approver identity from a decided approval, which `ApprovalRequest` does not currently expose (the
+        row stores `decided_by`; the domain type returns only the decision), so it is a domain change rather
+        than a call-site one. That is `P3-012c`'s remainder and is where a duplicate delivery would become a
+        second effect.
   - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
 
 ## P4: Memory And Context

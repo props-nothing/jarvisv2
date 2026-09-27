@@ -21,9 +21,12 @@ use std::{
 use super::*;
 use crate::{
     CallBinding, CallOrigin, CallTarget, DEFAULT_DATABASE_FILENAME, DatabaseError, LOCAL_USER_ID,
-    LOCAL_WORKSPACE_ID, NewRun, NewToolCall, SqliteDatabase, create_run,
+    LOCAL_WORKSPACE_ID, NewRun, NewToolCall, SqliteDatabase, create_approval, create_run,
 };
-use jarvis_core::ToolOutcomeRecord;
+use jarvis_core::{
+    ApprovalRequest, ApprovalRequestParts, AuthenticationStrength, CanonicalIntentHash,
+    DecisionNonce, ToolOutcomeRecord, WorkspaceId,
+};
 
 const SESSION: &str = "0198f000-0000-7000-8000-000000000003";
 const RUN: &str = "0198f000-0000-7000-8000-0000000000c3";
@@ -120,6 +123,34 @@ async fn live_run(database: &SqliteDatabase) -> String {
 /// A distinct key per call site, so a duplicate is deliberate rather than accidental.
 fn key_for(discriminator: u8) -> String {
     format!("0123456789abcdef0123456789abcde{discriminator}")
+}
+
+/// An approval for one caller's intent, used only to give the link a real other end.
+///
+/// Built through the domain constructor rather than inserted as SQL, so the row the link points at is one
+/// the daemon itself would produce — a hand-written row could satisfy a foreign key while violating an
+/// invariant the domain enforces, and the link would then be tested against a state that cannot occur.
+///
+/// The intent is computed from the same tool, version, and arguments the caller passes, which is what makes
+/// it the *same* intent a resume would compare against.
+fn approval_for(tool: &str, arguments: &serde_json::Value) -> ApprovalRequest {
+    let intent = must(CanonicalIntentHash::compute(tool, "1.0.0", arguments));
+    must(ApprovalRequest::new(ApprovalRequestParts {
+        id: jarvis_core::ApprovalId::new(),
+        workspace_id: must::<WorkspaceId, _>(LOCAL_WORKSPACE_ID.parse()),
+        run_id: must(RUN.parse()),
+        actor_id: LOCAL_USER_ID.to_owned(),
+        tool: tool.to_owned(),
+        tool_version: "1.0.0".to_owned(),
+        intent,
+        preview: "Send a message.".to_owned(),
+        risk_level: 2,
+        required_strength: AuthenticationStrength::Credential,
+        nonce: must(DecisionNonce::generate()),
+        correlation_id: CorrelationId::new(),
+        created_at: at(0),
+        expires_at: at(10),
+    }))
 }
 
 fn call(id: &str, key: &str) -> NewToolCall {
@@ -608,5 +639,112 @@ async fn the_unrepeatable_set_is_the_ambiguous_and_in_flight_calls() {
         identifiers,
         vec![unknown_call],
         "only the ambiguous call is unrepeatable: a proven effect is done, and a failed one is safe"
+    );
+}
+
+/// **A held call records which approval is holding it, and that link is written once.**
+///
+/// This is the join `P3-012c` adds. `tool_calls.approval_id` existed since `0007` and **no writer set
+/// it**, so a decision could move an approval to `approved` and nothing could find the call that was
+/// waiting on it. The link is what the resume path reads to know which decision it acts under.
+///
+/// # The write-once property is the reason this test exists in this shape
+///
+/// The link is not merely a convenience. A re-pointable link would let a call authorized under one
+/// approval be resumed under another — which is a way to obtain an effect the operator refused, because
+/// the operator's decision was about a *different* action. The second attempt below is therefore asserted
+/// to be **refused**, not merely ignored: an ignored write reads as a successful re-point.
+///
+/// The falsification run is what put this assertion here. Deleting the `AND approval_id IS NULL` guard
+/// from the statement was **not caught by any test**, because no test linked a call twice — a guard with no
+/// test is a guard that will be deleted by the next person to find it inconvenient.
+#[tokio::test]
+async fn a_call_links_to_its_approval_exactly_once() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    must(admit_tool_call(&database, &call(CALL, &key_for(1))).await);
+
+    // The approval must exist: the column carries a foreign key, so a link to nothing is refused by
+    // storage rather than stored as a dangling reference.
+    let approval = approval_for("jarvis.mail.send", &serde_json::json!({ "to": "a@b.test" }));
+    must(create_approval(&database, &approval).await);
+    let approval_id = approval.id().to_string();
+
+    assert_eq!(
+        must(find_tool_call(&database, CALL).await).approval_id(),
+        None,
+        "an admitted call has no approval until a hold is recorded"
+    );
+
+    must(link_tool_call_approval(&database, CALL, &approval_id).await);
+    let linked = must(find_tool_call(&database, CALL).await);
+    assert_eq!(
+        linked.approval_id(),
+        Some(approval_id.as_str()),
+        "the link must be readable, which is what the resume path does"
+    );
+
+    // A second, *different* approval. The link must not move to it.
+    let other = approval_for("jarvis.mail.send", &serde_json::json!({ "to": "c@d.test" }));
+    must(create_approval(&database, &other).await);
+    let refused = link_tool_call_approval(&database, CALL, &other.id().to_string()).await;
+    assert!(
+        matches!(refused, Err(DatabaseError::ToolCallApprovalLinkConflict)),
+        "re-pointing a link must be refused, got {refused:?}"
+    );
+    assert_eq!(
+        must(find_tool_call(&database, CALL).await).approval_id(),
+        Some(approval_id.as_str()),
+        "a refused re-point must leave the original link intact"
+    );
+
+    // Idempotence: the *same* approval again is a fact, not a conflict, and must not read as a failure a
+    // caller would retry. It is accepted so a re-driven hold is not an error, and it does not move the link.
+    must(link_tool_call_approval(&database, CALL, &approval_id).await);
+    assert_eq!(
+        must(find_tool_call(&database, CALL).await).approval_id(),
+        Some(approval_id.as_str())
+    );
+}
+
+/// A link to a call that does not exist is a not-found, and to an approval that does not exist is
+/// refused by the foreign key rather than stored as a dangling reference.
+#[tokio::test]
+async fn a_link_requires_both_ends_to_exist() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+
+    let approval = approval_for("jarvis.mail.send", &serde_json::json!({ "to": "a@b.test" }));
+    must(create_approval(&database, &approval).await);
+
+    let missing = link_tool_call_approval(&database, CALL, &approval.id().to_string()).await;
+    assert!(
+        matches!(missing, Err(DatabaseError::ToolCallNotFound)),
+        "linking a call that does not exist must be a not-found, got {missing:?}"
+    );
+
+    must(admit_tool_call(&database, &call(CALL, &key_for(1))).await);
+    let ghost = "0198f000-0000-7000-8000-0000000000ff";
+    let dangling = link_tool_call_approval(&database, CALL, ghost).await;
+    assert!(
+        dangling.is_err(),
+        "an approval that does not exist must be refused by the foreign key, got {dangling:?}"
+    );
+    assert_eq!(
+        must(find_tool_call(&database, CALL).await).approval_id(),
+        None,
+        "a refused link must leave the call unlinked rather than half-linked"
+    );
+
+    // A malformed identifier is refused before the write, so it cannot reach the foreign key at all.
+    let malformed = link_tool_call_approval(&database, CALL, "not-a-uuid").await;
+    assert!(
+        matches!(
+            malformed,
+            Err(DatabaseError::InvalidToolCallRequest {
+                field: "approval_id"
+            })
+        ),
+        "a malformed identifier must be refused as a request error, got {malformed:?}"
     );
 }

@@ -31,7 +31,7 @@
 //! predicate here compares a timestamp string. Ordering is by `created_at` with the identifier as a
 //! tie-break, which is stable without depending on the text form's collation.
 
-use jarvis_core::{CorrelationId, ToolOutcome, ToolOutcomeRecord, UtcTimestamp};
+use jarvis_core::{CorrelationId, SystemClock, ToolOutcome, ToolOutcomeRecord, UtcTimestamp};
 use sqlx::Row;
 
 use crate::database::{DatabaseError, SqliteDatabase};
@@ -670,6 +670,79 @@ pub async fn record_tool_outcome(
     }
 
     find_tool_call(database, id).await
+}
+
+/// Links an admitted call to the approval that is holding it.
+///
+/// # Why this is a second statement rather than a parameter of `admit_tool_call`
+///
+/// The approval does not exist when the call is admitted: `admit_tool_call` runs first and
+/// `create_approval` second, which is the write order `P3-012a` fixed deliberately so a crash between
+/// them leaves an undecidable approval rather than a secret nothing holds. So the identifier is not
+/// available to the insert, and the link has to be set afterwards.
+///
+/// # Why it cannot be *moved* once set, but may be set again to the same value
+///
+/// The `WHERE` clause requires the link to be NULL, so the statement is **write-once**. A second call
+/// cannot repoint the link at a different approval, which matters because the link is what a resume path
+/// reads to decide which decision it is acting under. A re-pointable link would let a call that was
+/// authorized under one approval be resumed under another.
+///
+/// Linking **again to the same approval** is accepted as a no-op, following `record_tool_outcome`'s own
+/// rule that "a retried write of the same fact is not an error while a changed fact is". A re-driven hold
+/// would otherwise fail on a write that changed nothing, which would read to a caller as a lost race and
+/// invite exactly the retry loop the distinction exists to prevent.
+///
+/// # Errors
+///
+/// - [`DatabaseError::InvalidToolCallRequest`] when either identifier is not UUID-sized.
+/// - [`DatabaseError::ToolCallNotFound`] when no call has that identifier.
+/// - [`DatabaseError::ToolCallApprovalLinkConflict`] when the call already links to a **different**
+///   approval. The caller re-reads rather than retrying: a set link is a fact, not a lost race.
+/// - [`DatabaseError::Sqlite`] when the referenced approval does not exist.
+pub async fn link_tool_call_approval(
+    database: &SqliteDatabase,
+    call_id: &str,
+    approval_id: &str,
+) -> Result<(), DatabaseError> {
+    for (field, value) in [("id", call_id), ("approval_id", approval_id)] {
+        if value.len() != 36 {
+            return Err(DatabaseError::InvalidToolCallRequest { field });
+        }
+    }
+
+    let result = sqlx::query(
+        "UPDATE tool_calls SET approval_id = ?2, updated_at = ?3, version = version + 1 \
+         WHERE id = ?1 AND approval_id IS NULL",
+    )
+    .bind(call_id)
+    .bind(approval_id)
+    .bind(UtcTimestamp::now(&SystemClock).to_string())
+    .execute(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "link a tool call to its approval",
+        source,
+    })?;
+
+    if result.rows_affected() == 0 {
+        // Zero rows: no such call, an unlinked call that vanished, or one that already links. The three
+        // need different answers, so the reason is read rather than reported as a generic conflict. The
+        // read is only reached on the refusal path, so the successful case pays one statement.
+        let existing = find_tool_call(database, call_id).await?;
+        return match existing.approval_id() {
+            // The same value again: a retried write of the same fact, which is a no-op rather than error.
+            Some(linked) if linked == approval_id => Ok(()),
+            Some(_) => Err(DatabaseError::ToolCallApprovalLinkConflict),
+            // Still unlinked, so the guard matched for some reason this read cannot explain. Reported as
+            // a conflict rather than retried in a loop, because the caller's next step is to re-read.
+            None => Err(DatabaseError::ToolCallConflict),
+        };
+    }
+
+    // `rows_affected() == 1` is the acknowledgement: the guarded UPDATE matched the row, which is the
+    // same proof a read-back would give, without a second statement that could not disagree.
+    Ok(())
 }
 
 /// Moves an admitted call to `authorized` or `submitted`, with no output attached.

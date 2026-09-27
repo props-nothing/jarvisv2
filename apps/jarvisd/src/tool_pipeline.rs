@@ -49,10 +49,14 @@ use std::sync::Arc;
 use jarvis_core::{
     ApprovalId, ApprovalRequest, ApprovalRequestParts, DecisionNonce, RunId, WorkspaceId,
 };
-use jarvis_core::{CanonicalIntentHash, CorrelationId, SystemClock, UtcTimestamp};
+use jarvis_core::{
+    CanonicalIntentHash, CorrelationId, EventSummary, RunEventKind, RunEventPayload, SystemClock,
+    UtcTimestamp,
+};
 use jarvis_storage::{
-    CallBinding, CallOrigin, CallTarget, DatabaseError, NewToolCall, SecretStore, SqliteDatabase,
-    admit_tool_call, advance_tool_call, create_approval, record_tool_outcome,
+    CallBinding, CallOrigin, CallTarget, DatabaseError, NewRunEvent, NewToolCall, SecretStore,
+    SqliteDatabase, admit_tool_call, advance_tool_call, append_run_event, create_approval,
+    link_tool_call_approval, record_tool_outcome,
 };
 #[cfg(test)]
 use jarvis_storage::{StoredToolCall, find_tool_call};
@@ -226,6 +230,19 @@ pub enum ToolPipelineError {
     /// an approval nobody has answered yet.
     #[error(transparent)]
     Secret(#[from] jarvis_storage::SecretStoreError),
+    /// A run event's fields were rejected by their own constructors.
+    ///
+    /// The event log and the call row are written on the same path, and a rejected summary or payload is
+    /// an authoring error in a fixed literal rather than a fact about the request — so it is reported
+    /// rather than retried with the event skipped. Skipping would make the log silently incomplete, which
+    /// is the failure an audit trail exists to prevent.
+    #[error("the run event for {kind} was rejected: {source}")]
+    Event {
+        /// The event kind whose fields were refused.
+        kind: &'static str,
+        /// The domain error, which names the rejected field without forwarding its content.
+        source: jarvis_core::InvalidRunEvent,
+    },
     /// A schema validator was rejected, which is an authoring error.
     #[error(transparent)]
     Schema(#[from] SchemaError),
@@ -251,6 +268,61 @@ fn deadline_after(start: UtcTimestamp, timeout_seconds: u32) -> UtcTimestamp {
     // failure falls back to `start`, which makes the deadline already passed — failing **closed** by
     // refusing the call rather than granting an unbounded deadline.
     UtcTimestamp::from_unix_nanos(start.unix_nanos().saturating_add(nanos)).unwrap_or(start)
+}
+
+/// Appends one run event, naming the kind in any rejection so the failure says which event failed.
+///
+/// # Why the event is written here rather than by the executor
+///
+/// The executor writes events for a **run's own** lifecycle — its states, its answer, its settlement. A
+/// tool call is a different kind of fact: it is recorded against a run but produced by the tool path, and
+/// the `P3-005` call row is its audit entry. `P3-012c` links the two so a client reading the stream learns
+/// that a call happened without having to read a second table — which matters because the tool call is the
+/// point at which an effect may have occurred, and a stream that omitted it would show a run that did
+/// something with no trace of it.
+///
+/// # Why the summary and payload are fixed literals
+///
+/// Nothing here renders tool arguments. `tool_calls` deliberately stores no argument column (`0007`), and a
+/// payload is a durable record excluded from that exclusion would have undone it. The identifiers are the
+/// run's own, the tool, and the call, so the event is linkable without carrying a payload.
+///
+/// # Errors
+///
+/// Returns [`ToolPipelineError::Event`] when a fixed literal is rejected — which is an authoring error
+/// rather than a fact about the request, so it is reported instead of the event being skipped.
+///
+/// # Why the label is derived rather than passed
+///
+/// An earlier shape took the kind **and** a `&'static str` label for the error message, which is two
+/// values that can disagree about one fact — the defect class `P3-006a` found between a receipt's risk and
+/// its decision. The label is now `kind.as_str()`, so a rejection names the kind that was actually refused.
+async fn append_event(
+    database: &SqliteDatabase,
+    run_id: &str,
+    kind: RunEventKind,
+    summary: &str,
+    payload: &str,
+    correlation_id: CorrelationId,
+    at: UtcTimestamp,
+) -> Result<(), ToolPipelineError> {
+    let reject = |source| ToolPipelineError::Event {
+        kind: kind.as_str(),
+        source,
+    };
+    let event = NewRunEvent::new(
+        RunId::new().to_string(),
+        run_id,
+        kind,
+        Some(EventSummary::new(summary).map_err(reject)?),
+        // Parsed rather than bound as a literal, so a malformed payload is a failure at the call site
+        // instead of a row that a reader cannot decode.
+        RunEventPayload::new(payload).map_err(reject)?,
+        correlation_id,
+        at,
+    )?;
+    append_run_event(database, &event).await?;
+    Ok(())
 }
 
 /// An admitted call that is ready to run.
@@ -634,6 +706,25 @@ impl ToolPipeline {
             });
         }
 
+        // The call is about to become a durable row, so the run's stream says so before the row exists.
+        // A refusal above writes nothing at all, deliberately: a stream entry for every denied attempt
+        // would let a caller fill the log by asking for tools it may not use, which is a write a refusal
+        // must not perform. What is emitted here is emitted for a call that is about to be admitted.
+        append_event(
+            &self.database,
+            actor.run_id(),
+            RunEventKind::ToolRequested,
+            &format!("Requested {tool}"),
+            &format!(
+                r#"{{"tool":{},"tool_version":{}}}"#,
+                serde_json::Value::String(tool.to_owned()),
+                serde_json::Value::String(definition.version().to_owned())
+            ),
+            correlation_id,
+            UtcTimestamp::now(&SystemClock),
+        )
+        .await?;
+
         // 3-5. Bind the authority, admit the call, and stop if a human must decide first.
         let prepared = self
             .authorize_and_admit(
@@ -1016,6 +1107,33 @@ impl ToolPipeline {
         create_approval(&self.database, &request).await?;
         self.secrets
             .store(&request.id().to_string(), request.nonce())?;
+
+        // The link is what makes the hold **findable**: without it the decision route can move the
+        // approval to `approved` and nothing can tell which call was waiting, because the two rows share
+        // no column. Written after the approval (the identifier does not exist before) and after the
+        // secret (so a crash leaves the safe direction: an approval nothing can decide, rather than a
+        // link to an approval whose nonce was never delivered). It is write-once, so a re-drive cannot
+        // repoint it at a different approval.
+        link_tool_call_approval(&self.database, &hold.call_id, &request.id().to_string()).await?;
+
+        // The stream records that a human is now the thing holding this run up, which is the one fact a
+        // client cannot infer from the tool events around it.
+        append_event(
+            &self.database,
+            &hold.run_id,
+            RunEventKind::ApprovalRequested,
+            &format!("Approval needed for {}", hold.tool),
+            &format!(
+                r#"{{"approval_id":{},"call_id":{},"required_strength":{}}}"#,
+                serde_json::Value::String(approval.to_string()),
+                serde_json::Value::String(hold.call_id.clone()),
+                serde_json::Value::String(hold.required_strength.as_str().to_owned())
+            ),
+            hold.correlation_id,
+            UtcTimestamp::now(&SystemClock),
+        )
+        .await?;
+
         hold.approval_id = approval.to_string();
         Ok(hold)
     }

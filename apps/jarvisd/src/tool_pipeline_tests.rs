@@ -843,7 +843,161 @@ async fn a_held_call_writes_the_approval_it_is_waiting_on() {
     let stored = must(pipeline.call(&call_id).await);
     assert_eq!(stored.outcome(), ToolOutcome::Requested);
     assert_eq!(stored.receipt(), call_id);
-    assert_eq!(stored.approval_id(), None);
+
+    // **The call now names the approval holding it**, which is what `P3-012c` adds. Without it the
+    // decision route can move the approval to `approved` and nothing can tell which call was waiting:
+    // the two rows would share no column, so there would be no join from a decision back to its subject.
+    assert_eq!(
+        stored.approval_id(),
+        Some(approval.id().to_string().as_str()),
+        "a held call must link to the approval that holds it"
+    );
+}
+
+/// **A held call is recorded in the run's stream, in the order it happened.**
+///
+/// `P3-012c` links tool calls to the event log, and the property that matters is not "an event exists" but
+/// **which** events and **in what order**. A client replaying the stream sees `tool_requested` and then
+/// `approval_requested`, which is the sequence that tells it the run asked for something and is now blocked
+/// on a human. Emitting only the approval event would make a held call appear with no request behind it;
+/// emitting them out of order would show the run asking for a tool it had already been blocked on.
+///
+/// The sequence numbers are asserted as well, because they are allocated by the writer rather than supplied:
+/// a test that only counted events would pass against a writer that appended the same kind twice.
+///
+/// **The assertion that the refusal path writes nothing** is the other half. A `Deny` produces no event at
+/// all, deliberately — a stream entry per denied attempt would let a caller fill the log by asking for
+/// tools it may not use, so a refusal must not be a write primitive. That is asserted separately below so a
+/// future change that emits on refusal fails here rather than being discovered as log growth.
+#[tokio::test]
+async fn a_held_call_writes_a_request_then_a_hold_to_the_run_stream() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let definition = held_definition();
+    let (root, database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![definition],
+        Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                json!({ "path": "notes/todo.txt" }),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval { approval_id, .. } = outcome else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+    let _ = root;
+
+    let events = must(
+        jarvis_storage::read_run_events(
+            &database,
+            RUN,
+            must(jarvis_core::ReplayRequest::new(
+                must(jarvis_core::RunEventSequence::new(1)),
+                16,
+            )),
+        )
+        .await,
+    );
+    // Only the tool-path kinds are compared, because `start_run` legitimately emits the run's own
+    // `state_changed` before any tool is asked for — a stream for a live run is never empty, so an
+    // assertion over all events would be asserting the fixture rather than this slice.
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| event.kind().as_str())
+        .filter(|kind| kind.starts_with("tool_") || kind.starts_with("approval_"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["tool_requested", "approval_requested"],
+        "a hold must appear in the stream after the request that produced it"
+    );
+
+    // The identifiers are what makes the event useful rather than decorative: a client reading the stream
+    // has to be able to name the approval without reading the approvals table.
+    let hold = events
+        .last()
+        .unwrap_or_else(|| panic!("the hold event must be the last one"));
+    assert_eq!(hold.kind().as_str(), "approval_requested");
+    assert!(
+        hold.payload().contains(&approval_id),
+        "the hold event must carry its approval identifier: {}",
+        hold.payload()
+    );
+    let request = &events[events.len() - 2];
+    assert_eq!(
+        request.sequence().get() + 1,
+        hold.sequence().get(),
+        "the writer allocates consecutive sequences"
+    );
+}
+
+/// A refused call writes no event, so a refusal cannot be used to fill the run's log.
+#[tokio::test]
+async fn a_refused_call_writes_nothing_to_the_run_stream() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (root, database) = database_with_run().await;
+    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+
+    // A workspace that denies the tool outright, so the refusal happens at step 2 and before admission.
+    let denied = must(ToolId::new("mcp.test.write"));
+    let policy = WorkspacePolicy::default().denying(denied);
+    let pipeline = must(ToolPipeline::with_adapters(
+        Arc::clone(&database),
+        Some(roots),
+        policy,
+        vec![(
+            vec![held_definition()],
+            Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+        )],
+        secrets,
+    ));
+
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                json!({ "path": "notes/todo.txt" }),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(
+        matches!(outcome, ToolPipelineOutcome::Refused { .. }),
+        "the fixture needs a refusal, got {outcome:?}"
+    );
+    let _ = directory;
+
+    let events = must(
+        jarvis_storage::read_run_events(
+            &database,
+            RUN,
+            must(jarvis_core::ReplayRequest::new(
+                must(jarvis_core::RunEventSequence::new(1)),
+                16,
+            )),
+        )
+        .await,
+    );
+    let tool_kinds: Vec<&str> = events
+        .iter()
+        .map(|event| event.kind().as_str())
+        .filter(|kind| kind.starts_with("tool_") || kind.starts_with("approval_"))
+        .collect();
+    assert!(
+        tool_kinds.is_empty(),
+        "a refusal must not be a write primitive, but the stream holds {tool_kinds:?}"
+    );
 }
 
 /// **A held call can actually be decided, which is what `P3-012a` could not deliver on its own.**

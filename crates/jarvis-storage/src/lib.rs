@@ -54,6 +54,6 @@ pub use session_repository::{
 };
 pub use tool_call_repository::{
     CallBinding, CallOrigin, CallTarget, NewToolCall, StoredToolCall, admit_tool_call,
-    advance_tool_call, find_tool_call, read_run_tool_calls, read_unrepeatable_calls,
-    record_tool_outcome,
+    advance_tool_call, find_tool_call, link_tool_call_approval, read_run_tool_calls,
+    read_unrepeatable_calls, record_tool_outcome,
 };

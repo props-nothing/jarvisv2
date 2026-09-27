@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -432,6 +432,15 @@ pub enum DatabaseError {
     /// — need different responses.
     #[error("the tool call version changed before this outcome could be recorded")]
     ToolCallConflict,
+    /// A call already links to a **different** approval, so the link is not moved.
+    ///
+    /// Distinct from [`Self::ToolCallConflict`] because the remedy is different: a version conflict
+    /// means re-read and retry, while a different link is a **fact**. The link decides which decision a
+    /// resume path acts under, so re-pointing it would let a call authorized under one approval be
+    /// resumed under another. Linking again to the *same* approval is a no-op rather than this error,
+    /// following the rule [`Self::ToolCallAlreadyResolved`] already sets for a repeated write of one fact.
+    #[error("this tool call already links to a different approval")]
+    ToolCallApprovalLinkConflict,
     /// A call's outcome may already be recorded, so this one is refused.
     ///
     /// Distinct from [`Self::ToolCallConflict`] because the cause is different and so is the remedy: a
