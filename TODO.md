@@ -2782,7 +2782,96 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       (`P5-002`+). No signature is verified (`P5-010`), no pagination is followed, no rate limit is enforced,
       and the manifest checks **self-consistency, not truth**: a connector that lies consistently is caught by
       review and the recorded research, not by a type. The ceilings are chosen, not measured.
-- [ ] `P5-002` Implement shared OAuth 2.0 Authorization Code plus PKCE flow, state/nonce validation, loopback callback, refresh rotation, revocation, and secret references.
+- [x] `P5-002` Implement shared OAuth 2.0 Authorization Code plus PKCE flow, state/nonce validation, loopback callback, refresh rotation, revocation, and secret references.
+      **New modules `authorization` + `token`** (36 tests, so **116 in `jarvis-connectors`**). `ADR-0055`.
+      Research record `docs/research/integrations/oauth2-pkce-native-apps.md` written **before** the code, from
+      the live RFC texts (RFC 7636, RFC 8252 BCP 212, RFC 9700 BCP 240, with RFC 6749 + RFC 9207 as
+      referenced). `getrandom` added — already in the workspace and the lock file, so **no new package**.
+      - **The transaction is consumable once, by construction.** `consume(self, ..)` takes `self` by value, so
+        "answer the same setup twice" has no expression — RFC 9700 §4.2.4's "SHOULD be invalidated after its
+        first use" as a property of the type rather than a caller's discipline. It carries the verifier, method,
+        state, nonce, **the redirect URI**, the optional issuer and the instant in ONE value, because RFC 8252
+        §8.10 requires exactly that grouping ("MUST store the redirect URI […] along with 'state'").
+      - **A loopback redirect is a two-variant type, so nothing else is representable.** `LoopbackHost` is
+        `127.0.0.1` or `[::1]`, so `http://evil.example/cb` and **`http://localhost/cb`** cannot be constructed
+        rather than being checked. `localhost` is excluded deliberately: RFC 8252 §8.3 says NOT RECOMMENDED
+        because it "avoids inadvertently listening on network interfaces other than the loopback interface" and
+        is "less susceptible to […] misconfigured host name resolution" — a name whose meaning depends on a
+        resolver cannot ground "only reachable from this machine".
+      - **The port varies and nothing else does, in the direction the RFCs specify.** `matches_except_port`
+        (RFC 9700 §2.1's "exact string matching except for port numbers in localhost redirection URIs"), plus
+        `matches_exactly` for the portless *registration* versus the ported *listening* URI. Tested both ways
+        (a different port accepted, a different **path** refused), since a one-sided test passes on a check that
+        refuses everything.
+      - **`state` is always sent even though PKCE can substitute.** RFC 9700 §2.1 permits PKCE-as-CSRF only
+        after confirming PKCE support and §4.7.1 makes that confirmation a **MUST** — so rather than make safety
+        depend on a discovery step, the state is unconditional and `parameters()` has no branch without it.
+        `StateMissing` and `StateMismatch` are distinct refusals; the value comparison is constant-time.
+      - **`nonce` is carried and handed back, unvalidated.** RFC 9700 §4.5.3.2 makes it meaningful only with an
+        ID token, and verifying one needs OIDC (signature/`iss`/`aud`/`at_hash`). A `validate_nonce` that could
+        not validate anything would be the declared-but-unconstructed pattern this repo has removed four times.
+      - **The mix-up defence has three states and only one is a refusal.** `NotNeeded` / `IssuerConfirmed` /
+        `NotSatisfied` / `IssuerMismatch`. RFC 9207's `iss` is **optional**, so its absence is not evidence of an
+        attack — collapsing `NotSatisfied` into a refusal breaks every conforming server that omits it, and
+        collapsing it into `IssuerConfirmed` reports a defence that never ran. Only a mismatch aborts.
+      - **The listener is a trait whose capabilities are reported, security separated from compatibility.**
+        RFC 8252 §8.3 + B.3 (`SO_EXCLUSIVEADDRUSE`) + B.5 ("SHOULD NOT set `SO_REUSEPORT`/`SO_REUSEADDR`") are
+        one rule for two OSes: **no second binder on the port**. Both-stacks (§7.3) is a *compatibility* concern,
+        so `UnmetListenerRequirement::is_security` is false for it — conflating a single-stack listener with an
+        off-machine-reachable one makes a real gap dismissible as cosmetic.
+      - **`TokenSet` has no access-token field, and that absence is the design.** Extends `P5-001`'s absence to
+        the exchange: the lifetime, the granted scopes, the scope change and a `SecretRef` **locating** the
+        refresh material, plus `has_refresh_token: bool` rather than the text. So no token material can reach a
+        model context, log, diagnostic, or column even by mistake. A test asserts the `Debug` rendering contains
+        neither `access_token` nor `refresh_token`, which is what catches a field added later.
+      - **Retry-safety is a variant, because the two cases are indistinguishable and opposite.** `NeverSent`
+        (safe) vs `SentAnswerUnknown` (**not** safe): RFC 9700 §4.2.4 makes a retry of a lost-answer request
+        able to get `invalid_grant` **and destroy a working grant** the first attempt issued. Same shape as
+        `P3-001`'s `RefusedBeforeReaching`/`AmbiguousAfterReaching`, one protocol over.
+      - **Rotation is detected, because noticing is what makes replay visible.** RFC 9700 §4.14.2's detection
+        property needs the client to see which shape came back; a client that kept its old token discards the
+        defence. `Rotated` is reported **even when the caller supplied no reference**, since a caller's storage
+        defect must not hide the half of the exchange that makes replay detectable.
+      - **The transient check outranks the error code — and that ordering is the falsification run's finding.**
+        A 503 carrying `invalid_grant` is a real shape (a proxy picks the code), and checking the grant first
+        would send the user to a consent screen **during a provider outage**. The first mutation of this
+        SURVIVED, and diagnosing why found the **fixture** was weak: it used `server_error`, for which both
+        orders agree. A fixture with a transient `invalid_grant` is the only shape where they differ, and the
+        guard then falsified.
+      - **`invalid_grant` needs the user; a client misconfiguration does not.** RFC 6749 §5.2's `invalid_grant`
+        covers "invalid, expired, revoked, does not match the redirection URI […] or issued to another client",
+        all needing a new authorization. `invalid_client`/`unauthorized_client` mean the *client* is broken, so
+        a consent screen lands on the same failure — they map to `Transient`, whose `needs_user` is false.
+      - **A revocation's failure is not the same claim as its success.** RFC 7009 §2.2 makes "already invalid" a
+        **success** (200 "if the token has been revoked successfully **or** if the client submitted an invalid
+        token"), so `AlreadyInvalid::is_withdrawn` is true while `Unsupported`/`Refused`/`Unreachable` are not.
+        Local material is discarded on every outcome, and an always-`true` predicate written here first was
+        **removed** — a predicate with one answer is not a predicate.
+      - **The generated verifier is RFC 7636 §7.1's own recipe** (32 octets → 43 unpadded base64url chars, the
+        RFC's floor) and goes **through `new()`** anyway, because the generator and the validator are two
+        implementations of one rule. `plain` stays representable (a server MAY ignore PKCE entirely, §5) but is
+        not reachable by accident: `code_challenge_method` is always sent, removing the `plain` default's effect.
+      **TWO DEFECTS THIS SLICE FOUND IN ITSELF, both a claim disagreeing with the code.** A doc comment said a
+      pathless redirect URI would be refused; the code normalises it to `/`, which is what **RFC 3986 §6.2.3**
+      says it is — the test written from the claim is what surfaced it. And a scope-loss fixture asserted a loss
+      from a grant that had lost nothing (`previous=[mail.read, calendar.read]`, `current=[mail.read,
+      calendar.read, new.scope]` is a pure *gain*), so the precedence rule was never exercised; the fixture now
+      loses one scope **and** gains another.
+      **All 25 guards falsified, A-B-A** (intact passes → neutered fails → restored passes). Two did not prove
+      first time: one mutant was invalid (it left its `match` unbalanced — the second attempt kept the arm and
+      made it unreachable), and one SURVIVED, which is what produced the ordering finding above. The harness
+      restores with `WriteAllText` + a forward mtime bump, because `Copy-Item` restores the **older** timestamp
+      and cargo then re-runs the stale mutant — the trap `P5-001` recorded.
+      **Limits:** **nothing consumes this crate** — no `Connector` trait, HTTP client, socket, `SecretStore`,
+      persistence, or daemon wiring. **No live verification**, deliberately: a live test needs a vendor,
+      registered credentials and a browser, i.e. the per-connector smoke test (`P5-005`+). `nonce` carried but
+      **not validated** (OIDC not implemented, so injection defence rests on PKCE alone). The mix-up defence
+      depends on a vendor sending `iss`. `Expired` vs `Revoked` is the caller's classification (no code
+      distinguishes them). **Sender-constraining is not implemented**, so a provider that does **not** rotate is
+      a configuration this client cannot make RFC 9700 §2.2.2-compliant on its own — the strongest reason DPoP
+      is on the roadmap. No automatic token-request retry, by design. No `localhost`, and no flag to enable it.
+      `AuthError::RandomUnavailable`'s branch is **untestable here** (the platform source does not fail on
+      demand), so it is verified by reading.
 - [ ] `P5-003` Create connector quality checklist and scaffold generator modeled on manifest-driven integration projects.
 - [ ] `P5-004` Research Google identity, Gmail, Calendar, push notifications, quotas, and restricted scopes; record findings.
 - [ ] `P5-005` Implement Google connection setup and Gmail/Calendar read tools with recorded wire fixtures.

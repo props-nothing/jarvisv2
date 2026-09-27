@@ -55,11 +55,13 @@
 
 mod account;
 mod auth;
+mod authorization;
 mod cursor;
 mod diagnostics;
 mod health;
 mod manifest;
 mod ratelimit;
+mod token;
 mod webhook;
 
 pub use account::{
@@ -70,6 +72,12 @@ pub use auth::{
     AuthCallback, AuthChallenge, AuthError, AuthFlow, AuthMethod, AuthState, ChallengeAction,
     PkceChallenge, PkceMethod, PkceVerifier, RefreshOutcome, ScopeChange, ScopeSetChange,
     SecretValue,
+};
+pub use authorization::{
+    AuthRefusal, AuthorizationCode, AuthorizationTransaction, Callback,
+    DEFAULT_TRANSACTION_SECONDS, Grant, ListenerCapabilities, LoopbackHost, LoopbackListener,
+    LoopbackRedirect, MAX_REDIRECT_PATH_CHARS, MixUpDefence, RedirectError,
+    UnmetListenerRequirement,
 };
 pub use cursor::{
     CursorError, MAX_SYNC_CURSOR_CHARS, SyncCursor, SyncCursorKind, SyncCursorParts, SyncWindow,
@@ -91,6 +99,11 @@ pub use manifest::{
 pub use ratelimit::{
     BudgetOutcome, MAX_RATE_LIMIT_BURST, MAX_RATE_LIMIT_PER_WINDOW, MAX_RETRY_AFTER_SECONDS,
     RateLimit, RateLimitError, RateLimitScope, RetryClass, RetryDecision, RetryGuidance,
+};
+pub use token::{
+    BEARER_TOKEN_TYPE, MAX_ACCESS_TOKEN_SECONDS, MAX_TOKEN_TYPE_CHARS, RefreshExchange,
+    RevocationKind, RevocationOutcome, TokenEndpointFailure, TokenRequestOutcome, TokenResponse,
+    TokenSet, split_scope,
 };
 pub use webhook::{
     MAX_REPLAY_WINDOW_SECONDS, MAX_SIGNATURE_HEADER_CHARS, MAX_TIMESTAMP_SKEW_SECONDS,

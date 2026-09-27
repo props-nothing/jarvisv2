@@ -47,6 +47,14 @@ pub const MAX_PKCE_VERIFIER_CHARS: usize = 128;
 /// The shortest accepted PKCE verifier, per RFC 7636's own bound.
 pub const MIN_PKCE_VERIFIER_CHARS: usize = 43;
 
+/// The random octet count a generated PKCE verifier starts from.
+///
+/// 32 octets is 256 bits, which RFC 7636 §7.1 names as the recommended entropy floor, and unpadded base64url
+/// of 32 octets is exactly 43 characters — [`MIN_PKCE_VERIFIER_CHARS`]. Those two facts agreeing is not a
+/// coincidence (the RFC chose both numbers for it), and pinning them means a change to either shows up as a
+/// failed assertion rather than as a shorter verifier nobody noticed.
+pub const PKCE_VERIFIER_OCTETS: usize = 32;
+
 /// The longest opaque state or nonce value accepted.
 ///
 /// The same bound `jarvis_core::DecisionNonce` uses, because these are compared rather than parsed and a
@@ -202,6 +210,32 @@ impl PkceVerifier {
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// Generates a verifier from the platform random source.
+    ///
+    /// # The shape is the RFC's own recipe, not a convention
+    ///
+    /// RFC 7636 §7.1: "The client SHOULD create a '`code_verifier`' with a minimum of 256 bits of entropy. This
+    /// can be done by having a suitable random number generator create a 32-octet sequence. The octet
+    /// sequence can then be base64url-encoded to produce a 43-octet URL safe string". So this takes exactly
+    /// 32 octets and encodes them **with the same unpadded base64url the challenge uses** — one encoder, and
+    /// §4.2's own ABNF says the challenge and the verifier share an alphabet and a length range, so the
+    /// encoding cannot be the wrong one for the other.
+    ///
+    /// 43 characters is [`MIN_PKCE_VERIFIER_CHARS`], so a generated verifier is at the RFC's minimum by
+    /// construction and `new` is called on it anyway: the generator and the validator cannot drift, because
+    /// the generator's output goes through the validator rather than beside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::RandomUnavailable`] when the platform source fails. Propagated rather than
+    /// retried or substituted, following `jarvis_core::DecisionNonce::generate`: a flow whose verifier was
+    /// guessable is worse than a flow that could not start, because the first one completes and looks fine.
+    pub fn generate() -> Result<Self, AuthError> {
+        let mut bytes = [0_u8; PKCE_VERIFIER_OCTETS];
+        getrandom::fill(&mut bytes).map_err(|_| AuthError::RandomUnavailable)?;
+        Self::new(base64url_no_pad(&bytes))
     }
 
     /// Derives the challenge this verifier proves, using the given method.
@@ -720,6 +754,13 @@ pub enum AuthError {
     /// The provider refused the authorization request.
     #[error("the provider refused the authorization request")]
     ProviderRefused,
+    /// The platform random source was unavailable.
+    ///
+    /// Separate from every other variant because the remedy differs: nothing about the request or the
+    /// configuration is wrong, and the operation is safe to attempt again unchanged. Same wording as
+    /// `jarvis_core::NonceError::RandomUnavailable`, so the two read alike in an operator's log.
+    #[error("random bytes are unavailable")]
+    RandomUnavailable,
 }
 
 /// Converts a manifest error into an auth error, for callers that validate both.
