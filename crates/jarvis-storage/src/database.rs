@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -403,6 +403,88 @@ pub enum DatabaseError {
     StoredApprovalInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
+    },
+    /// A memory failed the domain's own validation.
+    ///
+    /// Delegated from `MemoryRecord::new` rather than re-checked here, so every bound lives in one place.
+    /// The field name is stable and the offending value is never echoed: a memory's content is
+    /// user-authored text and its source locator can name a provider identifier, and neither belongs in an
+    /// error that could reach a log.
+    #[error("the memory {field} is invalid")]
+    InvalidMemoryRequest {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// No memory exists for the requested identifier.
+    #[error("no memory exists for the requested identifier")]
+    MemoryNotFound,
+    /// A memory already exists for this workspace and search key.
+    ///
+    /// The admission lifecycle's deduplication step, reported as its own variant because the caller's
+    /// response is specific: **reinforce the existing memory** rather than inserting a second row. A generic
+    /// conflict would push the caller into a retry loop that can never succeed.
+    #[error("a memory is already recorded for this claim in this workspace")]
+    MemoryDuplicate {
+        /// The identifier of the memory already recorded.
+        existing_memory_id: String,
+    },
+    /// A claim the user deleted is being re-ingested.
+    ///
+    /// Distinct from [`Self::MemoryDuplicate`] and the distinction matters: a duplicate is a claim that is
+    /// still present, while this is one that was **removed**. The caller must not insert it and must not
+    /// treat it as present — a re-ingest of a deleted memory is refused so that "forget" is durable against
+    /// the same source being read again.
+    #[error("this claim was deleted and must not be re-recorded")]
+    MemoryTombstoned,
+    /// A memory status change lost a race for the record's version.
+    ///
+    /// Nothing was written on the losing side. The caller re-reads rather than assuming the row is gone,
+    /// because the two causes — another writer advanced the version, or the memory does not exist — need
+    /// different responses.
+    #[error("the memory version changed before this change could be recorded")]
+    MemoryConflict,
+    /// A memory status change was refused by the domain's transition table.
+    ///
+    /// Carried as the domain's own error rather than re-implemented, so the legal edges have one home. The
+    /// from/to names are stable and neither carries content.
+    #[error("the memory status change from {from} to {to} is not permitted")]
+    InvalidMemoryStatus {
+        /// The stored status.
+        from: &'static str,
+        /// The requested status.
+        to: &'static str,
+    },
+    /// A stored memory row contradicted the domain's own closed sets.
+    ///
+    /// A storage-integrity finding, as [`Self::StoredApprovalInvalid`] is for approvals: a row written by
+    /// another build, restored from a backup, or edited outside JARVIS is reported rather than defaulted,
+    /// because a defaulted source trust would silently change whether content may instruct.
+    #[error("the stored memory has an invalid {field}")]
+    StoredMemoryInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// No entity exists for the requested identifier.
+    #[error("no entity exists for the requested identifier")]
+    EntityNotFound,
+    /// An entity merge was refused.
+    ///
+    /// Its own variant because the remedy is different from a version conflict: an unresolvable merge chain
+    /// or a self-merge is a caller error to fix, not a race to retry.
+    #[error("the entity merge is not permitted: {reason}")]
+    InvalidEntityMerge {
+        /// Why the merge was refused, in words an operator can act on.
+        reason: &'static str,
+    },
+    /// An entity alias is already verified for another entity in this workspace.
+    ///
+    /// The architecture's identity rule: "Ambiguous aliases remain separate candidates" applies to
+    /// *probabilistic* matches, while a **verified** alias is an identity claim — so two entities holding one
+    /// is a contradiction to surface rather than a second row to store.
+    #[error("this alias is already verified for a different entity")]
+    AliasAlreadyVerified {
+        /// The entity the alias is already bound to.
+        existing_entity_id: String,
     },
     /// A tool call request failed the domain's own validation.
     #[error("the tool call {field} is invalid")]

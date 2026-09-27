@@ -154,6 +154,12 @@ pub enum InvalidMemory {
     /// The record was already deleted, and a deleted memory is terminal.
     #[error("a deleted memory cannot be changed")]
     AlreadyDeleted,
+    /// A row marked deleted still carries recovered text or a claim.
+    ///
+    /// The decode-side counterpart of the schema's `check (status <> 'deleted' or length(content) = 0)`:
+    /// deletion is the act that removes the text, so a deleted row that still holds it contradicts itself.
+    #[error("a deleted memory must not retain its text or claim")]
+    DeletedRetainsText,
     /// The status a caller asked for is not reachable from the stored one.
     #[error("the status change from {from} to {to} is not permitted")]
     IllegalStatus {
@@ -1163,6 +1169,32 @@ pub struct MemoryRecordParts {
     pub created_at: UtcTimestamp,
 }
 
+/// The state a stored memory holds that construction derives.
+///
+/// # Why these five fields travel together
+///
+/// Each is one `new` cannot know: the **stored status** (a confirmed relationship memory is `active` even
+/// though the type starts as a proposal), the **replacement** (set only after a later correction exists),
+/// `updated_at` (a row may have been edited since it was written), and the two retrieval counters.
+///
+/// They travel together because they are all read from the same row, and because the status has to be judged
+/// with the content: `deleted` is the status whose content is empty and every other status must have content,
+/// so a decoder that derived a record and then stamped the status on could not apply that rule — which is how
+/// an earlier shape made a deleted memory unreadable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredMemoryState {
+    /// The status the row holds.
+    pub status: MemoryStatus,
+    /// The memory that replaced this one, when one has.
+    pub superseded_by: Option<MemoryId>,
+    /// When the row was last changed.
+    pub updated_at: UtcTimestamp,
+    /// When the memory was last selected into a context.
+    pub last_accessed_at: Option<UtcTimestamp>,
+    /// How many times the memory has been usefully retrieved.
+    pub retrieval_count: u32,
+}
+
 /// One durable memory: a sourced claim with lifecycle metadata.
 ///
 /// Immutable after construction except through the four transitions this module exposes — `confirm`,
@@ -1210,6 +1242,32 @@ impl MemoryRecord {
     /// - [`InvalidMemory::Source`] when a **provider record** backs a [`MemoryType::Preference`], which is
     ///   the document's own example of trust that does not transfer between claim kinds.
     pub fn new(parts: MemoryRecordParts) -> Result<Self, InvalidMemory> {
+        Self::build(parts, true, false)
+    }
+
+    /// The one constructor, with the entity requirement as a parameter.
+    ///
+    /// # Why the requirement is a parameter rather than checked at both call sites
+    ///
+    /// `new` needs at least one entity: a claim about nothing has no answer to "what is this about", and
+    /// retrieval is by entity. A **decoded** row cannot satisfy that, because the links live in their own
+    /// table and are read after the record exists — so the check is skipped for a decode and the links are
+    /// attached by [`Self::replace_entities`] immediately afterwards.
+    ///
+    /// `permit_empty_content` is the same shape for the same reason: `new` refuses empty content, but a
+    /// **deleted** row is required by the schema to have empty content, so a decode of one has to be able to
+    /// pass its own content check. It is passed as a boolean rather than read from `parts` because the stored
+    /// status is not one of the declared fields — it arrives in [`StoredMemoryState`] — and
+    /// [`Self::from_stored`] is the only caller that can pass `true`, only when the status is `Deleted`.
+    ///
+    /// Making these parameters rather than duplicating the body keeps every **other** rule in one place. The
+    /// alternative shapes are worse: public flags would let a caller build an entity-less or blank memory, and
+    /// a second constructor would be a second copy of the trust, confidence, and validity rules.
+    fn build(
+        parts: MemoryRecordParts,
+        require_entities: bool,
+        permit_empty_content: bool,
+    ) -> Result<Self, InvalidMemory> {
         let MemoryRecordParts {
             id,
             workspace_id,
@@ -1231,7 +1289,12 @@ impl MemoryRecord {
         } = parts;
 
         let content = content.trim().to_owned();
-        if content.is_empty() || content.chars().count() > MAX_MEMORY_CONTENT_CHARS {
+        // Empty content is refused unless the caller is decoding a deleted row, which the schema requires to
+        // have no content. The two halves live together here so a blank content is never storable in any
+        // other status.
+        if (content.is_empty() && !permit_empty_content)
+            || content.chars().count() > MAX_MEMORY_CONTENT_CHARS
+        {
             return Err(InvalidMemory::Content);
         }
 
@@ -1239,7 +1302,7 @@ impl MemoryRecord {
         // strongest would let one confident mention launder a second guess about the same entity in the
         // same memory, and the reader of the memory cannot tell which mention it was.
         let mut entities: Vec<EntityRef> = dedupe_entities(entities);
-        if entities.is_empty() || entities.len() > MAX_MEMORY_ENTITIES {
+        if entities.len() > MAX_MEMORY_ENTITIES || (require_entities && entities.is_empty()) {
             return Err(InvalidMemory::Entities);
         }
         entities.sort_by_key(EntityRef::entity_id);
@@ -1280,6 +1343,10 @@ impl MemoryRecord {
         // A relationship inference is high-impact, so it starts as a proposal rather than as a fact. The
         // status is derived from the type here rather than taken from the caller, so the rule is a property
         // of construction: a caller cannot record a `Relationship` claim already active.
+        //
+        // A decode passes `require_entities == false`, and the derived status is then overwritten by the
+        // stored one. The derivation still runs, so a decode cannot skip this rule — it is the *value* that
+        // is replaced, not the check.
         let status = if memory_type.requires_confirmation() {
             MemoryStatus::Proposed
         } else {
@@ -1310,6 +1377,81 @@ impl MemoryRecord {
             last_accessed_at: None,
             retrieval_count: 0,
         })
+    }
+
+    /// Rebuilds a memory from a stored row, re-applying every rule.
+    ///
+    /// # Why this exists beside `new` rather than instead of it
+    ///
+    /// `new` derives things a stored row already holds: the status is derived from the type (a relationship
+    /// claim starts as a proposal) and `valid_from` defaults to the creation time. A **decoded** row must not
+    /// have those derived again, because a confirmed relationship memory would be reverted to a proposal
+    /// on every read — so the state a row actually holds arrives in [`StoredMemoryState`].
+    ///
+    /// It still applies every **rule**, which is the point: a row whose source trust disagrees with its kind,
+    /// whose model inference claims a confidence, or whose provider record backs a preference is refused here
+    /// as well as at write time. The schema's `CHECK`s are the first enforcer and this is the second, so a
+    /// row that arrived some other way — another build, a restored backup, a hand edit — cannot decode into a
+    /// value the domain forbids.
+    ///
+    /// # Why the state is a parameter rather than a second constructor
+    ///
+    /// The status and the content have to be judged **together**: `deleted` is the one status whose content is
+    /// empty, and everything else must have content. Splitting construction in two — derive a record, then
+    /// stamp the stored status on — would leave the empty-content rule unable to see the status, and an
+    /// earlier shape did exactly that: a deleted row could not be read back at all, because its empty content
+    /// was refused before the status that explains it was applied. Passing the state in means the rule is
+    /// stated once, where both values are in hand.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::new`], except that the entity list is permitted to be empty —
+    /// the links live in their own table, so a decoder reads them after this value exists — and that an
+    /// empty content is permitted **only** in the `Deleted` status.
+    pub fn from_stored(
+        parts: MemoryRecordParts,
+        state: StoredMemoryState,
+    ) -> Result<Self, InvalidMemory> {
+        let mut record = Self::build(parts, false, state.status == MemoryStatus::Deleted)?;
+
+        // The one rule that needs the status and the content together. `build` refuses empty content, so a
+        // tombstone reaching here is refused there; this is the positive half of the rule, so the *stored*
+        // empty-content case is accepted rather than being indistinguishable from a corrupt blank row.
+        if state.status != MemoryStatus::Deleted && record.content.is_empty() {
+            return Err(InvalidMemory::Content);
+        }
+        if state.status == MemoryStatus::Deleted
+            && (!record.content.is_empty() || record.structured_claim.is_some())
+        {
+            return Err(InvalidMemory::DeletedRetainsText);
+        }
+
+        // A replacement direction is stored both ways, so a row carrying one that names itself would make
+        // "what replaced this" a cycle. Checked here rather than in `build` because `build` cannot know the
+        // stored status or replacement.
+        if state.superseded_by == Some(record.id) {
+            return Err(InvalidMemory::SupersedesSelf);
+        }
+
+        record.status = state.status;
+        record.superseded_by = state.superseded_by;
+        record.updated_at = state.updated_at;
+        record.last_accessed_at = state.last_accessed_at;
+        record.retrieval_count = state.retrieval_count;
+        Ok(record)
+    }
+
+    /// Replaces the entity links, which are stored in their own table.
+    ///
+    /// # Why this is a mutating call rather than a constructor parameter
+    ///
+    /// The links are a separate table, so a decoder builds the record first and attaches the links second. A
+    /// private setter would be the alternative, but this is deliberately `pub` on the **storage** crate's
+    /// behalf: the store is the authority on what a memory is linked to, and a decode that kept whatever a
+    /// caller supplied would let the two disagree. The value is replaced rather than merged for that reason.
+    pub fn replace_entities(&mut self, entities: Vec<EntityRef>) {
+        self.entities = dedupe_entities(entities);
+        self.entities.sort_by_key(EntityRef::entity_id);
     }
 
     /// Returns the memory identifier.
@@ -1513,6 +1655,9 @@ impl MemoryRecord {
     /// second attempt is a caller acting on a stale read rather than a no-op.
     pub fn delete(&self, at: UtcTimestamp) -> Result<Self, InvalidMemory> {
         let deleted = self.transition(MemoryStatus::Deleted, at)?;
+        // The claim goes with the content, and for the same reason: it is derived text. Keeping it would
+        // leave `subject=Alice, predicate=likes, object=espresso` readable from a row the user deleted, and
+        // the schema's own constraint has to clear both fields for the row to be storable at all.
         Ok(Self {
             content: String::new(),
             structured_claim: None,

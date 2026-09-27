@@ -52,7 +52,8 @@ pub use memory::{
     MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_IMPORTANCE, MAX_SEARCH_KEY_CHARS,
     MAX_SEARCH_KEY_WORD_CHARS, MAX_SEARCH_KEY_WORDS, MAX_SOURCE_LOCATOR_CHARS,
     MAX_STRUCTURED_CLAIM_BYTES, MemoryConfidence, MemoryRecord, MemoryRecordParts, MemorySearchKey,
-    MemorySource, MemorySourceKind, MemoryStatus, MemoryTrust, MemoryType, StructuredClaim,
+    MemorySource, MemorySourceKind, MemoryStatus, MemoryTrust, MemoryType, StoredMemoryState,
+    StructuredClaim,
 };
 pub use message::{
     InvalidMessage, MAX_MESSAGE_CONTENT_BYTES, MessageRole, MessageSource, NewMessage,

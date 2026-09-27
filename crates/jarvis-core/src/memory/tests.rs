@@ -356,6 +356,56 @@ fn deletion_removes_the_text_and_is_terminal() {
     );
 }
 
+/// **A deleted row decodes, and its emptiness is what says it is a tombstone.**
+///
+/// The read half of the invariant above, and the case an earlier shape got wrong: `from_stored` ran the
+/// content rule before the stored status was known, so a deleted row — which the *schema requires* to have
+/// empty content — could not be read back at all. Every other status is checked from the same place.
+#[test]
+fn a_deleted_row_decodes_but_only_in_the_deleted_status() {
+    let memory = preference();
+    let deleted = must(memory.delete(at(5)));
+    let stored = StoredMemoryState {
+        status: MemoryStatus::Deleted,
+        superseded_by: None,
+        updated_at: at(5),
+        last_accessed_at: None,
+        retrieval_count: 0,
+    };
+
+    // The same rows, decoded: the tombstone passes and the non-deleted statuses are refused, so the content
+    // rule is enforced at decode rather than bypassed by it.
+    let mut tombstone = parts(MemoryType::Preference, memory.source().clone());
+    tombstone.content = String::new();
+    tombstone.structured_claim = None;
+    let decoded = must(MemoryRecord::from_stored(tombstone.clone(), stored));
+    assert_eq!(decoded.status(), MemoryStatus::Deleted);
+    assert!(!decoded.effective_status_at(at(6)).is_current_truth());
+
+    for status in [
+        MemoryStatus::Proposed,
+        MemoryStatus::Active,
+        MemoryStatus::Archived,
+    ] {
+        let refusal =
+            MemoryRecord::from_stored(tombstone.clone(), StoredMemoryState { status, ..stored });
+        assert_eq!(
+            refusal,
+            Err(InvalidMemory::Content),
+            "blank content must be refused in the {status} status"
+        );
+    }
+
+    // And the reverse: a deleted row that still carries text contradicts itself.
+    let mut retaining = parts(MemoryType::Preference, memory.source().clone());
+    retaining.content = deleted.content().to_owned();
+    retaining.content = "Still here".to_owned();
+    assert_eq!(
+        MemoryRecord::from_stored(retaining, stored),
+        Err(InvalidMemory::DeletedRetainsText)
+    );
+}
+
 /// **A relationship memory starts as a proposal, because the class requires confirmation.**
 ///
 /// The document: "High-impact identity, medical, financial, authentication, and relationship inferences

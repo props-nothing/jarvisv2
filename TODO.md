@@ -2100,7 +2100,55 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       **Recorded as a limit:** nothing persists a memory yet. This slice is the vocabulary and its invariants;
       `P4-002` owns the tables, and the embedding fields in the canonical record are `P4-005` — a memory is
       fully usable without them, because "embeddings are one signal" and not a requirement.
-- [ ] `P4-002` Implement memories, entities, aliases, relations, sources, and deletion tombstones in SQLite.
+- [x] `P4-002` Implement memories, entities, aliases, relations, sources, and deletion tombstones in SQLite.
+      `crates/jarvis-storage/migrations/sqlite/0009_memories.sql` and
+      `crates/jarvis-storage/src/memory_repository.rs`. Six tables — `memories`, `entities`,
+      `entity_aliases`, `entity_relations`, `memory_entities`, `memory_tombstones` — and the slice's real
+      work was deciding **where each rule is enforced**, which turned out to be three schema decisions and
+      one domain-constructor one. Recorded as `ADR-0044`.
+      **A structured claim is three columns, not one JSON document.** `docs/data/schema.md` says JSON stores
+      "versioned provider payload fragments or flexible metadata, **not core relationships that need
+      constraints**", and a subject/predicate/object triple is exactly such a relationship. The first cut
+      stored one bounded document, which permitted an 8000-byte subject and an empty object; three columns
+      make each part boundable, make "all three or none" unrepresentable rather than a reader's check, and
+      turn a lookup by predicate into an index seek.
+      **The tombstone stores `SHA256(search_key)`, not the key.** The acceptance invariant is "deleting it
+      removes text **and derived indexes**", and a search key *is* derived text — it holds the claim's
+      words, case-folded and word-sorted. Keeping it would have satisfied "resurrection is blocked" while
+      violating "the text is gone", and the violation would be invisible because no retrieval reads the
+      tombstone table. The same technique `ADR-0018` uses for a decision nonce.
+      **"A relationship memory starts as a proposal" is deliberately *not* a table `CHECK`.** A `CHECK`
+      applies to every write, not to the insertion, so a constraint reading "a relationship row is never
+      `active`" would forbid the *confirmation* it exists to require. The invariant is about creation, and
+      only the constructor can express that — the same distinction `ADR-0041` draws about a sandbox
+      guarantee: a rule enforced in the wrong place is not a stricter rule.
+      **The stored status had to travel into the constructor.** The first cut decoded a record and then
+      stamped the status on, which could not work: the content rule refused an empty content *before*
+      anything could say that emptiness is what `deleted` means, so a tombstone could not be read back at
+      all. `MemoryRecord::from_stored(parts, state)` now takes the status with the parts, which makes both
+      halves of one rule expressible — empty content is permitted **only** in `Deleted`, and a `Deleted` row
+      that still carries text is `InvalidMemory::DeletedRetainsText`, the decode-side counterpart of the
+      schema's `CHECK`. Two independent enforcers, which is the argument the approval and tool-call
+      repositories already make.
+      **A compiler finding worth recording:** `read_entity_memories`'s statement takes a third parameter,
+      and the shared runner had an `entity_id` argument it **never bound**. The query still ran and
+      silently ignored the entity filter; only the arity check surfaced it. The runner now binds it as an
+      `Option`, so a caller cannot supply the entity-scoped statement without its entity.
+      **Falsified, one guard each:** forcing `is_tombstoned` to return `false` made
+      `deletion_removes_text_and_blocks_a_re_ingest` fail; removing the workspace scope from the read
+      statement made `a_memory_cannot_be_read_from_another_workspace` fail. Both restored, re-run green.
+      **Two test-fixture defects found and fixed by the failures:** the seeded workspace insert omitted
+      `mode`/`data_policy`, and `a_replacement_cannot_be_rewritten_in_storage` recorded rows with fresh
+      random identifiers and then linked two different ones — so it asserted a link to nothing and passed
+      only because the foreign key refused it. A fixture that cannot satisfy its own precondition is worse
+      than no test, because its failure reads as a defect in the code.
+      **Recorded as limits:** nothing retrieves or ranks a memory yet (`P4-004`; the reads are recency-ordered
+      only, and the embedding columns are `P4-005`), duplicate detection is exact-search-key only, the entity
+      links are written after the row rather than in one transaction with it (the safe direction, which is
+      not the same as atomic — `P4-008` needs the atomic form), and `entity_relations` has no cycle check.
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
+      (1095 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 156 tests, `jarvis-storage` 167.
 - [ ] `P4-003` Implement candidate extraction as a reviewable pipeline; never persist unsupported inference as fact.
 - [ ] `P4-004` Implement exact, full-text, recency, importance, entity, and workspace retrieval before adding embeddings.
 - [ ] `P4-005` Research and implement a provider-neutral embedding adapter with dimension/version metadata.
