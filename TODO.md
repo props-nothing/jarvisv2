@@ -1868,6 +1868,31 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         run-state change. Gates: fmt, clippy `-D warnings`, 44 suites / `--all-features` / `--locked` green,
         `cargo deny check` ok.
   - [ ] `P3-012b` Decide an approval and resume the admitted call.
+        **Recon done, and it found the crux before any code was written.** A stored approval **cannot
+        currently be decided**, and the reason is a design tension rather than a missing function:
+        `DecisionNonce` is generated into `record_hold`, stored only as a SHA-256 **digest**
+        (`ADR-0018`), and the plaintext is **dropped** when the hold returns. `record_decision` requires
+        the plaintext and compares it against that digest, so `expose()`/`nonce_for_storage()` have **no
+        production reader**. The nonce is meant to be **presented**, which needs an out-of-band delivery
+        channel that does not exist.
+        **Why this is not a bug to patch.** `ADR-0018` deliberately rejected deriving the nonce from a
+        server secret (it "removes the one-time property, because the derived value stays valid until the
+        secret rotates"). The nonce exists to defeat **model self-approval**, and in this codebase the
+        approval's *requester* is the run (`P3-012a`) — so the one identity that must never receive the
+        nonce is the identity that would receive a tool-call response once the executor routes
+        model→tool. **Putting the nonce in `AwaitingApproval` would therefore look like a fix today and
+        become a self-approval primitive the moment `P3-012c` wires that path**, because the same response
+        shape would then be handed to the model. The decision to make is the delivery channel, and it is
+        an ADR, not an implementation detail.
+        **The options, recorded rather than silently chosen:** (a) the daemon keeps pending nonces in
+        memory and the approver presents one delivered over the human's own channel — preserves
+        `ADR-0018` exactly, but a headless daemon has no such channel today; (b) decide without the nonce
+        via `apply_verified_decision` behind the remaining four rules (approver ≠ requester, strength
+        floor, expiry, intent revalidation) — weakens the control and must be **stated** as such, not
+        presented as equivalent. `apply_verified_decision` is public precisely so the *store* can call it
+        after checking the digest, so a service calling it directly is a new trust assumption either way.
+        Resuming also needs the **adapter path re-driven past `authorized`**, which is where a duplicate
+        delivery would become a second effect — the property `A06` and the Phase 3 gate both test.
   - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
 
 ## P4: Memory And Context
