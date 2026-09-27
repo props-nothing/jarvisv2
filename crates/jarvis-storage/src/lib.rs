@@ -12,6 +12,7 @@ mod run_repository;
 mod session_repository;
 
 mod approval_repository;
+mod secret_store;
 mod tool_call_repository;
 
 pub use approval_repository::{
@@ -46,6 +47,7 @@ pub use run_repository::{
     INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition, create_run,
     find_run, recover_interrupted_runs, request_run_cancellation, settle_run, transition_run,
 };
+pub use secret_store::{APPROVAL_NONCE_DIRECTORY, SecretStore, SecretStoreError};
 pub use session_repository::{
     API_SESSION_CHANNEL, NewSession, SessionTarget, StartRunInput, StartedRun, StoredSession,
     find_session, start_run,

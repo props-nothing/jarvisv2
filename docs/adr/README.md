@@ -59,3 +59,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0039](0039-a-remote-mcp-call-has-no-run.md) | A remote MCP call has no run, and its enforcement is the same enforcement | Accepted |
 | [0040](0040-conformance-is-measured-against-the-protocol-schema.md) | Conformance is measured against the protocol's schema, not against the SDK | Accepted |
 | [0041](0041-a-sandbox-guarantee-is-named-and-refused-when-unenforceable.md) | A sandbox guarantee is a named capability that is refused when it cannot be enforced | Accepted |
+| [0042](0042-a-decision-nonce-is-delivered-by-file.md) | A decision nonce is delivered through a profile-private file, and taking it consumes it | Accepted |

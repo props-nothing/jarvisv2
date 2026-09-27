@@ -1119,6 +1119,7 @@ mod tests {
             Arc::clone(&database),
             roots,
             jarvis_tools::WorkspacePolicy::default(),
+            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
         )
         .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
 

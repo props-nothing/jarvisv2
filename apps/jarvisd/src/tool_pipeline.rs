@@ -51,7 +51,7 @@ use jarvis_core::{
 };
 use jarvis_core::{CanonicalIntentHash, CorrelationId, SystemClock, UtcTimestamp};
 use jarvis_storage::{
-    CallBinding, CallOrigin, CallTarget, DatabaseError, NewToolCall, SqliteDatabase,
+    CallBinding, CallOrigin, CallTarget, DatabaseError, NewToolCall, SecretStore, SqliteDatabase,
     admit_tool_call, advance_tool_call, create_approval, record_tool_outcome,
 };
 #[cfg(test)]
@@ -219,6 +219,13 @@ pub enum ToolPipelineError {
         /// The domain error naming the offending field.
         field: jarvis_core::InvalidApprovalField,
     },
+    /// The decision nonce could not be delivered to the human who must present it.
+    ///
+    /// A fault rather than a decision: the approval row is written and the secret is not, which leaves an
+    /// approval nothing can decide. Reported loudly because a silent failure here would look exactly like
+    /// an approval nobody has answered yet.
+    #[error(transparent)]
+    Secret(#[from] jarvis_storage::SecretStoreError),
     /// A schema validator was rejected, which is an authoring error.
     #[error(transparent)]
     Schema(#[from] SchemaError),
@@ -423,6 +430,12 @@ fn describe(violations: &[SchemaViolation]) -> String {
 pub struct ToolPipeline {
     database: Arc<SqliteDatabase>,
     registry: ToolRegistry,
+    /// The profile-private store the plaintext decision nonce is written to.
+    ///
+    /// Held rather than derived from the database, because the nonce's whole point is that it is **not**
+    /// in a durable row (`ADR-0018`): it goes to a file only this account can read, and this field is
+    /// the only writer of it.
+    secrets: SecretStore,
     /// Which adapter runs which tool, resolved by canonical identifier.
     ///
     /// A table rather than one adapter because the pipeline already serves more than one tool area, and the
@@ -461,8 +474,9 @@ impl ToolPipeline {
         database: Arc<SqliteDatabase>,
         roots: WorkspaceRoots,
         workspace: WorkspacePolicy,
+        secrets: SecretStore,
     ) -> Result<Self, ToolPipelineError> {
-        Self::with_adapters(database, Some(roots), workspace, Vec::new())
+        Self::with_adapters(database, Some(roots), workspace, Vec::new(), secrets)
     }
 
     /// Builds the pipeline over granted workspace roots **and any additional adapters**.
@@ -495,6 +509,7 @@ impl ToolPipeline {
         roots: Option<WorkspaceRoots>,
         workspace: WorkspacePolicy,
         additional: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)>,
+        secrets: SecretStore,
     ) -> Result<Self, ToolPipelineError> {
         let mut registry = ToolRegistry::new();
         let mut sources: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)> =
@@ -537,6 +552,7 @@ impl ToolPipeline {
         Ok(Self {
             database,
             registry,
+            secrets,
             dispatch,
             workspace,
         })
@@ -991,7 +1007,15 @@ impl ToolPipeline {
         let expiry = jarvis_core::ApprovalRequest::default_expiry(&SystemClock);
         let approval = ApprovalId::new();
         let request = new_approval_request(&hold, &requester, approval, expiry)?;
+
+        // The digest goes into the durable row; the plaintext goes into a file only this account can read.
+        // The write order matters: the row is written **first**, so a crash between the two leaves an
+        // approval that is undecidable rather than a file for an approval that does not exist. The other
+        // order would leave a secret on disk whose digest no row holds, which is a value nothing can
+        // consume and nothing will ever clean up.
         create_approval(&self.database, &request).await?;
+        self.secrets
+            .store(&request.id().to_string(), request.nonce())?;
         hold.approval_id = approval.to_string();
         Ok(hold)
     }

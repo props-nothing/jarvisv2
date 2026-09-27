@@ -1867,32 +1867,59 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         `awaiting_approval`: the hold is a **tool-level** fact until the executor path (`P3-012c`) makes it a
         run-state change. Gates: fmt, clippy `-D warnings`, 44 suites / `--all-features` / `--locked` green,
         `cargo deny check` ok.
-  - [ ] `P3-012b` Decide an approval and resume the admitted call.
-        **Recon done, and it found the crux before any code was written.** A stored approval **cannot
-        currently be decided**, and the reason is a design tension rather than a missing function:
+  - [x] `P3-012b` Deliver the decision nonce so a stored approval can be decided. (The decision route and the
+        resumption of the held call remain, recorded below.)
+        **Recon done, and it found the crux before any code was written.** A stored approval **could not
+        be decided by anything**, and the reason is a design tension rather than a missing function:
         `DecisionNonce` is generated into `record_hold`, stored only as a SHA-256 **digest**
-        (`ADR-0018`), and the plaintext is **dropped** when the hold returns. `record_decision` requires
-        the plaintext and compares it against that digest, so `expose()`/`nonce_for_storage()` have **no
+        (`ADR-0018`), and the plaintext was **dropped** when the hold returned. `record_decision` requires
+        the plaintext and compares it against that digest, so `expose()`/`nonce_for_storage()` had **no
         production reader**. The nonce is meant to be **presented**, which needs an out-of-band delivery
-        channel that does not exist.
-        **Why this is not a bug to patch.** `ADR-0018` deliberately rejected deriving the nonce from a
-        server secret (it "removes the one-time property, because the derived value stays valid until the
-        secret rotates"). The nonce exists to defeat **model self-approval**, and in this codebase the
-        approval's *requester* is the run (`P3-012a`) — so the one identity that must never receive the
-        nonce is the identity that would receive a tool-call response once the executor routes
-        model→tool. **Putting the nonce in `AwaitingApproval` would therefore look like a fix today and
-        become a self-approval primitive the moment `P3-012c` wires that path**, because the same response
-        shape would then be handed to the model. The decision to make is the delivery channel, and it is
-        an ADR, not an implementation detail.
-        **The options, recorded rather than silently chosen:** (a) the daemon keeps pending nonces in
-        memory and the approver presents one delivered over the human's own channel — preserves
-        `ADR-0018` exactly, but a headless daemon has no such channel today; (b) decide without the nonce
-        via `apply_verified_decision` behind the remaining four rules (approver ≠ requester, strength
-        floor, expiry, intent revalidation) — weakens the control and must be **stated** as such, not
-        presented as equivalent. `apply_verified_decision` is public precisely so the *store* can call it
-        after checking the digest, so a service calling it directly is a new trust assumption either way.
-        Resuming also needs the **adapter path re-driven past `authorized`**, which is where a duplicate
-        delivery would become a second effect — the property `A06` and the Phase 3 gate both test.
+        channel that did not exist.
+        **DELIVERED: the delivery channel (`ADR-0042`).** New `crates/jarvis-storage/src/secret_store.rs`
+        holds the plaintext nonce in a **profile-private file** and `ToolPipeline::record_hold` writes it
+        immediately after the approval row. This is the shape the daemon already uses for its own client
+        credential: the daemon **issues** a secret into a file the human's account can read, and the
+        secret never travels in a request body and is never returned to whoever asked for the action.
+        Permission hardening reuses `paths::secure_private_file`, so `0600` on unix and the hardened DACL
+        on Windows keep one home.
+        **⭐ Why not the obvious place.** Returning the nonce in the hold's response would look like a fix
+        today and become a **self-approval primitive** the moment `P3-012c` routes model→tool: that
+        response travels the tool-call path, whose requester is the **run** — and the nonce exists to
+        defeat *model self-approval*. The one identity that must never receive it is the one that would.
+        Deliberately **not** "derive it from a server secret" either; `ADR-0018` already rejected that
+        because a derived value stays valid until the secret rotates and so is not one-time.
+        **The one-time property is enforced by the filesystem.** `SecretStore::take` removes the file
+        **before** returning the value, so two concurrent decisions race on one `remove_file` and exactly
+        one wins; the failure direction is the safe one — a crash loses the nonce and makes the approval
+        **undecidable** rather than **reusable**. A corrupt stored value is consumed as well as reported,
+        so a retry cannot repeat the read.
+        **`ApprovalRequest::nonce() -> &DecisionNonce`, never `&str`.** The nonce and its digest are both
+        fixed-length lowercase hex, so a caller holding a `&str` cannot tell them apart and a **digest
+        passed where a nonce belongs would be written out as the secret** — recreating exactly the flaw
+        `P3-004` found. The typed return makes "the digest is not the nonce" a property of the type system.
+        **The identifier is parsed, not sanitized**: `path_for` refuses anything that is not an
+        `ApprovalId` *before* joining a path, so `../../escape` has to be unrepresentable rather than
+        escaped.
+        **Proved end to end, which no unit test could show:** hold a call, take the nonce the way the
+        operator's client would, decide as the **human** and land `approved`. The gap was *between* a
+        correct store and a correct pipeline. Also asserted: deciding as the **run** is refused (so
+        `P3-012a`'s requester choice now has an executable consequence), and a refused decision does
+        **not** burn the nonce (the domain refuses after the digest matches and the guarded UPDATE rotates
+        only when the write lands) — so one honest mistake does not destroy an approval.
+        **Falsified, one property each:** deleting the `secrets.store(..)` call fails with `Absent`;
+        deleting the `remove_file` in `take` fails `a nonce must not be presentable twice` **and** the
+        corrupt-value test. Both mutations restored, both suites re-run green.
+        **⚠ The stale-mtime trap again:** `Copy-Item` restoring a `.bak` restores the **older**
+        timestamp, so cargo skipped the rebuild and the restored suite appeared red while the working copy
+        was correct. Touch the file before believing a post-restoration failure.
+        **Remaining for `P3-012b`:** nothing consumes the delivered nonce through a **route** — a
+        `POST /approvals/{id}/decision` and the resumption of the held call are the rest of this slice,
+        and resumption is where a duplicate delivery becomes a second effect, which is why it is not
+        rushed in beside the delivery. Gates: fmt, clippy `-D warnings`, 44 suites with the application
+        binaries absent and **zero skips**, both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`,
+        `cargo deny` ok. Limits recorded in `ADR-0042`: the secret is cleartext protected by filesystem
+        permissions only; nothing sweeps a lapsed approval's nonce file.
   - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
 
 ## P4: Memory And Context

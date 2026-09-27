@@ -478,7 +478,7 @@ async fn compose_tools(
         })
         .unwrap_or_default();
 
-    let tools = compose_tool_pipeline(config, database, additional)?;
+    let tools = compose_tool_pipeline(config, database, additional, paths)?;
     Ok((mcp, tools))
 }
 
@@ -504,6 +504,7 @@ fn compose_tool_pipeline(
         Vec<jarvis_tools::ToolDefinition>,
         Arc<dyn jarvis_tools::ToolExecutor>,
     )>,
+    paths: &AppPaths,
 ) -> Result<Option<Arc<crate::tool_pipeline::ToolPipeline>>, DaemonError> {
     // **No filesystem roots and no additional adapters means no pipeline**, not an empty one. Registering
     // the filesystem adapter over zero roots would let the daemon advertise a tool that fails every call,
@@ -526,6 +527,12 @@ fn compose_tool_pipeline(
         roots,
         jarvis_tools::WorkspacePolicy::default(),
         additional,
+        // The plaintext decision nonce goes to a file only this account can read, never into the durable
+        // approval row: `ADR-0018` stores a digest there deliberately, and `SecretStore`'s module
+        // documentation records why the profile's **state** directory is the right home for the plaintext
+        // (a cache may be cleared and a runtime directory is login-lifetime, either of which would make
+        // every pending approval undecidable across a logout).
+        jarvis_storage::SecretStore::in_state(paths.state()),
     )
     .map_err(|source| DaemonError::ToolPipeline { source })?;
     Ok(Some(Arc::new(pipeline)))

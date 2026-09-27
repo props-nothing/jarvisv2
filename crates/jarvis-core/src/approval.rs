@@ -1060,6 +1060,23 @@ impl ApprovalRequest {
         self.nonce.expose()
     }
 
+    /// Returns the one-time decision nonce, for handing to whatever will present it.
+    ///
+    /// # Why this returns the typed value rather than a `&str`
+    ///
+    /// The nonce and its stored digest are **both** fixed-length lowercase hexadecimal, so a caller
+    /// holding a `&str` cannot tell them apart and a digest passed where a nonce belongs would be
+    /// written out as the presentable secret — recreating exactly the flaw `P3-004` found, where a
+    /// fabricated value became a secret. Returning [`DecisionNonce`] makes "the digest is not the
+    /// nonce" a property of the type system rather than of a reader's attention.
+    ///
+    /// This is an accessor rather than a field so that every call site is a visible decision: the only
+    /// legitimate consumer is the component that delivers the nonce to the human who must present it.
+    #[must_use]
+    pub const fn nonce(&self) -> &DecisionNonce {
+        &self.nonce
+    }
+
     /// Returns when the request lapses, computed from a clock, for a caller that has one.
     ///
     /// Provided so a caller does not hand-roll `created_at + MAX_APPROVAL_LIFETIME_SECONDS` and

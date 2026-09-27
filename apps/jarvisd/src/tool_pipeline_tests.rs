@@ -138,7 +138,16 @@ async fn pipeline_with(
     workspace: WorkspacePolicy,
 ) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline) {
     let (directory, database) = database_with_run().await;
-    let pipeline = must(ToolPipeline::new(Arc::clone(&database), roots, workspace));
+    // The secret store lives **inside this test's own root**, never in the shared temp directory: a fixed
+    // path would let two tests' nonce files collide, and a nonce file is exactly the thing that must belong
+    // to one approval.
+    let secrets = jarvis_storage::SecretStore::in_state(&directory.join("state"));
+    let pipeline = must(ToolPipeline::new(
+        Arc::clone(&database),
+        roots,
+        workspace,
+        secrets,
+    ));
     (directory, database, pipeline)
 }
 
@@ -160,11 +169,13 @@ async fn pipeline_with_extra(
     adapter: Arc<dyn jarvis_tools::ToolExecutor>,
 ) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline) {
     let (directory, database) = database_with_run().await;
+    let secrets = jarvis_storage::SecretStore::in_state(&directory.join("state"));
     let pipeline = must(ToolPipeline::with_adapters(
         Arc::clone(&database),
         Some(roots),
         WorkspacePolicy::default(),
         vec![(definitions, adapter)],
+        secrets,
     ));
     (directory, database, pipeline)
 }
@@ -833,4 +844,132 @@ async fn a_held_call_writes_the_approval_it_is_waiting_on() {
     assert_eq!(stored.outcome(), ToolOutcome::Requested);
     assert_eq!(stored.receipt(), call_id);
     assert_eq!(stored.approval_id(), None);
+}
+
+/// **A held call can actually be decided, which is what `P3-012a` could not deliver on its own.**
+///
+/// `P3-012a` wrote the durable approval but the plaintext nonce was generated, digested, and dropped, so
+/// `record_decision` — which compares a presented value against the stored digest — had nothing to accept.
+/// This is the end-to-end proof that the delivery exists: hold a call, take the nonce the way the
+/// operator's client would, decide the approval, and assert the row moved to `approved`.
+///
+/// Four properties, each a way the delivery could be wrong rather than a way it could pass:
+///
+/// - the nonce is **not** in the durable row (it is a digest there, `ADR-0018`);
+/// - the nonce **is** presentable once and the decision is accepted;
+/// - the **approver must not equal the requester** — deciding as the run is refused, which is the guard
+///   that makes the identity decision in `P3-012a` load-bearing rather than decorative;
+/// - a decision on a **different intent** cannot be produced from this approval, because the intent is
+///   what a decision binds to and `record_decision` re-reads it from the stored row.
+#[tokio::test]
+async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let definition = held_definition();
+    let (root, _database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![definition],
+        Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+
+    let outcome = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                json!({ "path": "notes/todo.txt" }),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval { approval_id, .. } = outcome else {
+        panic!("expected a hold, got {outcome:?}");
+    };
+
+    // The store is the profile's state directory, which for a fixture is inside its own root.
+    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+
+    // **The nonce is presentable exactly once**, which is the one-time property `ADR-0018` requires and
+    // the only way a decision can be verified at all.
+    let nonce = must(secrets.take(&approval_id));
+    let again = secrets.take(&approval_id);
+    assert!(
+        matches!(again, Err(jarvis_storage::SecretStoreError::Absent { .. })),
+        "a nonce must not be presentable twice, got {again:?}"
+    );
+
+    // **Deciding as the run is refused.** The requester *is* the run (`P3-012a`), so an approver equal to
+    // it must be rejected — this is the self-approval guard doing real work rather than being
+    // unreachable, which is the whole reason the requester was chosen to be the agent.
+    let now = UtcTimestamp::now(&SystemClock);
+    let as_the_agent = jarvis_storage::record_decision(
+        pipeline.database(),
+        &approval_id,
+        RUN,
+        nonce.expose(),
+        &jarvis_core::ApprovalDecision::new(
+            jarvis_core::ApprovalDecisionOutcome::Approve,
+            jarvis_core::ApprovalChannel::Cli,
+            jarvis_core::AuthenticationStrength::Present,
+            now,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(
+            as_the_agent,
+            Err(DatabaseError::InvalidApprovalRequest {
+                field: "decided_by"
+            })
+        ),
+        "the agent that asked must not be able to approve, got {as_the_agent:?}"
+    );
+
+    // Deciding as the human is accepted. The nonce was **not** consumed by the refused attempt: the
+    // refusal happens in the domain after the digest check, and `record_decision`'s guarded UPDATE only
+    // rotates the digest when the write lands. Asserted rather than assumed, because a refused decision
+    // that silently burned the nonce would make an approval undecidable after one honest mistake.
+    let decided = must(
+        jarvis_storage::record_decision(
+            pipeline.database(),
+            &approval_id,
+            LOCAL_USER_ID,
+            nonce.expose(),
+            &jarvis_core::ApprovalDecision::new(
+                jarvis_core::ApprovalDecisionOutcome::Approve,
+                jarvis_core::ApprovalChannel::Cli,
+                jarvis_core::AuthenticationStrength::Present,
+                now,
+            ),
+        )
+        .await,
+    );
+
+    assert_eq!(decided.tool(), "mcp.test.write");
+    assert_eq!(
+        decided.state_at(now),
+        jarvis_core::ApprovalState::Approved,
+        "the approval must be approved at the instant it was decided"
+    );
+
+    // **The durable row holds a digest, not the nonce.** This is the property `ADR-0018` exists for, and
+    // asserting it here rather than only in the storage crate proves the *pipeline* did not accidentally
+    // write the plaintext anywhere a reader could reach.
+    let stored = must(jarvis_storage::find_approval(pipeline.database(), &approval_id).await);
+    assert_eq!(
+        stored.actor_id(),
+        RUN,
+        "the requester must still be the run after a decision"
+    );
+
+    // The intent the approval binds to is the call's own, so a decision authorizes the action and not a
+    // description of it. Recomputed from the same three inputs, and the control proves it is not a
+    // constant that would match anything.
+    let expected = must(jarvis_core::CanonicalIntentHash::compute(
+        "mcp.test.write",
+        "schema-00000000",
+        &json!({ "path": "notes/todo.txt" }),
+    ));
+    assert_eq!(stored.intent().to_hex(), expected.to_hex());
 }

@@ -110,6 +110,7 @@ async fn pipeline_over(root: &TempRoot) -> (Arc<SqliteDatabase>, Arc<ToolPipelin
         Arc::clone(&database),
         roots,
         WorkspacePolicy::default(),
+        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     ));
     (database, Arc::new(pipeline))
 }
@@ -349,6 +350,7 @@ async fn a_workspace_requiring_an_approval_refuses_the_remote_call() {
         Arc::clone(&database),
         roots,
         approval_requiring_workspace(),
+        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     ));
     let served = must(pipeline.definitions());
     let correlation_id = CorrelationId::new();
@@ -530,6 +532,7 @@ async fn a_tool_declaring_an_approval_is_refused_even_where_the_workspace_would_
             vec![approval_declaring_definition()],
             Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
+        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     )));
 
     let served = must(pipeline.definitions());
