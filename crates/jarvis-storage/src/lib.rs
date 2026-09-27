@@ -16,6 +16,7 @@ mod session_repository;
 mod approval_repository;
 mod secret_store;
 mod tool_call_repository;
+mod workspace_repository;
 
 pub use approval_repository::{
     create_approval, find_approval, read_pending_approvals, read_run_approvals, record_decision,
@@ -72,3 +73,4 @@ pub use tool_call_repository::{
     advance_tool_call, find_tool_call, link_tool_call_approval, read_run_tool_calls,
     read_unrepeatable_calls, record_tool_outcome,
 };
+pub use workspace_repository::{DataPolicy, NewWorkspace, WorkspaceMode, record_workspace};

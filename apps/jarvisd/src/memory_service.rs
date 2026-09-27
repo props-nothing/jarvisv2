@@ -42,8 +42,8 @@ use jarvis_protocol::{
 };
 use jarvis_storage::{
     DatabaseError, SqliteDatabase, StoredMemory, apply_memory_transition,
-    count_memory_entity_links, find_memory_including_deleted, load_local_identity, purge_memory,
-    read_all_memories, read_retrievable_memories, read_workspace_memories, record_entity,
+    count_memory_entity_links, find_entity, find_memory_including_deleted, load_local_identity,
+    purge_memory, read_all_memories, read_retrievable_memories, read_workspace_memories,
     record_memory,
 };
 
@@ -283,7 +283,9 @@ impl MemoryService {
         let workspace = self.workspace().await?;
         let memory_type = parse_memory_type(&request.memory_type)?;
         let source_kind = parse_source_kind(&request.source_kind)?;
-        let entities = Self::resolve_entities(&request.entity_ids)?;
+        let entities = self
+            .resolve_entities(workspace, &request.entity_ids)
+            .await?;
 
         let candidate = MemoryCandidate {
             workspace_id: workspace,
@@ -390,7 +392,7 @@ impl MemoryService {
             });
         }
         let entities = match &request.entity_ids {
-            Some(ids) => Self::resolve_entities(ids)?,
+            Some(ids) => self.resolve_entities(workspace, ids).await?,
             None => existing.record().entities().to_vec(),
         };
         let replacement = MemoryRecord::new(MemoryRecordParts {
@@ -600,29 +602,15 @@ impl MemoryService {
             });
         };
 
-        // An entity link is a foreign key, so every entity a claim names must exist first. They are written
-        // here rather than in the pipeline because the pipeline is pure and does not know about tables.
-        for entity in &to_store.entities {
-            record_entity(
-                &self.database,
-                &jarvis_storage::NewEntity {
-                    id: entity.entity_id(),
-                    workspace_id: workspace,
-                    // The pipeline does not know what kind of thing an entity is — that is resolution's job,
-                    // which this path does not run. `Document` is the value that claims the least: it says
-                    // "something a claim is about" without asserting it is a person.
-                    kind: jarvis_storage::EntityKind::Document,
-                    label: entity.entity_id().to_string(),
-                    attributes: None,
-                    // An `EntityRef` records how a match was established, not a confidence; `Confirmed` is
-                    // what the caller stated by naming the entity explicitly.
-                    confidence: MemoryConfidence::Confirmed,
-                    created_at: now,
-                },
-            )
-            .await?;
-        }
-
+        // **The entities are read, never written.** An earlier version of this loop called `record_entity`,
+        // which invented any entity the caller named — so a request naming a subject the workspace did not
+        // have was silently turned into a claim about a fabricated entity and answered `201`, and the identity
+        // vocabulary became caller-controlled. `resolve_entities` now reads the store and refuses an unknown
+        // or foreign subject, so by this point every entity exists in this workspace and the link below is a
+        // foreign key onto a row that is really there.
+        //
+        // The link itself is written by `record_memory`, which inserts the `memory_entities` rows in the same
+        // call as the memory row — so a claim cannot exist without the subjects it named.
         let record = MemoryRecord::new(MemoryRecordParts {
             id: MemoryId::new(),
             workspace_id: workspace,
@@ -746,17 +734,70 @@ impl MemoryService {
     /// person it is really about will not find it, and nothing in the store says why. Refusing with the field
     /// named is a refusal the caller can act on, and inventing `MemoryCandidate::proposed_entities` from the
     /// text would be entity extraction, which no slice has built.
-    fn resolve_entities(entity_ids: &[String]) -> Result<Vec<EntityRef>, MemoryServiceError> {
+    ///
+    /// # Why an unknown entity is refused rather than created
+    ///
+    /// The first version of this function only parsed, and the link step then **invented** any entity the
+    /// caller named. Two consequences, both bad:
+    ///
+    /// - A request naming an entity the workspace does not have was silently turned into a claim about a
+    ///   fabricated subject and answered `201`. Nothing distinguished it from a claim about a real person, so a
+    ///   typo in an identifier produced a memory nobody could find or correct — the exact failure mode the
+    ///   placeholder refusal above exists to prevent, left in place one layer down.
+    /// - The identity vocabulary became caller-controlled. `docs/architecture/identity-and-workspaces.md`
+    ///   requires that an entity be established through resolution — verified provider IDs, exact identifiers,
+    ///   user confirmation, or a probabilistic match recorded as such — and a caller asserting one over the
+    ///   wire is none of those.
+    ///
+    /// So the entity must already exist **in this workspace**, and the check is a read of the store rather than
+    /// a trust of the request. `entity_ids` then means what its name says: the subjects the claim is about.
+    async fn resolve_entities(
+        &self,
+        workspace: WorkspaceId,
+        entity_ids: &[String],
+    ) -> Result<Vec<EntityRef>, MemoryServiceError> {
         if entity_ids.is_empty() {
             return Err(MemoryServiceError::UnknownValue {
                 field: "entity_ids",
                 value: "(empty)".to_owned(),
             });
         }
-        entity_ids
-            .iter()
-            .map(|value| parse_entity_id(value).map(EntityRef::confirmed))
-            .collect()
+        let mut resolved = Vec::with_capacity(entity_ids.len());
+        for value in entity_ids {
+            let entity_id = parse_entity_id(value)?;
+            let stored = find_entity(&self.database, &entity_id.to_string())
+                .await
+                .map_err(|error| match error {
+                    // A missing entity is a **refusal about the request**, not a storage failure: the caller
+                    // named something the workspace does not have, and that is a value it can fix.
+                    DatabaseError::EntityNotFound => MemoryServiceError::UnknownValue {
+                        field: "entity_ids",
+                        value: value.clone(),
+                    },
+                    other => other.into(),
+                })?;
+            // The entity must belong to **this** workspace, or a caller could link its claim to another
+            // workspace's subject — a cross-workspace write dressed as a link.
+            if stored.workspace_id() != workspace {
+                return Err(MemoryServiceError::UnknownValue {
+                    field: "entity_ids",
+                    value: value.clone(),
+                });
+            }
+            // A merged entity's claims belong to the winner and a deleted one's to nobody, so a new claim
+            // against either would attach itself to a name that no longer denotes anything. `is_usable` is the
+            // domain's own predicate rather than a comparison restated here.
+            if !stored.is_usable() {
+                return Err(MemoryServiceError::Refused {
+                    reason: "entity_not_usable",
+                    detail:
+                        "an entity that is merged or deleted cannot be the subject of a new claim"
+                            .to_owned(),
+                });
+            }
+            resolved.push(EntityRef::confirmed(entity_id));
+        }
+        Ok(resolved)
     }
 }
 
@@ -1154,12 +1195,20 @@ mod tests {
 
     /// Builds a remember request for a preference about one entity.
     fn remember_request(entity: &jarvis_core::EntityId, content: &str) -> RememberRequest {
+        remember_request_str(&entity.to_string(), content)
+    }
+
+    /// Builds a remember request naming an entity by **text**.
+    ///
+    /// Separate from the typed helper because the refusals under test are about identifiers that do not denote
+    /// anything: an `EntityId` that parses and exists would skip exactly the check being asserted.
+    fn remember_request_str(entity_id: &str, content: &str) -> RememberRequest {
         RememberRequest {
             content: content.to_owned(),
             memory_type: "preference".to_owned(),
             source_kind: "user_statement".to_owned(),
             importance: None,
-            entity_ids: vec![entity.to_string()],
+            entity_ids: vec![entity_id.to_owned()],
             claim: None,
             supersedes: None,
         }
@@ -1606,5 +1655,116 @@ mod tests {
             }
             other => panic!("an oversized page must be refused, got {other:?}"),
         }
+    }
+
+    /// **A remember naming an entity the workspace does not have is refused, not invented.**
+    ///
+    /// This is the `P4-010` finding, asserted at the **service** level because the service is where the defect
+    /// lived: the link step called `record_entity`, which inserted any entity the caller named — so a request
+    /// naming a subject that did not exist produced a claim about a fabricated one and answered `remembered`.
+    ///
+    /// The wording is deliberately different from any stored claim's, so a refusal cannot come from the
+    /// duplicate index instead of the entity check.
+    #[tokio::test]
+    async fn a_remember_naming_an_unknown_entity_is_refused() {
+        let (service, database, _profile) = service().await;
+        let subject = entity(&database).await;
+        service
+            .remember(&remember_request(&subject, "Prefers dark roast coffee"))
+            .await
+            .unwrap_or_else(|error| panic!("remember: {error}"));
+
+        let unknown = jarvis_core::EntityId::new().to_string();
+        let refused = service
+            .remember(&remember_request_str(
+                &unknown,
+                "a claim about a subject that was never established",
+            ))
+            .await;
+        match refused {
+            Err(MemoryServiceError::UnknownValue { field, value }) => {
+                assert_eq!(field, "entity_ids");
+                assert_eq!(
+                    value, unknown,
+                    "the refusal must name the identifier the caller supplied, so it can be fixed"
+                );
+            }
+            other => panic!("an unknown entity must be refused by field, got {other:?}"),
+        }
+
+        // The entity was **not** created on the way to refusing. A check that stopped at the refusal would pass
+        // against a service that invented the subject and then refused for another reason, so the store is asked
+        // directly.
+        let created = jarvis_storage::find_entity(&database, &unknown).await;
+        assert!(
+            matches!(created, Err(jarvis_storage::DatabaseError::EntityNotFound)),
+            "the refused request must not have invented its entity, got {created:?}"
+        );
+    }
+
+    /// **A remember naming another workspace's entity is refused**, or a caller could file a claim that points
+    /// across a boundary every read respects.
+    ///
+    /// Asserted at the service level as well as in the acceptance gate, because this is the one write path where
+    /// a caller-supplied identifier reaches a foreign key.
+    #[tokio::test]
+    async fn a_remember_naming_another_workspaces_entity_is_refused() {
+        let (service, database, _profile) = service().await;
+        let subject = entity(&database).await;
+
+        // A second workspace with its own entity, recorded through the product's own functions.
+        let foreign_workspace = jarvis_core::WorkspaceId::new();
+        jarvis_storage::record_workspace(
+            &database,
+            &jarvis_storage::NewWorkspace {
+                id: foreign_workspace,
+                name: "Foreign".to_owned(),
+                mode: jarvis_storage::WorkspaceMode::Local,
+                data_policy: jarvis_storage::DataPolicy::Standard,
+                created_at: UtcTimestamp::now(&SystemClock),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("record the foreign workspace: {error}"));
+        let foreign_entity = jarvis_core::EntityId::new();
+        jarvis_storage::record_entity(
+            &database,
+            &jarvis_storage::NewEntity {
+                id: foreign_entity,
+                workspace_id: foreign_workspace,
+                kind: jarvis_storage::EntityKind::Person,
+                label: "Foreign subject".to_owned(),
+                attributes: None,
+                confidence: MemoryConfidence::Confirmed,
+                created_at: UtcTimestamp::now(&SystemClock),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("record the foreign entity: {error}"));
+
+        // The local subject is accepted, so the refusal below is the scope check and not a broken fixture.
+        assert!(
+            service
+                .remember(&remember_request(&subject, "Prefers dark roast coffee"))
+                .await
+                .is_ok(),
+            "the local subject must be accepted, or the refusal below proves nothing about scoping"
+        );
+        let refused = service
+            .remember(&remember_request_str(
+                &foreign_entity.to_string(),
+                "a claim filed across the workspace boundary",
+            ))
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(MemoryServiceError::UnknownValue {
+                    field: "entity_ids",
+                    ..
+                })
+            ),
+            "another workspace's entity must be refused as an unknown value, got {refused:?}"
+        );
     }
 }

@@ -486,6 +486,17 @@ pub enum DatabaseError {
         /// The entity the alias is already bound to.
         existing_entity_id: String,
     },
+    /// A workspace request failed the schema's own validation.
+    ///
+    /// The bound is checked in Rust before the insert so a caller receives a **field name** rather than a
+    /// constraint violation: a `CHECK` failure reports SQL and a table, which names neither the field the
+    /// caller got wrong nor the input that caused it. The offending value is never echoed — a workspace name
+    /// is user content and this error reaches logs.
+    #[error("the workspace {field} is invalid")]
+    InvalidWorkspaceRequest {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
     /// A tool call request failed the domain's own validation.
     #[error("the tool call {field} is invalid")]
     InvalidToolCallRequest {

@@ -2608,7 +2608,64 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       the README's cross-tenant recall note applies to a multi-workspace deployment; and the codec's
       `DistanceMetric::Euclidean` conversion is documented as an **ordering** rather than a similarity, because
       Euclidean distance has no similarity in the ranking's units.
-- [ ] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.
+- [x] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.
+      `tests/e2e/tests/phase4_gate.rs` (2 process-level cases) + `crates/jarvis-storage/src/workspace_repository.rs`
+      (+`workspace_tests.rs`, 5 tests) + `jarvis_storage::record_workspace` + the entity guards in
+      `apps/jarvisd/src/memory_service.rs` (2 daemon tests). `ADR-0052`.
+      **`jarvis-storage` 182 tests** (up from 177), **`jarvisd` 107** (up from 105).
+      **46 suites, 1229 workspace tests, 0 failed, 0 ignored.**
+      **⭐ The gate found three defects, and the first is security-relevant.** All three were **invisible to the
+      library suites**, which were green throughout:
+      **(1) `remember` invented any entity the caller named.** `resolve_entities` only *parsed* identifiers, and
+      the link step then called `record_entity` — so `POST /api/v1/memories` naming a subject that did not exist
+      **created that subject** and answered `201`. Two consequences: a claim about a fabricated entity is
+      **indistinguishable from a claim about a real person**, so a typo produced a memory nobody could find or
+      correct; and the **identity vocabulary became caller-controlled**, which
+      `identity-and-workspaces.md` forbids (an entity must be established through resolution — verified provider
+      IDs, exact identifiers, user confirmation, or a probabilistic match recorded as such). `ADR-0050` had
+      refused the placeholder *subject* while the placeholder *mechanism* stayed one layer down.
+      **(2) A claim could name another workspace's entity.** Nothing compared the entity's workspace against the
+      caller's, so a caller could **write** a claim into its own workspace pointing at another workspace's
+      subject — a cross-workspace link dressed as a local claim.
+      **(3) Nothing could create a second workspace**, which `A09` requires; every profile has one, seeded by
+      migration `0005`. So this slice added `jarvis_storage::record_workspace` — and it is **not** a multi-tenant
+      feature: no session, no credential, no route, and no actor can name a workspace.
+      **The fix is a read, not a check.** `resolve_entities` now reads the entity and refuses it unless it
+      exists, belongs to **this** workspace, and is **usable** (not merged, not deleted — a merged entity's
+      claims belong to the winner and a deleted one's to nobody, so a new claim against either attaches itself
+      to a name that no longer denotes anything). `is_usable` is the domain's own predicate rather than a
+      comparison restated at the edge. `apps/jarvisd` no longer calls `record_entity` at all: the
+      `memory_entities` rows are written by `record_memory` in the same call as the memory row, so a claim
+      cannot exist without the subjects it named and there is no second place an entity can appear.
+      **⭐ Every refusal is paired with an independent second fact**, because a status-code-only assertion can
+      pass for the wrong reason: the unknown-entity `422` is paired with a store read proving the entity was
+      **not created**; the cross-workspace entity `422` with a search proving no claim **matched**; and the
+      cross-workspace read `404` with a **positive** read of this workspace's own claim, so "refuses everything"
+      cannot pass.
+      **⭐ The gate's first run failed on a real wire-shape change, which is what it is for.**
+      `superseded["reference"]["status"]` was `null` — `MemoryDetailReply` **flattens** its reference, so the
+      fields are top-level. A client written against the nested shape would have broken in production, and the
+      gate reads raw JSON rather than the product's DTOs precisely so a field rename or re-nesting is caught.
+      **⭐ Two assertions the gate got wrong, and both were corrected rather than relaxed.** (a) A search for the
+      refused wording returned the *stored* claim for **recency** — `is_a_match` is the field that says whether
+      something answered the query, and `ADR-0046` deliberately includes recent claims that matched nothing, so
+      the assertion now filters on `is_a_match` rather than asserting an empty result. (b) The duplicate check
+      would have masked the entity bug if the refused wording had matched a stored claim, so the negative cases
+      use **distinct words**: with identical text the claim is refused whatever the entity check does.
+      **Falsified, one guard each:** with the entity-workspace comparison disabled the gate stored a claim naming
+      another workspace's entity and answered `201`; with the memory scope comparison disabled a read of another
+      workspace's claim answered `200` with its content. Both restored, green.
+      **Recorded as limits.** **No entity-creation surface exists**, so a remember is still unreachable by a user
+      of the shipped product — the gate reaches `record_entity` and then asserts the refusal, so the gap is
+      measured rather than hidden. No multi-tenant surface: `record_workspace` has no route and its doc says so.
+      No `memory_embeddings` table. `A08` does not exercise the model's context (that needs a configured
+      executor model and a provider; it is covered by the daemon's own tests), and `A09` does not cover "context
+      build", a model call, a tool, a trace, or diagnostics — those surfaces either take no workspace or do not
+      exist.
+      Gates: fmt, clippy `-D warnings` over the workspace, 46 suites with the binaries present and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, all four phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, and
+      `cargo deny check` ok (advisories, bans, licenses, sources — eight `duplicate` warnings, all pre-existing
+      and none an error).
 
 ## P5: Connectors
 
