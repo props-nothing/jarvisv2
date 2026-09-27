@@ -62,3 +62,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0042](0042-a-decision-nonce-is-delivered-by-file.md) | A decision nonce is delivered through a profile-private file, and taking it consumes it | Accepted |
 | [0043](0043-a-decision-carries-its-approver.md) | An approval decision carries the identity that made it, so a receipt can cite the approver | Accepted |
 | [0044](0044-a-deleted-memory-stores-a-hash-of-its-key.md) | A deleted memory stores a hash of its key, a claim triple is three columns, and the stored status reaches the constructor | Accepted |
+| [0045](0045-a-correction-is-declared-not-inferred.md) | A correction is declared, because a search key cannot detect one | Accepted |

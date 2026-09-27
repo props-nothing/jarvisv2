@@ -19,6 +19,7 @@ mod timestamp;
 mod transport;
 
 mod approval;
+mod candidate;
 mod memory;
 mod secretbytes;
 mod tool_outcome;
@@ -28,6 +29,12 @@ pub use approval::{
     ApprovalRequestParts, ApprovalState, AuthenticationStrength, CanonicalIntentHash,
     DecisionNonce, IntentError, InvalidApprovalField, MAX_APPROVAL_LIFETIME_SECONDS,
     MAX_APPROVAL_PREVIEW_CHARS, MAX_CANONICAL_INTENT_CHARS, NonceError,
+};
+pub use candidate::{
+    CandidateClassification, CandidateContext, CandidateRefusal, MAX_CANDIDATE_CONTENT_CHARS,
+    MAX_CANDIDATE_ENTITIES, MemoryAdmission, MemoryCandidate, MemoryCandidateComparison,
+    MemoryToStore, classify_sensitivity, compare, content_sensitivity_floor, normalized_equal,
+    type_sensitivity_floor,
 };
 pub use context::{
     ContextBudget, ContextError, ContextItem, ContextManifest, ContextPriority, ContextSource,

@@ -2149,7 +2149,58 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
       (1095 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 156 tests, `jarvis-storage` 167.
-- [ ] `P4-003` Implement candidate extraction as a reviewable pipeline; never persist unsupported inference as fact.
+- [x] `P4-003` Implement candidate extraction as a reviewable pipeline; never persist unsupported inference as fact.
+      `crates/jarvis-core/src/candidate.rs` + `candidate/tests.rs` (19 tests). The document's admission
+      lifecycle as stages, and the slice's central finding is that **one of its stages cannot be
+      implemented the way it reads**. Recorded as `ADR-0045`.
+      **`MemoryCandidate` is not a `MemoryRecord` with fewer fields.** It is the model's *proposal*, so it
+      must be representable with a confidence its source cannot support, a sensitivity below the floor, and
+      an entity set the store has not resolved — each of which a stage resolves or refuses. A record cannot
+      be built until every rule passes (`P4-001` made that structural), so the two types cannot be merged
+      without making every consumer defend against a half-valid memory.
+      **⭐ THE FINDING: a correction cannot be inferred from a key match.** The first cut compared contents
+      and called a same-key/different-content pair a correction. That branch is **unreachable**, because
+      `P4-002`'s search key *is* the sorted, case-folded word set: two records sharing a key have the same
+      words, so a key lookup can only return a memory whose words match, and `normalized_equal` agreed with
+      the key by construction. The test asserting a `Correction` got `Duplicate`, and the tempting repair —
+      "make the fixture differ more" — was wrong: the fixture was already as different as a shared key
+      permits, which is not different at all. Inferring from "same entity, different words" was the next
+      candidate and is worse: "Alice is my sister" and "Alice lives in Rotterdam" share an entity, so it
+      would retire a memory for every second fact about anyone.
+      So **supersession is declared** (`MemoryCandidate::supersedes`), checked before the comparison because
+      it asserts the candidate's own history rather than observing the store, and it outranks the
+      fact-or-proposal decision — a corrected *relationship* claim must supersede, not become a proposal.
+      `compare`'s `Correction` branch is kept as a **diagnostic**: a caller supplies `existing`, so a caller
+      passing a row from a wrong lookup would otherwise have it reinforced as though it held the candidate's
+      claim; returning `Correction` makes that bug surface as a visible supersession instead of a silent
+      merge.
+      **A second finding from the same test run:** `MemorySearchKey` bounds each key *word* at 64 chars as
+      well as the content at 4096, so a 4096-character single word is within the content bound and
+      unkeyable. The first cut reported `Content` for both, which would send an operator shortening text
+      that already fits — now `CandidateRefusal::Unkeyable`, with a test asserting both bounds (a
+      single-word fixture conflates them, which is how the bug was found).
+      **Confidence is lowered, never raised.** A model inference is admitted at `Unverified` **and** as a
+      proposal whatever it claimed; a document claim caps at `Likely`; a caller claiming *less* certainty
+      than its source could support is not overruled. The invariant is therefore a property of the stored
+      value rather than a check a later reader must remember.
+      **Sensitivity is the maximum of three floors** — the type's (a relationship claim is `Confidential`),
+      the content's (a credential or health term raises it to `Restricted`), and the extractor's. Only one
+      direction is safe to correct automatically, because exclusion from a remote model is decided from the
+      *stored* level.
+      **Falsified, one guard each:** removing the confidence cap failed exactly
+      `a_model_inference_is_never_admitted_as_fact` and `an_overconfident_claim_is_lowered_rather_than_refused`;
+      making the proposal branch unreachable failed exactly the two tests about inferences and relationships.
+      Both restored, re-run green.
+      **Recorded as limits:** nothing extracts a candidate from anything yet (the model-facing half is
+      `P4-007`, where context assembly and the provider boundary live), **nothing writes an admission** so
+      the end-to-end property is unproven, nothing reads the store (`CandidateContext` carries borrowed
+      values because entity resolution needs `jarvis-storage`), the restricted-content check is a keyword
+      list rather than a classifier, `supersedes` is a single link with no chain walk, and a candidate
+      carries no identifier so the domain's self-supersession refusal belongs to `P4-001` where the
+      identifier does.
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
+      (1114 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 175 tests.
 - [ ] `P4-004` Implement exact, full-text, recency, importance, entity, and workspace retrieval before adding embeddings.
 - [ ] `P4-005` Research and implement a provider-neutral embedding adapter with dimension/version metadata.
 - [ ] `P4-006` Add hybrid retrieval and explainable scoring; embeddings are an index, not canonical truth.
