@@ -8,6 +8,7 @@ mod inspect;
 mod memory_repository;
 mod message_repository;
 mod paths;
+mod pgvector;
 mod run_event_repository;
 mod run_repository;
 mod session_repository;
@@ -48,6 +49,10 @@ pub use message_repository::{
 pub use paths::{
     AppPaths, PathError, PathKind, PathMode, RuntimePathSource, portable_layout,
     secure_private_file,
+};
+pub use pgvector::{
+    DistanceMetric, MAX_INDEXED_DIMENSIONS, PgVectorError, decode as decode_embedding,
+    encode as encode_embedding, is_indexable,
 };
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,

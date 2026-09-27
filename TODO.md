@@ -2558,6 +2558,56 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1` (**1210 tests, 0 failed, 0 ignored**), all three phase gates with
       `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
 - [ ] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.
+      **PARTIAL — the pgvector boundary is built and tested; the backend is not. `P4-009` is not complete.**
+      `crates/jarvis-storage/src/pgvector.rs` (10 tests) + `docs/research/integrations/postgres-pgvector.md` +
+      `ADR-0051`. `jarvis-storage` 177 tests (up from 167).
+      **What is done:** the pgvector text codec with a bit-exact round trip, the three distance metrics paired
+      with their index operator classes, the distance-to-similarity conversion `jarvis_core::retrieval`
+      scores, `is_indexable`, and a named refusal for an embedding above the indexed dimension cap.
+      **What is NOT done, and why "parity" is not claimed:** no `memory_embeddings` table; no repository
+      function that reads or writes a vector; no `CREATE EXTENSION` or `CREATE INDEX` DDL; no Postgres
+      migration; no SQLx `postgres` feature; no server-mode composition; **no test against a live server.**
+      **⭐ The research record decided the code, and four findings are load-bearing.**
+      (1) **SQLx 0.9.0 has no `vector` type mapping** — verified against the driver's own type table, which
+      lists `bool`, the integers, `f32`/`f64`, strings, `BYTEA`, `UUID`, `JSON`/`JSONB`, `TIMESTAMPTZ` and no
+      vector type of any kind. A hand-written text codec is therefore unavoidable, and it is the part that can
+      be wrong without a server noticing.
+      (2) **pgvector indexes a `vector` column only up to 2,000 dimensions** while *storing* up to 16,000, and
+      JARVIS's own `EmbeddingDimensions::MAX` is **16,384** — eight times the indexed cap. So a
+      JARVIS-valid embedding can be storable-but-unindexable, which is a retrieval that silently stops being
+      a search. Refused by name, with the documented alternatives (`halfvec` to 4,000, binary quantization,
+      subvector indexing, dimensionality reduction) in the message.
+      (3) **The query shape decides whether the index is used at all.** "The `ORDER BY` must be the result of a
+      distance operator (not an expression) in ascending order", and the README's own counter-example is
+      `ORDER BY 1 - (embedding <=> q) DESC` — which is exactly how a caller naturally writes cosine
+      *similarity*. So the module names the operator and the operator class **together**, because the README
+      also requires an index per distance function and a metric without its index is an exact scan that looks
+      like a working search.
+      (4) **`<#>` is the negative inner product**, "since Postgres only supports `ASC` order index scans on
+      operators" — so a caller reading a stored value as a similarity would rank **backwards** while every
+      type checked. `ascending_is_closer` is a named predicate for that reason, even though it is currently
+      constant for all three metrics.
+      **⭐ The codec crosses an adapter boundary as plain data, and that is forced rather than chosen.**
+      `repository-layout.md`'s graph allows adapters to depend on `jarvis-core` and `jarvis-protocol` and
+      **not on each other**; `jarvis-storage` and `jarvis-models` are both adapters, so the codec takes
+      `&[f32]` and returns `Vec<f32>` instead of `EmbeddingVector`. The composition root maps between them —
+      the same rule `ADR-0047` applied inside the provider boundary.
+      **⭐ The round trip is asserted by bit pattern, and the documented form is asserted literally.**
+      `-0.0 == 0.0`, so a value comparison cannot see a sign lost by the text form; `1.0 / 3.0` and
+      `f32::MIN_POSITIVE` are what a fixed-decimal formatter fails. And a round trip alone cannot distinguish
+      a correct form from a self-consistent wrong one, so `encode(&[1.0, 2.0, 3.0]) == "[1,2,3]"` is asserted
+      against the README's own example.
+      **Falsified, one guard each:** with the dimension cap check removed, `encode` accepted 2,001 dimensions
+      and the guard failed (two tests); with the **encode-side** finite check removed,
+      `encode(&[1.0, f32::NAN])` returned `Ok("[1,NaN]")` — because `NaN` **formats successfully**, so a
+      read-only guard would let this platform write a row it cannot read and the write would look like it
+      worked. Both restored, green.
+      **Recorded as limits:** the extension is never installed or detected, so the failure a migration sees
+      when it is missing is an unresolved question; no `hnsw.ef_search` tuning, so a filtered query returns
+      fewer rows than requested by documented default; no iterative index scans; no workspace partitioning, so
+      the README's cross-tenant recall note applies to a multi-workspace deployment; and the codec's
+      `DistanceMetric::Euclidean` conversion is documented as an **ordering** rather than a similarity, because
+      Euclidean distance has no similarity in the ranking's units.
 - [ ] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.
 
 ## P5: Connectors
