@@ -1,0 +1,19 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.history.list (a cursor outside the retained range)",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/guides/sync#limitations",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented shape of the 404 that a `startHistoryId` outside the available range returns.",
+  "_the_point_of_this_fixture": "THERE IS NO `reason` FIELD, AND THAT IS THE FINDING. The sync guide documents that a `startHistoryId` outside the retained range returns `HTTP 404`, and the error guide's status summary documents `404` as \"the requested resource couldn't be found\" -- with NO 404 subsection and therefore NO `reason` code of its own. So the same status, with the same (absent) code, is what an absent mailbox returns, and the two causes are indistinguishable from the response. A connector cannot resolve this with a predicate; it resolves it by the consequence of the action, which for both causes begins with a full sync.",
+  "_the_two_documented_causes": [
+    "history pruned: the cursor is outside the retained range (at least a week, sometimes shorter)",
+    "the mailbox was not found: an absent or disconnected account"
+  ],
+  "_why_resyncing_is_safe_answer": "If history was pruned, a full sync is the documented remedy. If the account is gone, the full sync's own first call fails and surfaces that. So the wrong reading is self-correcting, and its worst case is one extra call rather than a store that resumes from a dead position and reports itself in sync.",
+  "_sanitized": "No real message text, request id, or address appears here.",
+  "error": {
+    "code": 404,
+    "message": "Requested entity was not found."
+  }
+}

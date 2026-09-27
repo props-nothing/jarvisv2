@@ -34,6 +34,12 @@ fn version() -> ConnectorVersion {
     must(ConnectorVersion::new("1.0.0"), "a valid connector version")
 }
 
+/// One instant, so a test compares cursors without restating a timestamp.
+fn now() -> UtcTimestamp {
+    UtcTimestamp::from_unix_nanos(1_774_000_000_500_000_000)
+        .unwrap_or_else(|_| panic!("a representable instant"))
+}
+
 fn cursor() -> SyncCursor {
     must(
         SyncCursor::new(
@@ -238,16 +244,29 @@ fn a_page_token_is_bounded_and_an_empty_one_is_refused() {
 }
 
 #[test]
-fn a_gmail_history_404_is_pruned_history_and_not_a_missing_account() {
-    // The finding this module was written around, asserted from both sides: the predicate is true for the
-    // status Gmail documents as pruned history, and the *same* status must not be read as an absent resource
-    // by any other reading. `gmail_history_status_is_pruned` is a named predicate precisely so the caller
-    // applies it to `history.list` alone.
-    assert!(gmail_history_status_is_pruned(404));
-    assert!(!gmail_history_status_is_pruned(200));
-    assert!(!gmail_history_status_is_pruned(403));
-    // And the ambiguity is real rather than theoretical: 404 is also the status for a missing resource, which
-    // is why the function's name says `history`.
+fn a_gmail_history_404_carries_no_information_that_could_distinguish_two_causes() {
+    // **This test previously asserted the opposite claim, and the reversal is the finding.**
+    //
+    // An earlier version was named `a_gmail_history_404_is_pruned_history_and_not_a_missing_account` and
+    // asserted `gmail_history_status_is_pruned(404)` -- that a 404 on `history.list` IS pruned history. Finding
+    // 2 in the research record says that distinction cannot be made, and the error guide confirms it: 404 is
+    // documented as "the requested resource couldn't be found" with **no `reason` code**, so the same status
+    // with the same code is what an absent mailbox returns. The old predicate claimed knowledge the response
+    // does not carry, and a caller reading it would believe two cases had been distinguished when they had not.
+    assert!(gmail_history_status_cannot_prove_usable(404));
+    assert!(!gmail_history_status_cannot_prove_usable(200));
+    assert!(!gmail_history_status_cannot_prove_usable(403));
+    // The name is the content: "cannot prove usable" is what is readable, and `404` is the one status where a
+    // resync may be warranted. A 429 or a 5xx is retryable, and a resync would discard a working store over a
+    // transient failure -- so those must NOT be read as a dead cursor.
+    for status in [429, 500, 502, 503, 504] {
+        assert!(
+            !gmail_history_status_cannot_prove_usable(status),
+            "{status} is retryable, so a resync would discard a working store"
+        );
+    }
+    // And the ambiguity is real rather than theoretical, which is why it cannot be resolved by a predicate:
+    // the classifier reads the SAME status as permanent, so nothing in this crate invents a reason code for it.
     assert_eq!(
         classify(404, GmailErrorReason::Unrecognised, None, None).class,
         RetryClass::Permanent
@@ -277,7 +296,15 @@ fn a_history_cursor_advances_and_refuses_to_move_backwards() {
         .unwrap_or_else(|_| panic!("a representable instant"));
 
     let advanced = must(
-        advance_gmail_history(&start, Some("1234567999"), &account, &version, now),
+        advance_gmail_history(
+            &start,
+            &SyncSignal::Advanced {
+                history_id: Some("1234567999".to_owned()),
+            },
+            &account,
+            &version,
+            now,
+        ),
         "a forward advance must succeed",
     );
     assert_eq!(advanced.advance, SyncAdvance::Advanced);
@@ -288,9 +315,16 @@ fn a_history_cursor_advances_and_refuses_to_move_backwards() {
 
     // An unchanged mailbox is an ordinary outcome and keeps the previous cursor rather than inventing one.
     let unchanged = must(
-        advance_gmail_history(&start, None, &account, &version, now),
+        advance_gmail_history(
+            &start,
+            &SyncSignal::Advanced { history_id: None },
+            &account,
+            &version,
+            now,
+        ),
         "no new id must be accepted",
     );
+    assert_eq!(unchanged.advance, SyncAdvance::Advanced);
     assert_eq!(
         unchanged.cursor.as_ref().and_then(SyncCursor::token),
         Some("1234567890")
@@ -299,7 +333,15 @@ fn a_history_cursor_advances_and_refuses_to_move_backwards() {
     // A smaller id is refused. `historyId` increases, so a smaller value is a stale or foreign response, and
     // storing it would silently re-walk history the connector has already processed — a repeat for a connector
     // that acts on changes.
-    let backwards = advance_gmail_history(&start, Some("1234567000"), &account, &version, now);
+    let backwards = advance_gmail_history(
+        &start,
+        &SyncSignal::Advanced {
+            history_id: Some("1234567000".to_owned()),
+        },
+        &account,
+        &version,
+        now,
+    );
     assert!(
         backwards.is_err(),
         "a backwards historyId must be refused rather than stored"
@@ -307,6 +349,70 @@ fn a_history_cursor_advances_and_refuses_to_move_backwards() {
     // The positive control on the ordering check: one id forward IS accepted, so the refusal above is the
     // ordering rule and not a check that refuses every change.
     assert_eq!(advanced.advance, SyncAdvance::Advanced);
+}
+
+#[test]
+fn a_gmail_cursor_that_cannot_be_used_requires_a_resync_and_carries_no_cursor() {
+    // The documented remedy, now REACHABLE. Before `SyncSignal`, `advance_gmail_history` took only the new
+    // history id, so `HistoryPruned` could not be produced by any input at all — the remedy was named in a
+    // variant that nothing could construct.
+    let outcome = must(
+        advance_gmail_history(
+            &cursor(),
+            &SyncSignal::CursorUnusable,
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a dead cursor is an outcome, not an error",
+    );
+    assert_eq!(outcome.advance, SyncAdvance::HistoryPruned);
+    assert!(
+        outcome.cursor.is_none(),
+        "carrying the rejected cursor forward would invite a resume from a dead position"
+    );
+    // And the same signal on Calendar names Calendar's own reason, so the shared variant does not lose the
+    // distinction between Gmail's pruned history and Calendar's invalidated token.
+    let calendar = must(
+        advance_calendar_sync(
+            &must(
+                SyncCursor::new(
+                    SyncCursorKind::OpaqueToken,
+                    Some("CPDAlvWDx70CEPDAlvWDx70CGAU=".to_owned()),
+                    account(),
+                    "1.0.0",
+                    now(),
+                ),
+                "an opaque cursor",
+            ),
+            &SyncSignal::CursorUnusable,
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a dead Calendar token is an outcome, not an error",
+    );
+    assert_eq!(calendar.advance, SyncAdvance::TokenInvalidated);
+    assert!(calendar.cursor.is_none());
+}
+
+#[test]
+fn a_refused_advance_carries_the_decision_and_no_cursor() {
+    // A refusal is neither an advance nor a dead cursor, and the decision is carried so a caller can report
+    // *why*. No cursor is returned, so a caller cannot store a new position on the strength of a failure.
+    let decision = classify(429, GmailErrorReason::Unrecognised, Some(30), None);
+    let outcome = must(
+        advance_gmail_history(
+            &cursor(),
+            &SyncSignal::Refused(decision.clone()),
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a refusal is an outcome, not an error",
+    );
+    assert_eq!(outcome.advance, SyncAdvance::Refused(decision));
+    assert!(outcome.cursor.is_none());
 }
 
 #[test]
@@ -329,7 +435,15 @@ fn a_calendar_token_is_treated_as_opaque_so_no_ordering_is_invented() {
     );
     // A lexicographically smaller token is NOT refused, because no ordering is defined for it.
     let next = must(
-        advance_calendar_sync(&opaque, Some("AAA="), &account, &version, now),
+        advance_calendar_sync(
+            &opaque,
+            &SyncSignal::Advanced {
+                history_id: Some("AAA=".to_owned()),
+            },
+            &account,
+            &version,
+            now,
+        ),
         "an opaque token has no ordering, so any value is accepted",
     );
     assert_eq!(next.advance, SyncAdvance::Advanced);

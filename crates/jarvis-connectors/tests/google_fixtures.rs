@@ -269,6 +269,52 @@ fn the_error_type_cannot_hold_the_prose_it_parsed() {
 }
 
 #[test]
+fn the_gmail_history_404_fixture_carries_no_reason_code() {
+    // The fixture that closes the 404-is-staleness item in the research record's Verification Plan, and it
+    // closes it by **falsifying the question rather than answering it**. The sync guide documents a 404 for a
+    // pruned history; the error guide documents 404 as "the requested resource couldn't be found" with no 404
+    // subsection at all. So there is no `reason` code to switch on, and the two causes are indistinguishable.
+    let text = fixture("gmail_history_404_no_reason.json");
+    assert_declared_shape(&text);
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(value["error"]["code"], 404);
+    assert!(
+        value["error"].get("errors").is_none(),
+        "the fixture must carry NO `errors` array, because that is where a `reason` code would live and \
+         Google publishes none for a 404"
+    );
+    assert!(
+        value["error"]["message"].is_string(),
+        "the message is present, and it is prose -- which is why nothing may classify from it"
+    );
+
+    // The consequence: this crate's classifier reads the status as permanent and the reason as unrecognised,
+    // so nothing invents the `reason` the response does not carry.
+    let body: GmailErrorBody = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(body.error.code, 404);
+    assert_eq!(
+        body.reason(),
+        None,
+        "there is no reason code, which is the whole point"
+    );
+    let decision = client::classify(404, GmailErrorReason::Unrecognised, None, None);
+    assert_eq!(
+        decision.guidance,
+        jarvis_connectors::RetryGuidance::DoNotRetry
+    );
+    assert!(
+        !decision.guidance.permits_retry(),
+        "a 404 is not retryable; the remedy is a resync, which is a different action"
+    );
+}
+
+#[test]
 fn every_fixture_is_json_and_declares_itself() {
     // A sweep, so a new fixture is held to the same standard as these. A file that is not JSON, or that does
     // not declare its provenance, fails here rather than being noticed by a reader.

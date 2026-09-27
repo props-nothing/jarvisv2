@@ -3553,6 +3553,59 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     were withdrawn; **`takes_effect_later` has no duration**, so nothing can schedule a verification or re-check a
     revocation; and **revocation is not wired to anything** — no route, command, or teardown path calls this
     module, so a disconnect is still not something a deployment can perform.
+  - **This round fixed the sync advance path, and found that a documented remedy was UNREACHABLE.** `SyncSignal`
+    added to `client.rs`, `advance_gmail_history`/`advance_calendar_sync` rewritten to take it, and a false
+    predicate replaced (2 new lib tests + 1 new fixture test, so **291 in the crate**). **`ADR-0066`.**
+  - **⭐⭐ THE FINDING: `SyncAdvance::HistoryPruned` AND `TokenInvalidated` COULD NOT BE PRODUCED BY ANY INPUT.**
+    `SyncAdvance` has a `HistoryPruned` variant whose own doc calls it "the finding this module was written
+    around" — and `advance_gmail_history` took only `next_history_id`, never a status or any failure signal, so
+    **no caller could reach the resync path at all**. Calendar's `TokenInvalidated` was unreachable the same way.
+    This is the "refusal that can never fire" pattern `P5-001`/`P5-003` each recorded, in its **inverse** form: a
+    *remedy* that can never be produced. The fix is `SyncSignal { Advanced { history_id }, CursorUnusable,
+    Refused(RetryDecision) }`, which also makes the third case explicit so a refusal that is neither an advance
+    nor a dead cursor is carried with its classification rather than swallowed.
+  - **The signal is a parameter because the INFERENCE DEPENDS ON THE METHOD, and only the caller knows it.** A
+    `404` on `users.history.list` may mean pruned history; a `404` on `users.messages.get` means the message does
+    not exist, and resyncing on that would discard a whole sync over one missing message. Requiring the signal
+    turns a caller's inference into an explicit act instead of a comparison hidden inside a function that never
+    saw the request.
+  - **⭐⭐ A PREDICATE ASSERTED A DISTINCTION THE PROVIDER DOES NOT PUBLISH — AND RESEARCHING IT PROPERLY MADE
+    THAT WORSE, NOT BETTER.** `gmail_history_status_is_pruned` returned `status == 404`, claiming that a 404 on
+    `history.list` IS pruned history while Finding 2 says the two causes are indistinguishable. The error guide
+    (`handle-errors`, updated **2026-09-15**) settles it the wrong way for the predicate: its status summary
+    lists `404 - Not Found` and it then has **NO 404 subsection at all** (its sections are 400, 401, 403, 429,
+    5xx), so Google publishes **no `reason` code** for a 404. The ambiguity is **irreducible from the response**,
+    so no predicate can resolve it and I removed the one that pretended to. It is replaced by
+    `gmail_history_status_cannot_prove_usable`, which claims only what is readable.
+  - **⭐ WHY RESYNCING ON AN AMBIGUOUS 404 IS SAFE: THE WRONG READING IS SELF-CORRECTING.** For **both**
+    documented causes the first correct action is a full sync — if the history was pruned that is the documented
+    remedy, and if the account is gone the full sync's own first call fails and surfaces *that*. So the wrong
+    reading costs **one extra `messages.list` call**, while the alternative (resuming from a rejected position)
+    yields a store that reports itself in sync while missing everything. Cost asymmetry decides the direction,
+    the same reasoning `ADR-0062` uses for an ambiguous transport failure. And a dead cursor now carries
+    **no cursor forward**, so a caller cannot resume from the position the provider just rejected.
+  - **`429` and `5xx` are explicitly NOT dead cursors.** The predicate is true for `404` alone, asserted false for
+    the retryable family — because a resync on a transient failure discards a working store, which is the
+    opposite mistake and a far more expensive one.
+  - **⭐ THREE GUARDS FALSIFIED WITH COMPILING MUTANTS.** Carrying a rejected cursor forward → **2 tests
+    detected**; making the predicate unfailable → **2**; reporting a refusal as an advance → **2**. The
+    multi-line anchors needed LF-joined strings built in the script, because here-strings are CRLF — the trap
+    this session records, hit again.
+  - **⭐ A VERIFICATION-PLAN ITEM WAS FALSIFIED AND THE RECORD SAYS SO.** The plan's "404-is-staleness test"
+    required a fixture showing two causes produce opposite outcomes; that comparison needs information the
+    response does not carry, so the test **cannot be written as stated**. The item is marked **WRITTEN** and
+    **corrected**: the new fixture `gmail_history_404_no_reason.json` asserts the **absence of an `errors` array
+    and therefore of a `reason`**, and the research record explains that the discrimination it asked for is
+    impossible. A plan item being disproved is a result rather than a failure — `ADR-0063` records the same
+    outcome for a different assumption.
+  - **NEW LIMITS:** **no request is sent** — the signal is produced by a caller that does not exist, since there
+    is no `history.list` transport, no sync loop, and no resync orchestration; **nothing can PERFORM the full
+    sync**, so a caller reaching `HistoryPruned` has a verdict and no remedy; **the 404 reading is still an
+    inference, now named as one** — the doc argues it is safe because self-correcting, not that the response
+    distinguishes the cases, so a provider that changed its 404 behaviour would not be caught; **Calendar's
+    `400`-is-a-query-error path still has no fixture**, so nothing pins which reason code accompanies it; and the
+    signal does **not** protect against calling the wrong `advance_*` function — a mismatched cursor is caught by
+    `SyncCursorKind`, not by the signal.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

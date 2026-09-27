@@ -83,3 +83,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0063](0063-a-wire-fixture-declares-whether-it-is-a-capture-or-a-shape.md) | A wire fixture declares whether it is a capture or a shape | Accepted |
 | [0064](0064-a-token-answer-is-read-from-its-body-and-its-token-is-never-copied.md) | A token endpoint's answer is read from its body, and the token it grants is never copied into a value | Accepted |
 | [0065](0065-a-protocol-type-stays-correct-when-a-provider-disagrees.md) | A protocol type stays correct when a provider disagrees with it | Accepted |
+| [0066](0066-a-cursor-decision-takes-a-signal-not-a-status.md) | A cursor decision takes a signal, not a status, because only the caller knows the method | Accepted |

@@ -382,6 +382,20 @@ already asks this question; this record supplies Gmail's answer as **"only from 
 from the cursor's shape"**, and a connector must classify a 404 on `history.list` specifically as staleness
 rather than as absence. Calendar's 410 has no such ambiguity.
 
+**⚠ And the ambiguity cannot be resolved from the response, which took a third pass to establish.** The error
+guide (`handle-errors`, last updated **2026-09-15**) lists `404 - Not Found — The requested resource couldn't be
+found` in its status summary and then **has no 404 subsection at all**: the guide's sections are 400, 401, 403,
+429 and 5xx. So Google publishes **no `reason` code** for a 404, and a connector has nothing machine-readable to
+switch on. The two causes are therefore genuinely indistinguishable at the response level.
+
+**The resolution is the *consequence*, not the classification.** For **both** causes the first correct action is
+a full sync: if the history was pruned that is the documented remedy, and if the account is gone the full sync's
+own first call fails and surfaces *that*. So reading a 404 as "resync" is safe because the wrong reading is
+**self-correcting**, and its worst case is one extra `messages.list` call rather than a store that resumes from a
+dead position while reporting itself in sync. `client::advance_gmail_history` therefore resyncs on a
+caller-supplied signal, and the predicate that used to assert "pruned" was **removed** — it claimed knowledge the
+response does not carry, which is worse than the ambiguity it pretended to settle.
+
 ### Finding 3 — Google publishes a first-party Gmail MCP server, which is an alternative to a connector
 
 `https://gmailmcp.googleapis.com/mcp/v1` is a **Google-operated** MCP server, currently in **Developer Preview**,
@@ -460,11 +474,18 @@ where every line looks equally done is a plan nobody can audit.
   that batches trigger rate limiting, so the test asserts both the batch size and the delay. **Not written.**
 - **The 404-is-staleness test.** A `history.list` fixture returning 404 must produce "resync from scratch", not
   "account not found" — and a fixture for a genuinely absent account must produce the opposite. **This is the
-  cheapest test that would disprove the central assumption of Finding 2**, and it is the one most worth
-  writing first. **Not written** — the *classification* it would test is decided and tested
-  (`client::gmail_history_status_is_pruned`, `advance_gmail_history`), but no 404 fixture exists.
-- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error. **Not written** as fixtures; the
-  classification is tested (`client::calendar_status_requires_resync`, `advance_calendar_sync`).
+  cheapest test that would disprove the central assumption of Finding 2**, and it was the item most worth
+  writing first. **WRITTEN, AND IT DISPROVED THE ASSUMPTION.** `tests/fixtures/google/gmail_history_404_no_reason.json`
+  plus `the_gmail_history_404_fixture_carries_no_reason_code` establish that the fixture carries **no `errors`
+  array and therefore no `reason` code**, so the test the plan asked for — "404 must produce resync rather than
+  account-not-found" — **cannot be written as stated**, because the response does not carry the information a
+  discrimination would need. What replaced it: a fixture asserting the *absence*, and code that resyncs on a
+  caller-supplied signal whose wrong reading is self-correcting (see Finding 2). The predicate
+  `gmail_history_status_is_pruned`, which claimed the discrimination, was **removed**.
+- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error. **PARTIALLY WRITTEN** — the
+  classification is tested (`client::calendar_status_requires_resync`, `advance_calendar_sync`) and the
+  unreachable `TokenInvalidated` variant is now reachable, but no 410 fixture exists and no 400-is-a-query-error
+  fixture exists.
 - **A `domainPolicy` test.** A 403 with `reason: domainPolicy` must be `Permanent` and must not be retried,
   which a status-code-only classifier cannot distinguish from `rateLimitExceeded`. **WRITTEN** — see below.
 - **A recording fixture for the Pub/Sub envelope** — a sanitized delivery with `message.data` Base64URL-decoded

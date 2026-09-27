@@ -352,6 +352,43 @@ pub fn next_page(next_page_token: Option<&str>) -> Result<Option<String>, PageTo
 
 /// What a cursor advance concluded about the provider's history.
 ///
+/// What a provider's answer to an incremental read **signals** about the cursor.
+///
+/// # Why the caller supplies this rather than the status
+///
+/// Gmail's staleness signal cannot be read from a status alone: a `startHistoryId` outside the retained range
+/// returns an ordinary **`404`**, and the error guide documents `404` as "the requested resource couldn't be
+/// found" with **no `reason` code** that distinguishes a pruned history from an absent mailbox. So "this status
+/// means the cursor is unusable" is an inference that depends on **which method was called**, and only the
+/// caller knows that. Requiring the signal makes the inference a caller's explicit act instead of a comparison
+/// hidden inside a function that never saw the request.
+///
+/// **This type is the fix for a real gap**: `advance_gmail_history` used to take only `next_history_id`, so
+/// [`SyncAdvance::HistoryPruned`] — the documented remedy for a stale cursor — was **unreachable**, and
+/// [`SyncAdvance::TokenInvalidated`] was unreachable for Calendar the same way.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncSignal {
+    /// The read succeeded, and the response carried this position when it had one.
+    ///
+    /// `None` means the mailbox was unchanged since the cursor, which is an ordinary outcome rather than a
+    /// failure — a caller that had to invent a position for it would store a guess.
+    Advanced {
+        /// The provider's new position, when it stated one.
+        history_id: Option<String>,
+    },
+    /// The provider's answer means the cursor can no longer be used.
+    ///
+    /// One variant for both providers because the *signal* is one thing — "this position is dead" — while the
+    /// reason differs: Gmail prunes history, Calendar invalidates a token. Each `advance_*` function names its
+    /// own reason, so the distinction is not lost.
+    CursorUnusable,
+    /// The provider refused for a reason that is neither of the above, with the caller's classification.
+    ///
+    /// Carried rather than swallowed, so a caller can report *why* rather than an unexplained failure to
+    /// advance. The caller classifies because it is the component that has the response body.
+    Refused(RetryDecision),
+}
+
 /// **Not `Copy`**, unlike the enums around it, and the reason is [`Self::Refused`]: it carries a
 /// [`RetryDecision`], which holds an optional provider request id — a `String`. Losing `Copy` is the honest
 /// cost of carrying *why* rather than a bare verdict.
@@ -392,15 +429,27 @@ pub struct CursorOutcome {
     pub cursor: Option<SyncCursor>,
 }
 
-/// Advances a Gmail history cursor from a response's status.
+/// Advances a Gmail history cursor from what the provider's answer **signalled**.
 ///
-/// Returns [`SyncAdvance::Advanced`] with the supplied `next_history_id` on a success, or
-/// [`SyncAdvance::HistoryPruned`] on a **404**, which the Gmail sync guide documents as a `startHistoryId`
-/// outside the retained window requiring a full sync.
+/// A read that succeeded advances the cursor. [`SyncSignal::CursorUnusable`] — which the caller produces from a
+/// **`404` on `users.history.list`**, the status the Gmail sync guide documents as a `startHistoryId` outside
+/// the retained window — requires a full sync, so the previous cursor is **not** carried forward: a caller must
+/// not resume from a position the provider has already rejected.
 ///
-/// The caller must only use this for `users.history.list`: a 404 from `users.messages.get` means the message
-/// does not exist, and mapping that to a resync would discard a whole sync over one missing message. The
-/// function's name says `history` for that reason.
+/// **The caller must only produce `CursorUnusable` for `users.history.list`.** A `404` from
+/// `users.messages.get` means the message does not exist, and mapping that to a resync would discard a whole
+/// sync over one missing message. That is why the signal is a parameter: only the caller knows which method it
+/// called, and the inference from a `404` to "history pruned" is exactly the part that depends on it.
+///
+/// # Why a `404` may be read as pruned even though it is ambiguous
+///
+/// Google documents **no `reason` code** for a `404` on this call, so "history pruned" cannot be *proved* from
+/// the response — a `404` is equally what an absent mailbox returns. The two readings **converge by
+/// consequence**, and that is what makes the choice safe rather than merely convenient: if the history was
+/// pruned, the full sync is the documented remedy; if the mailbox is genuinely gone or the account is
+/// disconnected, the full sync's own first call fails and *that* surfaces the truth. The wrong reading is
+/// therefore **self-correcting**, and its worst case is one extra `messages.list` call rather than a store that
+/// resumes from a dead position and reports itself in sync.
 ///
 /// # Errors
 ///
@@ -408,12 +457,29 @@ pub struct CursorOutcome {
 /// provider-issued text that becomes a request parameter.
 pub fn advance_gmail_history(
     previous: &SyncCursor,
-    next_history_id: Option<&str>,
+    signal: &SyncSignal,
     account: &AccountReference,
     connector_version: &ConnectorVersion,
     now: UtcTimestamp,
 ) -> Result<CursorOutcome, CursorError> {
-    let Some(history_id) = next_history_id else {
+    let history_id = match signal {
+        SyncSignal::Advanced { history_id } => history_id.as_deref(),
+        SyncSignal::CursorUnusable => {
+            return Ok(CursorOutcome {
+                advance: SyncAdvance::HistoryPruned,
+                // No cursor. Carrying the old one forward would invite a caller to resume from the position the
+                // provider just rejected, which is the defect this arm exists to prevent.
+                cursor: None,
+            });
+        }
+        SyncSignal::Refused(decision) => {
+            return Ok(CursorOutcome {
+                advance: SyncAdvance::Refused(decision.clone()),
+                cursor: None,
+            });
+        }
+    };
+    let Some(history_id) = history_id else {
         // No new id means the mailbox is unchanged since the cursor. That is an ordinary outcome, not a
         // failure, and the previous cursor is returned unchanged rather than replaced by a guess.
         return Ok(CursorOutcome {
@@ -448,23 +514,38 @@ pub fn advance_gmail_history(
     })
 }
 
-/// Advances a Calendar sync cursor from a response's status.
+/// Advances a Calendar sync cursor from what the provider's answer **signalled**.
 ///
-/// Calendar's staleness signal is unambiguous: **410 Gone** invalidates the token and requires a full wipe,
-/// while **400** is a disallowed query restriction — a caller's mistake, not a stale token — so it is refused
-/// as a permanent error rather than triggering a resync.
+/// Calendar's staleness signal is unambiguous where Gmail's is not: **410 Gone** invalidates the token and
+/// requires a full wipe, while **400** is a disallowed query restriction — a caller's mistake, not a stale
+/// token — so it is refused through [`SyncSignal::Refused`] rather than triggering a resync.
 ///
 /// # Errors
 ///
 /// Returns [`CursorError`] when the new token is unusable.
 pub fn advance_calendar_sync(
     previous: &SyncCursor,
-    next_sync_token: Option<&str>,
+    signal: &SyncSignal,
     account: &AccountReference,
     connector_version: &ConnectorVersion,
     now: UtcTimestamp,
 ) -> Result<CursorOutcome, CursorError> {
-    let Some(token) = next_sync_token else {
+    let token = match signal {
+        SyncSignal::Advanced { history_id } => history_id.as_deref(),
+        SyncSignal::CursorUnusable => {
+            return Ok(CursorOutcome {
+                advance: SyncAdvance::TokenInvalidated,
+                cursor: None,
+            });
+        }
+        SyncSignal::Refused(decision) => {
+            return Ok(CursorOutcome {
+                advance: SyncAdvance::Refused(decision.clone()),
+                cursor: None,
+            });
+        }
+    };
+    let Some(token) = token else {
         return Ok(CursorOutcome {
             advance: SyncAdvance::Advanced,
             cursor: Some(previous.clone()),
@@ -490,17 +571,34 @@ pub fn advance_calendar_sync(
 ///
 /// Separated from [`advance_calendar_sync`] because it answers a question about a **failure** while that
 /// function answers one about a success, and a caller needs both: it will see the 410 in its own error path.
+/// The result is what the caller passes as [`SyncSignal::CursorUnusable`], so the inference and the decision
+/// stay adjacent rather than one being hidden inside the other.
 #[must_use]
 pub const fn calendar_status_requires_resync(status: u16) -> bool {
     status == 410
 }
 
-/// Returns whether a Gmail history status means the history was pruned.
+/// Returns whether a Gmail **`history.list`** status cannot prove the cursor is unusable.
 ///
-/// The same 404 a missing resource returns, which is why this is a **named predicate** rather than an inline
-/// comparison: the caller must apply it to `history.list` only, and a name that says `history` is the doc.
+/// # This reverses an earlier answer, and the reversal is the finding
+///
+/// An earlier version of this function was named `gmail_history_status_is_pruned` and returned
+/// `status == 404`. That **asserted** the distinction Finding 2 in `docs/research/integrations/google.md`
+/// says cannot be made: the sync guide documents a `404` for a `startHistoryId` outside the retained range,
+/// while the error guide documents `404` as "the requested resource couldn't be found" with **no `reason`
+/// code** — so the same status, with the same code, is what an absent mailbox returns. A predicate that says
+/// "pruned" is claiming knowledge the response does not carry, and a caller reading it would believe the
+/// connector had distinguished two cases it never distinguished.
+///
+/// So the predicate now answers what can actually be read: **"this status carries no distinguishing
+/// information"**. A caller still resyncs on it — see [`advance_gmail_history`] for why that is safe — but it
+/// does so through [`SyncSignal::CursorUnusable`], which is a deliberate act, rather than through a name that
+/// implied the question was settled.
+///
+/// `404` is the one status where a resync may be warranted; `429` and the `5xx` family are retryable and a
+/// resync would discard a working store over a transient failure.
 #[must_use]
-pub const fn gmail_history_status_is_pruned(status: u16) -> bool {
+pub const fn gmail_history_status_cannot_prove_usable(status: u16) -> bool {
     status == 404
 }
 
