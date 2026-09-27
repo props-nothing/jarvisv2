@@ -3435,6 +3435,68 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     not shape**, so a fixture is not validated against the schema it feeds (the *rendering* now is, which is a
     different join); and **`_shape_documented_at` is a URL nothing re-checks**, so a fixture can drift from the
     page it cites with no assertion failing.
+  - **This round built the token exchange — the "connection setup" half, which was the least built part.**
+    `crates/jarvis-connectors/src/google/token.rs` + `token_tests.rs` (25 new tests, so **278 in the crate**).
+    Until now a connector could *start* a flow and *classify* a refresh and could not complete a first
+    authorization. **`ADR-0064`.**
+  - **⭐ THE FINDING: OAUTH ANSWERS FROM THE BODY AND NOT FROM THE STATUS — THE OPPOSITE OF THE REST OF THIS
+    CRATE.** Everywhere else here a refusal is read from the status: `client::classify` switches on the code and
+    `TransportResponse::is_success` is `status == 200`. RFC 6749 §5.1 puts the token parameters in a *successful*
+    body, and §5.2 makes a failure an `error` parameter with those parameters **omitted** — so the presence of
+    `error` is what makes an answer a refusal, and a `400` **without** one is a proxy's page or a misrouted
+    request. A status-first reading would report "the server refused" and attribute a decision to a server that
+    never made one. The status keeps exactly one bit: `5xx` marks the refusal transient, because RFC 6749 §5.2's
+    codes describe the *request* and cannot say whether the server is unwell — that is the transport's
+    observation.
+  - **⭐⭐ I WROTE THE EXACT BUG `ADR-0061` EXISTS TO PREVENT, IN THE FIRST DRAFT OF THIS MODULE.**
+    `parse_answer` read `access_token` into an owned `String` and then dropped it, with a comment saying so. It
+    satisfies the letter of the rule and breaks its purpose: an owned copy existed, **with a lifetime**, in a
+    function whose other outputs are `Debug`-printed. The rule is about **copies, not lifetimes**, so the draft
+    was replaced — `parse_answer` now asks only whether a non-empty token is *present* (`.is_some_and`, producing
+    a `bool`) and never binds the bytes to a named value, and `Granted` has **no field for them**: a field would
+    be a second, unredacted copy of the credential in a value the rest of the crate prints. A test renders a
+    granted answer and asserts **neither** the access token **nor** the refresh token appears.
+  - **A refusal is a VARIANT, not an error, and the three outcomes stay apart.** An **unreadable** `400` (HTML,
+    or JSON with neither a token nor an error) is `TokenRequestError::Body` — not `Refused`, which would invent a
+    provider decision, and not a transport failure, which would claim unreadability when the provider answered.
+    A grant that *completed* but is unusable (`token_type` not `Bearer`, or a lifetime past the bound) is
+    `UnusableGrant` rather than `Refused`, because saying the provider declined would be false. And
+    `TokenEndpointAnswer`'s two accessors are **disjoint** — exactly one of `response()` and `failure()` is
+    `Some` — which is asserted, because it is the property the whole split rests on.
+  - **The transient check precedes the error code, and both halves are asserted.** A provider behind a proxy can
+    answer a `503` through the protocol's own channel carrying `invalid_grant` — a real shape — so reading the
+    code first would send a user to a consent screen **during an outage**, which finds the same failure and looks
+    like a broken connector. The test asserts the ordering **and** the control: the same code without the outage
+    **is** the user's problem, so the rule is not simply "ignore the code".
+  - **The rotation rule is about ARRIVAL, never about storage.** `invalid_grant` covers "invalid, expired,
+    revoked, does not match the redirection URI, or was issued to another client" and the protocol does not say
+    which — so `vendor_says_revoked` is a **parameter**, and a refresh is `Rotated` by whether new material
+    arrived rather than by whether the caller stored it. A caller that failed to store one has a defect of its
+    own, and reporting `Refreshed` would hide the half of the exchange that makes replay detectable.
+  - **The request is a parameter LIST, not an `HttpRequest`, and there is no `client_secret` field anywhere.**
+    `HttpRequest` is a `GET` with no body and no credential field *by design*, so forcing a credential-bearing
+    form `POST` into it would undo `ADR-0060`. The list has no `Display` and no `Serialize`. The parameter set is
+    asserted as an exact **set**, so an added parameter is a failing test — and the manifest's **empty
+    `secret_fields`** and this request now cannot disagree, because there is no field to put a secret in.
+  - **`Secret` refuses the paste mistake at construction, ordered by actionability.** Empty, oversized,
+    whitespace-containing, and control-containing are four separate reasons; the specific case is a **trailing
+    newline from a paste**, which reaches the provider as a different string and surfaces as a generic auth
+    failure that sends a reader to debug the credential's *validity* instead of its *shape*. A PKCE verifier is
+    separately checked against RFC 7636's 43–128 bounds **and** its unreserved alphabet, because a verifier
+    outside it produces a challenge mismatch that looks like a PKCE bug.
+  - **⭐ FOUR GUARDS FALSIFIED WITH COMPILING MUTANTS.** Ignoring the `error` parameter → **8 tests detected**;
+    letting the outage lose precedence to the error code → **2**; never reporting a rotation → **2**; dropping
+    the credential-shape whitespace check → **2**. Tree verified clean with `git diff --stat` afterwards.
+  - **NEW LIMITS:** **no request is sent and no token has ever been obtained** — there is no transport for a
+    form `POST`, and the fixtures do **not** yet include a token response; **the access token deliberately never
+    reaches a value, so a caller must read it from the response body itself**, which means those bytes exist
+    outside this module's boundary where it cannot enforce anything about them; **no ID-token verification**, so
+    the `nonce` `P5-002` carries is still unvalidated; **no DPoP**, which needs a non-exportable key and is a
+    decision rather than a header; **`redirect_uri` is not validated here** (the flow owns the registered value,
+    so a caller could build a request the flow would refuse); **the parameter list is never tested as a body**,
+    because nothing joins it — the encoding is asserted per value and the joining is not; and the **`client_id`
+    is only checked for non-emptiness**, so a pasted URL or a project number is accepted here and fails at the
+    provider.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
