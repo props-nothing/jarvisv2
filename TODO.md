@@ -3287,6 +3287,70 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     because this type controls its own rendering and not anything derived from it; the length floor is a
     heuristic and proves nothing about validity; and **nothing checks the token is for Google**, because
     provenance is not a property a string carries.
+  - **This round built the transport port and the read operations — the connective tissue that makes every
+    earlier slice reachable.** `crates/jarvis-connectors/src/google/transport.rs` + `transport_tests.rs` and
+    `operations.rs` + `operations_tests.rs` (25 new tests, so **248 in the crate**). **`ADR-0062`.**
+  - **⭐ THE FINDING: "THE REQUEST FAILED" IS NOT ONE CONDITION, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.**
+    `TransportFailure` is `Connect | Send | Body | Timeout | Refused`, and the variants encode **when** the
+    failure happened rather than what it was called. `Send` exists separately from `Connect` because "the
+    request was written and then the connection broke" is not "the request could not be sent"; conflating them
+    is exactly how an ambiguous failure becomes a certain one. `may_have_reached_the_provider()` is `false` for
+    `Connect`/`Refused` and `true` for `Send`/`Timeout`/`Body`, and it is deliberately **not** named
+    `is_certain_nothing_happened` — that reading invites a `true` default in a `match` fallback, and a new
+    variant would then silently become retryable. It is a **wildcard-free `match`**, so a new variant is a
+    compile error rather than a default.
+  - **The subtle case is `Body`: the provider DID answer.** A response whose body could not be read means the
+    request was certainly received and nothing is known about what it did — so grouping it with `Connect` would
+    be the precise mistake the ambiguous variant exists to prevent. Its consequence is asserted, not just its
+    class: `AmbiguousAfterReaching`, which **refuses an automatic retry** — because for a non-idempotent effect
+    a retry is a second effect.
+  - **A refusal is a RESULT, not an error, and the reason is the provider's machine-readable code.** A `403` was
+    received and refused, so it becomes a `ToolCallResult` with a `Failed` outcome. Collapsing a non-2xx into a
+    transport error would lose the status and the `errors[].reason` code, which is everything the next decision
+    needs — and the prose is never carried, because `P3-008c` forbids deriving a decision from message text. A
+    body that cannot be parsed still yields a reason naming the **status**, which is a fact even when the body
+    is not: the difference between "we know little" and "we know nothing".
+  - **⭐ A 200 WHOSE BODY IS UNREADABLE IS `Unknown` — AND A RESULT, NOT AN ERROR.** The status proves the
+    request was answered; the body says nothing about what it produced. Reporting `Confirmed` would claim an
+    effect from a status code and reporting `Failed` would claim nothing happened, so `Unknown` is the only
+    honest reading. It is reached through a returned result rather than an error **because the provider did
+    answer**, and `Unknown` refuses an automatic retry — the consequence that matters.
+  - **The port keeps the credential boundary `ADR-0061` built.** `send` takes `request` and `token` as
+    **separate parameters** rather than one authenticated-request type, because `HttpRequest` may be rendered
+    (its `Display` prints the path and parameter *names*) and `AccessToken` may not; merging them would make a
+    single `{:?}` leak the token. `HttpMethod` is a **closed enum with one variant** — `POST`/`PATCH`/`PUT`/
+    `DELETE` are absent rather than present-and-unused, because a variant nothing constructs is a method a
+    reader assumes is reachable — so `P5-009`'s write grows the enum and turns every `match` into a compile
+    error, which is what makes a new method a deliberate edit.
+  - **The operation layer renders the tool's DECLARED output, not the provider's resource.** `read_output`
+    emits `message_ids`/`event_ids` plus the declared schema's fields, because a parser returning Gmail's
+    `Message` would make `ADR-0059`'s schema a fiction. `next_sync_token` is rendered **separately** from
+    `next_page_token`: the sync token positions a **future** incremental sync while the page token continues the
+    current walk, so merging them would store a cursor that expires with the walk.
+  - **An argument that is supplied but wrong is REFUSED rather than dropped** — the defect `P5-004` records from
+    the other direction, where a value that is present and ignored is indistinguishable from one that was
+    honoured. A `null` is treated as *absent* (that is what a serializer emits for an unset optional field) and
+    accepted; a wrong-typed or out-of-range value is refused. An unknown tool is `NotImplemented` rather than a
+    default, because a fallback would make a mistyped name silently read a mailbox.
+  - **⭐ THREE GUARDS FALSIFIED WITH COMPILING MUTANTS.** Making `Timeout` certain → **4 tests detected**;
+    making `Body` certain → **3 detected**; ignoring the status in the response classifier → **2 detected**
+    (`a_provider_refusal_is_a_result_and_not_an_error`, `a_refusal_with_an_unreadable_body_still_names_the_status`).
+    Each mutant **compiled**, so `FAIL` is a real detection rather than a build failure — the `VACUOUS`/`FAIL`
+    distinction kept, and verified with a `git diff --stat` afterwards because an earlier aborted run had left
+    one mutant in place.
+  - **Limits:** **there is no transport implementation** — the port has a test double and nothing else, so **no
+    request has been sent to Google and no response has been parsed from Google**, and every fixture is
+    constructed from the research record, which means these tests prove the layer implements the *record*, not
+    that the record matches the provider; **the port is synchronous** (an async binding belongs to a caller that
+    owns a runtime, and nothing here has one — a `reqwest` transport blocking inside an async context would be
+    the defect `P2-007` records from the other direction); **no credential is minted, refreshed, or expiry-checked**
+    (`execute` takes an `AccessToken` it did not obtain); **no deadline is applied** (the signature takes no
+    cancellation token, so "an implementation must bound its own wait" is a requirement on an implementation
+    that does not exist); **`Retry-After` is carried and never interpreted**, so a transport could report it and
+    a caller could ignore it with no test failing; **`evidence_from` has no caller in this crate** (provider
+    evidence locates an *effect* and a read produces none, so it exists for `P5-009`); **the output rendering is
+    not validated back through the schemas it claims to match**; and **nothing dispatches to `GoogleReadTool`**,
+    so the tool is reachable from a test and not from a run.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
