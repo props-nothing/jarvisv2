@@ -39,6 +39,7 @@ pub mod credential;
 pub mod definitions;
 pub mod operations;
 pub mod request;
+pub mod revocation;
 pub mod token;
 pub mod transport;
 

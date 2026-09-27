@@ -82,3 +82,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0062](0062-an-unanswered-request-is-classified-by-whether-it-reached-the-provider.md) | An unanswered request is classified by whether it may have reached the provider | Accepted |
 | [0063](0063-a-wire-fixture-declares-whether-it-is-a-capture-or-a-shape.md) | A wire fixture declares whether it is a capture or a shape | Accepted |
 | [0064](0064-a-token-answer-is-read-from-its-body-and-its-token-is-never-copied.md) | A token endpoint's answer is read from its body, and the token it grants is never copied into a value | Accepted |
+| [0065](0065-a-protocol-type-stays-correct-when-a-provider-disagrees.md) | A protocol type stays correct when a provider disagrees with it | Accepted |

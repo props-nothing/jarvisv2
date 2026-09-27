@@ -3497,6 +3497,62 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     because nothing joins it — the encoding is asserted per value and the joining is not; and the **`client_id`
     is only checked for non-emptiness**, so a pasted URL or a project number is accepted here and fails at the
     provider.
+  - **This round built revocation — the teardown half of connection setup — and found a contract contradiction.**
+    `crates/jarvis-connectors/src/google/revocation.rs` + `revocation_tests.rs` (11 new tests, so **289 in the
+    crate**). **`ADR-0065`.**
+  - **⭐⭐ THE FINDING: `RevocationKind::requires_reauth_afterwards()` IS WRONG FOR GOOGLE, AND THE SHARED TYPE IS
+    RIGHT ABOUT THE PROTOCOL.** `P5-002` reads RFC 7009 correctly: `token_type_hint` **selects which token** is
+    revoked, so revoking the access token leaves the grant intact and `AccessToken.requires_reauth_afterwards()`
+    returns `false`. Google's own page (last updated **2026-09-14**) says the opposite twice: revoking an access
+    token **also revokes the paired refresh token**, and revocation "removes **all** OAuth 2.0 scopes previously
+    granted to a **project**, invalidating any issued access or refresh tokens for **all clients registered under
+    that project**". So on Google **no** revocation kind leaves the account usable, and a caller that trusted the
+    shared `false` would tell a user their connection was disconnected-but-authorised while the account in fact
+    needs a new consent. The shared type is **not changed** — it is provider-agnostic and correct — and the
+    provider's answer lives in `effect_of`, with a test asserting **both sides and their divergence**, so a change
+    to either fails rather than silently re-opening the gap.
+  - **⭐ THE LINT IMPROVED THE DESIGN, AND IT WAS A REAL SIGNAL RATHER THAN NOISE.** `clippy::struct_excessive_bools`
+    fired on a five-bool `RevokedEffect`, and it was right: `refresh_invalidated: false` could not distinguish
+    *the refresh token survived* from *the account never had one* — two facts with opposite consequences, one of
+    which would tell a user their refresh token was revoked when it never existed. So `MaterialState` has three
+    variants (`Invalidated`, `Absent`, `Untouched`), where `Untouched` is never produced for this provider and
+    exists so "we do not know" is representable rather than rounded. Likewise `EffectTiming { Immediate,
+    MayTakeTime }` rather than a `bool`: "it might take some time" is the whole content of the distinction.
+  - **`requires_reauth` is DERIVED from the grant's removal, not stored beside it.** With the scopes gone there is
+    no consent to reuse and no refresh token to mint from, so needing a person follows from `scopes_removed`. A
+    separate stored field would be a second value that must agree with the first — the defect class this repo
+    keeps recording — and a mutant that hard-codes it is detected by 3 tests.
+  - **A `200` means ACCEPTED, not IN FORCE.** "Following a successful revocation response, it might take some
+    time before the revocation has full effect." A caller must not treat it as proof that a concurrent call will
+    now fail, and **a test that asserted it would be flaky against the provider itself** — which is why the
+    timing is a state a caller reads rather than a comment.
+  - **An unreachable provider is never reported as revoked.** `parse_revocation_answer` takes `reached`
+    **separately from the status**, because a transport cannot say "the provider refused" and "nothing answered"
+    with one value. `Unreachable.is_withdrawn()` is `false`, so a `200` that was never received cannot read as
+    success — the overclaim direction worth designing against. Likewise a **gateway's `502`** classifies as a
+    refusal (the provider *was* reached, through something) and `status_is_documented` lets a caller tell the
+    documented `200`/`400` pair from a layer in front of the endpoint.
+  - **A `200` cannot report "already invalid", and the gap is stated rather than papered over.** RFC 7009 §2.2
+    makes `200` cover both success and "the client submitted an invalid token", so the status carries **no signal
+    about whether the token was live**. `AlreadyInvalid` stays reachable out of band but is **not derived from a
+    response**, because inventing it from the status would read a fact out of a response that does not carry it.
+  - **⭐ FOUR GUARDS FALSIFIED WITH COMPILING MUTANTS.** Hard-coding `requires_reauth` to `false` → **3 tests
+    detected**; collapsing `Absent` into `Invalidated` → **2**; claiming an immediate effect → **2**; letting an
+    unreachable provider read as `Revoked` → **2**. One first attempt was `VACUOUS` (a move error, not a test
+    failure) and was replaced with a compiling mutant — the `VACUOUS`/`FAIL` distinction kept, tree verified
+    clean with `git status` afterwards.
+  - **NEW LIMITS:** **no request is sent and nothing has been revoked** — there is no transport for a form `POST`,
+    so no `200` has been seen and the behaviour is derived from documentation and the RFC; **the divergence is
+    documented, not measured** — confirming that Google revokes the paired refresh token would need a live grant
+    and deliberately destroying it, so a provider whose *behaviour* differed from its *documentation* would not be
+    caught; **`has_refresh_token` is the caller's claim about its own store**, and answering `false` incorrectly
+    narrows the reported effect; **`RevocationKind::Grant` cannot be performed in one call to a strictly
+    conforming server** (RFC 7009 revokes one token at a time), so relying on Google's single-call behaviour is a
+    recorded provider property rather than an encoded one; **nothing handles the multi-account consequence** — the
+    module reports the blast radius is the project, and no type holds the set of *other* accounts whose grants
+    were withdrawn; **`takes_effect_later` has no duration**, so nothing can schedule a verification or re-check a
+    revocation; and **revocation is not wired to anything** — no route, command, or teardown path calls this
+    module, so a disconnect is still not something a deployment can perform.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

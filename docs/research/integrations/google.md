@@ -182,13 +182,28 @@ the server's own published configuration.
   provider that *does* return one would otherwise go unnoticed.
 - **Revocation is `https://oauth2.googleapis.com/revoke` with the token as a parameter**, HTTP 200 on success and
   400 on error, and "the token can be an access token or a refresh token. If the token is an access token and it
-  has a corresponding refresh token, the refresh token will also be revoked". **`P5-002`'s `RevocationKind`
-  `token_type_hint` is therefore about which token to present, not about scope of effect.**
-- **⚠ Revocation's blast radius is wider than one account.** The page states: "Revocation removes all OAuth 2.0
-  scopes previously granted to a project, invalidating any issued access or refresh tokens for all clients
-  registered under that project." And "it might take some time before the revocation has full effect". A
-  connector that revokes to disconnect *one* account must not assume the effect is limited to that account's
-  grant — the unit Google revokes by is the **project**.
+  has a corresponding refresh token, the refresh token will also be revoked".
+- **⚠⚠ THE FINDING THAT DECIDES HOW A DISCONNECT MUST BE REPORTED: Google's revocation is NOT RFC 7009's, and
+  `RevocationKind::requires_reauth_afterwards()` IS WRONG FOR THIS PROVIDER.** RFC 7009 has `token_type_hint`
+  select *which token* is revoked, so revoking the access token leaves the grant intact — and
+  `RevocationKind::AccessToken.requires_reauth_afterwards()` returns `false` on exactly that assumption. Google's
+  own page (last updated **2026-09-14**) says the opposite in two places: revoking an access token **also
+  revokes the paired refresh token**, and revocation "removes **all** OAuth 2.0 scopes previously granted to a
+  **project**, invalidating any issued access or refresh tokens for **all clients registered under that
+  project**". So on Google no revocation kind leaves the account usable, and a connector that trusted the shared
+  `false` would tell a user their connection was disconnected-but-authorised when the account in fact needs a new
+  consent. The shared type is **correct about the protocol** and is therefore **not changed**; the provider's
+  answer lives in `google::revocation::effect_of`, and a test **asserts the divergence** so that a change to
+  either side fails rather than silently re-opening the gap.
+- **⚠ The blast radius is wider than one account, and it is not immediate.** The documented unit is the
+  **project**, so a connector that revokes to disconnect *one* account must not assume the effect is limited to
+  that account's grant — it can withdraw grants belonging to other accounts and other clients in the same Cloud
+  project. And "it might take some time before the revocation has full effect", so a `200` means **accepted**
+  rather than **in force**: a caller must not treat it as proof that a concurrent call will now fail, and a test
+  that asserted it would be flaky against the provider itself.
+- **A `200` also covers "the client submitted an invalid token"** (RFC 7009 §2.2, which this endpoint follows),
+  so the status carries **no signal about whether the token was live**. `RevocationOutcome::AlreadyInvalid`
+  therefore cannot be derived from a response and is not invented from one.
 - **DPoP is optional and recommended, and it changes the key-material obligation rather than a parameter.** A
   successful token request with a `DPoP` header binds the **refresh token** to the key while access tokens keep
   `token_type: Bearer`. For a code exchange the `jti` must be `BASE64URL(SHA256(AUTHORIZATION_CODE))`, and a
