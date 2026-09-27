@@ -2716,7 +2716,72 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 
 ## P5: Connectors
 
-- [ ] `P5-001` Define connector manifest, account, auth flow, health, sync cursor, webhook, rate-limit, scope, and diagnostics contracts.
+- [x] `P5-001` Define connector manifest, account, auth flow, health, sync cursor, webhook, rate-limit, scope, and diagnostics contracts.
+      **New crate `crates/jarvis-connectors`** (8 modules, **80 tests**), an adapter depending only on
+      `jarvis-core` + `jarvis-tools`. `ADR-0054`.
+      The manifest is a *security* document: `docs/architecture/tools-and-connectors.md`'s "parseable without
+      loading provider code" is a **trust** requirement, not a packaging one, because the manifest is the only
+      artifact an operator reads before granting access and the provider code it describes is what has *not*
+      run. So the module's job is not to list fields but to **check its own claims against each other**:
+      - **Effects are per operation and the classification is cross-checked.** A connector whose operations
+        reach outward may not declare `Public` or `Internal` — those are exactly the levels
+        `Classification::may_reach_a_remote_model` permits, so the combination mislabels content leaving the
+        machine. The rule is a **floor, not an equality**: a mail connector legitimately declares
+        `Confidential` because what it *handles* is confidential, and requiring equality would push every
+        outward connector to the top of the ladder, making the classification meaningless. Tested in all three
+        directions (two low levels refused, three high accepted, a read-only connector allowed `Internal`).
+      - **A secret is a *field name*, never a value.** No `String` in the crate holds token material; that
+        absence is the mechanical form of `security.md`. Names are environment-variable-shaped because they
+        become config keys, and a name that could not be one would fail at deployment.
+      - **Documentation links must discharge the research requirement.** `LinkKind`'s variants *are*
+        `external-research.md`'s ordered source list (`LlmsTxt`, `Documentation`, `Specification`, `Sdk`, …), so
+        a manifest with only a homepage is **incomplete rather than terse** — `satisfies_research_requirement()`
+        must be true for at least one link. Plus a `ResearchRecord` path that is refused if absolute or holding
+        `..`/`:`.
+      - **The risk floor is checked here**, the first place an operation's risk is stated. Deliberately *not*
+        checked: `P3-001`'s blind-retry rule — a non-idempotent outward operation is legitimate and common, and
+        **this type carries no retry policy to disagree with**. That pairing becomes expressible in `P5-009`;
+        the boundary is written down so a later reader does not "fix" it by refusing every write connector.
+      - **A cursor's *kind* names what may be concluded from it.** `Start` is a variant with **no token**, not
+        "no cursor yet", and a `Start` carrying a token is refused because it makes *never synced* and *synced
+        to here* indistinguishable — the one distinction the type exists to keep. Bound to the account **and
+        connector version** (`applies_to`), since a 1.0.0 cursor applied after a 2.0.0 upgrade is a silent
+        misread.
+      - **Health carries its probe, and staleness takes a *supplied* instant.** A state without its probe is an
+        assertion with no evidence: "connected" by an identity call and by a subscription are different claims.
+        `unix_nanos` comparison, not RFC 3339 text (`P3-004`'s trap: a zero fraction makes the text not sort).
+      - **`Unknown` never permits a call, and `RetryClass::Unknown` never retries whatever the idempotency
+        says.** Two rules, one shape: *the unanswered question refuses*. `Transient`/`Throttled`/`ProviderFault`
+        delegate to the provider's idempotency claim; `Unknown` returns false in **every** column because the
+        question is unanswered rather than because the provider said no.
+      - **A webhook body is raw bytes, and an ambiguous security header is refused rather than picked.**
+        `single_header` returns `None` for zero **and** for more than one: a repeated security header is either
+        an accident or an attack, and taking the first turns *two signatures disagree* into *one was valid*.
+        Only `Replayed` is acknowledged to the provider, so a genuine retry stops and a forgery gets no signal.
+      - **The diagnostics field set is closed so `is_loggable()` is true for all twenty.** The constancy is the
+        point — a field needing an exception would mean a value in the type was not safe to log.
+        `may_reach_a_model()` is false only for `ProviderRequestId`, and **not because it is a secret** but
+        because `security.md` minimizes what reaches a model rather than deciding per call site. A cursor's
+        token is never a field, only its kind and observation time.
+      - **PKCE against RFC 7636's own numbers**, with the S256 challenge asserted on **Appendix B's published
+        vector** rather than a second implementation of the same mistake. `is_loopback_redirect` matches whole
+        hosts over `http://` only, since a substring check accepts `127.0.0.1.evil.example`.
+      **Two defects this slice found in itself, both from writing the tests, both an implementation disagreeing
+      with its own doc comment:** `VerifiedAccount::new` checked `is_empty()` rather than `trim().is_empty()`, so
+      `"  "` — an identifier whose whole purpose is to be usable — was accepted; and `ConnectorHealth::is_fresh_at`
+      rejected only `checked_sub`'s overflow, so **a future observation was reported as fresh**, letting a record
+      whose clock moved backwards look current.
+      **All 12 guards falsified in an A-B-A design** (guard intact *passes* → neutered *fails* → restored
+      *passes*). A′ is load-bearing: restoring with `Copy-Item` sets the mtime **backwards**, older than the
+      mutant build, so cargo can run the stale mutant again — which happened here and produced a false
+      "SURVIVED" for a guard whose test does catch it. The first harness also produced two false verdicts
+      because the *mutant* was wrong, not the guard (`elapsed < -1000000` is still true one second in the
+      future; one probe mutated `needs_full_resync_when_lost` while the test exercised `requires_full_resync`).
+      **Limits:** **nothing consumes this crate** — no `Connector` trait, no HTTP, no RNG (so no code path
+      *generates* a verifier), no loopback listener, no `SecretStore`, no persistence, no daemon wiring
+      (`P5-002`+). No signature is verified (`P5-010`), no pagination is followed, no rate limit is enforced,
+      and the manifest checks **self-consistency, not truth**: a connector that lies consistently is caught by
+      review and the recorded research, not by a type. The ceilings are chosen, not measured.
 - [ ] `P5-002` Implement shared OAuth 2.0 Authorization Code plus PKCE flow, state/nonce validation, loopback callback, refresh rotation, revocation, and secret references.
 - [ ] `P5-003` Create connector quality checklist and scaffold generator modeled on manifest-driven integration projects.
 - [ ] `P5-004` Research Google identity, Gmail, Calendar, push notifications, quotas, and restricted scopes; record findings.

@@ -3,6 +3,7 @@ members = [
     "apps/jarvis-cli",
     "apps/jarvisd",
     "crates/jarvis-application",
+    "crates/jarvis-connectors",
     "crates/jarvis-core",
     "crates/jarvis-diagnostics",
     "crates/jarvis-mcp",
@@ -57,6 +58,7 @@ http = { version = "1.5", default-features = false }
 http-body = "1.0"
 http-body-util = "0.1.5"
 jarvis-application = { path = "crates/jarvis-application", version = "0.1.0" }
+jarvis-connectors = { path = "crates/jarvis-connectors", version = "0.1.0" }
 jarvis-core = { path = "crates/jarvis-core", version = "0.1.0" }
 jarvis-diagnostics = { path = "crates/jarvis-diagnostics", version = "0.1.0" }
 jarvis-mcp = { path = "crates/jarvis-mcp", version = "0.1.0" }

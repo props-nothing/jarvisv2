@@ -71,3 +71,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0051](0051-the-query-is-shaped-by-the-index.md) | The query is shaped by the index, and a vector the index cannot hold is refused | Accepted |
 | [0052](0052-an-entity-is-read-from-the-store-not-invented.md) | An entity is read from the store, never invented from a request | Accepted |
 | [0053](0053-pgvector-indexes-a-partial-cast-expression.md) | pgvector indexes a partial cast expression, and the vector's width is a capability | Accepted |
+| [0054](0054-a-connector-is-described-before-it-is-trusted.md) | A connector is described before it is trusted, and its declarations are checked against each other | Accepted |

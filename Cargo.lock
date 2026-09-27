@@ -1198,6 +1198,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-connectors"
+version = "0.1.0"
+dependencies = [
+ "jarvis-core",
+ "jarvis-tools",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "jarvis-core"
 version = "0.1.0"
 dependencies = [
