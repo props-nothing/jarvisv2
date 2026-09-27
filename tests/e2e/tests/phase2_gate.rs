@@ -163,19 +163,29 @@ fn binary(name: &str) -> Option<PathBuf> {
 }
 
 fn required_binaries() -> Option<(PathBuf, PathBuf)> {
-    let daemon = binary("jarvisd");
-    let client = binary("jarvis");
-    if let (Some(daemon), Some(client)) = (daemon, client) {
-        return Some((daemon, client));
+    match (binary("jarvisd"), binary("jarvis")) {
+        (Some(daemon), Some(client)) => Some((daemon, client)),
+        (daemon, client) => {
+            // Name the artifact that is actually absent. `cargo test --workspace` builds neither, so a
+            // message that names both leaves the reader to work out which command is missing -- and an
+            // earlier version of this harness proved the cost of that, by being run in the `cargo test
+            // --workspace` step and failing on three operating systems at once.
+            let missing = match (&daemon, &client) {
+                (None, _) => "jarvisd",
+                (Some(_), None) => "jarvis",
+                (Some(_), Some(_)) => unreachable!("both binaries are handled above"),
+            };
+            let message = format!(
+                "the phase 2 gate requires the built {missing} binary; run `cargo build --workspace` first"
+            );
+            assert!(
+                std::env::var_os(REQUIRE_BINARIES_ENV).is_none(),
+                "{message}"
+            );
+            eprintln!("SKIP: {message}");
+            None
+        }
     }
-
-    let message = "the phase 2 gate requires built jarvisd and jarvis binaries";
-    assert!(
-        std::env::var_os(REQUIRE_BINARIES_ENV).is_none(),
-        "{message}; run `cargo build --workspace` first"
-    );
-    eprintln!("SKIP: {message}; run `cargo build --workspace` first");
-    None
 }
 
 /// A running daemon that is terminated when dropped.

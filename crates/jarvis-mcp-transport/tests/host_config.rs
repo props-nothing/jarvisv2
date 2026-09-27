@@ -105,7 +105,13 @@ fn request_for(
 }
 
 /// Environment variable that turns a missing-fixture skip into a failure.
-const REQUIRE_BINARIES_ENV: &str = "ACCEPTANCE_REQUIRE_BINARIES";
+///
+/// Deliberately the `fixture-peer` name, **not** `ACCEPTANCE_REQUIRE_BINARIES`: that one belongs to
+/// the process-level gates, which require the application binaries `jarvisd` and `jarvis`. The two
+/// are different artifacts — `--all-features` builds this fixture, `--workspace` builds the
+/// applications into a directory the test executable is not in — so one name for both made the
+/// workspace test step assert a binary it never produces.
+const REQUIRE_FIXTURE_PEER_ENV: &str = "ACCEPTANCE_REQUIRE_FIXTURE_PEER";
 
 /// Locates the `fixture-peer` binary beside the current test executable.
 fn fixture_binary() -> Option<PathBuf> {
@@ -126,7 +132,7 @@ fn fixture_or_skip() -> Option<PathBuf> {
     if let Some(path) = fixture_binary() {
         return Some(path);
     }
-    let required = std::env::var(REQUIRE_BINARIES_ENV).is_ok_and(|value| value == "1");
+    let required = std::env::var(REQUIRE_FIXTURE_PEER_ENV).is_ok_and(|value| value == "1");
     assert!(
         !required,
         "the fixture-peer binary is missing; run \

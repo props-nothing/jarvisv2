@@ -119,14 +119,22 @@ jobs:
         # `shell: bash` because the default shell on windows-latest is PowerShell, where
         # redirecting a native command's stderr fails the step even on success.
         #
-        # `ACCEPTANCE_REQUIRE_BINARIES` turns a *skip* into a failure. The stdio tests in
+        # `ACCEPTANCE_REQUIRE_FIXTURE_PEER` turns a *skip* into a failure. The stdio tests in
         # `jarvis-mcp-transport` exercise `connect_stdio` against a real child process and
         # skip when the fixture binary is absent; `--all-features` builds it, so the skip
         # cannot legitimately happen here, and without this a fixture that silently stopped
-        # being built would make those tests pass by not running. Same pattern, and the same
-        # name, as the phase gates below.
+        # being built would make those tests pass by not running.
+        #
+        # This is deliberately NOT `ACCEPTANCE_REQUIRE_BINARIES`, which the phase gates below
+        # read. That variable is about the APPLICATION binaries `jarvisd` and `jarvis`, and this
+        # step does not build them: `cargo test --workspace --all-features` builds each package's
+        # test harness and the `fixture-peer` binary (`--all-features` enables it), but never
+        # `target/<profile>/jarvisd`, which is where the gate looks. One variable carrying both
+        # meanings made this step assert a binary it never produces, and the Phase 1 gate failed on
+        # every operating system for four consecutive pushes. A variable that turns a skip into a
+        # failure must name the one artifact it is about.
         env:
-          ACCEPTANCE_REQUIRE_BINARIES: "1"
+          ACCEPTANCE_REQUIRE_FIXTURE_PEER: "1"
         shell: bash
         run: cargo test --workspace --all-features --locked > test.txt 2>&1
       - name: Annotate test failures

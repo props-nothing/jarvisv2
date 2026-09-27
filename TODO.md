@@ -1780,6 +1780,39 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     chains, identical `match` arms, an error-type mismatch in the kill path, and a duplicated `linux` module from
     declaring `mod linux;` in both `lib.rs` and `backend.rs` (a `#[path]` module declared twice includes the file
     **twice**, as two modules with distinct copies of every type).
+- [x] `P3-014` Split the overloaded acceptance skip-guard, because one variable described two artifacts and made CI red on every OS.
+      **CI had been red for four consecutive completed runs, and the cause was a configuration value rather than a
+      code defect.** `ACCEPTANCE_REQUIRE_BINARIES` was read by two guards that require *different artifacts produced
+      by different commands*: the process-level phase gates need the application binaries (`jarvisd`, `jarvis`), and
+      the MCP stdio tests need the `fixture-peer` child process. Commit `42f7017` set that single variable on the
+      *Test workspace* step, whose command is `cargo test --workspace --all-features`. That builds each package's test
+      harness and — because `--all-features` enables the `fixture-peer` feature — the fixture binary, but it **never
+      builds `target/<profile>/jarvisd`**, which is one directory above `target/<profile>/deps` where the gate looks.
+      So the skip cannot legitimately happen for the fixture and **always** happened for the application binaries,
+      and the phase 1 gate inside that step asserted on all three runners.
+      **Measured rather than reasoned:** with the application binaries removed, `cargo test -p jarvisd --no-run`
+      compiles `jarvisd` but produces **no `target/debug/jarvisd.exe`** — `cargo test` does not place a package's
+      binary beside its test harness. The failing assertion was reproduced locally by deleting the two binaries and
+      running the gate with the variable set, and it printed the variable's own message ("requires built jarvisd and
+      jarvis binaries") while the real question — which binary, and which command produces it — stayed unstated.
+      **The fix is per-artifact variables.** The MCP guards now read `ACCEPTANCE_REQUIRE_FIXTURE_PEER`; only the two
+      phase-gate steps, which run `cargo build --workspace` first, set `ACCEPTANCE_REQUIRE_BINARIES`. The workspace
+      test step sets the fixture variable only. A skip-guard that turns absence into a failure must name the one
+      artifact it is about, because the failure it reports is otherwise about a build step the reader cannot see.
+      **Both directions were falsified, one property each:** with the fixture binary moved aside and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, the stdio suite fails with its actionable message; with the *old* variable
+      set and the fixture absent, it skips — so the rename is effective rather than merely documented. The phase gate
+      still fails closed when `ACCEPTANCE_REQUIRE_BINARIES=1` and the applications are missing, and skips when it is
+      unset.
+      **Two failure messages were also made diagnostic.** Each phase gate now names the specific absent binary
+      (`jarvisd` or `jarvis`), because the gate cannot know *why* a build is missing and should not imply it does.
+      Docs updated: `docs/development/testing.md` states the per-artifact rule and that `cargo test` does not produce
+      an application binary in `target/<profile>` at all, and
+      `docs/research/integrations/github-actions-rust-supply-chain.md` records the observed failure.
+      **Gates:** `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+      `cargo test --workspace --all-features --locked` **with the application binaries absent** (the exact state the
+      workspace step runs in — 0 skips), both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, and `cargo deny check`
+      all green.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.
 
 ## P4: Memory And Context

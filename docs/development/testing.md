@@ -49,6 +49,18 @@ Set `ACCEPTANCE_REQUIRE_BINARIES=1` to make a missing build fail instead of
 skipping. CI sets it. The variable deliberately avoids the `JARVIS_` prefix, because
 the daemon rejects unknown `JARVIS_*` variables as configuration errors.
 
+**A variable that turns a skip into a failure must name the artifact it is about.** A
+second skip-guard exists for a *different* artifact: the stdio tests in
+`jarvis-mcp-transport` spawn the `fixture-peer` binary, which `--all-features` builds
+and a plain workspace run does not. That guard reads
+`ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`. The two were once one variable named
+`ACCEPTANCE_REQUIRE_BINARIES`, and because the workspace test step runs
+`cargo test --workspace --all-features` — which builds the fixture but **not**
+`target/<profile>/jarvisd` — the phase gate in that step asserted a binary the step
+never produces. It failed on all three operating systems for four consecutive pushes.
+`cargo test` does not build a package's binary into `target/<profile>` at all, so any
+check for an application executable belongs in a step that runs `cargo build` first.
+
 Two properties are worth preserving if this gate is edited:
 
 - **Readiness is scoped to the process.** A hard-terminated daemon never records its

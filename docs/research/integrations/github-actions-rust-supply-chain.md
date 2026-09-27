@@ -52,6 +52,18 @@ prefix, because the daemon rejects unknown `JARVIS_*` variables as configuration
 errors and would refuse to start. This was observed: naming it `JARVIS_REQUIRE_ACCEPTANCE`
 made `jarvisd` exit with `unknown configuration environment variable`.
 
+**The skip-guard variable is per-artifact, and this was learned from a red CI run.**
+The workspace test step sets `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1` for the
+`fixture-peer` child process that `--all-features` builds; only the phase-gate steps,
+which run `cargo build --workspace` first, set `ACCEPTANCE_REQUIRE_BINARIES=1`. When
+one variable carried both meanings, the workspace test step ran `cargo test
+--workspace --all-features` with it set, and the Phase 1 gate inside that run failed
+on Windows, macOS, and Linux: `cargo test` builds a package's test harness and, with
+`--all-features`, the `fixture-peer` binary — but never `target/<profile>/jarvisd`,
+which is where the gate looks. Four consecutive completed runs were red before the
+failure was read; the annotation channel added earlier is what made the assertion
+legible, since the job log itself needs authentication.
+
 The selected immutable action revisions are:
 
 - `actions/checkout` v7.0.1 commit `3d3c42e5aac5ba805825da76410c181273ba90b1`

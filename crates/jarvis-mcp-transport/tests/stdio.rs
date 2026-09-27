@@ -23,8 +23,18 @@
 //! `cargo test --workspace` does not enable `fixture-peer`, so this binary is absent on a plain
 //! workspace run. Failing then would make the default suite red for a reason unrelated to the code,
 //! so the tests skip with a message naming the feature. CI enables the feature and sets
-//! `ACCEPTANCE_REQUIRE_BINARIES=1`, which turns the skip into a failure — the same pattern the
-//! phase gates use, and for the same reason.
+//! `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, which turns the skip into a failure.
+//!
+//! # This variable is per-artifact, because "a binary is required" is not a property
+//! # the workspace test step can assert
+//!
+//! It used to share the name `ACCEPTANCE_REQUIRE_BINARIES` with the phase gates, which require the
+//! *application* binaries (`jarvisd`, `jarvis`). Those are two different artifacts with two
+//! different build commands: `--all-features` produces the fixture, while `--workspace` does **not**
+//! produce `target/<profile>/jarvisd` beside the test executable. So one variable carrying both
+//! meanings made the workspace test step assert something it never builds, and the phase 1 gate
+//! failed on every operating system. A variable that turns a skip into a failure must name the one
+//! artifact it is about.
 
 use std::path::PathBuf;
 
@@ -35,7 +45,10 @@ use jarvis_mcp_transport::{StdioCommand, ToolBuffer, connect_stdio};
 ///
 /// Deliberately not prefixed `JARVIS_`: the daemon treats every unknown `JARVIS_*` variable as a
 /// configuration error, so a harness variable there would stop the daemon from starting.
-const REQUIRE_BINARIES_ENV: &str = "ACCEPTANCE_REQUIRE_BINARIES";
+///
+/// Distinct from `ACCEPTANCE_REQUIRE_BINARIES`, which the process-level gates use for the
+/// application binaries — see this file's module documentation.
+const REQUIRE_FIXTURE_PEER_ENV: &str = "ACCEPTANCE_REQUIRE_FIXTURE_PEER";
 
 /// Locates the `fixture-peer` binary beside the current test executable.
 ///
@@ -57,13 +70,13 @@ fn fixture_binary() -> Option<PathBuf> {
 /// `exit(0)` here would stop the suite after the first test and report the rest as absent, which is
 /// indistinguishable from them passing. Each test therefore returns early on `None`.
 ///
-/// When `ACCEPTANCE_REQUIRE_BINARIES=1` the absence is a failure instead, which is what lets CI prove
-/// this file ran rather than skipped.
+/// When `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1` the absence is a failure instead, which is what lets CI
+/// prove this file ran rather than skipped.
 fn fixture_binary_or_skip() -> Option<PathBuf> {
     if let Some(path) = fixture_binary() {
         return Some(path);
     }
-    let required = std::env::var(REQUIRE_BINARIES_ENV).is_ok_and(|value| value == "1");
+    let required = std::env::var(REQUIRE_FIXTURE_PEER_ENV).is_ok_and(|value| value == "1");
     assert!(
         !required,
         "the fixture-peer binary is missing; run \

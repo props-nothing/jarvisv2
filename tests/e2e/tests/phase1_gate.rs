@@ -81,22 +81,31 @@ fn binary(name: &str) -> Option<PathBuf> {
 }
 
 fn required_binaries() -> Option<(PathBuf, PathBuf)> {
-    let daemon = binary("jarvisd");
-    let client = binary("jarvis");
-    if let (Some(daemon), Some(client)) = (daemon, client) {
-        return Some((daemon, client));
+    match (binary("jarvisd"), binary("jarvis")) {
+        (Some(daemon), Some(client)) => Some((daemon, client)),
+        (daemon, client) => {
+            // Name the artifact that is actually absent. `cargo test --workspace` builds neither,
+            // so "requires built binaries" was the message a reader of this failure got while the
+            // real question -- which binary, and produced by which command -- stayed unstated.
+            let missing = match (&daemon, &client) {
+                (None, _) => "jarvisd",
+                (Some(_), None) => "jarvis",
+                (Some(_), Some(_)) => unreachable!("both binaries are handled above"),
+            };
+            let message = format!(
+                "acceptance gate requires the built {missing} binary; run `cargo build --workspace` first"
+            );
+            // The variable deliberately does NOT use the `JARVIS_` prefix: the daemon's
+            // configuration loader rejects any unknown `JARVIS_*` variable by design, so a
+            // harness variable in that namespace stops the daemon from starting at all.
+            assert!(
+                std::env::var_os(REQUIRE_BINARIES_ENV).is_none(),
+                "{message}"
+            );
+            eprintln!("SKIP: {message}");
+            None
+        }
     }
-
-    let message = "acceptance gate requires built jarvisd and jarvis binaries";
-    // The variable deliberately does NOT use the `JARVIS_` prefix: the daemon's
-    // configuration loader rejects any unknown `JARVIS_*` variable by design, so a
-    // harness variable in that namespace stops the daemon from starting at all.
-    assert!(
-        std::env::var_os(REQUIRE_BINARIES_ENV).is_none(),
-        "{message}; run `cargo build --workspace` first"
-    );
-    eprintln!("SKIP: {message}; run `cargo build --workspace` first");
-    None
 }
 
 fn run_client(client: &Path, root: &Path, arguments: &[&str]) -> (bool, String, String) {
