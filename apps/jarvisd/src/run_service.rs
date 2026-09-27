@@ -267,17 +267,26 @@ impl RunService {
             // the claim being high.
             AuthenticationStrength::Present,
             now,
-        );
-
-        let decided = record_decision(
-            &self.database,
-            id,
+            // The approver is the profile's local identity, and it is recorded **on the decision** rather
+            // than passed beside it, so the identity the self-approval guard checks and the identity the row
+            // stores cannot be different values. There is deliberately no request field for it: see
+            // `jarvis_protocol::ApprovalDecisionBody`.
             identity.user_id(),
-            &body.nonce,
-            &decision,
         )
-        .await
-        .map_err(|error| map_decision_error(&error))?;
+        // The only field this constructor can refuse is the approver, and the approver here is the
+        // profile's own seeded identity — which the schema already bounds at the same length. So this arm
+        // is unreachable for a profile that could start; it is mapped rather than unwrapped because
+        // "unreachable" is a claim about the seeded row, and a panic would turn a corrupted profile into a
+        // crash instead of an answer.
+        .map_err(|_| {
+            map_decision_error(&DatabaseError::InvalidApprovalRequest {
+                field: "decided_by",
+            })
+        })?;
+
+        let decided = record_decision(&self.database, id, &body.nonce, &decision)
+            .await
+            .map_err(|error| map_decision_error(&error))?;
 
         // The decision is recorded, so the delivered secret has served its purpose. Removing it is
         // defence in depth: the digest already rotated, so a surviving file cannot decide anything. A

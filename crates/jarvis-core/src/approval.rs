@@ -18,7 +18,7 @@
 //!    the request, and a decision below it is refused by [`ApprovalRequest::apply_decision`] rather
 //!    than recorded.
 //! 4. **An approval that outlives its intent.** Expiry is checked by [`ApprovalRequest::state_at`],
-//!    and the state is derived from the stored decision plus the clock — so a lapsed approval cannot
+//!    and the state is derived from the stored decision plus the clock â€” so a lapsed approval cannot
 //!    report itself approved, whatever a caller asks.
 //!
 //! # Why expiry is compared in Rust and not in SQL
@@ -60,6 +60,12 @@ pub const MAX_CANONICAL_INTENT_CHARS: usize = 8192;
 /// hour is long enough for a person to answer a prompt and short enough that a stored grant cannot
 /// survive an incident response.
 pub const MAX_APPROVAL_LIFETIME_SECONDS: u32 = 3600;
+
+/// The longest approver identifier an approval may record.
+///
+/// The same bound the `approvals` table's `decided_by` column carries, so the domain and the schema agree
+/// about what is storable rather than deferring a rejection to a `Sqlite` error naming a `CHECK`.
+pub const MAX_APPROVER_ID_CHARS: usize = 128;
 
 /// Explains why a canonical intent could not be hashed.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -186,7 +192,7 @@ impl<'de> Deserialize<'de> for CanonicalIntentHash {
 /// Renders JSON with object keys in a deterministic order.
 ///
 /// `serde_json::Map` is a `BTreeMap` unless the `preserve_order` feature is enabled, so its default
-/// serialization is already sorted — but that is a property of a feature flag rather than of this
+/// serialization is already sorted â€” but that is a property of a feature flag rather than of this
 /// code, and a feature added for an unrelated reason would silently make two equal argument objects
 /// hash differently. Sorting explicitly here makes the canonical form independent of that choice.
 fn canonicalize(value: &serde_json::Value) -> Result<String, IntentError> {
@@ -468,6 +474,14 @@ pub enum InvalidApprovalField {
     /// The actor and approver were the same identity.
     #[error("an approver must not be the actor that requested the action")]
     SelfApproval,
+    /// The approver identity was empty, whitespace-only, or too long to store.
+    ///
+    /// Checked when the decision is built rather than when it is written, so a decision this build can
+    /// construct is one the schema can hold. `MAX_APPROVER_ID_CHARS` is the column's own bound.
+    #[error(
+        "an approver identity must be non-empty and at most {MAX_APPROVER_ID_CHARS} characters"
+    )]
+    ApproverUnusable,
     /// The decision used weaker authentication than the request requires.
     #[error("a decision needs {required} authentication but was supplied {supplied}")]
     InsufficientAuthentication {
@@ -504,7 +518,7 @@ pub enum InvalidApprovalField {
 
 /// Where an approval is.
 ///
-/// `Expired` is a state rather than a decision, because an approval that lapsed was never decided —
+/// `Expired` is a state rather than a decision, because an approval that lapsed was never decided â€”
 /// recording the lapse as a `Deny` would attribute a decision to a person who made none, and
 /// `docs/architecture/runtime-and-models.md` distinguishes the documented `cancelled/expired` edge
 /// from a cancellation.
@@ -548,8 +562,8 @@ impl ApprovalState {
 
     /// Returns whether the approval authorized the action.
     ///
-    /// Only `Approved`. Every other state — including `Expired` and `Cancelled`, which are not
-    /// refusals — must be treated as "not authorized", so a caller checking this cannot mistake a
+    /// Only `Approved`. Every other state â€” including `Expired` and `Cancelled`, which are not
+    /// refusals â€” must be treated as "not authorized", so a caller checking this cannot mistake a
     /// lapse for permission.
     #[must_use]
     pub const fn authorizes(self) -> bool {
@@ -591,12 +605,27 @@ impl FromStr for ApprovalState {
 }
 
 /// One decision to record against an approval.
+///
+/// # Why the approver is a field here rather than an argument to the application calls
+///
+/// An earlier shape took the approver as a **separate argument** to `apply_decision` /
+/// `apply_verified_decision`, and the storage layer's write path took it as another. That is two values
+/// describing one fact, and it had a concrete cost: `decided_by` was parsed and validated when a row was
+/// decoded, then **discarded**, so nothing above storage could learn who answered. A resume path that needs
+/// the approver identity for an authorization citation therefore had no way to obtain it â€” which is exactly
+/// the kind of gap a duplicated field produces, because the validation and the retention lived in
+/// different places.
+///
+/// Holding it here makes "who answered" a property of the decision. The self-approval guard compares it
+/// against the request's actor, the writer stores it, and the reader reads it back â€” from one field.
+/// `ADR-0043` records the reasoning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalDecision {
     outcome: ApprovalDecisionOutcome,
     channel: ApprovalChannel,
     strength: AuthenticationStrength,
     decided_at: UtcTimestamp,
+    approver_id: String,
 }
 
 /// Which way a decision went.
@@ -633,20 +662,42 @@ impl ApprovalDecisionOutcome {
 }
 
 impl ApprovalDecision {
-    /// Declares a decision.
-    #[must_use]
-    pub const fn new(
+    /// Declares a decision, naming the identity that made it.
+    ///
+    /// # Why the approver is required rather than optional
+    ///
+    /// An `Option` would make "a decision with nobody behind it" representable, and every consumer would
+    /// then have to decide what that means. It never means anything useful: a decision is an **act** by an
+    /// identity, so an identity-less one is not a decision with a missing field but an unrepresentable
+    /// thing. [`InvalidApprovalField::SelfApproval`] and the strength rule both read this value, so
+    /// admitting an empty one would let a decision pass checks that need a subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidApprovalField::ApproverUnusable`] when the identifier is empty, whitespace-only, or
+    /// longer than the bound the `approvals` table's `decided_by` column enforces. Checked here rather than
+    /// at the writer so a decision that storage would refuse cannot exist in memory first.
+    pub fn new(
         outcome: ApprovalDecisionOutcome,
         channel: ApprovalChannel,
         strength: AuthenticationStrength,
         decided_at: UtcTimestamp,
-    ) -> Self {
-        Self {
+        approver_id: impl Into<String>,
+    ) -> Result<Self, InvalidApprovalField> {
+        let approver_id = approver_id.into();
+        // The same bound the column carries, so a value this accepts is one storage can hold and a value
+        // storage can hold is one this accepts. A tighter check here would be an arbitrary rule nothing
+        // else enforces; a looser one would defer the failure to a `Sqlite` error naming a CHECK.
+        if approver_id.trim().is_empty() || approver_id.len() > MAX_APPROVER_ID_CHARS {
+            return Err(InvalidApprovalField::ApproverUnusable);
+        }
+        Ok(Self {
             outcome,
             channel,
             strength,
             decided_at,
-        }
+            approver_id,
+        })
     }
 
     /// Returns which way the decision went.
@@ -672,6 +723,16 @@ impl ApprovalDecision {
     pub const fn decided_at(&self) -> UtcTimestamp {
         self.decided_at
     }
+
+    /// Returns the identity that made the decision.
+    ///
+    /// The value a resume path cites as an approval's approver, and the value the self-approval guard
+    /// compares against the requesting actor. Read from the decision rather than from a second source,
+    /// because two sources for one fact is how they come to disagree.
+    #[must_use]
+    pub fn approver_id(&self) -> &str {
+        &self.approver_id
+    }
 }
 
 /// One durable approval request.
@@ -696,7 +757,7 @@ pub struct ApprovalRequest {
     expires_at: UtcTimestamp,
     decision: Option<ApprovalDecision>,
     /// Whether this value holds the real nonce. `false` for a record rebuilt from storage, which
-    /// holds only the digest — see [`InvalidApprovalField::NonceUnavailable`].
+    /// holds only the digest â€” see [`InvalidApprovalField::NonceUnavailable`].
     nonce_usable: bool,
 }
 
@@ -804,7 +865,7 @@ impl ApprovalRequest {
     ///
     /// # Errors
     ///
-    /// Returns the same failures as [`Self::new`] when a stored row disagrees with the invariants —
+    /// Returns the same failures as [`Self::new`] when a stored row disagrees with the invariants â€”
     /// so a hand-edited row cannot produce a request that in-memory construction would have refused.
     ///
     /// The resulting request **cannot verify a nonce** ([`InvalidApprovalField::NonceUnavailable`]),
@@ -838,6 +899,13 @@ impl ApprovalRequest {
     ///   what is judged.
     /// - [`InvalidApprovalField::SelfApproval`] when the approver is the requesting actor.
     ///
+    /// # Why the approver is not a parameter
+    ///
+    /// It is read from the decision, which carries it ([`ApprovalDecision::approver_id`]). An earlier shape
+    /// took it here **and** in the decision, which is two values for one fact â€” and the cost was concrete:
+    /// the store passed the approver to this call and separately bound it into the row, while the reader
+    /// validated `decided_by` and discarded it, so nothing above storage could learn who answered.
+    ///
     /// # Why `decided_at` is a parameter rather than read from a clock
     ///
     /// So the function stays pure and the expiry check is testable at a chosen instant. A function
@@ -845,7 +913,6 @@ impl ApprovalRequest {
     /// than of logic.
     pub fn apply_decision(
         &self,
-        approver_id: &str,
         presented_nonce: &str,
         decision: ApprovalDecision,
     ) -> Result<Self, InvalidApprovalField> {
@@ -858,7 +925,7 @@ impl ApprovalRequest {
         if !self.nonce.matches(presented_nonce) {
             return Err(InvalidApprovalField::NonceMismatch);
         }
-        self.apply_verified_decision(approver_id, decision)
+        self.apply_verified_decision(decision)
     }
 
     /// Applies a decision whose nonce has **already been verified** against the stored digest.
@@ -879,7 +946,7 @@ impl ApprovalRequest {
     ///
     /// The nonce can only be verified by whoever holds its digest, which is the store rather than the
     /// domain. Splitting the function means every other rule still has exactly one home, and the
-    /// nonce check has one home too — in the store, where the digest is. The alternative was to
+    /// nonce check has one home too â€” in the store, where the digest is. The alternative was to
     /// re-implement the strength floor and the expiry in SQL, which would have been two copies of a
     /// security rule.
     ///
@@ -890,7 +957,6 @@ impl ApprovalRequest {
     /// than of logic.
     pub fn apply_verified_decision(
         &self,
-        approver_id: &str,
         decision: ApprovalDecision,
     ) -> Result<Self, InvalidApprovalField> {
         if let Some(existing) = self.decision.as_ref() {
@@ -902,7 +968,11 @@ impl ApprovalRequest {
         // then approving it is the confused-deputy case `security.md` names, and for a local
         // single-owner profile the actor is the user, so an equal identifier is either a bug or a
         // forged request.
-        if approver_id == self.actor_id {
+        //
+        // Read from the decision rather than taken as an argument: the approver is what the decision
+        // *is*, so a caller able to pass a different value here could record one approver while the
+        // decision it stored names another.
+        if decision.approver_id() == self.actor_id {
             return Err(InvalidApprovalField::SelfApproval);
         }
         // An approval is not a permanent bearer token: a decision taken after the expiry does not
@@ -1049,6 +1119,11 @@ impl ApprovalRequest {
     }
 
     /// Returns the recorded decision, when one exists.
+    ///
+    /// The decision carries **who** answered as well as what they answered. That is deliberate: a resume
+    /// path building an approval citation needs the approver identity, and a caller that reached for it
+    /// separately would be reading a second source that could disagree with the decision it is citing. The
+    /// approver is a property **of the decision**, not of the request.
     #[must_use]
     pub const fn decision(&self) -> Option<&ApprovalDecision> {
         self.decision.as_ref()
@@ -1066,7 +1141,7 @@ impl ApprovalRequest {
     ///
     /// The nonce and its stored digest are **both** fixed-length lowercase hexadecimal, so a caller
     /// holding a `&str` cannot tell them apart and a digest passed where a nonce belongs would be
-    /// written out as the presentable secret — recreating exactly the flaw `P3-004` found, where a
+    /// written out as the presentable secret â€” recreating exactly the flaw `P3-004` found, where a
     /// fabricated value became a secret. Returning [`DecisionNonce`] makes "the digest is not the
     /// nonce" a property of the type system rather than of a reader's attention.
     ///
@@ -1157,7 +1232,17 @@ mod tests {
         strength: AuthenticationStrength,
         offset: i128,
     ) -> ApprovalDecision {
-        ApprovalDecision::new(outcome, ApprovalChannel::Desktop, strength, at(offset))
+        // The approver is the profile's own non-requester identity. `actor-1` above is the requester, and
+        // the domain refuses the two being equal, so a fixture that used one identity for both would fail
+        // every decision test on the self-approval rule rather than on what it meant to assert.
+        ApprovalDecision::new(
+            outcome,
+            ApprovalChannel::Desktop,
+            strength,
+            at(offset),
+            "approver-1",
+        )
+        .unwrap_or_else(|error| panic!("decision: {error}"))
     }
 
     /// A canonical hash is deterministic and independent of key order.
@@ -1234,7 +1319,7 @@ mod tests {
     /// **The separator matters: parts must not be able to bleed into each other.**
     ///
     /// Without a separator between the tool and the version, `("a", "bc", args)` and `("ab", "c",
-    /// args)` would produce the same digest — so one approval would authorize the other tool.
+    /// args)` would produce the same digest â€” so one approval would authorize the other tool.
     #[test]
     fn the_parts_cannot_bleed_into_each_other() {
         let first = CanonicalIntentHash::compute("a", "bc", &json!({}))
@@ -1358,7 +1443,6 @@ mod tests {
         let request = request();
         let decided = request
             .apply_decision(
-                "user-1",
                 request.nonce_for_storage(),
                 decision(
                     ApprovalDecisionOutcome::Approve,
@@ -1388,7 +1472,6 @@ mod tests {
         let forged = "0".repeat(CREDENTIAL_CHARS);
         assert_eq!(
             request.apply_decision(
-                "user-1",
                 &forged,
                 decision(
                     ApprovalDecisionOutcome::Approve,
@@ -1416,7 +1499,6 @@ mod tests {
         ] {
             assert_eq!(
                 request.apply_decision(
-                    "user-1",
                     request.nonce_for_storage(),
                     decision(ApprovalDecisionOutcome::Approve, supplied, 10)
                 ),
@@ -1431,7 +1513,6 @@ mod tests {
         assert!(
             request
                 .apply_decision(
-                    "user-1",
                     request.nonce_for_storage(),
                     decision(
                         ApprovalDecisionOutcome::Approve,
@@ -1451,7 +1532,6 @@ mod tests {
         for offset in [600, 601, 10_000] {
             assert_eq!(
                 request.apply_decision(
-                    "user-1",
                     request.nonce_for_storage(),
                     decision(
                         ApprovalDecisionOutcome::Approve,
@@ -1468,7 +1548,6 @@ mod tests {
         // One nanosecond before is still inside the lifetime, so the boundary is the expiry itself.
         let just_in_time = request
             .apply_decision(
-                "user-1",
                 request.nonce_for_storage(),
                 decision(
                     ApprovalDecisionOutcome::Approve,
@@ -1489,7 +1568,6 @@ mod tests {
         let request = request();
         let denied = request
             .apply_decision(
-                "user-1",
                 request.nonce_for_storage(),
                 decision(
                     ApprovalDecisionOutcome::Deny,
@@ -1502,7 +1580,6 @@ mod tests {
 
         assert_eq!(
             denied.apply_decision(
-                "user-2",
                 request.nonce_for_storage(),
                 decision(
                     ApprovalDecisionOutcome::Approve,
@@ -1523,19 +1600,24 @@ mod tests {
     /// `security.md` names "model self-approval / confused deputy" as the threat this control exists
     /// for. For a local single-owner profile the actor is the user, so an equal identifier is either
     /// a bug or a forged request, and refusing is the fail-closed choice.
+    ///
+    /// The approver is now **inside** the decision, so the way to express "the requester answered" is a
+    /// decision naming the requester. That is the honest shape: a caller cannot pass an approver that
+    /// differs from the one the recorded decision cites, which was possible when the two were separate
+    /// arguments.
     #[test]
     fn the_requesting_actor_cannot_approve_its_own_request() {
         let request = request();
+        let self_answered = ApprovalDecision::new(
+            ApprovalDecisionOutcome::Approve,
+            ApprovalChannel::Desktop,
+            AuthenticationStrength::Present,
+            at(10),
+            request.actor_id(),
+        )
+        .unwrap_or_else(|error| panic!("decision: {error}"));
         assert_eq!(
-            request.apply_decision(
-                request.actor_id(),
-                request.nonce_for_storage(),
-                decision(
-                    ApprovalDecisionOutcome::Approve,
-                    AuthenticationStrength::Present,
-                    10
-                )
-            ),
+            request.apply_decision(request.nonce_for_storage(), self_answered),
             Err(InvalidApprovalField::SelfApproval)
         );
         assert_eq!(request.stored_state(), ApprovalState::Pending);
@@ -1624,7 +1706,6 @@ mod tests {
         let request = request();
         let cancelled = request
             .apply_decision(
-                "user-1",
                 request.nonce_for_storage(),
                 decision(
                     ApprovalDecisionOutcome::Cancel,
@@ -1648,13 +1729,77 @@ mod tests {
         ] {
             let decided = request
                 .apply_decision(
-                    "user-1",
                     request.nonce_for_storage(),
                     decision(outcome, AuthenticationStrength::Present, 5),
                 )
                 .unwrap_or_else(|error| panic!("{outcome:?}: {error}"));
             assert_eq!(decided.stored_state(), outcome.state());
         }
+    }
+
+    /// **The decision carries who answered, so a resume path can cite the approver.**
+    ///
+    /// This is the property the link slice needed and could not get: the storage layer parsed
+    /// `decided_by`, validated it, and **discarded** it, so nothing above storage could learn the approver
+    /// identity an `ApprovalCitation` requires. The assertion is on the retained value rather than on the
+    /// round trip alone, because a field that is accepted and dropped is exactly the failure being fixed.
+    #[test]
+    fn a_recorded_decision_retains_its_approver() {
+        let request = request();
+        let decided = request
+            .apply_decision(
+                request.nonce_for_storage(),
+                decision(
+                    ApprovalDecisionOutcome::Approve,
+                    AuthenticationStrength::Present,
+                    10,
+                ),
+            )
+            .unwrap_or_else(|error| panic!("a valid decision: {error}"));
+        assert_eq!(
+            decided.decision().map(ApprovalDecision::approver_id),
+            Some("approver-1"),
+            "the approver must survive application, or a resume path cannot cite it"
+        );
+    }
+
+    /// An unusable approver identity is refused when the decision is built, not left for storage.
+    ///
+    /// The three ways it can be unusable: empty, whitespace-only, and longer than the column's own bound.
+    /// Checked here so a decision the domain accepts is one the schema can hold — a rejection deferred to
+    /// storage would surface as a `Sqlite` error naming a `CHECK`, which reads as a database fault rather
+    /// than a caller's mistake.
+    #[test]
+    fn an_unusable_approver_is_refused() {
+        for approver in [
+            String::new(),
+            "   ".to_owned(),
+            "x".repeat(MAX_APPROVER_ID_CHARS + 1),
+        ] {
+            assert_eq!(
+                ApprovalDecision::new(
+                    ApprovalDecisionOutcome::Approve,
+                    ApprovalChannel::Desktop,
+                    AuthenticationStrength::Present,
+                    at(10),
+                    approver.clone(),
+                ),
+                Err(InvalidApprovalField::ApproverUnusable),
+                "{approver:?} must not produce a decision"
+            );
+        }
+        // The bound itself is accepted, so it is a bound and not an off-by-one.
+        assert!(
+            ApprovalDecision::new(
+                ApprovalDecisionOutcome::Approve,
+                ApprovalChannel::Desktop,
+                AuthenticationStrength::Present,
+                at(10),
+                "x".repeat(MAX_APPROVER_ID_CHARS),
+            )
+            .is_ok(),
+            "the maximum length itself must be accepted"
+        );
     }
 
     /// Every state's name round-trips, and only `Pending` is decidable.

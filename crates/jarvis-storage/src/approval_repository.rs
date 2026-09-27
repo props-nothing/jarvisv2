@@ -79,7 +79,10 @@ const fn invalid_field(error: &jarvis_core::InvalidApprovalField) -> DatabaseErr
         Field::ExpiryNotAfterCreation | Field::LifetimeTooLong => "expiry",
         Field::UnknownStrength => "required_strength",
         Field::UnknownChannel => "decision_channel",
-        Field::SelfApproval => "decided_by",
+        // Both identify the same column: `SelfApproval` is a usable value the domain refused on a rule, and
+        // `ApproverUnusable` is a value the column could not hold. A caller learns the field either way, and
+        // the reason is in the domain error rather than in this mapping.
+        Field::SelfApproval | Field::ApproverUnusable => "decided_by",
         Field::InsufficientAuthentication { .. } => "decision_strength",
         Field::NonceMismatch => "nonce",
         Field::NonceUnavailable => "nonce_hash",
@@ -188,7 +191,6 @@ pub async fn find_approval(
 pub async fn record_decision(
     database: &SqliteDatabase,
     id: &str,
-    approver_id: &str,
     presented_nonce: &str,
     decision: &jarvis_core::ApprovalDecision,
 ) -> Result<ApprovalRequest, DatabaseError> {
@@ -206,7 +208,7 @@ pub async fn record_decision(
     }
 
     let decided = request
-        .apply_verified_decision(approver_id, decision.clone())
+        .apply_verified_decision(decision.clone())
         .map_err(|error| invalid_field(&error))?;
 
     // The nonce digest is rotated to the digest of the *empty* string rather than left in place, so
@@ -222,7 +224,9 @@ pub async fn record_decision(
     .bind(decided.stored_state().as_str())
     .bind(decision.channel().as_str())
     .bind(decision.strength().as_str())
-    .bind(approver_id)
+    // From the decision, not a separate parameter: the approver the self-approval guard checked and the
+    // approver this row records are then the same value by construction rather than by a caller's care.
+    .bind(decision.approver_id())
     .bind(decision.decided_at().to_string())
     .bind(digest(""))
     .execute(database.pool())
@@ -371,22 +375,28 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
             let decided_by_text = text("decided_by")?;
             let occurred_at = text("occurred_at")?;
             // The row's own grouping is re-checked, so a hand-edited row with a decision but no
-            // approver is reported rather than decoded with an empty identity.
-            if decided_by_text.is_empty() {
+            // approver is reported rather than decoded with an empty identity. The value is then **carried
+            // into the decision** rather than discarded: it is the identity a resume path cites, and a
+            // reader that validated it and dropped it left no way to learn who answered.
+            if decided_by_text.trim().is_empty() {
                 return Err(invalid("decided_by"));
             }
-            Some(jarvis_core::ApprovalDecision::new(
-                match stored_state {
-                    ApprovalState::Approved => jarvis_core::ApprovalDecisionOutcome::Approve,
-                    ApprovalState::Denied => jarvis_core::ApprovalDecisionOutcome::Deny,
-                    _ => jarvis_core::ApprovalDecisionOutcome::Cancel,
-                },
-                channel.parse().map_err(|_| invalid("decision_channel"))?,
-                decision_strength
-                    .parse()
-                    .map_err(|_| invalid("decision_strength"))?,
-                parse_timestamp(&occurred_at, "occurred_at")?,
-            ))
+            Some(
+                jarvis_core::ApprovalDecision::new(
+                    match stored_state {
+                        ApprovalState::Approved => jarvis_core::ApprovalDecisionOutcome::Approve,
+                        ApprovalState::Denied => jarvis_core::ApprovalDecisionOutcome::Deny,
+                        _ => jarvis_core::ApprovalDecisionOutcome::Cancel,
+                    },
+                    channel.parse().map_err(|_| invalid("decision_channel"))?,
+                    decision_strength
+                        .parse()
+                        .map_err(|_| invalid("decision_strength"))?,
+                    parse_timestamp(&occurred_at, "occurred_at")?,
+                    decided_by_text,
+                )
+                .map_err(|error| invalid_field(&error))?,
+            )
         }
     };
 

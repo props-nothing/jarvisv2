@@ -1060,14 +1060,14 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
     let as_the_agent = jarvis_storage::record_decision(
         pipeline.database(),
         &approval_id,
-        RUN,
         nonce.expose(),
-        &jarvis_core::ApprovalDecision::new(
+        &must(jarvis_core::ApprovalDecision::new(
             jarvis_core::ApprovalDecisionOutcome::Approve,
             jarvis_core::ApprovalChannel::Cli,
             jarvis_core::AuthenticationStrength::Present,
             now,
-        ),
+            RUN,
+        )),
     )
     .await;
     assert!(
@@ -1088,14 +1088,14 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
         jarvis_storage::record_decision(
             pipeline.database(),
             &approval_id,
-            LOCAL_USER_ID,
             nonce.expose(),
-            &jarvis_core::ApprovalDecision::new(
+            &must(jarvis_core::ApprovalDecision::new(
                 jarvis_core::ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
                 jarvis_core::AuthenticationStrength::Present,
                 now,
-            ),
+                LOCAL_USER_ID,
+            )),
         )
         .await,
     );

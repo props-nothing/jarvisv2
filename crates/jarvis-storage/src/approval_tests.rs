@@ -68,7 +68,7 @@ fn at(minute: i128) -> UtcTimestamp {
 /// Opens a migrated database and seeds the session an approval needs.
 ///
 /// The workspace and user come from the migration's own seeds rather than new rows, so the fixture
-/// uses the same identities a real profile has — a fixture that invented its own would not exercise
+/// uses the same identities a real profile has â€” a fixture that invented its own would not exercise
 /// the `REFERENCES` clauses against the seeded values.
 async fn seeded_database() -> (TestDirectory, SqliteDatabase) {
     let directory = TestDirectory::new();
@@ -139,7 +139,9 @@ fn approve(minute: i128) -> ApprovalDecision {
         jarvis_core::ApprovalChannel::Desktop,
         AuthenticationStrength::Present,
         at(minute),
+        APPROVER,
     )
+    .unwrap_or_else(|error| panic!("decision: {error}"))
 }
 
 fn deny(minute: i128) -> ApprovalDecision {
@@ -148,8 +150,16 @@ fn deny(minute: i128) -> ApprovalDecision {
         jarvis_core::ApprovalChannel::Desktop,
         AuthenticationStrength::Present,
         at(minute),
+        APPROVER,
     )
+    .unwrap_or_else(|error| panic!("decision: {error}"))
 }
+
+/// The identity that answers in these tests, and it is **not** the requesting actor.
+///
+/// `approval_expiring_at` records `LOCAL_USER_ID` as the requester, so a fixture that approved as the same
+/// identity would fail every decision test on the self-approval rule rather than on what it meant to assert.
+const APPROVER: &str = "0198f000-0000-7000-8000-0000000000a1";
 
 /// A request round-trips: it is created, read back, and every field agrees.
 #[tokio::test]
@@ -214,7 +224,6 @@ async fn a_valid_decision_is_recorded_and_the_nonce_is_consumed() {
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &approve(1),
         )
@@ -248,14 +257,15 @@ async fn a_decisions_attribution_survives_the_round_trip() {
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &ApprovalDecision::new(
                 ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
                 AuthenticationStrength::Present,
                 at(1),
-            ),
+                APPROVER,
+            )
+            .unwrap_or_else(|error| panic!("decision: {error}")),
         )
         .await,
     );
@@ -277,14 +287,7 @@ async fn a_forged_nonce_is_refused() {
     must(create_approval(&database, &request).await);
 
     let forged = "0".repeat(64);
-    let refused = record_decision(
-        &database,
-        &request.id().to_string(),
-        "approver-1",
-        &forged,
-        &approve(1),
-    )
-    .await;
+    let refused = record_decision(&database, &request.id().to_string(), &forged, &approve(1)).await;
     assert!(
         matches!(refused, Err(DatabaseError::ApprovalNonceMismatch)),
         "a forged nonce must be refused as such, got {refused:?}"
@@ -311,7 +314,6 @@ async fn a_recorded_decision_cannot_be_replayed_or_replaced() {
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &deny(1),
         )
@@ -323,7 +325,6 @@ async fn a_recorded_decision_cannot_be_replayed_or_replaced() {
     let replayed = record_decision(
         &database,
         &request.id().to_string(),
-        "approver-1",
         request.nonce_for_storage(),
         &deny(1),
     )
@@ -337,7 +338,6 @@ async fn a_recorded_decision_cannot_be_replayed_or_replaced() {
     let replacement = record_decision(
         &database,
         &request.id().to_string(),
-        "approver-2",
         request.nonce_for_storage(),
         &approve(2),
     )
@@ -371,7 +371,6 @@ async fn a_decision_after_the_expiry_is_refused_and_an_approval_lapses_on_read()
         let late = record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &approve(minute),
         )
@@ -392,7 +391,6 @@ async fn a_decision_after_the_expiry_is_refused_and_an_approval_lapses_on_read()
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &approve(9),
         )
@@ -501,7 +499,6 @@ async fn a_decided_approval_still_blocks_the_same_intent() {
         record_decision(
             &database,
             &first.id().to_string(),
-            "approver-1",
             first.nonce_for_storage(),
             &deny(1),
         )
@@ -529,7 +526,6 @@ async fn a_decided_request_cannot_be_created() {
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &approve(1),
         )
@@ -566,12 +562,21 @@ async fn the_requesting_actor_cannot_decide_its_own_approval() {
     let request = approval_for("jarvis.mail.purge", &serde_json::json!({"all": true}));
     must(create_approval(&database, &request).await);
 
+    // The requester answering its own request: the decision names the actor rather than a separate
+    // argument, so "the requester decided" is expressed by a decision the requester made.
+    let self_answered = ApprovalDecision::new(
+        ApprovalDecisionOutcome::Approve,
+        jarvis_core::ApprovalChannel::Desktop,
+        AuthenticationStrength::Present,
+        at(1),
+        LOCAL_USER_ID,
+    )
+    .unwrap_or_else(|error| panic!("decision: {error}"));
     let refused = record_decision(
         &database,
         &request.id().to_string(),
-        LOCAL_USER_ID,
         request.nonce_for_storage(),
-        &approve(1),
+        &self_answered,
     )
     .await;
     assert!(
@@ -604,14 +609,15 @@ async fn a_weak_decision_is_refused() {
         let refused = record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &ApprovalDecision::new(
                 ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Voice,
                 strength,
                 at(1),
-            ),
+                APPROVER,
+            )
+            .unwrap_or_else(|error| panic!("decision: {error}")),
         )
         .await;
         assert!(
@@ -640,14 +646,7 @@ async fn a_missing_approval_is_not_found() {
         "expected not-found, got {found:?}"
     );
 
-    let decided = record_decision(
-        &database,
-        absent,
-        "approver-1",
-        &"0".repeat(64),
-        &approve(1),
-    )
-    .await;
+    let decided = record_decision(&database, absent, &"0".repeat(64), &approve(1)).await;
     assert!(
         matches!(decided, Err(DatabaseError::ApprovalNotFound)),
         "expected not-found, got {decided:?}"
@@ -698,7 +697,7 @@ async fn a_runs_approvals_are_listed_reproducibly() {
 /// is not covered by that argument, so the decoder re-checks. The plain update is asserted to be
 /// rejected first, so this test also proves the `CHECK` exists.
 ///
-/// Note what the `CHECK` does and does not enforce. It enforces the **grouping** — a decided row
+/// Note what the `CHECK` does and does not enforce. It enforces the **grouping** â€” a decided row
 /// carries all four attribution fields and an undecided one carries none. It cannot enforce *which*
 /// decision was made, because `state` is the only column that records that, so there is no second
 /// source to disagree with. An earlier version of the decoder compared `state` against the decision
@@ -713,7 +712,6 @@ async fn a_row_whose_decision_attribution_is_missing_is_reported() {
         record_decision(
             &database,
             &request.id().to_string(),
-            "approver-1",
             request.nonce_for_storage(),
             &deny(1),
         )
@@ -734,7 +732,7 @@ async fn a_row_whose_decision_attribution_is_missing_is_reported() {
     // A constraint-free writer, so a row another build could have written can be reproduced without
     // editing the schema. `PRAGMA` is per-connection, so one connection is acquired and held: issuing
     // it through the pool would apply it to whichever connection the pool happened to hand out, and
-    // the update could land on a different one — which is exactly what happened when this test was
+    // the update could land on a different one â€” which is exactly what happened when this test was
     // first written, and the failure looked like a refused write rather than a misplaced pragma.
     let mut connection = must(database.pool().acquire().await);
     must(
