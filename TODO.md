@@ -3289,7 +3289,16 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     provenance is not a property a string carries.
   - **This round built the transport port and the read operations — the connective tissue that makes every
     earlier slice reachable.** `crates/jarvis-connectors/src/google/transport.rs` + `transport_tests.rs` and
-    `operations.rs` + `operations_tests.rs` (25 new tests, so **248 in the crate**). **`ADR-0062`.**
+    `operations.rs` + `operations_tests.rs` (28 new tests, so **251 in the crate**). **`ADR-0062`.**
+  - **⭐ I SHIPPED A SYNCHRONOUS PORT AND `ToolExecutor::execute` IS `async` — so the port could never back an
+    adapter.** Written, formatted, tested, gated, and committed as `416fd94` before the flaw was noticed: a
+    synchronous `send` cannot be called from an `async fn` without blocking a runtime worker for the whole round
+    trip, which is the failure `P2-007` records for a blocking read inside a stream. The reasoning that produced
+    it — "defer the async binding to whoever owns a runtime" — is internally consistent and still produced an
+    **unreachable** port: the one interface it exists to satisfy is async, so the deferral meant "never". Fixed
+    by making the port `#[async_trait]` **and** by implementing `ToolExecutor` for the adapter, which is what
+    turns "the port exists" into "the port can be used". Recorded because a plausible deferral is the easiest
+    way to build a component nothing can consume.
   - **⭐ THE FINDING: "THE REQUEST FAILED" IS NOT ONE CONDITION, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.**
     `TransportFailure` is `Connect | Send | Body | Timeout | Refused`, and the variants encode **when** the
     failure happened rather than what it was called. `Send` exists separately from `Connect` because "the
@@ -3322,6 +3331,17 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `DELETE` are absent rather than present-and-unused, because a variant nothing constructs is a method a
     reader assumes is reachable — so `P5-009`'s write grows the enum and turns every `match` into a compile
     error, which is what makes a new method a deliberate edit.
+  - **The adapter is a `ToolExecutor`, and its test drives the real trait with a request the REAL policy engine
+    authorized.** The receipt's digest is recomputed from the arguments the request carries and the decision
+    comes from an actual `evaluate` over the tool's own derived definition, because `AuthorizationReceipt::new`
+    and `ToolExecutionRequest::new` verify everything — a fixture cannot stand in an invented digest or a
+    fabricated decision. The actor holds exactly `mail.read` + `calendar.read`, the scopes the manifest
+    declares, so the decision is allowed by the connector's own contract rather than by a wildcard.
+  - **The deadline is checked before anything is sent, and refused rather than failed.** `RefusedBeforeReaching`
+    is honest — nothing was sent, so nothing happened — and `AmbiguousAfterReaching` would send a reader
+    investigating an effect that never existed. `jarvis-tools`' filesystem adapter makes the same choice before
+    its first read. The pure `run` method takes `now` as a parameter while the trait `execute` reads the clock,
+    so the deterministic layer can assert an exact `reported_at` and the logic is implemented once.
   - **The operation layer renders the tool's DECLARED output, not the provider's resource.** `read_output`
     emits `message_ids`/`event_ids` plus the declared schema's fields, because a parser returning Gmail's
     `Message` would make `ADR-0059`'s schema a fiction. `next_sync_token` is rendered **separately** from
@@ -3332,25 +3352,29 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     honoured. A `null` is treated as *absent* (that is what a serializer emits for an unset optional field) and
     accepted; a wrong-typed or out-of-range value is refused. An unknown tool is `NotImplemented` rather than a
     default, because a fallback would make a mistyped name silently read a mailbox.
-  - **⭐ THREE GUARDS FALSIFIED WITH COMPILING MUTANTS.** Making `Timeout` certain → **4 tests detected**;
-    making `Body` certain → **3 detected**; ignoring the status in the response classifier → **2 detected**
-    (`a_provider_refusal_is_a_result_and_not_an_error`, `a_refusal_with_an_unreadable_body_still_names_the_status`).
-    Each mutant **compiled**, so `FAIL` is a real detection rather than a build failure — the `VACUOUS`/`FAIL`
-    distinction kept, and verified with a `git diff --stat` afterwards because an earlier aborted run had left
-    one mutant in place.
+  - **⭐ FOUR GUARDS FALSIFIED WITH COMPILING MUTANTS.** Making `Timeout` certain → **4 tests detected**;
+    making `Body` certain → **3 detected**; ignoring the status in the response classifier → **2 detected**;
+    deleting the deadline check → **1 detected**; turning the deadline refusal into `AmbiguousAfterReaching` →
+    **1 detected**. Each mutant **compiled**, so `FAIL` is a real detection rather than a build failure — the
+    `VACUOUS`/`FAIL` distinction kept, and verified with a `git diff --stat` afterwards because an earlier
+    aborted run had left one mutant in place.
+  - **One new dependency edge: `async-trait`** (already a workspace dependency, so nothing new is fetched), for
+    an object-safe `async` trait method. Still **no `reqwest` and no socket** in this crate.
   - **Limits:** **there is no transport implementation** — the port has a test double and nothing else, so **no
     request has been sent to Google and no response has been parsed from Google**, and every fixture is
     constructed from the research record, which means these tests prove the layer implements the *record*, not
-    that the record matches the provider; **the port is synchronous** (an async binding belongs to a caller that
-    owns a runtime, and nothing here has one — a `reqwest` transport blocking inside an async context would be
-    the defect `P2-007` records from the other direction); **no credential is minted, refreshed, or expiry-checked**
-    (`execute` takes an `AccessToken` it did not obtain); **no deadline is applied** (the signature takes no
-    cancellation token, so "an implementation must bound its own wait" is a requirement on an implementation
-    that does not exist); **`Retry-After` is carried and never interpreted**, so a transport could report it and
-    a caller could ignore it with no test failing; **`evidence_from` has no caller in this crate** (provider
-    evidence locates an *effect* and a read produces none, so it exists for `P5-009`); **the output rendering is
-    not validated back through the schemas it claims to match**; and **nothing dispatches to `GoogleReadTool`**,
-    so the tool is reachable from a test and not from a run.
+    that the record matches the provider; **the port's own requirements (no redirect, no retry, no proxy from
+    the environment) are unenforced** because the only implementations are test doubles — they become testable
+    only when a real transport is written; **no credential is minted, refreshed, or expiry-checked** (`run`
+    takes an `AccessToken` it did not obtain, so a stale token becomes a provider refusal); **the deadline is
+    read from the system clock**, so the trait boundary can only be tested with a *lapsed* deadline; **no
+    deadline is passed to the transport**, so "an implementation must bound its own wait and report `Timeout`"
+    is a requirement on an implementation that does not exist; **`Retry-After` is carried and never
+    interpreted**, so a transport could report it and a caller could ignore it with no test failing;
+    **`evidence_from` has no caller in this crate** (provider evidence locates an *effect* and a read produces
+    none, so it exists for `P5-009`); **the output rendering is not validated back through the schemas it claims
+    to match**; and **nothing constructs the adapter in a binary** — no registry, executor, or route offers
+    `google.gmail_messages_list`, so the adapter is reachable from a test and not from a run.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

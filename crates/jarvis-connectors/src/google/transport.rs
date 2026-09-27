@@ -7,7 +7,7 @@
 //! provider's request and response *types* would become the shape the rules are written against, and every
 //! mapping would need a server or a mock to test.
 //!
-//! So this module states the **port** and nothing else. It mirrors `jarvis-models`' `Transport`, with two
+//! So this module states the **port** and nothing else. It mirrors `jarvis-models`' `Transport`, with three
 //! differences that are forced rather than stylistic:
 //!
 //! - **An access token is a parameter, not a field of the request.** The request is a value that may be logged;
@@ -17,6 +17,9 @@
 //!   would be a field with one value and a typo would be a runtime fault. When a write operation arrives
 //!   (`P5-009`) the enum grows by one variant and every `match` on it is a compile error — which is what makes
 //!   a new method a deliberate edit.
+//! - **`send` is `async`.** Not a preference: [`jarvis_tools::ToolExecutor::execute`] is `async`, so an
+//!   adapter binding this port must be too, and an `async` function calling a blocking one blocks a runtime
+//!   worker for the whole round trip. The interface this port must satisfy decides the shape.
 //!
 //! # What a transport must not do
 //!
@@ -165,6 +168,17 @@ impl TransportResponse {
 /// [`HttpRequest`] is a value that may be rendered — its own `Display` prints the method, the path, and
 /// parameter *names* — and [`AccessToken`] is a value that may not. Merging them into one authenticated-request
 /// type would make a single `{:?}` leak the credential, which is the mistake the split exists to prevent.
+///
+/// # Why `async` rather than a blocking method
+///
+/// [`jarvis_tools::ToolExecutor::execute`] is `async`, so an adapter that bound this port must itself be
+/// `async` — and an `async` function calling a blocking one is not a style choice, it is a defect: it blocks a
+/// runtime worker for the whole round trip, which is the failure `P2-007` records for a blocking read inside a
+/// stream. So the port is `async` because the interface it must satisfy is `async`, and the honest alternative
+/// — an adapter that spawns a blocking thread per call — would be a threading decision taken inside one
+/// connector. `#[async_trait]` is used rather than native `async fn` in a trait because the trait must stay
+/// **object safe** to be held as `&dyn GoogleTransport`.
+#[async_trait::async_trait]
 pub trait GoogleTransport: Send + Sync {
     /// Performs a request and returns the response.
     ///
@@ -180,7 +194,7 @@ pub trait GoogleTransport: Send + Sync {
     /// nothing here has one — the same absence `ToolExecutor`'s module records for the same reason. A
     /// transport that cannot bound its own wait would hang a worker, so an implementation **must** apply a
     /// timeout and report [`TransportFailure::Timeout`] rather than waiting indefinitely.
-    fn send(
+    async fn send(
         &self,
         method: HttpMethod,
         request: &HttpRequest,

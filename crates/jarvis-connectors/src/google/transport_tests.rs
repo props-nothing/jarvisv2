@@ -148,8 +148,9 @@ fn the_transport_trait_can_be_formatted_without_printing_a_client() {
     // `Debug` impl names the port and stops.
     struct Silent;
 
+    #[async_trait::async_trait]
     impl GoogleTransport for Silent {
-        fn send(
+        async fn send(
             &self,
             _method: HttpMethod,
             _request: &request::HttpRequest,

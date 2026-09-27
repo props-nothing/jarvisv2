@@ -11,7 +11,6 @@ use super::*;
 use crate::google::credential::AccessToken;
 use jarvis_core::ToolOutcome;
 use serde_json::json;
-
 fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {
         Ok(value) => value,
@@ -309,8 +308,9 @@ struct Scripted {
     result: Result<TransportResponse, TransportFailure>,
 }
 
+#[async_trait::async_trait]
 impl GoogleTransport for Scripted {
-    fn send(
+    async fn send(
         &self,
         _method: HttpMethod,
         _request: &crate::google::request::HttpRequest,
@@ -320,25 +320,25 @@ impl GoogleTransport for Scripted {
     }
 }
 
-#[test]
-fn the_read_tool_drives_a_transport_and_reports_what_it_established() {
+#[tokio::test]
+async fn the_read_tool_drives_a_transport_and_reports_what_it_established() {
     // The end-to-end shape: arguments become a request, the transport answers, and the answer becomes a result.
     // This is also the first caller of `GoogleTransport`, so the port is exercised rather than merely declared.
     let ok = Scripted {
         result: Ok(response(200, r#"{"messages":[{"id":"m1"}]}"#)),
     };
-    let tool = GoogleReadTool::new(&ok);
     let token = must(
         AccessToken::new("ya29.a0AfH6SMBsecretvalue1234567890"),
         "a valid token",
     );
+    let tool = GoogleReadTool::new(&ok, &token, "google-read");
     let result = must(
-        tool.execute(
+        tool.run(
             "google.gmail_messages_list",
             &json!({ "query": "is:unread" }),
-            &token,
             now(),
-        ),
+        )
+        .await,
         "a successful read must report a result",
     );
     assert_eq!(result.outcome(), ToolOutcome::Confirmed);
@@ -347,9 +347,10 @@ fn the_read_tool_drives_a_transport_and_reports_what_it_established() {
     let ambiguous = Scripted {
         result: Err(TransportFailure::Timeout),
     };
-    let tool = GoogleReadTool::new(&ambiguous);
+    let tool = GoogleReadTool::new(&ambiguous, &token, "google-read");
     let error = tool
-        .execute("google.gmail_messages_list", &json!({}), &token, now())
+        .run("google.gmail_messages_list", &json!({}), now())
+        .await
         .err()
         .unwrap_or_else(|| panic!("a timeout must be ambiguous"));
     assert!(matches!(error, AdapterError::AmbiguousAfterReaching { .. }));
@@ -358,12 +359,183 @@ fn the_read_tool_drives_a_transport_and_reports_what_it_established() {
     let certain = Scripted {
         result: Err(TransportFailure::Connect),
     };
-    let tool = GoogleReadTool::new(&certain);
+    let tool = GoogleReadTool::new(&certain, &token, "google-read");
     let error = tool
-        .execute("google.gmail_messages_list", &json!({}), &token, now())
+        .run("google.gmail_messages_list", &json!({}), now())
+        .await
         .err()
         .unwrap_or_else(|| panic!("a connect failure must be a refusal"));
     assert!(matches!(error, AdapterError::RefusedBeforeReaching { .. }));
+}
+
+#[test]
+fn the_adapter_reports_the_identifier_it_was_given() {
+    // `adapter_id` names the adapter in a diagnostic, and the identifier is the pipeline's rather than a
+    // constant here — so it is asserted to round-trip rather than assumed to be a literal.
+    use jarvis_tools::ToolExecutor;
+    let ok = Scripted {
+        result: Ok(response(200, "{}")),
+    };
+    let token = must(
+        AccessToken::new("ya29.a0AfH6SMBsecretvalue1234567890"),
+        "valid",
+    );
+    assert_eq!(
+        GoogleReadTool::new(&ok, &token, "google-read").adapter_id(),
+        "google-read"
+    );
+    assert_eq!(
+        GoogleReadTool::new(&ok, &token, "google-mail-read").adapter_id(),
+        "google-mail-read"
+    );
+}
+
+/// Builds a request the pipeline would have authorized for one Google read tool.
+///
+/// The authority is **real**: the digest is recomputed from the arguments the request carries and the decision
+/// comes from an actual `evaluate` over the tool's own derived definition, because
+/// `AuthorizationReceipt::new` and `ToolExecutionRequest::new` both verify everything. A fixture cannot stand
+/// in an invented digest or a fabricated decision — that is what makes this a test of the adapter rather than
+/// of a mock.
+fn authorized(
+    tool: &str,
+    arguments: serde_json::Value,
+    deadline: UtcTimestamp,
+) -> jarvis_tools::ToolExecutionRequest {
+    use jarvis_tools::{
+        ActorAuthority, AuthenticationStrength, AuthorizationReceipt, AuthorizationReceiptParts,
+        IdempotencyKey, PolicyRequest, Scope, ScopeSet, TargetAssessment, ToolExecutionRequest,
+        ToolExecutionRequestParts, ToolId, WorkspacePolicy, evaluate,
+    };
+    let definition = must(
+        crate::google::definitions::definitions(&must(
+            super::super::GoogleConnector::manifest(),
+            "the manifest must be built",
+        )),
+        "the manifest must derive its definitions",
+    )
+    .into_iter()
+    .find(|candidate| candidate.id().to_string() == tool)
+    .unwrap_or_else(|| panic!("the manifest must declare {tool}"));
+
+    // The actor holds exactly the two scopes the manifest requires, so the decision is allowed by the
+    // declared contract rather than by a wildcard that would also cover tools this connector does not have.
+    let actor = ActorAuthority::active(ScopeSet::new([
+        must(Scope::new("mail.read"), "a valid scope"),
+        must(Scope::new("calendar.read"), "a valid scope"),
+    ]));
+    let workspace = WorkspacePolicy::default();
+    let decision = evaluate(&PolicyRequest {
+        definition: &definition,
+        actor,
+        workspace: &workspace,
+        channel: jarvis_core::SessionChannel::Cli,
+        claimed_strength: AuthenticationStrength::Present,
+        available: true,
+        target: TargetAssessment::none(),
+    });
+    assert!(
+        decision.is_allowed(),
+        "{tool} must be allowed for the fixture, got {:?}",
+        decision.reason_code()
+    );
+
+    let intent_hash = must(
+        jarvis_core::CanonicalIntentHash::compute(tool, "1.0.0", &arguments),
+        "the arguments must be hashable",
+    );
+    let issued_at = UtcTimestamp::from_unix_nanos(1_774_000_000_000_000_000)
+        .unwrap_or_else(|_| panic!("a representable instant"));
+    let receipt = must(
+        AuthorizationReceipt::new(AuthorizationReceiptParts {
+            receipt_id: "0198f000-0000-7000-8000-0000000000f1".to_owned(),
+            tool: must(ToolId::new(tool), "a valid tool id"),
+            tool_version: "1.0.0".to_owned(),
+            arguments: arguments.clone(),
+            intent_hash,
+            policy_version: "policy-3".to_owned(),
+            decision,
+            approval: None,
+            correlation_id: jarvis_core::CorrelationId::new(),
+            issued_at,
+        }),
+        "the receipt must be built",
+    );
+    must(
+        ToolExecutionRequest::new(ToolExecutionRequestParts {
+            call_id: "0198f000-0000-7000-8000-0000000000f3".to_owned(),
+            tool: must(ToolId::new(tool), "a valid tool id"),
+            tool_version: "1.0.0".to_owned(),
+            arguments,
+            receipt,
+            idempotency_key: must(IdempotencyKey::generate(), "a key"),
+            deadline,
+            correlation_id: jarvis_core::CorrelationId::new(),
+        }),
+        "the request must be built",
+    )
+}
+
+#[tokio::test]
+async fn the_adapter_is_a_tool_executor_and_drives_a_request_the_pipeline_built() {
+    // Why this test exists: the port was first written **synchronous**, and `ToolExecutor::execute` is `async`.
+    // A synchronous port can never back an adapter for an async interface — an `async` function calling a
+    // blocking one blocks a runtime worker for the whole round trip — so the shape was wrong and this test is
+    // what would have caught it. It drives the real trait, not the helper.
+    use jarvis_tools::ToolExecutor;
+
+    let transport = Scripted {
+        result: Ok(response(200, r#"{"messages":[{"id":"m1"}]}"#)),
+    };
+    let token = must(
+        AccessToken::new("ya29.a0AfH6SMBsecretvalue1234567890"),
+        "valid",
+    );
+    let adapter = GoogleReadTool::new(&transport, &token, "google-read");
+    let request = authorized(
+        "google.gmail_messages_list",
+        json!({ "query": "is:unread" }),
+        UtcTimestamp::from_unix_nanos(1_900_000_000_000_000_000)
+            .unwrap_or_else(|_| panic!("a representable future instant")),
+    );
+    let result = must(
+        adapter.execute(&request).await,
+        "an authorized call must produce a result",
+    );
+    assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+}
+
+#[tokio::test]
+async fn a_call_already_past_its_deadline_is_refused_before_anything_is_sent() {
+    // The deadline guard, and why it must be `RefusedBeforeReaching` rather than a failure: nothing was sent, so
+    // nothing happened. Reporting it as ambiguous would send a reader investigating an effect that never
+    // existed — the same choice `jarvis-tools`' filesystem adapter makes before its first read.
+    use jarvis_tools::ToolExecutor;
+
+    let transport = Scripted {
+        result: Ok(response(200, r#"{"messages":[]}"#)),
+    };
+    let token = must(
+        AccessToken::new("ya29.a0AfH6SMBsecretvalue1234567890"),
+        "valid",
+    );
+    let adapter = GoogleReadTool::new(&transport, &token, "google-read");
+    // A deadline in the Unix epoch, which every real clock is past.
+    let request = authorized(
+        "google.gmail_messages_list",
+        json!({ "query": "is:unread" }),
+        UtcTimestamp::from_unix_nanos(1).unwrap_or_else(|_| panic!("a representable instant")),
+    );
+    let error = adapter
+        .execute(&request)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a lapsed deadline must be refused"));
+    assert!(
+        matches!(error, AdapterError::RefusedBeforeReaching { .. }),
+        "a call that was never sent is a certain refusal, not an ambiguity: {error:?}"
+    );
+    assert!(error.to_string().contains("deadline"), "{error}");
 }
 
 #[test]

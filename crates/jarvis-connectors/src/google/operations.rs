@@ -392,32 +392,55 @@ pub fn method_for(request: &request::HttpRequest) -> Result<HttpMethod, Transpor
 
 /// A read operation bound to a transport — what makes this module's pieces reachable.
 ///
-/// Holds a borrowed transport so a caller can share one client across every tool. The port is **synchronous**,
-/// which is a deliberate deferral rather than an oversight: an async binding belongs to whichever caller owns a
-/// runtime, and a `reqwest` transport performing a blocking read inside an async context would be the defect
-/// `P2-007` records from the other direction.
+/// Holds a borrowed transport so a caller can share one client across every tool, and an `AccessToken` so the
+/// adapter is a **`ToolExecutor`** rather than a helper a caller has to drive with a credential it obtained
+/// itself. That is the difference between this being reachable from a run and reachable only from a test.
+///
+/// # Why the token is borrowed from a caller rather than minted here
+///
+/// Minting or refreshing belongs to whoever holds the stored grant, and this crate has no store. A token that
+/// expired mid-run would need a refresh exchange, and a refresh is a durable write with its own failure modes —
+/// so this type takes the token it was given and reports a provider refusal honestly when that token is stale.
+/// An adapter that silently refreshed would make a credential's rotation invisible to the audit record.
 pub struct GoogleReadTool<'a> {
     transport: &'a dyn GoogleTransport,
+    token: &'a AccessToken,
+    adapter_id: &'static str,
 }
 
 impl<'a> GoogleReadTool<'a> {
-    /// Binds a transport.
+    /// Binds a transport, a credential, and the adapter identifier to report.
+    ///
+    /// The identifier is a parameter rather than a constant here because it names the **adapter** in a
+    /// diagnostic, and the adapter's identity is the pipeline's — the same reason `ToolExecutor::adapter_id`
+    /// returns `&'static str` rather than deriving one.
     #[must_use]
-    pub fn new(transport: &'a dyn GoogleTransport) -> Self {
-        Self { transport }
+    pub const fn new(
+        transport: &'a dyn GoogleTransport,
+        token: &'a AccessToken,
+        adapter_id: &'static str,
+    ) -> Self {
+        Self {
+            transport,
+            token,
+            adapter_id,
+        }
     }
 
-    /// Performs one read operation.
+    /// Performs one read operation for a tool name and an argument object.
+    ///
+    /// This is the whole of the logic; [`ToolExecutor::execute`] is a thin unwrapping of the pipeline's request
+    /// onto it, so the behaviour is asserted once rather than twice. `now` is a parameter rather than read from
+    /// a clock here, so the pure layer stays deterministic and a test can assert an exact `reported_at`.
     ///
     /// # Errors
     ///
     /// Returns [`AdapterError`] for an argument fault, an unimplemented tool, or an ambiguous transport
     /// failure — as [`interpret`] and [`request_for`] do.
-    pub fn execute(
+    pub async fn run(
         &self,
         tool: &str,
         arguments: &serde_json::Value,
-        token: &AccessToken,
         now: UtcTimestamp,
     ) -> Result<ToolCallResult, AdapterError> {
         let request = match request_for(tool, arguments) {
@@ -440,8 +463,42 @@ impl<'a> GoogleReadTool<'a> {
             Ok(method) => method,
             Err(failure) => return Err(failure_to_adapter_error(failure)),
         };
-        let response = self.transport.send(method, &request, token);
+        let response = self.transport.send(method, &request, self.token).await;
         interpret(tool, response, now)
+    }
+}
+
+#[async_trait::async_trait]
+impl jarvis_tools::ToolExecutor for GoogleReadTool<'_> {
+    fn adapter_id(&self) -> &'static str {
+        self.adapter_id
+    }
+
+    /// Runs one call the pipeline has already authorized.
+    ///
+    /// # The deadline is checked before anything is sent
+    ///
+    /// A call already past its deadline must not start a network write, and "nothing happened" is the honest
+    /// reading — the same choice `jarvis-tools`' filesystem adapter makes before its first read. Reporting it as
+    /// a *failure* would suggest something may have happened, which would then need investigating.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`], plus [`AdapterError::RefusedBeforeReaching`] for a lapsed deadline.
+    async fn execute(
+        &self,
+        request: &jarvis_tools::ToolExecutionRequest,
+    ) -> Result<ToolCallResult, AdapterError> {
+        let now = UtcTimestamp::now(&jarvis_core::SystemClock);
+        if request.is_past_deadline(now) {
+            return Err(AdapterError::RefusedBeforeReaching {
+                reason: "the call was already past its deadline".to_owned(),
+            });
+        }
+        // The tool is taken from the request's own canonical identifier and matched by its name segment, so a
+        // request naming a tool this adapter does not implement is refused rather than defaulting to a read.
+        self.run(&request.tool().to_string(), request.arguments(), now)
+            .await
     }
 }
 

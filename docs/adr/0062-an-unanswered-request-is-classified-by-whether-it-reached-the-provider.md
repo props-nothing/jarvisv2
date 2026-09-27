@@ -35,10 +35,10 @@ confirmation nor a failure.
 
 ## Decision
 
-**1. The port is a trait with a synchronous method, and it names the two arguments separately.**
+**1. The port is a trait with an `async` method, and it names the two arguments separately.**
 
 ```rust
-fn send(&self, method: HttpMethod, request: &HttpRequest, token: &AccessToken)
+async fn send(&self, method: HttpMethod, request: &HttpRequest, token: &AccessToken)
     -> Result<TransportResponse, TransportFailure>;
 ```
 
@@ -46,6 +46,15 @@ fn send(&self, method: HttpMethod, request: &HttpRequest, token: &AccessToken)
 may be rendered (its `Display` prints the path and parameter *names*) and `AccessToken` may not. Merging them
 would make a single `{:?}` leak the credential — the control `ADR-0061` built, undone by a convenient
 signature.
+
+**1a. The port is `async` because the interface it must satisfy is, and a synchronous first draft was wrong.**
+
+`jarvis_tools::ToolExecutor::execute` is `async`, so an adapter binding this port must be `async`. An `async`
+function calling a blocking one is not a style choice: it blocks a runtime worker for the whole round trip,
+which is the failure `P2-007` records for a blocking read inside a stream. **The first draft of this port was
+synchronous and was replaced**, because a synchronous port can never back a Google adapter — so the "defer the
+async binding" reasoning that produced it was internally consistent and still produced an unreachable port.
+`#[async_trait]` is used rather than native `async fn` in a trait so the trait stays **object safe**.
 
 **2. The method is a closed `enum`, not a `&'static str`.**
 
@@ -116,12 +125,30 @@ declared schema a fiction. `next_sync_token` is rendered **separately** from `ne
 token positions a future incremental sync while the page token continues the current walk; merging them would
 store a cursor that expires with the walk.
 
-**12. `GoogleReadTool` binds the pieces, and it is the only caller of the port.**
+**12. `GoogleReadTool` binds the pieces, and it implements `ToolExecutor`.**
 
 Arguments become a request, the request's own method is read back rather than restated, and the transport's
 answer becomes a result. The method is taken from the request so that a request kind added later cannot be sent
 with the wrong verb; a method the port cannot express is classified through the same failure mapping rather than
 with `?`, because it is a crate defect and the mapping already states what a refusal before writing means.
+
+**13. The adapter checks the request deadline before it sends, and refuses rather than fails.**
+
+A call already past its deadline must not start a network write. `RefusedBeforeReaching` is the honest reading —
+nothing was sent, so nothing happened — and `AmbiguousAfterReaching` would send a reader investigating an effect
+that never existed. `jarvis-tools`' filesystem adapter makes the same choice before its first read, and
+`ToolExecutionRequest::is_past_deadline` exists to be called at the point the adapter chooses.
+
+**14. The pure `run` method takes `now` as a parameter; the trait `execute` reads the clock.**
+
+Split so the deterministic layer can assert an exact `reported_at` in a test while the trait implementation
+supplies the real instant. It also keeps one implementation of the logic: `execute` checks the deadline and then
+delegates, so the argument mapping is asserted once.
+
+**15. The deadline guard was falsified twice with compiling mutants.**
+
+Deleting the check → detected. Turning the deadline refusal into `AmbiguousAfterReaching` → detected by a single
+test, which is what pins the *variant* rather than merely the existence of a refusal.
 
 ## Consequences
 
@@ -132,12 +159,15 @@ with `?`, because it is a crate defect and the mapping already states what a ref
   and the response classifier are wildcard-free `match`es.
 - **Every prior slice is now reachable from one entry point.** The contract, the auth flow, the client's
   classification, the definitions, the request builder, and the credential boundary all feed `GoogleReadTool`
-  — which is the `P1`/`P3-006d` pattern: a capability a caller can use, not one an operator can reach.
-- **No new dependency.** The port is a trait, so this crate still has no `reqwest`, no `async-trait`, and no
-  socket.
-- **Three guards were falsified with compiling mutants**: making `Timeout` certain (4 tests detected),
-  making `Body` certain (3 tests detected), and ignoring the status in the response classifier (2 tests
-  detected). Each mutant compiled, so a `FAIL` verdict is a real detection rather than a build failure.
+  — which is the `P1`/`P3-006d` pattern: a capability a caller can use, not one an operator can reach. It is also
+  a **`ToolExecutor`**, so the pipeline can dispatch to it, and a test drives the trait with a request the real
+  policy engine authorized rather than a hand-built fixture.
+- **`async-trait` became a dependency of this crate.** The one new edge, and it exists so the port can be
+  object-safe `async` rather than because the rules here need it.
+- **Four guards were falsified with compiling mutants**: making `Timeout` certain (4 tests detected),
+  making `Body` certain (3 tests detected), ignoring the status in the response classifier (2 tests
+  detected), and deleting/altering the deadline guard (each detected by 1 test). Each mutant compiled, so a
+  `FAIL` verdict is a real detection rather than a build failure.
 
 ## Limits
 
@@ -145,24 +175,17 @@ with `?`, because it is a crate defect and the mapping already states what a ref
   been sent to Google and no response has been parsed from Google**. Every fixture in the tests is constructed
   from `docs/research/integrations/google.md`, so they prove this layer implements the *record* and not that the
   record matches the provider.
-- **The port is synchronous.** An async binding belongs to whichever caller owns a runtime, and nothing here
-  has one. A `reqwest` transport performing a blocking read inside an async context would be the defect
-  `P2-007` records from the other direction, so this is a deferral with a reason rather than an oversight.
-- **No credential is minted or refreshed.** `GoogleReadTool::execute` takes an `AccessToken` it did not obtain,
-  so there is no token source, no refresh exchange, and no expiry handling. `ADR-0055` decided the `TokenSet`
-  shape; nothing implements it.
-- **No deadline is applied.** The port's signature takes no cancellation or timeout token, because those belong
-  to a run and nothing here has one. The doc states that an implementation **must** bound its own wait and
-  report `Timeout` rather than hang a worker, but that is a requirement on an implementation that does not
-  exist.
-- **`Retry-After` is carried and not interpreted.** A transport passes it through; whether a stated delay is
-  honoured is `client::classify`'s decision and nothing currently joins the two. So a transport could report
-  `retry_after_seconds` and a caller could ignore it with no test failing.
-- **`evidence_from` has no caller in this crate.** Provider evidence is the locator for an *effect*, and a read
-  produces none — so the helper exists for `P5-009`'s writes and is currently exercised only by its own test.
-  It is recorded here rather than left to look like a wired control.
-- **The output rendering is not validated against the schemas it claims to match.** `ADR-0059` declares the
-  schemas and `read_output` renders their fields, but nothing parses the rendering back through the schema, so a
-  divergence between the two would be found by a reader rather than by a test.
-- **Nothing consumes the `OperationError` type outside this crate.** The mapping onto `AdapterError` is asserted,
-  and no executor dispatches to `GoogleReadTool` yet, so the tool is reachable from a test and not from a run.
+- **No `reqwest` transport exists, so the port's own requirements are unenforced.** The module doc states that an
+  implementation must not follow a redirect, must not retry, and must not read a proxy from the environment —
+  and nothing yet checks any of those, because the only implementations are test doubles. They become testable
+  only when a real transport is written, which is why `jarvis-models`' client states the same three rules with
+  `redirect(Policy::none())` and `no_proxy()` visible in the builder.
+- **No credential is minted or refreshed.** `GoogleReadTool` takes an `AccessToken` it did not obtain, so there is
+  no token source, no refresh exchange, and no expiry handling — a stale token becomes a provider refusal, which
+  is honest but means a long-lived adapter needs a token source before it is usable.
+- **The deadline is read from the system clock, so it is not testable at the trait boundary.** `execute` calls
+  `UtcTimestamp::now(&SystemClock)`, which means a test can only assert a *lapsed* deadline and not a
+  just-in-time one; the deterministic layer takes `now` as a parameter for exactly that reason.
+- **Nothing consumes the `OperationError` type outside this crate, and nothing constructs the adapter in a
+  binary.** The mapping onto `AdapterError` is asserted and the trait is implemented, and no registry, executor,
+  or route offers `google.gmail_messages_list`, so the adapter is reachable from a test and not from a run.
