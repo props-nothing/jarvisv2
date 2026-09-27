@@ -200,6 +200,22 @@ typed_id!(
     /// Identifies one durable approval request.
     ApprovalId
 );
+typed_id!(
+    /// Identifies one durable memory record.
+    ///
+    /// Distinct from every other identifier: a memory outlives the run that produced it and the
+    /// session it was learned in, so reusing either would make "forget this" ambiguous about which
+    /// thing is being forgotten.
+    MemoryId
+);
+typed_id!(
+    /// Identifies one canonical entity: a person, organization, project, document, or similar.
+    ///
+    /// An entity is what memories are *about*, and it is deliberately separate from a memory: two
+    /// claims about one person are two memories and one entity, and merging the two concepts would
+    /// make identity resolution a property of every claim rather than an auditable act of its own.
+    EntityId
+);
 
 #[cfg(test)]
 mod tests {

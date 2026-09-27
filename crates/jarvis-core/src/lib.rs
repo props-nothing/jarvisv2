@@ -19,6 +19,7 @@ mod timestamp;
 mod transport;
 
 mod approval;
+mod memory;
 mod secretbytes;
 mod tool_outcome;
 
@@ -40,11 +41,19 @@ pub use endpoint::{
 };
 pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessageReason};
 pub use id::{
-    ApprovalId, ClientId, CorrelationId, DaemonRunId, IdGenerator, InvalidId, InvalidIdReason,
-    ProfileId, RequestId, RunId, SessionId, SystemIdGenerator, WorkspaceId,
+    ApprovalId, ClientId, CorrelationId, DaemonRunId, EntityId, IdGenerator, InvalidId,
+    InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SystemIdGenerator,
+    WorkspaceId,
 };
 pub use loglevel::LogLevel;
 pub use loopback::{InvalidLoopbackHost, LOOPBACK_ADDRESS, LoopbackHost};
+pub use memory::{
+    EffectiveMemoryStatus, EntityMatch, EntityRef, InvalidMemory, MAX_CLAIM_PART_CHARS,
+    MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_IMPORTANCE, MAX_SEARCH_KEY_CHARS,
+    MAX_SEARCH_KEY_WORD_CHARS, MAX_SEARCH_KEY_WORDS, MAX_SOURCE_LOCATOR_CHARS,
+    MAX_STRUCTURED_CLAIM_BYTES, MemoryConfidence, MemoryRecord, MemoryRecordParts, MemorySearchKey,
+    MemorySource, MemorySourceKind, MemoryStatus, MemoryTrust, MemoryType, StructuredClaim,
+};
 pub use message::{
     InvalidMessage, MAX_MESSAGE_CONTENT_BYTES, MessageRole, MessageSource, NewMessage,
 };

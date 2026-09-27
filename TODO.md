@@ -2042,7 +2042,64 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 
 ## P4: Memory And Context
 
-- [ ] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.
+- [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.
+      `crates/jarvis-core/src/memory.rs`, built from `docs/architecture/memory-and-context.md` rather than
+      invented, and the module's central claim is the document's own sentence taken literally: **a memory is a
+      sourced claim with lifecycle metadata, not an unqualified string**. `MemorySource` is a **required**
+      field and `MemoryRecord::new` refuses a record without one, so the admission lifecycle's rejection step
+      ("not supported by source" → do not persist as fact) is enforceable rather than a review note — there is
+      no way to build the value the rule forbids.
+      **The invariants are constructor rules, not advice.** Three are worth naming because each closes a path
+      a caller could otherwise take:
+      - **A model inference cannot exceed `Unverified`.** "Never persist unsupported inference as fact" is a
+        refusal at construction, so a candidate the model produced cannot be recorded as `Confirmed` — the
+        acceptance invariant "an inferred preference never appears as confirmed fact" has no way to be
+        violated by a caller that tried.
+      - **A provider record cannot back a preference.** The document's own example of trust that does not
+        transfer between claim kinds ("authoritative for an event timestamp but not for a person's
+        preference"), stated once at the constructor instead of left for each reader to apply.
+      - **A source cannot claim a trust class its kind does not carry.** `MemorySourceKind::permitted_trust`
+        is an equality, so `ExternalContent` cannot claim `Authoritative` — the injection boundary is a
+        property of construction rather than of every consumer. The default is `ExternalContent`/`Untrusted`,
+        because a default is what a deserialiser fills in when a field is absent and an unrecorded origin
+        must not read as something the user said.
+      **Deliberate design choices, each with a rejected alternative:**
+      - **Confidence is four named levels, not a float.** A `f64` invites arithmetic that means nothing (two
+        confidences averaged are not a third) and lets a caller threshold at `0.6` with a meaning that changes
+        across builds. The levels are ordered for a **floor** comparison and never for arithmetic.
+      - **`Expired` is not a stored status.** Same split as `ApprovalState`: a stored `expired` would need a
+        sweep job for correctness and would make a row restored from a backup wrong.
+        `MemoryStatus::effective_at` derives it, and `EffectiveMemoryStatus` distinguishes `Expired` (lapsed)
+        from `Superseded` (replaced) because those are different answers to "why is this not being used".
+      - **Both supersession directions are stored.** `supersedes` alone would make "is this claim still
+        current" a scan of every later memory, and that question is on the retrieval path.
+      - **`Proposed` exists.** A candidate deterministic code cannot support as fact is stored as a proposal
+        rather than dropped, which is what makes "the model may propose candidates" produce something.
+      - **`Relationship` memories start as proposals.** Derived from the type at construction rather than
+        taken from the caller, so "high-impact identity and relationship inferences require explicit user
+        confirmation" cannot be skipped. `Semantic` is deliberately **not** flagged: a semantic claim can be a
+        medical or financial fact and the type alone cannot say, so flagging it would refuse an ordinary fact
+        about a city — the per-claim classification is `P4-003`'s, where the content is read.
+      - **Deletion clears the content in the domain as well as in storage.** A value already held cannot be
+        returned by a caller that kept a reference, so the domain — not only the repository — is unable to
+        produce deleted text. The row's existence is retained so a source link and an audit record resolve.
+      - **A repeated entity keeps the weakest match basis.** A reader of one memory cannot tell which mention
+        it is looking at, so one confident mention must not launder a later guess about the same entity.
+      - **The search key normalizes case, whitespace, and word order only.** No stemming, no stop words, no
+        synonyms: each would make two *different* claims collide, and over-collapsing loses information the
+        user gave, while under-collapsing a duplicate costs one row.
+      **Falsified, one guard each:** forcing the model-inference check false made
+      `a_model_inference_cannot_claim_confidence` fail at `Uncertain`; forcing the provider-preference check
+      false made `a_provider_record_cannot_back_a_preference` fail. Both restored and re-run green —
+      **155 `jarvis-core` tests.**
+      **⚠ Naming defect found and fixed while writing the tests:** the supersession transition and its
+      accessor were both `superseded_by`, distinguishable only by arity. A reader could not tell an act from a
+      query, and the act is the one that changes state — renamed to `replace_with`.
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**,
+      `cargo deny` ok.
+      **Recorded as a limit:** nothing persists a memory yet. This slice is the vocabulary and its invariants;
+      `P4-002` owns the tables, and the embedding fields in the canonical record are `P4-005` — a memory is
+      fully usable without them, because "embeddings are one signal" and not a requirement.
 - [ ] `P4-002` Implement memories, entities, aliases, relations, sources, and deletion tombstones in SQLite.
 - [ ] `P4-003` Implement candidate extraction as a reviewable pipeline; never persist unsupported inference as fact.
 - [ ] `P4-004` Implement exact, full-text, recency, importance, entity, and workspace retrieval before adding embeddings.
