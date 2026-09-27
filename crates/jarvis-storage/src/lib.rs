@@ -34,10 +34,11 @@ pub use identity_repository::{
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
 pub use memory_repository::{
     EntityKind, EntityStatus, MemoryTransition, NewEntity, StoredAlias, StoredEntity, StoredMemory,
-    StoredRelation, apply_memory_transition, find_entity, find_memory, is_tombstoned,
-    link_memory_entity, merge_entities, read_alias_candidates, read_entity_memories,
-    read_subject_relations, read_workspace_memories, record_alias, record_entity, record_memory,
-    record_relation, record_tombstone, reinforce_memory, resolve_alias,
+    StoredRelation, TASK_LIKE_PREDICATES, apply_memory_transition, find_entity, find_memory,
+    is_tombstoned, link_memory_entity, merge_entities, read_alias_candidates, read_entity_memories,
+    read_retrievable_memories, read_subject_relations, read_workspace_memories, record_alias,
+    record_entity, record_memory, record_relation, record_tombstone, reinforce_memory,
+    resolve_alias,
 };
 pub use message_repository::{
     MAX_MESSAGE_PAGE, StoredMessage, append_message, count_messages, find_message, read_messages,

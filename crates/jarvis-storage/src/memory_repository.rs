@@ -560,7 +560,7 @@ pub async fn find_memory(
 /// # Errors
 ///
 /// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded, so one corrupt row is
-/// reported rather than silently skipped â€” a skipped memory would look like a memory that does not exist.
+/// reported rather than silently skipped — a skipped memory would look like a memory that does not exist.
 pub async fn read_workspace_memories(
     database: &SqliteDatabase,
     workspace_id: WorkspaceId,
@@ -574,6 +574,91 @@ pub async fn read_workspace_memories(
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
                 retrieval_count, version \
          FROM memories WHERE workspace_id = ?1 AND status <> 'deleted' \
+         ORDER BY created_at DESC, id ASC LIMIT ?2",
+        workspace_id,
+        None,
+        limit,
+    )
+    .await
+}
+
+/// The claim predicates that assert a **task** rather than a durable fact.
+///
+/// # Why a predicate list and not a memory type
+///
+/// The retrieval path for a model request must not offer the model its own unfinished work — an objective it
+/// was previously given, a planned step, a pending call — because a plan replayed into a prompt reads as an
+/// instruction to continue it. `P4-001` models that as [`MemoryType::Working`], which is the *retention*
+/// question ("is this expected to survive the run that produced it"), and the two are not the same set: a
+/// user statement about a task ("I am working on the tax return") is a durable fact that happens to mention
+/// one.
+///
+/// So this is a list of predicates, not a type filter, and it is deliberately **narrow**. Each entry names a
+/// claim whose object is the work itself. A predicate this list does not know is treated as a fact, which is
+/// the permissive direction for *offering* and the safe one for the failure mode that matters here: offering
+/// a fact the model did not need costs budget, while omitting a fact costs the answer.
+///
+/// The list lives in the storage half rather than in `jarvis-core` because it is a **query predicate** — it
+/// is what the SQL below filters on — and `jarvis-core`'s retrieval module operates on records a caller
+/// already holds.
+pub const TASK_LIKE_PREDICATES: [&str; 6] = [
+    "objective",
+    "current_objective",
+    "pending_call",
+    "planned_step",
+    "plan",
+    "next_action",
+];
+
+/// Reads the memories eligible to be offered to a model for one request.
+///
+/// # Why this is not `read_workspace_memories` with a `WHERE` clause added by the caller
+///
+/// The eligibility rules here are not a convenience filter; each one closes a path that would otherwise put
+/// content into a prompt that must not be there, and every one of them is **in SQL rather than in the
+/// assembler** so a caller cannot forget it:
+///
+/// - **`status <> 'deleted'`** — a tombstone has no content, but the row exists and decoding one is only
+///   refused by the domain. Excluding it here means the candidate set never contains a claim the user
+///   removed.
+/// - **`status <> 'proposed'`** — a proposal is awaiting review, and `ADR-0045`'s whole point is that a
+///   candidate is not a fact until it is admitted. Offering one to the model would make the review step
+///   decorative.
+/// - **`status <> 'superseded'`** — a corrected claim is retained for audit, and retrieving it *as current*
+///   is precisely what `ADR-0046` excludes. The domain check would catch it; excluding it here keeps the
+///   window from being spent on rows that can only be dropped.
+/// - **A task-like predicate is excluded** — see [`TASK_LIKE_PREDICATES`].
+/// - **A model inference is excluded** — the rule `P4-003` established, enforced at the read rather than
+///   only at conversion. A model's own previous output re-entering a prompt as evidence is the self-feeding
+///   loop the inference boundary exists to prevent, and `status <> 'proposed'` does not cover it: an
+///   inference the user *confirmed* is active by status, and is still the model's claim.
+///
+/// `valid_until` is deliberately **not** filtered. Expiry is a read-side fact evaluated against the clock
+/// the caller holds (`MemoryRecord::effective_status_at`), and comparing a stored RFC 3339 string against a
+/// clock in SQL is the lexicographic-comparison trap `ADR-0034` recorded — the fraction is omitted when it
+/// is zero, so an expired row can sort as unexpired. The domain check is the one that decides.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded.
+pub async fn read_retrievable_memories(
+    database: &SqliteDatabase,
+    workspace_id: WorkspaceId,
+    limit: u32,
+) -> Result<Vec<StoredMemory>, DatabaseError> {
+    read_memories(
+        database,
+        "SELECT id, workspace_id, memory_type, content, claim_subject, claim_predicate, claim_object, source_kind, source_locator, \
+                source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
+                status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
+                created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
+                retrieval_count, version \
+         FROM memories \
+         WHERE workspace_id = ?1 \
+           AND status IN ('active', 'archived') \
+           AND source_kind <> 'model_inference' \
+           AND (claim_predicate IS NULL OR lower(claim_predicate) NOT IN ( \
+                 'objective', 'current_objective', 'pending_call', 'planned_step', 'plan', 'next_action')) \
          ORDER BY created_at DESC, id ASC LIMIT ?2",
         workspace_id,
         None,

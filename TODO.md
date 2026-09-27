@@ -2377,7 +2377,89 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
       (1172 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 205 tests.
-- [ ] `P4-007` Integrate memory retrieval into context budgets with provenance and injection-resistant quoting.
+- [x] `P4-007` Integrate memory retrieval into context budgets with provenance and injection-resistant quoting.
+      `crates/jarvis-core/src/isolation.rs` (+`isolation/tests.rs`, 10 tests) +
+      `crates/jarvis-core/src/memory/context_tests.rs` (11 tests) +
+      `MemoryRecord::{context_trust, context_item}` + `RetrievedMemory` + `memory_context_introduction` +
+      `jarvis-storage::read_retrievable_memories` + `apps/jarvisd`'s `load_memories`/`context_summary` and
+      the `messages_from_manifest` memory path (4 daemon tests). `ADR-0049`.
+      **`jarvis-core` 227 tests** (up from 205), **1198 workspace tests** in 45 suites.
+      **⭐ Isolation is not detection, and the module says so.** "Detect and remove instructions" is not
+      implementable — deciding whether a sentence is an instruction requires understanding it, and any pattern
+      list is defeated by rephrasing or by a language it does not cover. So the module makes the text have
+      three properties an attacker cannot undo instead: **format characters are removed** (a bidi override
+      changes how text *reads* without changing what it *is*, so in a prompt it is a deception primitive); the
+      **fence token cannot appear in the payload**, so the region cannot be closed from inside; and the
+      **framing is authoritative text this platform wrote**, placed before the payload. Property three is why
+      the fence is not itself a security claim — properties one and two hold regardless of what the model
+      decides to do.
+      **⭐ The model may still obey an instruction inside the fence, and that is recorded as the design.**
+      Prompt injection is *mitigated* here, not solved, and no fencing scheme solves it. What protects the
+      system is that the *effect* of any instruction still passes through schema validation, authorization,
+      risk classification, approval, and audit: the model may ask, and deterministic Rust decides. Stated in
+      the ADR so the fence is not read as a guarantee it is not.
+      **⭐ Two real defects the tests found, and the second is the more interesting.**
+      (1) The fence-token check **silently did nothing for every payload, including the real marker**: it
+      stripped separators from the text and then searched for a token that still had its own hyphens in it, so
+      the comparison could never match. An assertion written in terms of the same normalisation had reproduced
+      the bug and passed — what caught it was counting opening markers in the *rendering*. A guard that cannot
+      fire reads exactly like a guard that finds nothing.
+      (2) **Neutralisation removed every control character, and `\n` and `\t` are control characters** — so a
+      multi-line memory silently became one run-on line, and a list rendered as a sentence is a different
+      claim. Line structure is kept; a carriage return is not, since a lone one is a line-overwrite primitive.
+      The failure mode was a *quiet reshaping* rather than a loss, which is why the test asserts the exact
+      text.
+      **⭐ A third defect: the token estimate was two bytes short of what would be sent.** It added the two
+      marker lengths and forgot the newlines `render` inserts. That is the one direction a budget must not err
+      in. The estimate now takes the rendering itself, so there is no length arithmetic left to get wrong, and
+      the test asserts an inequality over four payload shapes rather than an equality against one hand-computed
+      length.
+      **Eligibility is split between the read and the conversion, deliberately.** SQL excludes what only SQL
+      can decide (deleted/proposed/superseded rows, **model inferences**, task-shaped predicates); conversion
+      excludes what needs the clock or a policy (not current truth at this instant, a type the use case does
+      not allow). Two rules deserve their reasons recorded: a **model inference is filtered by source kind,
+      not by status**, because a *confirmed* inference is `active` and is still the model's own claim — the
+      self-feeding loop the inference boundary exists to prevent; and **`Working`/`Conversation` are excluded
+      by the allow-list**, the first because a plan replayed into a prompt reads as an instruction to continue
+      it, the second because the history replay already provides it and offering it twice would make one turn
+      look like independent corroboration of itself.
+      **The trust mapping is deliberately not the identity.** A model inference is `Untrusted`, never
+      `Derived`, or the model could reach a future prompt by first writing a memory. An unconfirmed claim from
+      an authoritative source is `Derived`, not `User`, because a user statement recorded `Uncertain` is this
+      platform's uncertain reading of something rather than the person speaking. Nothing maps to
+      `Authoritative`, because a memory is never JARVIS's own policy — and only `Authoritative` is
+      instruction-bearing.
+      **Retrieved records go in one message, after the history and before the question.** One message per
+      record would interleave untrusted text with the conversation's turns, so a record could be read as a
+      turn; appending them to the user's own turn would make them indistinguishable from something the user
+      typed. Membership comes from the manifest and order from the conversation, and a record the manifest
+      included but which cannot be found is an **error** rather than a skip, or the request would disagree
+      with its own audit record.
+      **Falsified, one guard each:** disabling the newline exemption failed
+      `line_structure_survives_but_a_carriage_return_does_not`; restoring the un-normalised needle failed two
+      isolation tests; sending `isolated().body()` instead of `.render()` failed three of the four daemon
+      memory tests; neutralising the `source_kind` filter failed `a_model_inference_and_a_task_claim_are_not_offered`.
+      All restored, green.
+      **A test weakness the falsification exposed and fixed:** `a_stored_memory_reaches_the_request_inside_a_fence`
+      *passed* with the fence removed, because the introduction itself names both markers, so "the message
+      contains the marker" was satisfied by prose about the fence. Extracted a shared `fenced_record_message`
+      helper that requires the marker **on its own line**, which is the structural property `render` produces
+      and prose cannot satisfy.
+      **Recorded as limits:** no ranking, scoring, or diversity is applied — `P4-004`'s eligibility and
+      `P4-006`'s ranking exist and are tested and **nothing calls them on this path**, so the read is a recency
+      window rather than a relevance one and `MAX_MEMORIES_LOADED` is the only bound; `retrieval_count` is
+      **never incremented** and `last_accessed_at` stays null (`reinforce_memory` exists, nothing calls it), so
+      the reinforcement signal is zero for every memory; **no vector search**, because nothing writes an
+      embedding, so the hybrid ranking is not yet hybrid; `read_entity_memories` exists and is unused, so
+      "what do I know about this person" is still answered by ranking rather than an index seek; **expiry is
+      evaluated in Rust**, so expired-but-active rows still fill the window (`ADR-0034`'s timestamp comparison
+      defect would have to be fixed first); the format-character range set is **duplicated** between
+      `jarvis-core` and `jarvis-mcp` because the dependency runs one way; the event says how many memories were
+      offered/included/altered but **not which**, beyond the manifest's references not being stored; and no
+      CLI or route exposes any of it (`P4-008`).
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
+      (1198 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 227 tests, `jarvisd` 93.
 - [ ] `P4-008` Add inspect, search, remember, correct, forget, export, retention, and full user-deletion APIs/CLI.
 - [ ] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.
 - [ ] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.

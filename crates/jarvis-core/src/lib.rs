@@ -20,6 +20,7 @@ mod transport;
 
 mod approval;
 mod candidate;
+mod isolation;
 mod memory;
 mod retrieval;
 mod secretbytes;
@@ -53,15 +54,19 @@ pub use id::{
     InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SystemIdGenerator,
     WorkspaceId,
 };
+pub use isolation::{
+    FENCE_CLOSE, FENCE_OPEN, FENCE_TOKEN, IsolatedText, IsolationError, MAX_ISOLATED_CHARS,
+    is_format_character, looks_like_an_instruction,
+};
 pub use loglevel::LogLevel;
 pub use loopback::{InvalidLoopbackHost, LOOPBACK_ADDRESS, LoopbackHost};
 pub use memory::{
     EffectiveMemoryStatus, EntityMatch, EntityRef, InvalidMemory, MAX_CLAIM_PART_CHARS,
     MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_IMPORTANCE, MAX_SEARCH_KEY_CHARS,
     MAX_SEARCH_KEY_WORD_CHARS, MAX_SEARCH_KEY_WORDS, MAX_SOURCE_LOCATOR_CHARS,
-    MAX_STRUCTURED_CLAIM_BYTES, MemoryConfidence, MemoryRecord, MemoryRecordParts, MemorySearchKey,
-    MemorySource, MemorySourceKind, MemoryStatus, MemoryTrust, MemoryType, StoredMemoryState,
-    StructuredClaim,
+    MAX_STRUCTURED_CLAIM_BYTES, MemoryConfidence, MemoryContextRefusal, MemoryRecord,
+    MemoryRecordParts, MemorySearchKey, MemorySource, MemorySourceKind, MemoryStatus, MemoryTrust,
+    MemoryType, RetrievedMemory, StoredMemoryState, StructuredClaim, memory_context_introduction,
 };
 pub use message::{
     InvalidMessage, MAX_MESSAGE_CONTENT_BYTES, MessageRole, MessageSource, NewMessage,
