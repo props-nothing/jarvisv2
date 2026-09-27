@@ -11,6 +11,7 @@
 
 mod api_client;
 mod chat;
+mod memory;
 mod output;
 
 use std::{io, path::PathBuf, process::ExitCode};
@@ -45,6 +46,7 @@ async fn main() -> ExitCode {
         Some("ask") => ask(&arguments).await,
         Some("chat") => chat(&arguments).await,
         Some("logs") => logs(&arguments),
+        Some("memory") => memory_command(&arguments).await,
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
         Some(other) => {
@@ -61,7 +63,25 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]"
+}
+
+/// Runs one `jarvis memory` verb against the daemon's HTTP API.
+///
+/// Shares `run_client` with `ask` and `chat`, because the memory surface lives on the same HTTP API and
+/// needs the same four facts. A separate client builder here would be the second place a configured port is
+/// read, which is how two commands come to target different ports.
+async fn memory_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    memory::run(&client, arguments).await
 }
 
 fn json_requested(arguments: &[String]) -> bool {

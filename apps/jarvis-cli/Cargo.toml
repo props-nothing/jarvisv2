@@ -20,6 +20,7 @@ jarvis-storage.workspace = true
 # workspace through the model adapter, so this adds no new version. Its defaults are
 # overridden in `api_client.rs`: proxies and redirects off, verification on.
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

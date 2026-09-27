@@ -34,8 +34,9 @@ pub use identity_repository::{
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
 pub use memory_repository::{
     EntityKind, EntityStatus, MemoryTransition, NewEntity, StoredAlias, StoredEntity, StoredMemory,
-    StoredRelation, TASK_LIKE_PREDICATES, apply_memory_transition, find_entity, find_memory,
-    is_tombstoned, link_memory_entity, merge_entities, read_alias_candidates, read_entity_memories,
+    StoredRelation, TASK_LIKE_PREDICATES, apply_memory_transition, count_memory_entity_links,
+    find_entity, find_memory, find_memory_including_deleted, is_tombstoned, link_memory_entity,
+    merge_entities, purge_memory, read_alias_candidates, read_all_memories, read_entity_memories,
     read_retrievable_memories, read_subject_relations, read_workspace_memories, record_alias,
     record_entity, record_memory, record_relation, record_tombstone, reinforce_memory,
     resolve_alias,

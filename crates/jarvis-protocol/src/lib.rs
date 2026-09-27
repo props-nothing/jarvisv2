@@ -2,6 +2,7 @@
 
 mod approval;
 mod frame;
+mod memory_api;
 mod rest;
 mod run_api;
 mod session;
@@ -9,6 +10,11 @@ mod version;
 mod wire;
 pub use approval::{ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalReply};
 pub use frame::{FrameError, MAX_FRAME_BYTES, decode_frame, encode_frame, read_frame, write_frame};
+pub use memory_api::{
+    ClaimBody, CorrectMemoryRequest, DeletionReceipt, ExportedMemory, ForgetMemoryRequest,
+    MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference, MemoryReply,
+    MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest, SignalContribution,
+};
 pub use rest::{
     JSON_CONTENT_TYPE, MAX_STREAM_PAGE, RESYNC_HINT_SECONDS, RunEventPageReply, RunEventReply,
     RunReply, SSE_CONTENT_TYPE, StartRunRequest, rest_error, safe,

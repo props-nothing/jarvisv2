@@ -537,7 +537,8 @@ pub async fn find_memory(
 
     // The links are read **after** the record so a decode failure does not leave a half-built value. The
     // order also means the entity set is the store's, not one a caller supplied.
-    let record = with_linked_entities(database, record).await?;
+    let mut record = record;
+    load_linked_entities(database, &mut record).await?;
 
     let version = row
         .try_get::<i64, _>("version")
@@ -621,12 +622,15 @@ pub const TASK_LIKE_PREDICATES: [&str; 6] = [
 /// - **`status <> 'deleted'`** — a tombstone has no content, but the row exists and decoding one is only
 ///   refused by the domain. Excluding it here means the candidate set never contains a claim the user
 ///   removed.
-/// - **`status <> 'proposed'`** — a proposal is awaiting review, and `ADR-0045`'s whole point is that a
-///   candidate is not a fact until it is admitted. Offering one to the model would make the review step
-///   decorative.
-/// - **`status <> 'superseded'`** — a corrected claim is retained for audit, and retrieving it *as current*
-///   is precisely what `ADR-0046` excludes. The domain check would catch it; excluding it here keeps the
-///   window from being spent on rows that can only be dropped.
+/// - **`status = 'active'`** — a proposal is awaiting review, and `ADR-0045`'s whole point is that a
+///   candidate is not a fact until it is admitted. An **archived** claim is either superseded by a
+///   correction or set aside by the user, and `MemoryStatus::Archived`'s own doc says it is "retained for
+///   audit, not retrieved as current truth". It is excluded here rather than left to the conversion's
+///   currency check, because a row that can only ever be dropped should not consume the candidate window.
+///   `P4-007`'s recorded claim that this read filtered superseded rows was **wrong** — it filtered
+///   `deleted` and `proposed` and admitted `archived`, relying on the conversion to refuse it. The
+///   behaviour was correct and the statement about it was not, which is the same class of defect as a test
+///   whose name and fixture disagree.
 /// - **A task-like predicate is excluded** — see [`TASK_LIKE_PREDICATES`].
 /// - **A model inference is excluded** — the rule `P4-003` established, enforced at the read rather than
 ///   only at conversion. A model's own previous output re-entering a prompt as evidence is the self-feeding
@@ -655,7 +659,7 @@ pub async fn read_retrievable_memories(
                 retrieval_count, version \
          FROM memories \
          WHERE workspace_id = ?1 \
-           AND status IN ('active', 'archived') \
+           AND status = 'active' \
            AND source_kind <> 'model_inference' \
            AND (claim_predicate IS NULL OR lower(claim_predicate) NOT IN ( \
                  'objective', 'current_objective', 'pending_call', 'planned_step', 'plan', 'next_action')) \
@@ -699,14 +703,366 @@ pub async fn read_entity_memories(
     .await
 }
 
-/// Runs one of the two workspace-scoped memory reads.
+/// Reads every memory in a workspace, including deleted ones, for an export.
 ///
-/// # Why this exists rather than two copies
+/// # Why this is not `read_workspace_memories`
 ///
-/// The two statements select the same columns in the same order and differ only in their `FROM` and
-/// `WHERE`. Two copies would be two decoders, and a column added to one would make the other's decode
-/// silently read the wrong field. The `workspace_id` is bound as `?1` in both, so the scoping is stated once
-/// and cannot be omitted from a variant.
+/// An export and a listing answer different questions, and the difference is what each excludes.
+/// `read_workspace_memories` is a **retrieval** read: it omits deleted rows, because a claim the user removed
+/// must not be offered. An export is a **portability** read: `docs/architecture/memory-and-context.md`
+/// requires "each memory type has configurable retention and export behavior", and an export that silently
+/// omitted archived and superseded claims would be an incomplete picture of what this platform holds, which
+/// is exactly what a portability request exists to reveal.
+///
+/// Deleted rows are included as their **tombstone form**: the content is empty and the search key is gone, so
+/// the export shows that a claim existed and was removed rather than either hiding it or resurrecting its
+/// text. That is `ADR-0044`'s design read back out — a deleted row is a tombstone-shaped remainder, and an
+/// export should say so.
+///
+/// # Why this has its own statement rather than joining `read_memories`
+///
+/// The shared runner binds a positional `limit` and an optional entity, and this read needs a second
+/// positional parameter (`offset`) *after* the limit. Adding a fourth shape to a runner whose whole purpose
+/// is to keep one statement's parameter positions in one place would put the divergence back where the
+/// runner exists to remove it. The decoder below is shared, which is where the real duplication would be.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded, so a corrupt row is
+/// reported rather than silently absent from a user's own data.
+pub async fn read_all_memories(
+    database: &SqliteDatabase,
+    workspace_id: WorkspaceId,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<StoredMemory>, DatabaseError> {
+    let rows = sqlx::query(
+        "SELECT id, workspace_id, memory_type, content, claim_subject, claim_predicate, claim_object, source_kind, source_locator, \
+                source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
+                status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
+                created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
+                retrieval_count, version \
+         FROM memories WHERE workspace_id = ?1 \
+         ORDER BY created_at DESC, id ASC LIMIT ?2 OFFSET ?3",
+    )
+    .bind(workspace_id.to_string())
+    .bind(i64::from(limit))
+    .bind(i64::from(offset))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read all memories",
+        source,
+    })?;
+
+    let mut memories = Vec::with_capacity(rows.len());
+    for row in &rows {
+        memories.push(decode_stored_memory(row)?);
+    }
+    attach_entity_links(database, &mut memories).await?;
+    Ok(memories)
+}
+
+/// Reads one memory by identifier **without** the deleted status exclusion.
+///
+/// `find_memory` refuses a deleted row because a retrieval should not see one; an export, a receipt, and a
+/// purge all need to. Separate rather than a flag on `find_memory`, because a boolean parameter at a call
+/// site reads as `find_memory(db, id, true)` and the `true` says nothing about what it permits.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::MemoryNotFound`] when no memory has that identifier, and
+/// [`DatabaseError::StoredMemoryInvalid`] when the row cannot be decoded.
+pub async fn find_memory_including_deleted(
+    database: &SqliteDatabase,
+    id: &str,
+) -> Result<StoredMemory, DatabaseError> {
+    let row = sqlx::query(
+        "SELECT id, workspace_id, memory_type, content, claim_subject, claim_predicate, claim_object, source_kind, source_locator, \
+                source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
+                status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
+                created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
+                retrieval_count, version \
+         FROM memories WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "find a memory including deleted",
+        source,
+    })?;
+
+    let Some(row) = row else {
+        return Err(DatabaseError::MemoryNotFound);
+    };
+    let mut stored = decode_stored_memory(&row)?;
+    // The links are loaded here too, and that is not cosmetic: this is the read `load_scoped` uses, so a
+    // correction that inherited its entities from here would otherwise inherit an **empty** set and be
+    // refused for naming no entity. The failure would be a correct operation rejected.
+    load_linked_entities(database, &mut stored.record).await?;
+    Ok(stored)
+}
+
+/// Counts the entity links attached to one memory, before a purge removes them.
+///
+/// A count read **before** the delete, because the cascade removes the rows and an `AFTER` count would always
+/// be zero — a receipt field that can only ever report one value is a field that reports nothing.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the read fails.
+pub async fn count_memory_entity_links(
+    database: &SqliteDatabase,
+    memory_id: &str,
+) -> Result<u32, DatabaseError> {
+    let row = sqlx::query("SELECT COUNT(*) AS total FROM memory_entities WHERE memory_id = ?1")
+        .bind(memory_id)
+        .fetch_one(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "count memory entity links",
+            source,
+        })?;
+    let total = row
+        .try_get::<i64, _>("total")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid {
+            field: "memory_entities_count",
+        })?;
+    u32::try_from(total).map_err(|_| DatabaseError::StoredMemoryInvalid {
+        field: "memory_entities_count",
+    })
+}
+
+/// Writes the tombstone that blocks a purged claim from returning, **on the purge's own transaction**.
+///
+/// # Why this takes a transaction rather than the database
+///
+/// The tombstone must be written on the same connection as the delete, and the first version of
+/// [`purge_memory`] did not do that: it called the pool-level [`record_tombstone`], which takes a second
+/// connection, while the purge's transaction held a read. SQLite in WAL mode then fails the transaction's
+/// own write with `SQLITE_BUSY_SNAPSHOT` — the snapshot it read from is no longer current — and the caller
+/// sees a bare "failed to purge a memory". Accepting the transaction makes writing through the pool a
+/// *compile* error rather than a subtle runtime one.
+///
+/// It also means the row's fields are read from the transaction's own `SELECT` rather than through a second
+/// read, so the type and provenance written into the tombstone are the ones the delete acts on.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] for a row whose columns do not decode, and
+/// [`DatabaseError::Sqlite`] when the insert fails.
+async fn write_tombstone_on(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row: &SqliteRow,
+    memory_id: &str,
+    at: UtcTimestamp,
+) -> Result<(), DatabaseError> {
+    let search_key = row
+        .try_get::<Option<String>, _>("search_key")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid {
+            field: "search_key",
+        })?;
+    // A row with no search key is already a tombstone-shaped remainder, so there is nothing to block: the
+    // deletion that cleared the key wrote its own tombstone. Not an error, and not a silent skip either —
+    // the caller's receipt reports `removed_search_key: false` for the same row.
+    let Some(search_key) = search_key else {
+        return Ok(());
+    };
+    let text = |field: &'static str| -> Result<String, DatabaseError> {
+        row.try_get::<String, _>(field)
+            .map_err(|_| DatabaseError::StoredMemoryInvalid { field })
+    };
+    sqlx::query(
+        "INSERT INTO memory_tombstones (\
+            id, workspace_id, memory_type, search_key_hash, memory_id, deleted_by_actor_id, \
+            correlation_id, deleted_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT (workspace_id, search_key_hash) DO NOTHING",
+    )
+    .bind(jarvis_core::MemoryId::new().to_string())
+    .bind(text("workspace_id")?)
+    .bind(text("memory_type")?)
+    .bind(search_key_hash(&search_key))
+    .bind(memory_id)
+    .bind(text("created_by_actor_id")?)
+    .bind(text("correlation_id")?)
+    .bind(at.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "record a memory tombstone",
+        source,
+    })?;
+    Ok(())
+}
+
+/// Removes a memory row outright, with its search key, tombstone, and entity links.
+///
+/// # This is the full user deletion, and it is a different operation from `Delete`
+///
+/// `apply_memory_transition`'s `Delete` clears the **text** and keeps the row, which is what
+/// `docs/architecture/memory-and-context.md`'s acceptance invariant needs ("deleting it removes text and
+/// derived indexes") and what a source link continues to resolve against. It is not a full deletion: the
+/// row, its actor, its correlation identity, and its provenance remain.
+///
+/// A **full user deletion** is the stronger request — "remove this and do not keep a record that says
+/// anything" — and it is what `docs/architecture/memory-and-context.md` describes as covering "source links
+/// where owned, embeddings, full-text indexes, caches, and relation edges". So this really deletes the row,
+/// and the foreign keys (`memory_entities`, and `memories.supersedes_memory_id` /
+/// `superseded_by_memory_id` via `ON DELETE SET NULL`) do the rest.
+///
+/// # Why the tombstone is written *before* the delete
+///
+/// The tombstone is the only durable record that blocks a re-ingest, and it deliberately has **no** foreign
+/// key to the memory so it can outlive it. Writing it first means a crash between the two leaves a tombstone
+/// for a memory that still exists, which is recoverable by deleting again — whereas the reverse order would
+/// leave a deleted memory with no tombstone, so a later ingest would resurrect a claim the user removed. The
+/// safe failure direction is the one that over-blocks.
+///
+/// `allow_relearn` is the deliberate exception: it skips the tombstone **and** removes any existing one, which
+/// is an undo of a deletion rather than a cleanup, and it is reported in the receipt so the audit trail
+/// distinguishes the two.
+///
+/// # Errors
+///
+/// - [`DatabaseError::MemoryNotFound`] when no memory has that identifier.
+/// - [`DatabaseError::MemoryConflict`] when a concurrent writer advanced the version.
+/// - [`DatabaseError::Sqlite`] when any statement fails.
+pub async fn purge_memory(
+    database: &SqliteDatabase,
+    id: &str,
+    expected_version: i64,
+    allow_relearn: bool,
+    at: UtcTimestamp,
+) -> Result<(), DatabaseError> {
+    // The version guard is a `SELECT`-then-`DELETE` inside **one transaction**, so a concurrent edit cannot
+    // slip between the check and the removal. A bare `DELETE ... WHERE version = ?` would be simpler and
+    // would report the same conflict, but it would not let the caller distinguish "the version moved" from
+    // "the row is gone" — and those need different answers: the first is retryable, the second is not.
+    //
+    // Every statement below runs on this one connection, including the tombstone write. That is not a style
+    // choice: SQLite in WAL mode fails a **deferred** transaction that reads and then writes with
+    // `SQLITE_BUSY_SNAPSHOT` if another connection committed in between, so a tombstone written through the
+    // pool while this transaction held a read made the delete fail with a bare "failed to purge a memory".
+    // The first version of this function did exactly that, and the failure was invisible until a purge ran
+    // against a memory whose tombstone had to be written.
+    let mut transaction =
+        database
+            .pool()
+            .begin()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "begin a memory purge",
+                source,
+            })?;
+
+    let row = sqlx::query(
+        "SELECT version, workspace_id, memory_type, search_key, created_by_actor_id, correlation_id \
+         FROM memories WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read a memory to purge",
+        source,
+    })?;
+    let Some(row) = row else {
+        transaction
+            .commit()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "commit a memory purge",
+                source,
+            })?;
+        return Err(DatabaseError::MemoryNotFound);
+    };
+    let stored_version = row
+        .try_get::<i64, _>("version")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid { field: "version" })?;
+    if stored_version != expected_version {
+        // Committed rather than dropped so the read is not left holding a write lock. Nothing was written,
+        // so this is only releasing the snapshot.
+        transaction
+            .commit()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "commit a memory purge",
+                source,
+            })?;
+        return Err(DatabaseError::MemoryConflict);
+    }
+
+    if allow_relearn {
+        sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = ?1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "remove a memory tombstone",
+                source,
+            })?;
+    } else {
+        write_tombstone_on(&mut transaction, &row, id, at).await?;
+    }
+
+    // `memory_entities` cascades, and the two supersession columns are `ON DELETE SET NULL`, so a claim that
+    // pointed at this one stops pointing at a row that no longer exists. `sqlite3` enforces that only when
+    // `PRAGMA foreign_keys` is on; `SqliteDatabase::open` sets it, which is what makes the cascade real
+    // rather than decorative.
+    let result = sqlx::query("DELETE FROM memories WHERE id = ?1 AND version = ?2")
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "purge a memory",
+            source,
+        })?;
+
+    if result.rows_affected() == 0 {
+        transaction
+            .commit()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "commit a memory purge",
+                source,
+            })?;
+        return Err(DatabaseError::MemoryConflict);
+    }
+
+    transaction
+        .commit()
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "commit a memory purge",
+            source,
+        })
+}
+
+/// Decodes one row from any of the memory reads into a `StoredMemory`.
+///
+/// Shared by every read so the column list and the decode cannot drift apart between them — the defect this
+/// module's `read_memories` doc records, where a parameter went unbound and the query silently ignored a
+/// filter. A second decode would be a second chance to name the wrong column.
+fn decode_stored_memory(row: &sqlx::sqlite::SqliteRow) -> Result<StoredMemory, DatabaseError> {
+    let search_key = row
+        .try_get::<Option<String>, _>("search_key")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid {
+            field: "search_key",
+        })?;
+    let version = row
+        .try_get::<i64, _>("version")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid { field: "version" })?;
+    Ok(StoredMemory {
+        record: decode_memory(row)?,
+        search_key,
+        version,
+    })
+}
+
+/// Runs one of the workspace-scoped memory reads that take no entity.
 ///
 /// # Why the entity filter is an `Option` bound conditionally rather than a statement per shape
 ///
@@ -738,24 +1094,11 @@ async fn read_memories(
 
     let mut memories = Vec::with_capacity(rows.len());
     for row in &rows {
-        let search_key = row
-            .try_get::<Option<String>, _>("search_key")
-            .map_err(|_| DatabaseError::StoredMemoryInvalid {
-                field: "search_key",
-            })?;
-        let version = row
-            .try_get::<i64, _>("version")
-            .map_err(|_| DatabaseError::StoredMemoryInvalid { field: "version" })?;
-        let record = decode_memory(row)?;
-        memories.push(StoredMemory {
-            record,
-            search_key,
-            version,
-        });
+        memories.push(decode_stored_memory(row)?);
     }
+    attach_entity_links(database, &mut memories).await?;
     Ok(memories)
 }
-
 /// Records that a memory was selected into a context, reinforcing it.
 ///
 /// # Errors
@@ -1509,10 +1852,10 @@ async fn find_memory_id_by_key(
 }
 
 /// Reads a memory's entity links into the domain value.
-async fn with_linked_entities(
+async fn load_linked_entities(
     database: &SqliteDatabase,
-    mut record: MemoryRecord,
-) -> Result<MemoryRecord, DatabaseError> {
+    record: &mut MemoryRecord,
+) -> Result<(), DatabaseError> {
     let rows = sqlx::query(
         "SELECT entity_id, matched_by FROM memory_entities WHERE memory_id = ?1 ORDER BY entity_id ASC",
     )
@@ -1546,7 +1889,24 @@ async fn with_linked_entities(
     // The entity set is replaced rather than merged: the store is the authority on what a memory is linked
     // to, and a decode that kept whatever a caller supplied would let the two disagree.
     record.replace_entities(entities);
-    Ok(record)
+    Ok(())
+}
+
+/// Loads entity links for a page of memories, so a listing and an export report the entities a claim is
+/// about rather than an empty set.
+///
+/// One statement per row rather than a join, because the link rows carry a `matched_by` per entity and a
+/// join would either fan the memory columns out or need a second decode path. The page is bounded by
+/// `MAX_MEMORY_PAGE`, so the count is bounded too — which is the reason the bound exists rather than a
+/// later optimisation.
+async fn attach_entity_links(
+    database: &SqliteDatabase,
+    memories: &mut [StoredMemory],
+) -> Result<(), DatabaseError> {
+    for stored in memories.iter_mut() {
+        load_linked_entities(database, &mut stored.record).await?;
+    }
+    Ok(())
 }
 
 /// Decodes one memory row, re-checking the domain's invariants.

@@ -33,13 +33,40 @@
 //! daemon does not serve. See that type for why the rule is a shape rather than a check.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use jarvis_core::LoopbackHost;
+// The CLI does not depend on serde directly, so the trait is reached through serde_json, which is
+// already a dependency for parsing the daemon's replies. Adding serde to the manifest for one bound would
+// be a new direct dependency for a name.
+
 use jarvis_protocol::{
-    JSON_BODY_CONTENT_TYPE, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT,
-    StartRunRequest, WireError, run_path, run_stream_path, runs_path,
+    CorrectMemoryRequest, DeletionReceipt, ForgetMemoryRequest, JSON_BODY_CONTENT_TYPE,
+    MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply,
+    MemorySearchRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
+    SSE_ACCEPT, StartRunRequest, WireError, path_segment, run_path, run_stream_path, runs_path,
 };
+
+/// The base path of the memory surface.
+///
+/// A constant rather than a function because it takes no parameter, unlike a run path: there is one memory
+/// collection per profile, and its scope comes from the credential rather than from the URL.
+const MEMORIES_PATH: &str = "/api/v1/memories";
+
+/// Builds the path for one memory, validating the identifier first.
+///
+/// The identifier is validated by [`jarvis_protocol::path_segment`], which is the **segment** rule the run
+/// paths are built from. Reusing it rather than writing a second validator is deliberate: two validators over
+/// the same class of untrusted value are two chances for one of them to miss a character, and a memory
+/// identifier is no more trustworthy than a run identifier.
+///
+/// # Errors
+///
+/// Returns [`RunPathError`] when the identifier contains a character that would change the request target.
+fn memory_path(memory_id: &str) -> Result<String, RunPathError> {
+    Ok(format!("/api/v1/memories/{}", path_segment(memory_id)?))
+}
 
 /// Time allowed to establish a connection to a loopback daemon.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -239,6 +266,178 @@ impl ApiClient {
                 .json::<RunReply>()
                 .await
                 .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Lists the workspace's remembered claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the daemon refuses the page size or the transport fails.
+    pub async fn list_memories(&self, limit: Option<u32>) -> Result<MemoryListReply, ApiError> {
+        let path = match limit {
+            Some(limit) => format!("{MEMORIES_PATH}?limit={limit}"),
+            None => MEMORIES_PATH.to_owned(),
+        };
+        self.get_json(&path).await
+    }
+
+    /// Reads one claim, with its content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Identifier`] when the identifier is not usable in a path, and
+    /// [`ApiError::Refused`] when the claim is unknown.
+    pub async fn read_memory(&self, memory_id: &str) -> Result<MemoryDetailReply, ApiError> {
+        self.get_json(&memory_path(memory_id)?).await
+    }
+
+    /// Searches the workspace's claims, returning the ranked matches and their explanations.
+    ///
+    /// A `POST` with a body rather than a query string, so the search term never reaches a URL: a URL lands
+    /// in access logs, browser history, and `Referer` headers, and a memory search term is exactly the kind
+    /// of phrase that should not. It is also the value that would otherwise need percent-encoding and
+    /// re-validation, which is a second parsing path for something the body carries safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the daemon refuses a value or the transport fails.
+    pub async fn search_memories(
+        &self,
+        request: &MemorySearchRequest,
+    ) -> Result<MemorySearchReply, ApiError> {
+        let response = self
+            .bounded_request(reqwest::Method::POST, &format!("{MEMORIES_PATH}/search"))
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<MemorySearchReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Stores a claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the daemon refuses the claim — which is an ordinary outcome, since the
+    /// candidate pipeline applies the confidence caps and sensitivity floors — or the transport fails.
+    pub async fn remember(&self, request: &RememberRequest) -> Result<MemoryReply, ApiError> {
+        let response = self
+            .bounded_request(reqwest::Method::POST, MEMORIES_PATH)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<MemoryReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Corrects a claim, replacing its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` when the caller's version is stale.
+    pub async fn correct_memory(
+        &self,
+        memory_id: &str,
+        request: &CorrectMemoryRequest,
+    ) -> Result<MemoryReply, ApiError> {
+        let path = format!("{}/correct", memory_path(memory_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<MemoryReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Forgets a claim, returning the receipt of what was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` when the caller's version is stale.
+    pub async fn forget_memory(
+        &self,
+        memory_id: &str,
+        request: &ForgetMemoryRequest,
+    ) -> Result<DeletionReceipt, ApiError> {
+        let path = format!("{}/forget", memory_path(memory_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<DeletionReceipt>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Exports every claim the workspace holds, including archived and deleted ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the page size is refused or the transport fails.
+    pub async fn export_memories(
+        &self,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<MemoryExportReply, ApiError> {
+        let mut path = format!("{MEMORIES_PATH}/export");
+        let mut separator = '?';
+        for (name, value) in [("limit", limit), ("offset", offset)] {
+            if let Some(value) = value {
+                path.push(separator);
+                separator = '&';
+                // `write!` rather than `push_str(&format!(..))`, which the lint forbids: the temporary
+                // `String` is allocation the formatter can write into the path directly. The `Result` is
+                // discarded because writing to a `String` cannot fail.
+                let _ = write!(path, "{name}={value}");
+            }
+        }
+        self.get_json(&path).await
+    }
+
+    /// Performs an authenticated `GET` and decodes the reply.
+    ///
+    /// The shared body of every read on this surface, so the timeout, the credential, and the refusal
+    /// handling are written once — the same reason `bounded_request` exists.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
+        let response = self
+            .bounded_request(reqwest::Method::GET, path)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json::<T>().await.map_err(|_| ApiError::Decode);
         }
         Err(self.refusal(response).await)
     }

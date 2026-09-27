@@ -1191,6 +1191,7 @@ dependencies = [
  "jarvis-protocol",
  "jarvis-storage",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

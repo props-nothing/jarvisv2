@@ -2460,7 +2460,103 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
       (1198 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 227 tests, `jarvisd` 93.
-- [ ] `P4-008` Add inspect, search, remember, correct, forget, export, retention, and full user-deletion APIs/CLI.
+- [x] `P4-008` Add inspect, search, remember, correct, forget, export, retention, and full user-deletion APIs/CLI.
+      `crates/jarvis-protocol/src/memory_api.rs` (the wire DTOs) + `apps/jarvisd/src/memory_service.rs`
+      (8 tests) + six routes in `apps/jarvisd/src/gateway.rs` (3 tests) + `apps/jarvis-cli/src/memory.rs`
+      (seven verbs) and `api_client.rs`'s seven memory methods. `jarvis-storage`'s `purge_memory`,
+      `read_all_memories`, `find_memory_including_deleted`, `count_memory_entity_links`, and
+      `write_tombstone_on`. `ADR-0050`.
+      **`jarvisd` 105 tests** (up from 93). **45 suites, 1210 workspace tests, 0 failed, 0 ignored.**
+      **⭐ This slice was mostly wiring, and the wiring is what found the defects.** The domain, storage,
+      pipeline, retrieval, and embedding port all existed and were tested, and **nothing could reach any of
+      them**. Every defect below was found by *connecting* a tested component to a caller — which is the case
+      for these tests existing at all.
+      **⭐ A guard that was unreachable because its input was never supplied.** The deduplication check lives in
+      the pipeline's `compare(context.existing, …)`, and `remember` passed `existing: None` — so the entire
+      duplicate path was dead code and a re-statement fell through to the unique index and surfaced as
+      `MemoryDuplicate` → `409` "the memory was changed by another writer". **A user restating their own claim
+      was told another writer had edited it.** The gateway test asserting `200` for a repeated claim found it.
+      The mapping had even carried a comment saying the variant "is reachable only as a race": a comment
+      explaining why an error is unlikely is how a bug gets a justification instead of a fix.
+      **⭐ The pipeline's outcome and the fact of a write are different answers.** Fixing the above exposed that
+      the reply was built from the admission alone, so a caught duplicate reported `outcome: "remembered"` —
+      right shape, wrong claim. `Stored { memory, wrote }` now travels out of the store, and `outcome_of`
+      reconciles the two: nothing stored means nothing was remembered, whatever the pipeline decided. Pairing
+      them makes the divergence unrepresentable rather than merely documented.
+      **⭐ Three reads silently skipped a join, and the refusal it caused looked like the caller's fault.**
+      `find_memory_including_deleted`, `read_all_memories`, and `read_memories` all decoded the memory row
+      without loading `memory_entities`. A correction inheriting `existing.record().entities()` inherited
+      **nothing** and was refused with *"a memory must name between 1 and 16 distinct entities"* — a message
+      about the caller's request for a defect in a read. A missing join is invisible: the row decodes, every
+      field is present and typed, and the empty vec looks like a legitimate "about nothing". Only `find_memory`
+      had loaded the links.
+      **⭐ SQLite in WAL fails a deferred transaction that reads then writes across connections.** The purge
+      read its row inside a transaction, wrote the tombstone through the **pool** (a second connection), then
+      tried to `DELETE` on the transaction — `SQLITE_BUSY_SNAPSHOT`, reported as a bare "failed to purge a
+      memory the SQLite database". `write_tombstone_on` takes the `Transaction` rather than the database, so
+      splitting the operation across connections is now a **compile** error.
+      **⭐ An operation's own doc described a path the code does not take.** The export's exclusion text said
+      "deleted claims appear as an empty record", which describes the `Delete` **transition** (clear text, keep
+      the row). The only deletion verb this surface has **purges**. The doc and the text agreed with each other
+      while both described something no verb does — an assertion that the purged id is *absent* from the export
+      found it, and agreement between two statements by the same author is not evidence.
+      **⭐ A correction cannot inherit the original's window, and the domain is right to refuse it.** A memory's
+      `valid_from` may not precede its `created_at`: a window that opens before the record existed is a
+      backdated claim, and it is how a correction would fail to outrank the thing it corrects. So a correction
+      takes `valid_from` from its own creation instant and carries `valid_until` over unchanged. The limit is
+      recorded rather than papered over: correcting a claim that had **not yet taken effect** makes the
+      correction effective from now, so the pair reads as overlapping; and a claim whose window has **already
+      closed** cannot be corrected at all (the correction would be born expired), refused with `lapsed` rather
+      than stored.
+      **⭐ A tombstone was reported as an infrastructure failure.** `DatabaseError::MemoryTombstoned` fell
+      through to `Storage` in the error mapping, so a client that restated a deleted claim was told *"the local
+      database is not available"* — sending an operator to check a daemon that is running.
+      **⭐ Deleting is two operations, not one with a flag.** `Delete` clears the text and keeps the row, because
+      a source link has to keep resolving and the audit trail has to survive; `purge_memory` deletes the row and
+      `memory_entities` cascades. Collapsing them would make "delete" mean whichever the caller intended, and
+      the one it did not mean would be unrequestable.
+      **The tombstone is written *before* the delete**, so a crash between the two leaves a tombstone for a
+      memory that still exists (resolvable by deleting again) rather than a deleted memory with no tombstone
+      (resurrected by the next ingest). The safe failure direction is the one that **over-blocks**.
+      **`allow_relearn` is an explicit undo**, not a skipped write: it removes any existing tombstone *and*
+      skips writing a new one, because a flag that merely suppressed the write would leave an older tombstone
+      in place and the undo would appear to work and then not.
+      **`expected_version` is required on correct and forget, and that is the opposite of `ADR-0022`.** A run
+      cancellation carries none, because a run's terminal-state rule already refuses a second one; correct and
+      forget change **what will be retrieved as current truth**, so the write's subject matters. The version is
+      on the **reference**, not only on a reply, because the caller obtains an expectation by reading and a
+      reply that omitted it would leave a client re-reading and hoping. Its absence from the CLI is a usage
+      error rather than an implicit re-read. **Two staleness reasons exist and both are tested**: a version the
+      caller never saw, and a version read *before a correction archived the claim* — which advanced that
+      claim's own version.
+      **A search hit reports version `0`, and a purge guard refuses it.** The ranking holds a `MemoryRecord`,
+      which carries no concurrency version, so `hit_of` can only fabricate a value; `0` cannot match a stored
+      version (they start at one), so it is safe as "I do not know" instead of dangerous as a plausible guess.
+      Recorded limit: a search result cannot be corrected without a `show` first.
+      **No scope in a request body**, and `deny_unknown_fields` is what makes it structural: a `workspace_id`
+      in a body is a `422` naming the field, so "client A's memory cannot enter client B's context" is a
+      transport property rather than a per-handler check. The read-side check is a comparison **after** the
+      read, and a claim in another workspace is `404`, never `403` — "not yours" would confirm that something
+      exists.
+      **A reference never carries content**; `show` and `export` are the two exceptions for different reasons
+      (one claim deliberately requested vs. `GDPR`-shaped portability). The export lists its **exclusions**,
+      because each entry is a different reason a reader might assume completeness.
+      **An empty entity list is refused rather than filled with a placeholder** — a claim attached to a
+      placeholder *looks* resolved, so a later question about the real subject will not find it and nothing in
+      the store says why.
+      **Falsified, one guard each:** setting the tombstone write to `if false` failed
+      `a_forgotten_claim_does_not_return_unless_relearning_was_allowed` (the claim came back with a fresh id);
+      replacing `load_scoped`'s workspace comparison with `false &&` failed
+      `a_claim_is_only_readable_under_the_workspace_that_holds_it`. Both restored, green.
+      **Recorded as limits:** **no entity resolution**, so a remember must name an entity identifier the caller
+      already holds; `importance` defaults to `2`, the middle of the range, so a default cannot outrank explicit
+      user statements; **no retention policy is implemented** — the verbs exist and the sweeper does not, so
+      nothing expires on its own; **no provider-side deletion** is possible and the receipt says so; the CLI
+      verb module has no test, so its argument parsing is unverified (the daemon service and the routes are
+      tested); and an entity-less remember is refused by the service rather than resolved.
+      Gates: fmt, clippy `-D warnings` over the workspace, 45 suites with the application binaries present and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1` (**1210 tests, 0 failed, 0 ignored**), all three phase gates with
+      `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
 - [ ] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.
 - [ ] `P4-010` Pass isolation, correction, deletion, stale-memory, and adversarial-source acceptance tests.
 

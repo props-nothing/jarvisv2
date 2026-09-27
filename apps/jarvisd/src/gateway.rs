@@ -45,7 +45,8 @@ use axum::{
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
 use jarvis_protocol::{
-    ApprovalDecisionBody, MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe,
+    ApprovalDecisionBody, CorrectMemoryRequest, ForgetMemoryRequest, MAX_STREAM_PAGE,
+    MemorySearchRequest, RememberRequest, RunEventPageReply, StartRunRequest, rest_error, safe,
 };
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,16 @@ impl GatewayState {
     pub fn database(&self) -> &SqliteDatabase {
         &self.database
     }
+
+    /// Returns the memory surface.
+    ///
+    /// Built on demand from the database rather than held as a field, because it owns nothing but an `Arc`
+    /// clone and a stored field would be one more thing a constructor has to remember to set — the shape a
+    /// route added later silently omits, which is the same reasoning the router's layers follow.
+    #[must_use]
+    pub fn memories(&self) -> crate::memory_service::MemoryService {
+        crate::memory_service::MemoryService::new(Arc::clone(&self.database))
+    }
 }
 
 /// Builds the authenticated router.
@@ -139,7 +150,13 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
         .route("/tools/{tool}/calls", post(call_tool))
         .route("/calls/{id}/resume", post(resume_call))
-        .route("/approvals/{id}/decision", post(decide_approval));
+        .route("/approvals/{id}/decision", post(decide_approval))
+        .route("/memories", get(list_memories).post(remember))
+        .route("/memories/search", post(search_memories))
+        .route("/memories/export", get(export_memories))
+        .route("/memories/{id}", get(read_memory))
+        .route("/memories/{id}/correct", post(correct_memory))
+        .route("/memories/{id}/forget", post(forget_memory));
 
     Router::new()
         .route("/health/live", get(health_live))
@@ -680,6 +697,210 @@ async fn read_events(
         resync_required,
     };
     (StatusCode::OK, Json(reply)).into_response()
+}
+
+/// `GET /api/v1/memories`
+///
+/// A listing of the workspace's claims, as **references** rather than content. The query parameter is
+/// optional so a client can page, and it is bounded on the server rather than trusted: `limit` arrives from
+/// the wire, and an unbounded one is a read whose cost grows with the user's history.
+async fn list_memories(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let page = match parse_memory_page(raw.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    let limit = page.limit.unwrap_or(crate::memory_service::MAX_MEMORY_PAGE);
+    match state.memories().list(limit).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/memories`
+async fn remember(
+    State(state): State<GatewayState>,
+    Json(request): Json<RememberRequest>,
+) -> Response {
+    match state.memories().remember(&request).await {
+        // `201` when something was written and `200` when the claim was already known: the second is not a
+        // creation, and reporting it as one would make a retry look like a second memory.
+        Ok(reply) => {
+            let status = if reply.outcome == "remembered" || reply.outcome == "proposed" {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(reply)).into_response()
+        }
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `GET /api/v1/memories/{id}`
+async fn read_memory(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
+    match state.memories().read(&id).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/memories/search`
+async fn search_memories(
+    State(state): State<GatewayState>,
+    Json(request): Json<MemorySearchRequest>,
+) -> Response {
+    match state.memories().search(&request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/memories/{id}/correct`
+async fn correct_memory(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<CorrectMemoryRequest>,
+) -> Response {
+    match state.memories().correct(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/memories/{id}/forget`
+async fn forget_memory(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<ForgetMemoryRequest>,
+) -> Response {
+    match state.memories().forget(&id, &request).await {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `GET /api/v1/memories/export`
+///
+/// The one memory read that returns **content**, because the user asked for their own data and an export
+/// whose text was redacted would not be one. It includes archived and deleted claims — the latter as
+/// tombstones with no text — so a reader can see what this platform holds rather than only what it would
+/// retrieve.
+async fn export_memories(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let page = match parse_memory_page(raw.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    let limit = page.limit.unwrap_or(crate::memory_service::MAX_MEMORY_PAGE);
+    let offset = page.offset.unwrap_or(0);
+    match state.memories().export(limit, offset).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// Paging parameters for the memory listings.
+///
+/// Parsed by hand for the same reason the event page is: the `Query` extractor needs axum's `query` feature,
+/// which pulls `serde_urlencoded` — a package not currently in this build's dependency graph. A two-field
+/// parameter set is not worth a new transitive dependency, and the parser below is the shape the adjacent
+/// event route already uses, so the two cannot drift in how they read a query string.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryPageQuery {
+    /// How many rows to return at most.
+    limit: Option<u32>,
+    /// How many rows to skip, for an export that pages.
+    offset: Option<u32>,
+}
+
+/// Parses the memory listing's query parameters.
+///
+/// # Errors
+///
+/// Returns a message naming the parameter that could not be read, so a caller is not sent hunting a problem
+/// in a parameter it did not send.
+fn parse_memory_page(raw: Option<&str>) -> Result<MemoryPageQuery, &'static str> {
+    let mut page = MemoryPageQuery::default();
+    let Some(raw) = raw else {
+        return Ok(page);
+    };
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "limit" => {
+                page.limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "the limit parameter is not a positive integer")?,
+                );
+            }
+            "offset" => {
+                page.offset = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "the offset parameter is not a positive integer")?,
+                );
+            }
+            // An unrecognized parameter is ignored rather than refused, matching the rule the event route
+            // follows: a request the daemon does not own tolerates an additive field.
+            _ => {}
+        }
+    }
+    Ok(page)
+}
+
+/// Maps a memory failure onto the shared error envelope.
+///
+/// # Why the status codes are what they are
+///
+/// - `404` for a claim that is not in this workspace. A claim in *another* workspace is reported the same
+///   way, deliberately: "not yours" would confirm that something exists, which is the rule the session
+///   lookup already follows.
+/// - `409` for a version conflict, because the caller's remedy is to re-read and retry rather than to change
+///   the request.
+/// - `422` for an unrecognized value or an oversized page. `422` rather than `400` because the body is
+///   syntactically valid and it is the *value* that is unacceptable, which is the same distinction the run
+///   route's `deny_unknown_fields` uses.
+/// - `503` for storage, with a generic message: a `DatabaseError`'s text can name a path or a SQL statement.
+///
+/// The detail string is carried in the message for the caller-actionable variants and **not** for storage,
+/// because a refusal that says only "refused" sends the caller looking for a problem that may not exist.
+fn memory_error(error: &crate::memory_service::MemoryServiceError) -> Response {
+    use crate::memory_service::MemoryServiceError as Memory;
+    match error {
+        Memory::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no memory exists for the requested identifier in this workspace",
+        ),
+        Memory::Conflict => error_response(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the memory was changed by another writer; re-read it and retry",
+        ),
+        Memory::UnknownValue { .. } | Memory::PageTooLarge { .. } | Memory::Refused { .. } => {
+            // The detail is passed through `SafeMessage`, which bounds the length and refuses a control
+            // character, so a refusal cannot forge a log line or a second header. It never contains stored
+            // content: every detail this service produces is written by the service.
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::Validation,
+                safe(&error.detail()).as_str(),
+            )
+        }
+        // Storage is matched last and deliberately without the detail.
+        Memory::Storage(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal,
+            "the local database is not available",
+        ),
+    }
 }
 
 /// Maps a storage failure onto the shared error envelope.
@@ -1914,6 +2135,466 @@ mod tests {
             StatusCode::OK,
             "a refused attempt must not consume the delivered nonce: {}",
             body_text(approved).await
+        );
+    }
+
+    /// Records an entity so a wire remember has a subject, returning its identifier.
+    ///
+    /// `memory_entities` is a foreign key, so a remember naming an unrecorded entity is refused at the link
+    /// step. The route tests therefore need one, and they obtain it through storage rather than through the
+    /// gateway: there is no entity-creation route, and a test that could reach one would mean the surface
+    /// allowed what the service deliberately does not.
+    async fn fixture_entity(database: &Arc<SqliteDatabase>) -> String {
+        let identity = jarvis_storage::load_local_identity(database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must have a seeded identity: {error}"));
+        let id = jarvis_core::EntityId::new();
+        jarvis_storage::record_entity(
+            database,
+            &jarvis_storage::NewEntity {
+                id,
+                workspace_id: identity
+                    .workspace_id()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("the seeded workspace must parse")),
+                kind: jarvis_storage::EntityKind::Person,
+                label: "Router fixture subject".to_owned(),
+                attributes: None,
+                confidence: jarvis_core::MemoryConfidence::Confirmed,
+                created_at: jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("record fixture entity: {error}"));
+        id.to_string()
+    }
+
+    /// Builds a router plus the database behind it, because the memory routes need a fixture entity written
+    /// directly and the two must be the same database.
+    async fn memory_router() -> (Router, String, TempProfile, Arc<SqliteDatabase>) {
+        let profile = TempProfile::new();
+        let database = jarvis_storage::SqliteDatabase::open(&profile.database_path())
+            .await
+            .unwrap_or_else(|error| panic!("open fixture database: {error}"));
+        let database = Arc::new(database);
+        let credential = ClientCredential::generate()
+            .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
+        let presented = credential.expose().to_owned();
+        let state = GatewayState::new(
+            Arc::clone(&database),
+            credential,
+            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
+        );
+        (router(state), presented, profile, database)
+    }
+
+    /// **A claim can be remembered, listed, read, and searched over HTTP.** The first half of the surface,
+    /// and the read-back half: every assertion is made against a *subsequent* request rather than against
+    /// the reply that caused it, so a handler that returned the right shape and wrote nothing would fail.
+    ///
+    /// The two status distinctions are asserted because they are the contract a client switches on: `201`
+    /// for a new claim and `200` for one already known, since reporting a re-statement as a creation would
+    /// make a retry look like a second memory.
+    #[tokio::test]
+    async fn the_memory_routes_remember_list_read_and_search() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let remember_body = serde_json::json!({
+            "content": "Prefers dark roast coffee",
+            "memory_type": "preference",
+            "source_kind": "user_statement",
+            "entity_ids": [subject],
+        })
+        .to_string();
+
+        let created = app
+            .clone()
+            .oneshot(post_json("/api/v1/memories", &presented, &remember_body))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            created.status(),
+            StatusCode::CREATED,
+            "a new claim must be created: {}",
+            body_text(created).await
+        );
+        let created_body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply = serde_json::from_str(&created_body)
+            .unwrap_or_else(|error| panic!("decode {created_body}: {error}"));
+        assert_eq!(remembered.outcome, "remembered");
+
+        // The same claim again is **not** a creation, and the outcome says so too. Both matter: a retry that
+        // reported `201` would tell a caller it had stored a second memory, and an outcome of "remembered"
+        // would say the same in the body while the status said otherwise.
+        let repeated = app
+            .clone()
+            .oneshot(post_json("/api/v1/memories", &presented, &remember_body))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            repeated.status(),
+            StatusCode::OK,
+            "a repeated claim is not a creation: {}",
+            body_text(repeated).await
+        );
+        let repeated_body = body_text(repeated).await;
+        let duplicate: jarvis_protocol::MemoryReply = serde_json::from_str(&repeated_body)
+            .unwrap_or_else(|error| panic!("decode {repeated_body}: {error}"));
+        assert_eq!(
+            duplicate.outcome, "already_remembered",
+            "a re-statement must not report itself as a new memory"
+        );
+        assert_eq!(
+            duplicate.memory_id, remembered.memory_id,
+            "and it must name the claim the workspace already holds"
+        );
+
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/memories?limit=10", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = body_text(listed).await;
+        let listing: jarvis_protocol::MemoryListReply = serde_json::from_str(&listed_body)
+            .unwrap_or_else(|error| panic!("decode {listed_body}: {error}"));
+        assert_eq!(
+            listing.returned, 1,
+            "the repeated claim must not have written a row"
+        );
+        assert_eq!(listing.memories[0].version, 1);
+
+        let read = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/memories/{}", remembered.memory_id),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(read.status(), StatusCode::OK);
+        let read_body = body_text(read).await;
+        let detail: jarvis_protocol::MemoryDetailReply = serde_json::from_str(&read_body)
+            .unwrap_or_else(|error| panic!("decode {read_body}: {error}"));
+        assert_eq!(detail.content, "Prefers dark roast coffee");
+        assert_eq!(
+            detail.entity_ids,
+            vec![subject.clone()],
+            "the read must report the entity links the store holds"
+        );
+
+        let searched = app
+            .oneshot(post_json(
+                "/api/v1/memories/search",
+                &presented,
+                r#"{"text":"dark roast coffee"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(searched.status(), StatusCode::OK);
+        let search_body = body_text(searched).await;
+        let search: jarvis_protocol::MemorySearchReply = serde_json::from_str(&search_body)
+            .unwrap_or_else(|error| panic!("decode {search_body}: {error}"));
+        assert_eq!(search.matches.len(), 1);
+        assert!(
+            search.matches[0].is_a_match,
+            "a keyword hit matched the query; it was not merely included for recency"
+        );
+    }
+
+    /// **A claim can be corrected, refused against a stale version, and deleted over HTTP.** The write half,
+    /// and the one where the version guard's *two* distinct staleness reasons are both pinned.
+    ///
+    /// The second staleness case is the subtle one and is asserted deliberately: correcting a claim archives
+    /// it, which **advances its version**, so the version the caller read before correcting is stale
+    /// immediately afterwards. A guard that only rejected a version the caller never saw would accept this
+    /// second write, and the caller would be deleting a claim on the strength of a version the correction
+    /// had already invalidated.
+    #[tokio::test]
+    async fn the_memory_routes_correct_and_forget_under_a_version_guard() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Prefers dark roast coffee",
+                    "memory_type": "preference",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let created_body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply = serde_json::from_str(&created_body)
+            .unwrap_or_else(|error| panic!("decode {created_body}: {error}"));
+        let memory_id = remembered.memory_id.clone();
+
+        let corrected = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/correct"),
+                &presented,
+                &serde_json::json!({
+                    "content": "Prefers light roast coffee",
+                    "expected_version": remembered.version,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            corrected.status(),
+            StatusCode::OK,
+            "a correction must be accepted: {}",
+            body_text(corrected).await
+        );
+        let corrected_body = body_text(corrected).await;
+        let correction: jarvis_protocol::MemoryReply = serde_json::from_str(&corrected_body)
+            .unwrap_or_else(|error| panic!("decode {corrected_body}: {error}"));
+        assert_eq!(correction.outcome, "corrected");
+        assert_ne!(
+            correction.memory_id, memory_id,
+            "a correction is a new claim with a supersedes link, never an in-place overwrite"
+        );
+
+        let never_seen = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/correct"),
+                &presented,
+                r#"{"content":"Prefers tea","expected_version":99}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            never_seen.status(),
+            StatusCode::CONFLICT,
+            "a version the caller never saw is a conflict rather than a validation failure: the remedy is to \
+             re-read and retry"
+        );
+
+        let superseded_version = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/forget"),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            superseded_version.status(),
+            StatusCode::CONFLICT,
+            "the original's version advanced when the correction archived it, so the version read before the \
+             correction is stale: {}",
+            body_text(superseded_version).await
+        );
+
+        let forgotten = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{}/forget", correction.memory_id),
+                &presented,
+                &serde_json::json!({ "expected_version": correction.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(forgotten.status(), StatusCode::OK);
+        let receipt_body = body_text(forgotten).await;
+        let receipt: jarvis_protocol::DeletionReceipt = serde_json::from_str(&receipt_body)
+            .unwrap_or_else(|error| panic!("decode {receipt_body}: {error}"));
+        assert!(receipt.tombstone_written);
+        assert!(
+            !receipt.unreachable.is_empty(),
+            "a receipt must never read as a total deletion"
+        );
+    }
+
+    /// **The export is the full user read**, so it reports what the workspace *holds* rather than what it
+    /// would retrieve, and it states what it leaves out.
+    ///
+    /// A purged claim is absent rather than present as an empty record, which is the shape the export's own
+    /// exclusion text got wrong: it described the `Delete` **transition** — clear the text, keep the row —
+    /// while the only deletion verb this surface has purges. The absence assertion is what keeps the two from
+    /// re-agreeing on the wrong thing.
+    #[tokio::test]
+    async fn the_memory_export_reports_what_the_workspace_holds() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Prefers dark roast coffee",
+                    "memory_type": "preference",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let created_body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply = serde_json::from_str(&created_body)
+            .unwrap_or_else(|error| panic!("decode {created_body}: {error}"));
+        let memory_id = remembered.memory_id.clone();
+
+        let corrected = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/correct"),
+                &presented,
+                &serde_json::json!({
+                    "content": "Prefers light roast coffee",
+                    "expected_version": remembered.version,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let corrected_body = body_text(corrected).await;
+        let correction: jarvis_protocol::MemoryReply = serde_json::from_str(&corrected_body)
+            .unwrap_or_else(|error| panic!("decode {corrected_body}: {error}"));
+
+        let forgotten = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{}/forget", correction.memory_id),
+                &presented,
+                &serde_json::json!({ "expected_version": correction.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(forgotten.status(), StatusCode::OK);
+
+        let exported = app
+            .oneshot(get_request("/api/v1/memories/export", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(exported.status(), StatusCode::OK);
+        let export_body = body_text(exported).await;
+        let export: jarvis_protocol::MemoryExportReply = serde_json::from_str(&export_body)
+            .unwrap_or_else(|error| panic!("decode {export_body}: {error}"));
+        // The original still exists as a superseded row, so it is exported; the correction was purged, so it
+        // is gone. One row is the assertion because the pair makes the export's rule visible: it reports
+        // **live and archived** rows alike, and only a purge removes one.
+        assert_eq!(
+            export.count, 1,
+            "the archived original is exported and the purged correction is not: {export_body}"
+        );
+        assert_eq!(
+            export.memories[0].memory_id, memory_id,
+            "the archived original is the row the export holds"
+        );
+        assert!(
+            !export.exclusions.is_empty(),
+            "an export that looks complete and is not is worse than one that says what it left out"
+        );
+    }
+
+    /// **The memory routes are behind the same authentication as everything else**, and a request body
+    /// cannot choose a workspace.
+    ///
+    /// The second half is the reason the DTOs use `deny_unknown_fields`: a `workspace_id` in a body is a
+    /// `422` rather than an ignored field, so "client A's memory cannot enter client B's context" is a
+    /// property of the transport rather than of each handler.
+    #[tokio::test]
+    async fn the_memory_routes_refuse_an_unauthenticated_or_over_scoped_request() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                "not-a-credential",
+                &serde_json::json!({
+                    "content": "Prefers dark roast coffee",
+                    "memory_type": "preference",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            unauthenticated.status(),
+            StatusCode::UNAUTHORIZED,
+            "a memory write must not be reachable without the credential"
+        );
+
+        let scoped = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Prefers dark roast coffee",
+                    "memory_type": "preference",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                    "workspace_id": jarvis_storage::LOCAL_WORKSPACE_ID,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert!(
+            scoped.status().is_client_error(),
+            "a request that names its own workspace must be refused rather than silently scoped, got {}",
+            scoped.status()
+        );
+
+        // An entity-less remember is refused by the **service**, so the route reports `422` with a message
+        // naming the field — not a `500` from a foreign-key failure at the link step.
+        let entity_less = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                r#"{"content":"Prefers dark roast coffee","memory_type":"preference","source_kind":"user_statement"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            entity_less.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an entity-less remember must be refused with a field-naming 422: {}",
+            body_text(entity_less).await
+        );
+
+        // A missing claim is a `404`, and a page over the bound is a `422` rather than a silent clamp.
+        let missing = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/memories/{}", jarvis_core::MemoryId::new()),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let oversized = app
+            .oneshot(get_request(
+                "/api/v1/memories?limit=100000",
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            oversized.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a page over the bound must be refused rather than clamped, and `422` rather than `400` because \
+             the query string is well formed and it is the *value* that is unacceptable: {}",
+            body_text(oversized).await
         );
     }
 }

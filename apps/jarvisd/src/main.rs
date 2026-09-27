@@ -8,6 +8,7 @@ mod gateway;
 mod health;
 mod mcp_host;
 mod mcp_serve;
+mod memory_service;
 mod run_service;
 mod singleton;
 mod sse;

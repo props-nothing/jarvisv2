@@ -67,3 +67,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0047](0047-a-vector-is-compared-with-its-metadata-or-not-at-all.md) | A vector is compared with its metadata or not at all, and the vector is not a number | Accepted |
 | [0048](0048-semantic-similarity-is-one-conditional-signal.md) | Semantic similarity is one conditional signal, and an incompatible vector is refused rather than approximated | Accepted |
 | [0049](0049-untrusted-content-is-fenced-not-detected.md) | Untrusted content is fenced, and the fence is not a promise the model will obey | Accepted |
+| [0050](0050-forgetting-is-a-purge-and-the-receipt-names-what-it-cannot-reach.md) | Forgetting is a purge that writes a tombstone first, and the receipt names what it cannot reach | Accepted |
