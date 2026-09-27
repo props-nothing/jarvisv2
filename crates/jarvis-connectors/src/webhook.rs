@@ -62,13 +62,23 @@ pub enum SignatureAlgorithm {
     HmacSha256,
     /// HMAC-SHA1, which some providers still use. Weaker, so named rather than folded in.
     HmacSha1,
-    /// An Ed25519 signature over the raw body, verified with a public key.
+    /// An Ed25519 signature, verified with a public key.
+    ///
+    /// Unlike the HMAC variants this is an **asymmetric** signature, so the verifier holds a public key and
+    /// the provider holds the private one — which is why [`is_keyed_mac`](Self::is_keyed_mac) is false for it
+    /// even though it also authenticates the delivered bytes. The two questions are separate: a keyed MAC and
+    /// an asymmetric signature both cover the body, but only the MAC requires the verifier to hold a secret.
+    /// A scheme whose *input* is unclear — a signature over parsed-and-reserialized fields, or over a
+    /// different body than the one delivered — is **not** representable, and that limit is deliberate rather
+    /// than an omission: naming such an algorithm would invite a verifier to compare the wrong bytes.
     Ed25519,
     /// The provider supplies no signature, so another mechanism must bind the delivery.
     ///
-    /// Refused by [`WebhookBinding::new`] unless the binding carries some other evidence, because a webhook
-    /// with no authenticator at all is an unauthenticated write into the platform — the "webhook spoof" row
-    /// with its control removed.
+    /// Refused for a [`WebhookSupport::Push`](crate::manifest::WebhookSupport::Push) declaration by
+    /// `ConnectorManifest`'s webhook validation, because a push endpoint whose deliveries are unauthenticated
+    /// is an unauthenticated write into the platform — the "webhook spoof" row of `security.md`'s table with
+    /// its control removed. Representable rather than absent so that an author must **state** the absence; a
+    /// scheme that omitted it would be indistinguishable from one whose author never considered the question.
     None,
 }
 
@@ -86,8 +96,10 @@ impl SignatureAlgorithm {
 
     /// Returns whether the algorithm is a keyed MAC over the raw body.
     ///
-    /// Both HMAC variants are, and the property matters because a keyed MAC is the only mechanism that
-    /// authenticates the **bytes** — a signature over a parsed structure authenticates a re-serialization.
+    /// Both HMAC variants are; [`Self::Ed25519`] is not, because it is verified with a **public** key rather
+    /// than a shared secret. The property it asks about is "does verifying require a secret", which is what a
+    /// provider's onboarding and a secret-storage decision depend on — it is *not* "does this cover the raw
+    /// bytes", which both HMAC and Ed25519 do and a signature over a parsed structure does not.
     #[must_use]
     pub const fn is_keyed_mac(self) -> bool {
         matches!(self, Self::HmacSha256 | Self::HmacSha1)

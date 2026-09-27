@@ -2962,7 +2962,60 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       **not compared against anything** — nothing runs a suite and checks the number. The scaffold writes two
       documents and nothing else (no crate, no test scaffolding, no registry entry). `check` reads one manifest
       at a time and has no notion of a connector repository.
-- [ ] `P5-004` Research Google identity, Gmail, Calendar, push notifications, quotas, and restricted scopes; record findings.
+- [x] `P5-004` Research Google identity, Gmail, Calendar, push notifications, quotas, and restricted scopes; record findings.
+  - `docs/research/integrations/google.md`, fifteen live official sources with access dates, indexed in
+    `docs/research/integrations/README.md`. **No Google API was called, no credential was used, and no Cloud
+    project was created**; the record says so and claims no live verification.
+  - **`llms.txt` is `not found`**, not assumed absent: `https://developers.google.com/llms.txt` and
+    `https://developers.google.com/gmail/api/llms.txt` both return **HTTP 404**. Recorded with the substitution
+    (the official guide and reference pages), because `external-research.md` requires a missing index to be
+    recorded as missing rather than silently worked around.
+  - **The research found a defect in shipped code, and the defect is the substantive outcome of this slice.**
+    Writing down Google's two push mechanisms — an OIDC bearer JWT for Pub/Sub, an echoed channel token for
+    Calendar, with a **zero-length body** so there is nothing to MAC — required explaining why neither fits
+    `WebhookSupport::Push`. Reading the type to explain that showed that `SignatureAlgorithm::None`'s doc claimed
+    the value "is refused by `WebhookBinding::new`", that `WebhookBinding::new` validates the *binding* and never
+    sees the algorithm, and that `SignatureScheme::authenticates()` was reachable **only from tests**.
+    `ConnectorManifest::new` never validated the webhook at all, so a manifest could declare `push` with an
+    authenticator of `none` and be accepted — an endpoint applying unauthenticated writes, declared in a
+    document a reviewer would read as having provided a control. **Fixed**, not merely recorded:
+    `validate_webhook` + `ConnectorError::Webhook`, with a refusal message that names the honest alternative
+    (`polling`). Two tests: the refusal, and an **over-refusal guard** proving all three real algorithms and
+    `polling` are still accepted — because a rule that refused every push declaration would satisfy the first
+    test while making the capability unusable.
+  - **Guard falsified with the three-run A-B-A design**, not asserted. A (intact) `1 passed`; B (branch
+    replaced with `false`) the refusal test **panicked at `manifest_tests.rs:1069`**; A′ (restored,
+    `mutant=0 guard=1` verified by regex count) `2 passed`. The first attempt used the filter `verify_nothing`
+    and reported `0 passed; 142 filtered out` — **a vacuous run that reads as a pass**, the trap `P5-003`
+    recorded; the correct filter is `verifies`. Recorded because the near-miss is the reusable part.
+  - **A second false doc claim was corrected in the same type**: `is_keyed_mac`'s comment said "a keyed MAC is
+    the only mechanism that authenticates the **bytes**", which `Ed25519` contradicts — it authenticates the
+    bytes with a public key, so the property the method actually answers is "does verifying require a secret".
+    The `Ed25519` and `None` variant docs were rewritten to match. Both were claims that read as protections.
+  - **Two findings reach past this integration.** (1) **Stale cursors arrive as ordinary status codes on a
+    read**: Gmail returns **HTTP 404** for a `startHistoryId` outside the retained window, which is the same
+    status as an absent account, while the required remedy is a full resync; Calendar returns **410 Gone**. So
+    `SyncCursorKind::can_be_detected_as_stale()` is answered "only from the read's response, not the cursor's
+    shape", and a Gmail connector must classify a 404 on `history.list` specifically. (2) **A 200 from a Gmail
+    send does not mean the mail was sent** — the page says so verbatim, the quota is shared with the user's web
+    client and IMAP, and 429s can lag "several minutes" — so `P5-009`'s send must be non-idempotent, never
+    auto-retried, and reported as *submitted* rather than *delivered*.
+  - **A third finding is an alternative to `P5-005` itself:** Google publishes a first-party **Gmail MCP
+    server** (`https://gmailmcp.googleapis.com/mcp/v1`) in **Developer Preview**, which `jarvis-mcp-transport`'s
+    existing `StreamableHttpClientTransport` could reach. Recorded as a **second surface, not a substitute** —
+    ten tools, no `watch`, no `history.list`, no send, no sync, and its tools would arrive as an unclassified
+    third-party source held for approval.
+  - **Limits:** the record **cannot state a Calendar scope's category** — the Gmail page gives categories per
+    scope, the Calendar page lists scopes without them, and the consent page gives the category *table* but not
+    the mapping, so it is an Unresolved Question rather than a guess. **Whether a self-hosted single-user JARVIS
+    qualifies for Google's internal-app exemption is unverified** and is the difference between days and months
+    of lead time before a Gmail connector is usable by its own author; **`quotaUser`/`userIp` behaviour was not
+    checked**, and it decides whether a multi-mailbox connector pays the 6,000-units/minute ceiling once or per
+    mailbox. Gmail read scopes are **all restricted** — including `gmail.metadata`, the least-privileged way to
+    read a mailbox — meaning a security assessment if the data is stored or transmitted. The quota model changed
+    **2026-05-01** and charges are announced as pending later in 2026, so quota must be **configuration, not a
+    constant**. **Six unresolved questions** are listed with impact and blocked capability; **no test for this
+    research exists** and the record's Verification Plan names them as `P5-005`'s work.
 - [ ] `P5-005` Implement Google connection setup and Gmail/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.

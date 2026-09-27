@@ -949,6 +949,7 @@ impl ConnectorManifest {
         validate_secret_fields(&secret_fields)?;
         validate_compatibility(&compatibility)?;
         validate_classification(classification, &operations)?;
+        validate_webhook(&webhook)?;
         Ok(Self {
             id,
             version,
@@ -1231,6 +1232,39 @@ fn validate_auth_methods(methods: &[AuthMethodDeclaration]) -> Result<(), Connec
     Ok(())
 }
 
+/// Validates a connector's webhook declaration.
+///
+/// # Why `Push` has to validate its scheme at all
+///
+/// [`WebhookSupport::Push`] carries a [`SignatureScheme`](crate::webhook::SignatureScheme), and that scheme
+/// may name [`SignatureAlgorithm::None`](crate::webhook::SignatureAlgorithm::None) — a delivery with **no**
+/// authenticator. [`SignatureScheme::authenticates`](crate::webhook::SignatureScheme::authenticates) exists
+/// to detect exactly that value, and its own documentation said the value "is refused by
+/// [`WebhookBinding::new`]". It was not: `WebhookBinding::new` validates the *binding* — the path and the
+/// account header or body field — and never sees the algorithm, which is a sibling field of the same enum
+/// variant. So a connector could declare `Push` with an algorithm of `None`, and the platform would accept
+/// unauthenticated writes from anyone who knew the path: the "webhook spoof" row of `security.md`'s threat
+/// table with its control removed, declared in a manifest a reviewer would read as having provided one.
+///
+/// The refusal is here rather than in [`WebhookBinding::new`] because the two types are siblings and neither
+/// owns the other; the manifest is the only object that holds both, and it is the one being validated.
+fn validate_webhook(webhook: &WebhookSupport) -> Result<(), ConnectorError> {
+    let unauthenticated = match webhook {
+        WebhookSupport::Push { scheme, .. } => !scheme.authenticates(),
+        // Neither of the other two carries a scheme, so neither can make a claim that needs checking.
+        WebhookSupport::Polling { .. } | WebhookSupport::Unsupported => false,
+    };
+    if unauthenticated {
+        return Err(ConnectorError::Webhook {
+            reason: "a `push` declaration must name a signature algorithm that verifies the delivery, so \
+                     `none` is refused: it would leave the endpoint accepting unauthenticated writes. A \
+                     connector that cannot verify the sender should declare `polling` and be honest about it",
+        });
+    }
+    Ok(())
+}
+
+/// Validates
 /// Validates that a connector's declared classification covers its operations' effects.
 ///
 /// # Why the under-reporting direction is the one that must be refused
@@ -1403,6 +1437,16 @@ pub enum ConnectorError {
         /// The offending value.
         value: String,
         /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// The webhook declaration would accept unauthenticated deliveries.
+    ///
+    /// A `push` connector whose signature algorithm is `none` has no control on its inbound path, so this
+    /// refuses at manifest validation rather than at delivery time — where the only remaining signal would be
+    /// traffic that already reached the handler.
+    #[error("the connector's webhook declaration is unusable: {reason}")]
+    Webhook {
+        /// What is wrong.
         reason: &'static str,
     },
     /// A connector version is unusable.

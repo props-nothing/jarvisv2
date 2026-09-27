@@ -1013,3 +1013,122 @@ fn a_classification_below_what_the_operations_do_is_refused() {
         "a read-only connector must be allowed a low classification"
     );
 }
+
+/// A valid webhook binding for the tests: an absolute path and an account header.
+fn binding() -> crate::webhook::WebhookBinding {
+    must(
+        crate::webhook::WebhookBinding::new(
+            "/webhooks/example",
+            Some("x-account".to_owned()),
+            false,
+        ),
+        "a valid webhook binding",
+    )
+}
+
+#[test]
+fn a_push_declaration_that_verifies_nothing_is_refused() {
+    // The guard this pins was **documented and not enforced**. `SignatureAlgorithm::None`'s doc said the value
+    // "is refused by `WebhookBinding::new`", but that constructor validates the binding — the path and the
+    // account field — and never sees the algorithm, which is a sibling field of the same enum variant. So a
+    // manifest could declare `push` with an authenticator of `none` and be accepted, leaving an endpoint that
+    // applies unauthenticated writes. A mutation that deleted the branch reproduced the original acceptance,
+    // which is how the gap was confirmed rather than assumed.
+    let refused = ConnectorManifest::new(
+        id("example"),
+        version("1.0.0"),
+        "Example",
+        "Example Incorporated",
+        vec![operation("list_messages", vec![ToolEffect::ReadOnly], 0)],
+        auth_methods(),
+        WebhookSupport::Push {
+            scheme: must(
+                crate::SignatureScheme::new(
+                    crate::SignatureAlgorithm::None,
+                    "x-signature",
+                    crate::SignatureEncoding::Hex,
+                ),
+                "a well-formed header",
+            ),
+            binding: binding(),
+        },
+        Vec::new(),
+        Classification::Confidential,
+        residency(),
+        links(),
+        research(),
+        compatibility(),
+    );
+    match refused {
+        Err(ConnectorError::Webhook { reason }) => {
+            assert!(
+                reason.contains("polling"),
+                "the refusal must name the honest alternative: {reason}"
+            );
+        }
+        other => panic!("a push declaration with no authenticator must be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_push_declaration_that_verifies_something_is_accepted() {
+    // The other direction, because a rule that refused every push declaration would pass the test above while
+    // making the `push` capability unusable — the shape of an over-broad guard.
+    for algorithm in [
+        crate::SignatureAlgorithm::HmacSha256,
+        crate::SignatureAlgorithm::HmacSha1,
+        crate::SignatureAlgorithm::Ed25519,
+    ] {
+        assert!(
+            ConnectorManifest::new(
+                id("example"),
+                version("1.0.0"),
+                "Example",
+                "Example Incorporated",
+                vec![operation("list_messages", vec![ToolEffect::ReadOnly], 0)],
+                auth_methods(),
+                WebhookSupport::Push {
+                    scheme: must(
+                        crate::SignatureScheme::new(
+                            algorithm,
+                            "x-signature",
+                            crate::SignatureEncoding::Hex,
+                        ),
+                        "a well-formed header",
+                    ),
+                    binding: binding(),
+                },
+                Vec::new(),
+                Classification::Confidential,
+                residency(),
+                links(),
+                research(),
+                compatibility(),
+            )
+            .is_ok(),
+            "{algorithm:?} is an authenticator, so a push declaration must be accepted"
+        );
+    }
+    // And `polling` needs no scheme at all, which is what the refusal tells an author to declare instead.
+    assert!(
+        ConnectorManifest::new(
+            id("example"),
+            version("1.0.0"),
+            "Example",
+            "Example Incorporated",
+            vec![operation("list_messages", vec![ToolEffect::ReadOnly], 0)],
+            auth_methods(),
+            WebhookSupport::Polling {
+                minimum_interval_seconds: 60
+            },
+            Vec::new(),
+            Classification::Confidential,
+            residency(),
+            links(),
+            research(),
+            compatibility(),
+        )
+        .is_ok(),
+        "polling carries no scheme, so it must not be dragged into the refusal"
+    );
+}

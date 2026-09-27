@@ -225,6 +225,31 @@ guard: `elapsed < -1000000` is still true for a one-second-future instant, so it
 mutated `needs_full_resync_when_lost` while the test exercised `requires_full_resync` — a different, uncalled
 method. Both are recorded because a green falsification run is worth exactly as much as the mutant's precision.
 
+### 12. A `push` declaration whose scheme verifies nothing is refused — added during `P5-004`
+
+`WebhookSupport::Push` carries a `SignatureScheme`, and that scheme may name `SignatureAlgorithm::None`.
+`SignatureScheme::authenticates()` exists to detect exactly that value, and its documentation said `None` "is
+refused by `WebhookBinding::new`". **It was not.** `WebhookBinding::new` validates the *binding* — the path and
+the account header or body field — and never sees the algorithm, which is a sibling field of the same enum
+variant. `ConnectorManifest::new` did not validate the webhook at all.
+
+So a manifest could declare `push` with an authenticator of `none` and be accepted, leaving an endpoint that
+applies unauthenticated writes from anyone who knows the path: `security.md`'s "webhook spoof" row with its
+control removed, declared in a document a reviewer would read as having provided one. `authenticates()` was
+called from **tests only**, which is why the gap survived the slice that introduced it.
+
+The fix is `validate_webhook`, called from `ConnectorManifest::new`, plus `ConnectorError::Webhook`. The refusal
+is in the manifest rather than in `WebhookBinding::new` because the two types are siblings and neither owns the
+other; the manifest is the only object holding both.
+
+**How it was found, and why that matters more than the fix.** The research task `P5-004` required writing down
+Google's push mechanisms, which are an OIDC bearer JWT and an echoed channel token — neither of which the
+scheme can name. Explaining *why* they could not be named meant reading the type, and reading the type meant
+noticing that its `None` doc described a check no code performed. **A documentation claim was the witness**: the
+comment asserted protection, the predicate was reachable only from tests, and the constructor named was the
+wrong one. The generalizable lesson is that a doc comment saying "refused by X" is a claim about code and must
+be read as one; a predicate that only tests call is a predicate that enforces nothing.
+
 ## Consequences
 
 - `crates/jarvis-connectors` is a new workspace member, depending only on `jarvis-core` and `jarvis-tools`, so
