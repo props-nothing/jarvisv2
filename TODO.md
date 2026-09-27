@@ -2314,7 +2314,69 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings` across the workspace, 45 suites with the application binaries absent
       and **zero skips** (1162 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok after `sha2` was added to `jarvis-models`.
-- [ ] `P4-006` Add hybrid retrieval and explainable scoring; embeddings are an index, not canonical truth.
+- [x] `P4-006` Add hybrid retrieval and explainable scoring; embeddings are an index, not canonical truth.
+      `crates/jarvis-core/src/retrieval.rs` (+`retrieval/semantic_tests.rs`, 10 tests; `jarvis-core` 205).
+      `ADR-0048`. The ninth signal, and the one the previous slice deliberately left out because it had no
+      data. **Research first**, because `P4-005` was the external integration; this slice is the domain logic
+      over it.
+      **The vectors cannot cross the crate boundary, and the domain does not need them to.** `jarvis-models`
+      depends on `jarvis-core`, so the domain naming `Embedding` would be a cycle. `jarvis-core` defines its
+      own borrowed `SemanticVector` carrying provider, model, version, normalization, and a `&[f32]` — which
+      is the whole contract — plus a `ScoringContext` that holds the query's vector and a lookup together.
+      They are one optional value rather than two arguments because they must agree: separate arguments would
+      make "a query vector with no index" and "an index with no query vector" both representable.
+      **⭐ The mutation that was itself a no-op.** Zeroing the semantic signal to prove the ranking tests
+      depended on it, the tests still passed — so a comment was written claiming the test had been vacuous
+      and the coincidence was the tie-break. It was not: the mutation was written as
+      `if false { 0 } else { real }`, which **selects the real branch**, so nothing had been changed and the
+      green result carried no information. With the mutation written as a plain `0`, both ranking tests fail
+      — `left: 0, right: 1000` on the signal and `Some(0)` vs `Some(1000)` on the total. The lesson is that a
+      falsification which passes is first a claim about the mutation, not about the test, and the mutation has
+      to be shown to compile into something different before a green run means anything.
+      **⭐ The orthogonal pair found a real defect in a doc comment and a real defect in the code.** A test
+      asserting an orthogonal pair scores half the scale failed with `left: 0`. The **test was wrong** — an
+      orthogonal cosine is exactly `0.0`, not `0.5`, and the code was right. But the failure also exposed
+      that `cosine <= 0.0` returned `absence: None`, which conflates an orthogonal pair with an opposed pair
+      and with a genuine refusal; the four states that produce a zero score (no index, no memory vector,
+      incomparable, zero magnitude) plus real arithmetic all collapsed into "zero, no reason" for two of
+      them. `SemanticAbsence::NoSimilarity` now names the arithmetic case, which is the same principle
+      `ADR-0046` applied when it made the total *be* the sum of the contributions.
+      **The comparability guard is the point of the feature.** A cosine over two vectors from **different
+      models** is a number with no meaning that still lands in the usual range, so a missing check does not
+      look like a bug — it looks like a slightly worse ranking. Provider, model, and version are compared
+      before any arithmetic and the differing field is named; the vectors' own lengths are compared too, which
+      makes a declared dimension field unnecessary and would have repeated a check `P4-005`'s constructor
+      already performs. A zero-magnitude vector refuses rather than dividing by zero, because a `NaN` in one
+      signal would poison a whole ranking.
+      **Nine weights that must still sum to `TOTAL_WEIGHT`, so the table was rebalanced and not extended.**
+      Every ordering the document states is kept, and the cap that no weight exceeds a quarter of the total is
+      unchanged, so `ADR-0046`'s "no single signal may dominate by accident" comparison still holds. The
+      *reason* precedence is deliberately **not** the weight order: the document lists semantic similarity
+      above entity overlap and the weights keep that, but a reason is what a user is told, and "this memory
+      means something close to what you asked" is an inference where "this memory repeats your words" is
+      present in the text — so text wins the reason and meaning keeps the weight.
+      **A memory without an embedding is not a worse memory.** It scores zero on one of nine signals and is
+      ranked on the other eight, which is the document's "embeddings are one signal" as arithmetic rather
+      than as policy — and no index is a zero **with a recorded reason**, so a caller can tell a zero from an
+      unconfigured provider, from a memory the index never saw, from an incomparable pair, and from two
+      genuinely orthogonal directions.
+      **Falsified, one guard each:** disabling the provider/model/version comparison and the length check
+      failed `a_vector_from_another_model_is_refused_and_names_the_field` and
+      `vectors_of_different_lengths_are_refused`; disabling the zero-magnitude guard failed
+      `a_zero_magnitude_vector_refuses_a_comparison`; zeroing the signal in `signals_for` failed both ranking
+      tests. All restored, green.
+      **Recorded as limits:** **nothing produces the vectors** — the `P4-005` port is wired to nothing, no
+      route embeds a memory, no job populates a lookup, and nothing writes a vector to storage, so what is
+      proven is the scoring and the guards rather than an end-to-end retrieval with embeddings; **nothing
+      calls `rank`** either (`P4-007` is the integration); the **weights are reasoned, not calibrated**, and
+      this slice makes that limit slightly larger by moving eight values rather than only adding one; the
+      lookup is a closure, so the module cannot say how a vector is *found* (`P4-009` owns pgvector);
+      the cosine is `f32`, so cross-platform bit-identity is not claimed even though the stored score is an
+      integer; relationship overlap and active project/task relevance remain absent as in `P4-004`; and a
+      text-free query is untested because no caller constructs one yet.
+      Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
+      (1172 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 205 tests.
 - [ ] `P4-007` Integrate memory retrieval into context budgets with provenance and injection-resistant quoting.
 - [ ] `P4-008` Add inspect, search, remember, correct, forget, export, retention, and full user-deletion APIs/CLI.
 - [ ] `P4-009` Implement PostgreSQL plus pgvector backend parity for the completed memory behavior.

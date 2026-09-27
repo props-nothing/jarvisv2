@@ -42,18 +42,33 @@
 //!
 //! # What this stage deliberately does not do
 //!
-//! **Semantic similarity is absent**, deliberately, and its absence is the `P4-004` slice title: "before
-//! adding embeddings". The document lists it as a signal, and there is no embedding to compute it from
-//! until `P4-005`. A placeholder that returned zero would make the weights table claim a signal it does not
-//! have, so the weights table simply does not list it and `P4-006` adds it with its own row.
-//!
-//! **Active project/task relevance is absent** for the same reason: there is no active project or task in
-//! the record, so a score for it would be a constant dressed as a signal.
+//! **Active project/task relevance is absent**: there is no active project or task in the record, so a score
+//! for it would be a constant dressed as a signal.
 //!
 //! **Relationship overlap is absent.** The document lists "entity/relationship overlap", and a relation
 //! graph exists in storage (`entity_relations`) but nothing traverses it yet, so only direct entity overlap
 //! is scored. `P4-004`'s storage half owns the read; traversing relations is a graph walk with its own cost
 //! and cycle question, and its own slice.
+//!
+//! **Semantic similarity is present but conditional**, which is the difference between this module and the
+//! previous slice. `P4-005` built the embedding port, so the signal now exists — but it needs a query vector
+//! and a memory vector, and neither is in the record or the query. They arrive as a [`ScoringContext`], and
+//! when it carries no index the signal is zero rather than absent from the table. The distinction matters:
+//! the row is in [`SIGNAL_WEIGHTS`] because the *signal* is implemented, and a caller can see from
+//! [`SemanticAbsence`] that the reason it produced nothing was missing data rather than a real zero.
+//!
+//! # An embedding is an index, not a truth
+//!
+//! Two constraints keep it that way, and both are structural rather than advisory:
+//!
+//! 1. **A memory is fully usable without one.** Nothing here requires an embedding to store, retrieve, or
+//!    rank a memory — the semantic term is one row of nine and a memory with no vector still scores on the
+//!    other eight.
+//! 2. **A vector from a different model is not comparable, and this module refuses rather than approximates.**
+//!    [`ScoringContext::semantic_outcome`] compares provider, model, and version before any arithmetic,
+//!    because a cosine over two vectors from different models is a number with no meaning that still lands
+//!    in the usual range — so a missing check does not look like a bug, it looks like a slightly worse
+//!    ranking.
 //!
 //! # Scoring is not selection
 //!
@@ -61,7 +76,7 @@
 //! whole candidate set and are about the *result* rather than about a memory. They live in
 //! [`diversify`], which is a separate function for exactly that reason.
 
-use crate::id::{EntityId, WorkspaceId};
+use crate::id::{EntityId, MemoryId, WorkspaceId};
 use crate::memory::{
     EffectiveMemoryStatus, EntityRef, MemoryRecord, MemorySourceKind, MemoryTrust, MemoryType,
 };
@@ -299,27 +314,32 @@ pub const SIGNAL_SCALE: SignalScore = 1000;
 ///    can contribute is a quarter of the maximum â€” a memory that scores perfectly on one signal and zero on
 ///    every other cannot reach the top quarter of the range, and therefore cannot displace a memory that is
 ///    good on several. That is the property "may not dominate **by accident**" made arithmetic.
-/// 3. **Every signal here is computable from the record and the query.** A row for semantic similarity
-///    would be a constant zero, which is a claim the table does not have the data to make.
+/// 3. **Every signal here is computable, and one of them is conditional.** Eight of the nine are computed
+///    from the record and the query alone. Semantic similarity needs embeddings, which `signals_for`
+///    receives as an optional index — see [`SemanticSimilarity`]. When no index is supplied that signal is
+///    zero, and the row is present because the *signal* exists rather than because the data does.
 ///
 /// The order is the document's own list, minus the two signals recorded as absent in the module doc.
+/// Semantic similarity sits third because that is where the document lists it, above entity overlap.
 pub const SIGNAL_WEIGHTS: SignalWeights = SignalWeights {
     // Exact identifiers and aliases: the entity the question names is the entity the memory is about.
     exact_identifier: 250,
     // Full-text/keyword match against the memory's content.
-    keyword: 200,
+    keyword: 175,
+    // Semantic similarity: what the memory means, against what the question means.
+    semantic: 150,
     // Entity overlap: some, but not all, of the question's entities appear.
-    entity_overlap: 150,
+    entity_overlap: 125,
     // Recency: how recently the memory was created or last used.
-    recency: 125,
+    recency: 100,
     // Temporal relevance: whether the query instant falls inside the claim's validity window.
-    temporal: 100,
+    temporal: 75,
     // The rank the memory itself declares.
-    importance: 75,
+    importance: 60,
     // What the origin can be asked about.
-    source_reliability: 60,
+    source_reliability: 40,
     // How often the memory has been usefully retrieved before.
-    reinforcement: 40,
+    reinforcement: 25,
 };
 
 /// The weights of every signal, as one comparable value.
@@ -333,6 +353,8 @@ pub struct SignalWeights {
     pub exact_identifier: u16,
     /// Weight of the keyword signal.
     pub keyword: u16,
+    /// Weight of the semantic-similarity signal.
+    pub semantic: u16,
     /// Weight of the entity-overlap signal.
     pub entity_overlap: u16,
     /// Weight of the recency signal.
@@ -353,13 +375,17 @@ pub const TOTAL_WEIGHT: u32 = 1000;
 /// The largest weight any single signal may carry.
 pub const MAX_SIGNAL_WEIGHT: u16 = 250;
 
+/// The number of signals, so a new signal cannot be added to the struct and forgotten in the array forms.
+pub const SIGNAL_COUNT: usize = 9;
+
 impl SignalWeights {
     /// Returns every weight, for a test or an operator display.
     #[must_use]
-    pub const fn all(&self) -> [(&'static str, u16); 8] {
+    pub const fn all(&self) -> [(&'static str, u16); SIGNAL_COUNT] {
         [
             ("exact_identifier", self.exact_identifier),
             ("keyword", self.keyword),
+            ("semantic", self.semantic),
             ("entity_overlap", self.entity_overlap),
             ("recency", self.recency),
             ("temporal", self.temporal),
@@ -374,6 +400,7 @@ impl SignalWeights {
     pub const fn total(&self) -> u32 {
         self.exact_identifier as u32
             + self.keyword as u32
+            + self.semantic as u32
             + self.entity_overlap as u32
             + self.recency as u32
             + self.temporal as u32
@@ -394,6 +421,8 @@ pub struct MemorySignals {
     pub exact_identifier: SignalScore,
     /// How much of the question's text appears in the memory.
     pub keyword: SignalScore,
+    /// How close the memory's meaning is to the question's, when both have a comparable embedding.
+    pub semantic: SignalScore,
     /// How much of the question's entity set the memory shares at all.
     pub entity_overlap: SignalScore,
     /// How recent the memory is, relative to the query instant.
@@ -411,10 +440,11 @@ pub struct MemorySignals {
 impl MemorySignals {
     /// Returns every signal with its name, for a test or an operator display.
     #[must_use]
-    pub const fn all(&self) -> [(&'static str, SignalScore); 8] {
+    pub const fn all(&self) -> [(&'static str, SignalScore); SIGNAL_COUNT] {
         [
             ("exact_identifier", self.exact_identifier),
             ("keyword", self.keyword),
+            ("semantic", self.semantic),
             ("entity_overlap", self.entity_overlap),
             ("recency", self.recency),
             ("temporal", self.temporal),
@@ -445,11 +475,15 @@ impl MemorySignals {
             + contributions[5].1
             + contributions[6].1
             + contributions[7].1
+            + contributions[8].1
     }
 
     /// Returns the weighted contribution of each signal, for an explanation.
     #[must_use]
-    pub const fn contributions(&self, weights: &SignalWeights) -> [(&'static str, u32); 8] {
+    pub const fn contributions(
+        &self,
+        weights: &SignalWeights,
+    ) -> [(&'static str, u32); SIGNAL_COUNT] {
         [
             (
                 "exact_identifier",
@@ -459,6 +493,10 @@ impl MemorySignals {
             (
                 "keyword",
                 self.keyword as u32 * weights.keyword as u32 / SIGNAL_SCALE as u32,
+            ),
+            (
+                "semantic",
+                self.semantic as u32 * weights.semantic as u32 / SIGNAL_SCALE as u32,
             ),
             (
                 "entity_overlap",
@@ -506,6 +544,8 @@ pub enum SelectionReason {
     KeywordMatch,
     /// The memory shares some of the question's entities.
     EntityOverlap,
+    /// The memory means something close to what the question asked, without sharing its words.
+    SemanticSimilarity,
     /// The claim is inside its validity window and recent, with nothing matching above.
     ///
     /// A memory included for this reason did not match the question; it is offered because it is current
@@ -524,6 +564,7 @@ impl SelectionReason {
             Self::ExactIdentifier => "exact_identifier",
             Self::KeywordMatch => "keyword_match",
             Self::EntityOverlap => "entity_overlap",
+            Self::SemanticSimilarity => "semantic_similarity",
             Self::RecentAndCurrent => "recent_and_current",
             Self::Important => "important",
         }
@@ -538,7 +579,10 @@ impl SelectionReason {
     pub const fn is_a_match(&self) -> bool {
         matches!(
             self,
-            Self::ExactIdentifier | Self::KeywordMatch | Self::EntityOverlap
+            Self::ExactIdentifier
+                | Self::KeywordMatch
+                | Self::EntityOverlap
+                | Self::SemanticSimilarity
         )
     }
 }
@@ -593,8 +637,13 @@ impl ScoredMemory {
 /// split means a caller that has a memory and a query can score it for a display without re-running the
 /// filter, and there is one place that decides who is eligible.
 #[must_use]
-pub fn score(record: &MemoryRecord, query: &MemoryQuery, weights: &SignalWeights) -> ScoredMemory {
-    let signals = signals_for(record, query);
+pub fn score(
+    record: &MemoryRecord,
+    query: &MemoryQuery,
+    context: &ScoringContext<'_>,
+    weights: &SignalWeights,
+) -> ScoredMemory {
+    let signals = signals_for(record, query, context);
     let total = signals.total(weights);
     let reason = reason_for(&signals, weights);
     ScoredMemory {
@@ -620,13 +669,14 @@ pub fn score(record: &MemoryRecord, query: &MemoryQuery, weights: &SignalWeights
 pub fn rank(
     records: &[MemoryRecord],
     query: &MemoryQuery,
+    context: &ScoringContext<'_>,
     weights: &SignalWeights,
 ) -> MemorySelection {
     let mut excluded = Vec::new();
     let mut scored = Vec::new();
     for record in records {
         match query.is_eligible(record) {
-            Ok(()) => scored.push(score(record, query, weights)),
+            Ok(()) => scored.push(score(record, query, context, weights)),
             Err(reason) => excluded.push(ExcludedMemory {
                 memory_id: record.id(),
                 reason,
@@ -943,15 +993,303 @@ fn scaled(numerator: usize, denominator: usize) -> SignalScore {
         .min(SIGNAL_SCALE)
 }
 
-/// Computes every signal for one memory.
+/// The query's semantic side and the per-memory vectors a ranking may compare it against.
 ///
-/// Each signal is a pure function of the record and the query, so a component can be recomputed in
-/// isolation and the total cannot depend on the order signals were evaluated.
+/// # Why this is one value rather than a second argument in two places
+///
+/// Semantic similarity is the only signal that needs something the record and the query do not carry, and
+/// the thing it needs comes in **two halves that must agree**: the query's vector and the memory's. Passing
+/// the query vector separately from the memory lookup would make "a query vector with no memory vectors"
+/// and "memory vectors with no query vector" both representable, and both are meaningless — so they are one
+/// optional value, and `None` means "no embedding index for this ranking".
+///
+/// # Why the vectors are borrowed rather than owned
+///
+/// A candidate set is scored once and the vectors are the largest values involved. Borrowing lets a caller
+/// hold one decoded index across a whole ranking, so a hundred memories do not become a hundred clones of
+/// their vectors. What the *result* retains is the metadata needed to explain the score, not the floats.
+///
+/// # Why there is no `Default`
+///
+/// `ScoringContext::default()` would read as "an unspecified context" and quietly disable a signal, which is
+/// the shape `P4-004` refused for the query defaults: a default is what a caller who did not think about the
+/// field gets, and for a *scoring input* the consequence of not thinking is a silently missing signal. A
+/// caller who wants no index writes [`ScoringContext::without_semantics`], which says so.
+///
+/// # Why the lookup is owned rather than borrowed
+///
+/// It was a `&dyn Fn` first, and every call site that passed a closure literal failed to compile: a
+/// temporary closure borrowed into a longer-lived context is dropped at the end of the statement. That
+/// error is correct but it is the wrong *shape* for a caller — the natural way to write a lookup is inline,
+/// and requiring a `let` binding for it first is a papercut on every use. Owning a box makes the
+/// one-allocation cost a per-ranking cost rather than a per-memory one, which is the trade the callers
+/// would make anyway.
+pub struct ScoringContext<'a> {
+    semantic: Option<SemanticScoring<'a>>,
+}
+
+/// The two halves of a semantic comparison, which must be present together.
+struct SemanticScoring<'a> {
+    query: SemanticVector<'a>,
+    vectors: SemanticLookup<'a>,
+}
+
+/// Looks up the vector stored for one memory.
+///
+/// Written as an alias rather than inline because the type is a boxed closure over a lifetime, which is
+/// noisy enough at the field, the constructor, and the call site that naming it is what keeps the three
+/// readable — and it makes the allocation decision visible in one place.
+type SemanticLookup<'a> = Box<dyn Fn(&MemoryId) -> Option<SemanticVector<'a>> + 'a>;
+
+/// A vector with the identity a comparison depends on.
+///
+/// # Why the provider, model, and version are here and not inferred
+///
+/// "Never compare vectors with incompatible metadata" is a rule about a pair, so both sides must carry the
+/// identity. A vector without it cannot be compared by any code that takes the rule seriously, and
+/// `jarvis-models`' `EmbeddingMetadata::ensure_comparable_with` is what performs the comparison — this type
+/// is the domain-side carrier for the four fields that rule needs.
+///
+/// # Why the dimension is not here
+///
+/// The vector's own length is the dimension, and a separate field could contradict it. `jarvis-models`
+/// checks the two against each other at construction; repeating the field here would let a caller construct
+/// a pair this module believes and `jarvis-models` would refuse.
+#[derive(Clone, Copy)]
+pub struct SemanticVector<'a> {
+    /// The embedding provider the vector came from.
+    pub provider: &'a str,
+    /// The embedding model.
+    pub model: &'a str,
+    /// The model version, when the provider states one.
+    pub version: Option<&'a str>,
+    /// Whether the vector's length is one.
+    pub normalized: SemanticNormalization,
+    /// The vector's components.
+    pub values: &'a [f32],
+}
+
+/// Whether a provider normalizes the vectors it returns.
+///
+/// `Unknown` is the default for the same reason `jarvis-models` defaults to it: the dot-product shortcut is
+/// the permissive assumption on a distance, and the one that goes wrong quietly. Here it makes the cosine
+/// division happen, so an unknown normalization is *slower and correct* rather than *faster and wrong*.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SemanticNormalization {
+    /// The provider states the vectors are length one.
+    Normalized,
+    /// The provider states the vectors are not normalized.
+    Unnormalized,
+    /// The provider states nothing.
+    #[default]
+    Unknown,
+}
+
+/// Why a memory's semantic signal is zero.
+///
+/// Recorded rather than folded into "no score", because the two are different answers: a memory with no
+/// embedding was never a candidate for this signal, while a memory whose embedding is *incomparable* is one.
+/// An operator asking "why did semantic similarity not help here" needs to tell the two apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticAbsence {
+    /// The ranking has no embedding index at all.
+    NoIndex,
+    /// The query has no embedding.
+    NoQueryVector,
+    /// The memory has no embedding.
+    NoMemoryVector,
+    /// The memory's embedding is not comparable with the query's, and the field that differs is named.
+    Incomparable(&'static str),
+    /// Both vectors are present but one has zero magnitude, so there is no angle between them.
+    ZeroMagnitude,
+    /// The two vectors have different lengths.
+    LengthMismatch,
+    /// **No similarity, and not a failure.** Either the two directions are orthogonal or one is opposed to
+    /// the other; both score zero.
+    ///
+    /// This is a distinct variant rather than a zero score with no reason, because the score alone cannot
+    /// distinguish it from a missing vector, an incomparable pair, or a zero magnitude. The distinction was
+    /// found by a test: an orthogonal pair with a dot product of exactly `0.0` was being reported as an
+    /// absence by a `cosine <= 0.0` guard, which conflates the two cases that produce that value.
+    NoSimilarity,
+}
+
+impl SemanticAbsence {
+    /// Returns the stable name for logs and wire values.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoIndex => "no_index",
+            Self::NoQueryVector => "no_query_vector",
+            Self::NoMemoryVector => "no_memory_vector",
+            Self::Incomparable(_) => "incomparable",
+            Self::ZeroMagnitude => "zero_magnitude",
+            Self::LengthMismatch => "length_mismatch",
+            Self::NoSimilarity => "no_similarity",
+        }
+    }
+}
+
+/// A semantic comparison's outcome: a score, or the reason there is none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SemanticOutcome {
+    score: SignalScore,
+    absence: Option<SemanticAbsence>,
+}
+
+impl SemanticOutcome {
+    /// Returns the score, which is zero when there is no comparison.
+    #[must_use]
+    pub const fn score(&self) -> SignalScore {
+        self.score
+    }
+
+    /// Returns why there is no comparison, or `None` when there was one.
+    #[must_use]
+    pub const fn absence(&self) -> Option<SemanticAbsence> {
+        self.absence
+    }
+}
+
+impl<'a> ScoringContext<'a> {
+    /// Builds a context with no embedding index, so the semantic signal is zero everywhere.
+    ///
+    /// Named rather than defaulted, so a caller that leaves semantics out has written a word meaning it.
+    #[must_use]
+    pub const fn without_semantics() -> Self {
+        Self { semantic: None }
+    }
+
+    /// Builds a context from a query vector and a lookup for a memory's vector.
+    #[must_use]
+    pub fn with_semantics(
+        query: SemanticVector<'a>,
+        vectors: impl Fn(&MemoryId) -> Option<SemanticVector<'a>> + 'a,
+    ) -> Self {
+        Self {
+            semantic: Some(SemanticScoring {
+                query,
+                vectors: Box::new(vectors),
+            }),
+        }
+    }
+
+    /// Returns whether this context can produce a semantic score at all.
+    #[must_use]
+    pub const fn has_semantics(&self) -> bool {
+        self.semantic.is_some()
+    }
+
+    /// Compares the query's vector against one memory's, or reports why it cannot.
+    ///
+    /// # Why the identity is compared before the arithmetic
+    ///
+    /// A cosine over two vectors from **different** models is a number with no meaning that still lands in
+    /// the usual range, so a missing check does not look like a bug — it looks like a slightly worse
+    /// ranking. `jarvis-models`' `ensure_comparable_with` performs the comparison and names the first field
+    /// that differed, and this call site is where the domain hands it both sides.
+    #[must_use]
+    pub fn semantic_outcome(&self, memory_id: &MemoryId) -> SemanticOutcome {
+        let Some(scoring) = &self.semantic else {
+            return absent(SemanticAbsence::NoIndex);
+        };
+        let Some(memory) = (scoring.vectors)(memory_id) else {
+            return absent(SemanticAbsence::NoMemoryVector);
+        };
+        let query = scoring.query;
+        // Identity first: everything after this point is arithmetic that would "succeed" on two vectors
+        // that have no business being compared.
+        if query.provider != memory.provider {
+            return absent(SemanticAbsence::Incomparable("provider"));
+        }
+        if query.model != memory.model {
+            return absent(SemanticAbsence::Incomparable("model"));
+        }
+        if query.version != memory.version {
+            return absent(SemanticAbsence::Incomparable("version"));
+        }
+        // A length mismatch is caught before the arithmetic because the dot product would truncate to the
+        // shorter one without complaint, which is the failure a metadata guard exists to prevent.
+        if query.values.len() != memory.values.len() {
+            return absent(SemanticAbsence::LengthMismatch);
+        }
+        let denominator = if query.normalized == SemanticNormalization::Normalized
+            && memory.normalized == SemanticNormalization::Normalized
+        {
+            1.0
+        } else {
+            let query_magnitude = magnitude(query.values);
+            let memory_magnitude = magnitude(memory.values);
+            if query_magnitude == 0.0 || memory_magnitude == 0.0 {
+                return absent(SemanticAbsence::ZeroMagnitude);
+            }
+            query_magnitude * memory_magnitude
+        };
+        let dot = dot_product(query.values, memory.values);
+        let cosine = (dot / denominator).clamp(-1.0, 1.0);
+        // A zero or negative cosine scores zero rather than a negative signal: a component score is a
+        // magnitude out of `SIGNAL_SCALE`, and treating an opposed vector as "less than no match" would let it
+        // pull a total down, which no other signal can do and which the weights are not shaped for. The
+        // reason is recorded rather than the score alone, so "no similarity" does not read as "not compared".
+        if cosine <= 0.0 {
+            return SemanticOutcome {
+                score: 0,
+                absence: Some(SemanticAbsence::NoSimilarity),
+            };
+        }
+        // Rounded once, at the end, so the stored score is reproducible: `f32` arithmetic is not
+        // associative, so scaling inside the loop would make the value depend on the component order. The
+        // cosine is clamped to `[-1, 1]` above and the zero-or-negative case has returned, so the product is
+        // provably in `[0, SIGNAL_SCALE]`.
+        //
+        // `as` between numeric types is normally denied because it truncates or wraps silently. It is allowed
+        // here for one statement because the value's range is established by the two checks immediately above
+        // it, and there is no fallible `f32`-to-integer conversion in the standard library to use instead.
+        // A `try_from` on the *integer* would not help: the lossy step is the float conversion itself.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let score = (cosine * f32::from(SIGNAL_SCALE)).round() as SignalScore;
+        SemanticOutcome {
+            score,
+            absence: None,
+        }
+    }
+}
+
+/// Returns a zero score with a reason.
+const fn absent(reason: SemanticAbsence) -> SemanticOutcome {
+    SemanticOutcome {
+        score: 0,
+        absence: Some(reason),
+    }
+}
+
+/// Returns the Euclidean length of a vector.
+fn magnitude(values: &[f32]) -> f32 {
+    values.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+/// Returns the dot product of two vectors, over the shorter one.
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+}
+
+/// Computes every signal for one memory given a scoring context.
+///
+/// Each signal is a pure function of the record, the query, and the context, so a component can be
+/// recomputed in isolation and the total cannot depend on the order signals were evaluated.
 #[must_use]
-pub fn signals_for(record: &MemoryRecord, query: &MemoryQuery) -> MemorySignals {
+pub fn signals_for(
+    record: &MemoryRecord,
+    query: &MemoryQuery,
+    context: &ScoringContext<'_>,
+) -> MemorySignals {
     MemorySignals {
         exact_identifier: exact_identifier_signal(record, query),
         keyword: keyword_signal(record, query),
+        semantic: context.semantic_outcome(&record.id()).score(),
         entity_overlap: entity_overlap_signal(record, query),
         recency: recency_signal(record, query),
         temporal: temporal_signal(record, query),
@@ -1176,19 +1514,28 @@ pub const REINFORCEMENT_SATURATION: u32 = 8;
 /// [`SelectionReason::is_a_match`] exists to expose.
 #[must_use]
 pub fn reason_for(signals: &MemorySignals, weights: &SignalWeights) -> SelectionReason {
-    // Specificity order, most specific first: the identifier, then the partial overlap, then the words.
+    // Specificity order, most specific first: the identifier, then the partial overlap, then the words, then
+    // meaning.
     //
     // The comparison is written out rather than `max_by_key` because the two are usually EQUAL — a memory
     // about an entity a question names usually also shares the question's words, scoring full on both —
     // and `max_by_key` returns the **last** maximum on a tie. So the reason would depend on the order of an
-    // array literal rather than on a decision, and a memory scoring full on all three would be reported as
-    // a keyword match. `>` rather than `>=` makes the first signal at a given score win, so this order is
+    // array literal rather than on a decision, and a memory scoring full on all four would be reported as
+    // whatever came last. `>` rather than `>=` makes the first signal at a given score win, so this order is
     // the precedence.
+    //
+    // Semantic similarity is **last** among the matching signals even though the document lists it above
+    // entity overlap. The reason is the one a user is told, and "this memory means something close to what
+    // you asked" is a weaker claim than "this memory is about the entity you named" or even "this memory
+    // repeats your words" — the first is an inference, and the other two are present in the text. The
+    // *weight* keeps the document's order, because a weight says how much a signal contributes rather than
+    // how confidently its result can be described.
     let mut best: Option<(SelectionReason, SignalScore)> = None;
     for (reason, score) in [
         (SelectionReason::ExactIdentifier, signals.exact_identifier),
         (SelectionReason::EntityOverlap, signals.entity_overlap),
         (SelectionReason::KeywordMatch, signals.keyword),
+        (SelectionReason::SemanticSimilarity, signals.semantic),
     ] {
         if score > 0 && best.is_none_or(|(_, held)| score > held) {
             best = Some((reason, score));

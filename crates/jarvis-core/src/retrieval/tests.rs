@@ -57,6 +57,16 @@ fn query() -> MemoryQuery {
     MemoryQuery::new(workspace(), at(100))
 }
 
+/// A scoring context with no embedding index.
+///
+/// Most tests are about the eight signals that need no embedding, and naming the absence is the point: the
+/// semantic signal is *zero because there is no index*, which is a different state from "the memory has no
+/// vector" and a different state again from "there is a semantic score of zero". The semantic tests below
+/// build a real index and assert against its [`SemanticOutcome`] directly.
+fn no_semantics() -> ScoringContext<'static> {
+    ScoringContext::without_semantics()
+}
+
 /// A memory built through the real constructor, so a fixture cannot hold a value the domain refuses.
 fn memory(content: &str, memory_type: MemoryType, entities: Vec<EntityRef>) -> MemoryRecord {
     must(MemoryRecord::new(MemoryRecordParts {
@@ -133,6 +143,7 @@ fn no_single_signal_can_dominate() {
     let mut one_signal = MemorySignals {
         exact_identifier: 0,
         keyword: 0,
+        semantic: 0,
         entity_overlap: 0,
         recency: 0,
         temporal: 0,
@@ -174,7 +185,7 @@ fn the_total_is_the_sum_of_the_stored_contributions() {
         vec![EntityRef::confirmed(entity())],
     );
     let query = query().with_text("dark roast coffee");
-    let scored = score(&record, &query, &weights);
+    let scored = score(&record, &query, &no_semantics(), &weights);
 
     let summed: u32 = scored
         .signals()
@@ -193,6 +204,7 @@ fn the_total_is_the_sum_of_the_stored_contributions() {
     let perfect = MemorySignals {
         exact_identifier: SIGNAL_SCALE,
         keyword: SIGNAL_SCALE,
+        semantic: SIGNAL_SCALE,
         entity_overlap: SIGNAL_SCALE,
         recency: SIGNAL_SCALE,
         temporal: SIGNAL_SCALE,
@@ -223,7 +235,12 @@ fn a_foreign_workspace_memory_is_excluded_by_name() {
         vec![held],
     );
 
-    let selection = rank(&[foreign.clone(), mine.clone()], &query(), &SIGNAL_WEIGHTS);
+    let selection = rank(
+        &[foreign.clone(), mine.clone()],
+        &query(),
+        &no_semantics(),
+        &SIGNAL_WEIGHTS,
+    );
     assert_eq!(selection.len(), 1, "only the local memory is a candidate");
     assert_eq!(selection.scored()[0].record().id(), mine.id());
     assert_eq!(
@@ -680,11 +697,13 @@ fn the_ranking_is_stable_and_ordered() {
     let forward = rank(
         &[about_bob.clone(), about_alice.clone()],
         &both,
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     let backward = rank(
         &[about_alice.clone(), about_bob.clone()],
         &both,
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     let ids = |selection: &MemorySelection| -> Vec<MemoryId> {
@@ -703,6 +722,7 @@ fn the_ranking_is_stable_and_ordered() {
     let ranked = rank(
         &[about_bob.clone(), about_alice.clone()],
         &specific,
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     assert_eq!(
@@ -733,7 +753,12 @@ fn the_reason_is_derived_from_the_signals() {
 
     // A question about something else entirely: no entity match, no keyword match.
     let unmatched = query().with_text("quantum chromodynamics");
-    let scored = score(&about_nothing_asked, &unmatched, &SIGNAL_WEIGHTS);
+    let scored = score(
+        &about_nothing_asked,
+        &unmatched,
+        &no_semantics(),
+        &SIGNAL_WEIGHTS,
+    );
     assert_eq!(
         scored.signals().keyword,
         0,
@@ -748,7 +773,12 @@ fn the_reason_is_derived_from_the_signals() {
 
     // A keymatch: the reason names the keyword signal, and the signal is what supports it.
     let matched = query().with_text("dark roast");
-    let scored = score(&about_nothing_asked, &matched, &SIGNAL_WEIGHTS);
+    let scored = score(
+        &about_nothing_asked,
+        &matched,
+        &no_semantics(),
+        &SIGNAL_WEIGHTS,
+    );
     assert_eq!(scored.reason(), SelectionReason::KeywordMatch);
     assert!(scored.signals().keyword > 0);
     assert!(scored.reason().is_a_match());
@@ -758,14 +788,26 @@ fn the_reason_is_derived_from_the_signals() {
     let named = query()
         .with_entities(vec![about_nothing_asked.entities()[0].entity_id()])
         .with_text("dark roast");
-    let scored = score(&about_nothing_asked, &named, &SIGNAL_WEIGHTS);
+    let scored = score(
+        &about_nothing_asked,
+        &named,
+        &no_semantics(),
+        &SIGNAL_WEIGHTS,
+    );
     assert_eq!(
         scored.reason(),
         SelectionReason::ExactIdentifier,
         "the more specific signal must be the reported reason"
     );
     assert!(
-        scored.total() > score(&about_nothing_asked, &matched, &SIGNAL_WEIGHTS).total(),
+        scored.total()
+            > score(
+                &about_nothing_asked,
+                &matched,
+                &no_semantics(),
+                &SIGNAL_WEIGHTS
+            )
+            .total(),
         "naming the entity must raise the total, not only the reason"
     );
 }
@@ -809,7 +851,7 @@ fn both_vocabularies_are_exhaustive_and_named() {
 
     // The weights table and the signals table must both list eight entries, and the reason precedence must
     // cover the three matching signals — otherwise a signal could be scored and never reported.
-    assert_eq!(SIGNAL_WEIGHTS.all().len(), 8);
+    assert_eq!(SIGNAL_WEIGHTS.all().len(), SIGNAL_COUNT);
     let signals = signals_for(
         &memory(
             "A claim",
@@ -817,9 +859,10 @@ fn both_vocabularies_are_exhaustive_and_named() {
             vec![EntityRef::confirmed(entity())],
         ),
         &query().with_text("A claim"),
+        &no_semantics(),
     );
-    assert_eq!(signals.all().len(), 8);
-    assert_eq!(signals.contributions(&SIGNAL_WEIGHTS).len(), 8);
+    assert_eq!(signals.all().len(), SIGNAL_COUNT);
+    assert_eq!(signals.contributions(&SIGNAL_WEIGHTS).len(), SIGNAL_COUNT);
 }
 
 /// **Every cap bounds its own category, and a memory over any cap is dropped by name.**
@@ -841,7 +884,7 @@ fn every_budget_cap_bounds_its_own_category() {
         })
         .collect();
     let query = query().with_text("prefers roast");
-    let ranked = rank(&candidates, &query, &SIGNAL_WEIGHTS);
+    let ranked = rank(&candidates, &query, &no_semantics(), &SIGNAL_WEIGHTS);
     assert_eq!(
         ranked.len(),
         6,
@@ -939,6 +982,7 @@ fn a_per_category_cap_forces_a_diverse_result() {
     let ranked = rank(
         &candidates,
         &query().with_text("prefers roast"),
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     assert_eq!(
@@ -1017,7 +1061,7 @@ fn the_reason_precedence_is_specificity_not_array_order() {
         .with_entities(vec![held.entity_id()])
         .with_text("Prefers dark roast");
 
-    let signals = signals_for(&about_the_named_entity, &named);
+    let signals = signals_for(&about_the_named_entity, &named, &no_semantics());
     assert_eq!(
         signals.exact_identifier, SIGNAL_SCALE,
         "the fixture must score full on the identifier signal, or the tie is not a tie"
@@ -1075,6 +1119,7 @@ fn the_capped_result_is_a_prefix_of_the_ranking() {
     let ranked = rank(
         &candidates,
         &query().with_text("dark roast coffee"),
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     let capped = diversify(
@@ -1115,6 +1160,7 @@ fn a_budget_drop_is_not_an_eligibility_refusal() {
     let ranked = rank(
         &[preference.clone(), foreign.clone()],
         &query(),
+        &no_semantics(),
         &SIGNAL_WEIGHTS,
     );
     assert_eq!(
@@ -1144,7 +1190,12 @@ fn a_budget_drop_is_not_an_eligibility_refusal() {
         MemoryType::Preference,
         vec![alice],
     );
-    let ranked = rank(&[preference, second], &query(), &SIGNAL_WEIGHTS);
+    let ranked = rank(
+        &[preference, second],
+        &query(),
+        &no_semantics(),
+        &SIGNAL_WEIGHTS,
+    );
     let capped = diversify(ranked, &must(DiversityBudget::new(100, 100, 1, 100)));
     assert_eq!(capped.len(), 1);
     assert_eq!(capped.dropped().len(), 1);
@@ -1200,3 +1251,10 @@ fn the_source_reliability_signal_matches_the_model_gate() {
         );
     }
 }
+
+/// Tests for the semantic signal, which needs vectors where the tests above need only records.
+///
+/// Declared here rather than beside `tests` so this module's fixtures — `memory`, `query`, `entity`,
+/// `at` — are reachable through `use super::*`, and a fixture cannot drift between the two files.
+#[path = "semantic_tests.rs"]
+mod semantic_tests;
