@@ -34,7 +34,8 @@
 //!   exists so that this can be said rather than fabricated — `Documented(60)` here would be a claim about
 //!   Google that no source supports.
 
-use crate::auth::AuthMethod;
+use crate::auth::{AuthError, AuthFlow, AuthMethod, PkceMethod};
+use crate::authorization::{LoopbackHost, LoopbackRedirect, RedirectError};
 use crate::manifest::{
     AuthMethodDeclaration, Classification, CompatibilityStatus, CompatibilityVerdict,
     ConnectorError, ConnectorId, ConnectorManifest, ConnectorOperation, ConnectorVersion,
@@ -215,22 +216,79 @@ impl GoogleConnector {
         Vec::new()
     }
 
-    /// The authorization endpoint the flow will use.
+    /// The authorization endpoint, from Google's discovery document.
     ///
-    /// Returned as a bare constant rather than as an [`AuthFlow`], and **that is a finding rather than an
-    /// omission**: `AuthFlow::new` requires a redirect URI for an OAuth method, and this slice cannot supply
-    /// one honestly. The research record establishes RFC 8252 §7.3's loopback rules — `http://127.0.0.1:{port}`
-    /// with the server accepting **any** port, and `localhost` NOT RECOMMENDED — but it does **not** record
-    /// which redirect form Google's own client registration expects, and Google matches redirect URIs
-    /// **exactly**. Declaring `http://127.0.0.1/` here would be a guess at a value a provider compares
-    /// byte-for-byte, which is the class of invented figure this slice exists to refuse.
-    ///
-    /// So the redirect is the **client slice's** first job: fetch Google's native-application documentation,
-    /// record the redirect form in `docs/research/integrations/google.md`, and only then construct the flow.
-    /// `P5-002`'s `LoopbackRedirect::registered` is what will carry the portless form once it is known.
+    /// Transcribed from `https://accounts.google.com/.well-known/openid-configuration`, which is
+    /// **machine-readable** — so this is the server's own published configuration rather than a page's
+    /// example. `the_endpoints_match_the_discovery_document` asserts both endpoints in this module against
+    /// those recorded values, so a drift is a failing test rather than a silent wrong URL.
     #[must_use]
     pub const fn authorization_endpoint() -> &'static str {
         "https://accounts.google.com/o/oauth2/v2/auth"
+    }
+
+    /// The token endpoint, from the same document.
+    ///
+    /// **Not the authorization endpoint's host**: `accounts.google.com` serves the consent screen and
+    /// `oauth2.googleapis.com` serves the exchange. Two different hosts for one flow is unusual enough that
+    /// a reader might "correct" it, so the discovery document is named as the source.
+    #[must_use]
+    pub const fn token_endpoint() -> &'static str {
+        "https://oauth2.googleapis.com/token"
+    }
+
+    /// The revocation endpoint, from the same document.
+    ///
+    /// Recorded because `P5-002`'s `RevocationKind` needs somewhere to revoke against, and because the
+    /// provider's blast radius is unusual: revocation removes the project's grants, not only one account's.
+    #[must_use]
+    pub const fn revocation_endpoint() -> &'static str {
+        "https://oauth2.googleapis.com/revoke"
+    }
+
+    /// The redirect URI this connector **registers** with Google.
+    ///
+    /// The **portless** loopback form, which is what `P5-002`'s `LoopbackRedirect::registered` produces and
+    /// what `LoopbackRedirect::matches_except_port` compares a listener against. RFC 8252 §7.3 requires the
+    /// server to accept any port at request time, so the registered form carries none.
+    ///
+    /// **One fact here is not established.** Google's native-app page shows the *exchange request* using a
+    /// ported URI (`redirect_uri=http://127.0.0.1:9004`) and states that `redirect_uri` must match an
+    /// authorized URI exactly, but it does not state which string the console accepts as the **registered**
+    /// value for a Desktop-app client. See Unresolved Question 7 in the research record. This constant is
+    /// therefore the form the flow's own rules produce rather than a value confirmed against the console, and
+    /// `the_registered_redirect_is_the_portless_form_the_flow_requires` records that distinction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedirectError`] if the constant is not a valid loopback redirect — which would be a defect in
+    /// this file rather than at runtime.
+    pub fn registered_redirect() -> Result<LoopbackRedirect, RedirectError> {
+        LoopbackRedirect::registered(LoopbackHost::V4, "/")
+    }
+
+    /// The connector's auth flow, constructed from the verified endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the flow is inconsistent. `AuthFlow::new` requires an `https://` authorization
+    /// endpoint, PKCE for an OAuth method, and a redirect URI; all three are supplied from the discovery
+    /// document and the loopback rules rather than chosen here.
+    pub fn auth_flow() -> Result<AuthFlow, AuthError> {
+        // The redirect comes from `registered_redirect`, whose failure is a defect in this file rather than
+        // something a caller can act on — so it is reported as a flow inconsistency instead of being
+        // propagated as a `RedirectError`, which `AuthError` has no conversion from and should not gain one
+        // for (a redirect error is about a URI, and a flow error is about the flow's *shape*).
+        let redirect = Self::registered_redirect().map_err(|_| AuthError::Flow {
+            reason: "the registered loopback redirect is not a valid `http` URI on a loopback literal, which \
+                     is a defect in this connector's own constant rather than a caller's input",
+        })?;
+        AuthFlow::new(
+            AuthMethod::OAuthPkce,
+            Some(PkceMethod::S256),
+            Some(redirect.as_uri()),
+            Self::authorization_endpoint(),
+        )
     }
 }
 

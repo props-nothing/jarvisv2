@@ -40,6 +40,8 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | OAuth consent and scope categories | https://developers.google.com/workspace/guides/configure-oauth-consent (last updated **2026-09-03**) | 2026-09-27 | which review each scope category requires |
 | Cloud Pub/Sub push authentication | https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions (last updated **2026-09-24**) | 2026-09-27 | **the JWT-bearer mechanism** — see Finding 1 |
 | Cloud Pub/Sub push subscriptions | https://cloud.google.com/pubsub/docs/push | 2026-09-27 | the envelope and the acknowledgement rule |
+| Google OIDC discovery document | https://accounts.google.com/.well-known/openid-configuration | 2026-09-27 | **machine-readable**: every endpoint, the PKCE methods, and whether the `iss` response parameter is supported |
+| Google OAuth 2.0 for native apps | https://developers.google.com/identity/protocols/oauth2/native-app (last updated **2026-09-14**) | 2026-09-27 | the installed-app flow: the loopback method, the token and refresh exchanges, the response fields, DPoP, revocation |
 
 The shared OAuth protocol facts — PKCE, loopback redirects, rotation, revocation — are recorded once in
 [oauth2-pkce-native-apps.md](oauth2-pkce-native-apps.md) and are not restated here.
@@ -105,6 +107,99 @@ important number for sizing a first sync**, and the reason a connector must batc
   listed on the consent screen and use of restricted or sensitive scopes doesn't require further review by
   Google". This is the single fact that decides whether a personal JARVIS deployment needs the security
   assessment at all — and it is about the *consent screen's audience setting*, not about scope choice.
+
+#### The endpoint set, read from the discovery document
+
+The values below come from `https://accounts.google.com/.well-known/openid-configuration`, which is the one
+source here that is **machine-readable** rather than prose — so these are not the documentation's examples but
+the server's own published configuration.
+
+| Field | Value |
+| --- | --- |
+| `issuer` | `https://accounts.google.com` |
+| `authorization_endpoint` | `https://accounts.google.com/o/oauth2/v2/auth` |
+| `token_endpoint` | `https://oauth2.googleapis.com/token` |
+| `revocation_endpoint` | `https://oauth2.googleapis.com/revoke` |
+| `userinfo_endpoint` | `https://openidconnect.googleapis.com/v1/userinfo` |
+| `device_authorization_endpoint` | `https://oauth2.googleapis.com/device/code` |
+| `jwks_uri` | `https://www.googleapis.com/oauth2/v3/certs` |
+| `code_challenge_methods_supported` | `["plain", "S256"]` |
+| `id_token_signing_alg_values_supported` | `["RS256"]` |
+| `authorization_response_iss_parameter_supported` | **`true`** |
+| `token_endpoint_auth_methods_supported` | `client_secret_post`, `client_secret_basic`, and more that appeared **truncated in capture** |
+| `grant_types_supported` | `authorization_code`, `refresh_token`, the device-code URN, and the JWT-bearer URN |
+| `subject_types_supported` | `public` |
+
+- **The authorization, token and revocation endpoints in the connector are transcribed from here**, which is
+  what makes them checkable: `the_authorization_endpoint_matches_the_discovery_document` asserts the constant
+  against these values, so a future change is a deliberate edit rather than a silent drift.
+- **`authorization_response_iss_parameter_supported: true`** is the fact that decides whether
+  `AuthorizationTransaction::with_issuer` has anything to check. `P5-002` stores the issuer and reports
+  `MixUpDefence::IssuerConfirmed` only when the response carries `iss`; Google supporting the parameter means
+  the confirmation is available rather than perpetually `NotSatisfied`.
+- **`plain` is offered as a code-challenge method**, which is the downgrade `P5-002` refuses to leave to a
+  server's defaulting: `AuthenticationTransaction::parameters` always sends `code_challenge_method` even for
+  `S256`, so a server reading an omission as `plain` cannot weaken the proof.
+- **The arrays marked truncated were truncated in the capture**, and that is recorded rather than glossed: the
+  record does **not** claim a complete `token_endpoint_auth_methods_supported` list, so nothing here concludes
+  whether `none` (a public client's auth method) is advertised. It does not need to: `P5-002`'s flow is the
+  authorization-code grant with PKCE, and the token endpoint's authentication method is what a *confidential*
+  client uses.
+
+#### The loopback redirect, and the exchange's own contract
+
+- **Loopback is the recommended method for macOS, Linux and Windows desktop**, from the page's own table: "if
+  your platform supports it, this is the recommended mechanism for obtaining the authorization code". The
+  application type is set to **Desktop app**.
+- **`localhost` is permitted but discouraged by the provider too**: "It is also possible to use `localhost` in
+  place of the loopback IP, but this configuration may cause issues with client firewalls." `P5-002` refuses
+  `localhost` for its own reasons (RFC 8252 §8.3), and Google's advice points the same way — two independent
+  reasons for one refusal.
+- **Custom URI schemes are no longer supported**, "due to the risk of app impersonation", and the OOB
+  copy/paste method is deprecated. So the loopback redirect is not merely recommended but the only supported
+  non-embedded option for a desktop client.
+- **`redirect_uri` "must exactly match one of the authorized redirect URIs"**, and a mismatch is the
+  `redirect_uri_mismatch` error. The page's own exchange example uses a **ported** form
+  (`redirect_uri=http://127.0.0.1:9004`). **What the Cloud Console accepts as the *registered* value is not
+  stated on this page** — see Unresolved Question 7.
+- **`client_secret` is `Optional`** on both the code exchange and the refresh, and the refresh section adds
+  "not applicable to requests from clients registered as Android, iOS, or Chrome applications". So a public
+  native client sends neither, which is what the manifest's **empty `secret_fields`** relies on.
+- **The token response's fields:** `access_token`, `expires_in`, `id_token` (**only when an identity scope such
+  as `openid`, `profile` or `email` was requested**), `refresh_token` ("always returned for installed
+  applications"), `refresh_token_expires_in` (only for a time-based access grant), `scope` (space-delimited,
+  case-sensitive — so the granted scopes are checkable and may be **fewer** than requested), and `token_type`
+  ("always `Bearer`", even under DPoP).
+- **An `id_token` is therefore expected on this connector's exchange**, because the manifest requests `openid`.
+  `P5-002` records that `nonce` is carried but **not validated**, which needs JWKS verification against
+  `jwks_uri`; the discovery document supplies that URI, and the verification is still unbuilt.
+- **Refresh-token issuance is limited, and the consequence is that older tokens stop working**: "one limit per
+  client/user combination, and another per user across all clients … If your application requests too many
+  refresh tokens, it may run into these limits, in which case older refresh tokens will stop working." A
+  deployment that re-authorizes repeatedly can silently invalidate the token it was relying on.
+- **Refreshing does not return a new refresh token** in the documented sample, so `P5-002`'s rotation detection
+  (`has_refresh_token`) reports `false` and no rotation here is expected. Rotation remains correct to detect: a
+  provider that *does* return one would otherwise go unnoticed.
+- **Revocation is `https://oauth2.googleapis.com/revoke` with the token as a parameter**, HTTP 200 on success and
+  400 on error, and "the token can be an access token or a refresh token. If the token is an access token and it
+  has a corresponding refresh token, the refresh token will also be revoked". **`P5-002`'s `RevocationKind`
+  `token_type_hint` is therefore about which token to present, not about scope of effect.**
+- **⚠ Revocation's blast radius is wider than one account.** The page states: "Revocation removes all OAuth 2.0
+  scopes previously granted to a project, invalidating any issued access or refresh tokens for all clients
+  registered under that project." And "it might take some time before the revocation has full effect". A
+  connector that revokes to disconnect *one* account must not assume the effect is limited to that account's
+  grant — the unit Google revokes by is the **project**.
+- **DPoP is optional and recommended, and it changes the key-material obligation rather than a parameter.** A
+  successful token request with a `DPoP` header binds the **refresh token** to the key while access tokens keep
+  `token_type: Bearer`. For a code exchange the `jti` must be `BASE64URL(SHA256(AUTHORIZATION_CODE))`, and a
+  refresh needs a unique per-request `jti`. A missing or unacceptable nonce yields `use_dpop_nonce` with a fresh
+  `DPoP-Nonce` header to cache. The documentation recommends storing the private key "in a way that it cannot be
+  copied off-device, for example by using TPMs, Secure Enclaves, or other hardware-backed keystores".
+
+  **So DPoP is a decision, not a default, and the reason is not the extra header.** It requires JARVIS to hold a
+  non-exportable signing key and to sign every token request, which is exactly the sender-constraining `P5-002`
+  records as **not implemented** — and its own ADR calls that the strongest argument for the work. Bypassing it
+  is safe (DPoP is optional); adopting it is a slice, not a flag.
 
 ### Limits And Failure Semantics
 
@@ -402,6 +497,16 @@ and no Cloud project was created.
    increased" and charges are "planned". *Impact:* the honest answer may be that no connector design avoids it
    except by reading less. *Blocks:* nothing; recorded so a later reader does not mistake the current no-charge
    state for a guarantee.
+7. **Which exact redirect URI string does Google's console accept as *registered* for a Desktop-app client?**
+   The native-app page's exchange example uses the **ported** form (`redirect_uri=http://127.0.0.1:9004`), and
+   RFC 8252 §7.3 says a server must accept **any** port, but the page does not state what may be entered in the
+   console — a portless `http://127.0.0.1/`, a loopback with a specific port, or the `localhost` equivalent.
+   *Impact:* the connector's registered form is unconfirmed, so a deployment may hit `redirect_uri_mismatch`
+   for a flow that is otherwise correct, and diagnosing it means reading a console page rather than a protocol
+   requirement. *Blocks:* nothing in the flow's code — `P5-002`'s `LoopbackRedirect::registered` produces the
+   portless form and `matches_except_port` joins it to a listening port, so **both sides of the comparison are
+   implemented and tested**; what is unverified is one string a human types. It must be confirmed before a live
+   smoke test, which is where a mismatch would surface.
 
 ## Verification Log
 
@@ -417,6 +522,9 @@ and no Cloud project was created.
 | 2026-09-27 | Calendar sync guide fetched | `nextSyncToken`; incremental sync with `syncToken`; **HTTP 410 Gone for an invalidated token** requiring a full wipe; **HTTP 400 for disallowed query restrictions**; the pagination rule of repeating the exact same query with `pageToken`; `modifiedSince` recorded as deprecated in favour of sync tokens. |
 | 2026-09-27 | Pub/Sub push authentication page fetched | **JWT (RS256) in `Authorization: Bearer`**; the claim set (`aud`, `azp`, `email`, `sub`, `iss`, `exp`, `iat`); validation = signature + **email and audience claims matching the subscription configuration**; tokens "may be up to an hour old"; no body signature. This is the finding that `WebhookSupport::Push` cannot express. |
 | 2026-09-27 | Gmail MCP reference fetched | `https://gmailmcp.googleapis.com/mcp/v1`, **Developer Preview**, ten tools with per-tool query costs; a Calendar MCP server linked from the Calendar navigation. |
-| 2026-09-27 | Cross-check against `jarvis-connectors` | `SignatureAlgorithm` has no OIDC/JWT variant and `SignatureScheme` requires a signed body, so **Finding 1 is a contract gap rather than a connector mistake**; `SyncCursorKind` has `MonotonicMarker` and `OpaqueToken`, so both cursor shapes are already representable and only the **staleness signal** (Finding 2) is new. |
+| 2026-09-27 | `https://accounts.google.com/.well-known/openid-configuration` fetched | **Machine-readable**, so the endpoint values are the server's own published configuration rather than documentation examples: `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`, `userinfo_endpoint`, `jwks_uri`; `code_challenge_methods_supported` = `plain`+`S256`; **`authorization_response_iss_parameter_supported: true`**; `token_endpoint_auth_methods_supported` **truncated in capture** and recorded as such. |
+| 2026-09-27 | Google OAuth 2.0 for native apps fetched | Loopback is the **recommended** desktop method and custom schemes are **no longer supported**, so loopback is the only non-embedded option; `redirect_uri` must match an authorized URI **exactly**; **`client_secret` is Optional** on both exchanges; the token response's fields including `refresh_token` "always returned for installed applications" and `id_token` only with an identity scope; **refresh-token limits make older tokens stop working**; the `revocation_endpoint` and its HTTP 200/400 contract; **revocation removes grants for the whole project**; DPoP's key-storage obligation. |
+| 2026-09-27 | Cross-check against `jarvis-connectors` | `AuthFlow::new` requires a **`https://` authorization endpoint** and a redirect URI for an OAuth method, so the discovery document's values are what make the flow constructible. `AuthorizationTransaction::begin` requires the listener's redirect to **match the flow's registration on host and path, ignoring the port** — so the registered form and the listening form are both needed, and the unverified question is what a human types into the console (Unresolved Question 7). |
+| 2026-09-27 | Cross-check against `jarvis-connectors` (webhook and cursor) | `SignatureAlgorithm` has no OIDC/JWT variant and `SignatureScheme` requires a signed body, so **Finding 1 is a contract gap rather than a connector mistake**; `SyncCursorKind` has `MonotonicMarker` and `OpaqueToken`, so both cursor shapes are already representable and only the **staleness signal** (Finding 2) is new. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

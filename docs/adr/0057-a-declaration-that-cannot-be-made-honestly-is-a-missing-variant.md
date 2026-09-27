@@ -102,8 +102,21 @@ provider never set".
 
 **5. A declaration that needs a provider fact this research does not establish is deferred, not guessed.**
 
-`GoogleConnector::authorization_endpoint()` returns a constant and no `AuthFlow` is constructed. The refusal to
-construct one is the decision; the redirect form belongs to the slice that can look it up.
+`GoogleConnector::authorization_endpoint()` returned a bare constant and no `AuthFlow` was constructed. The
+refusal to construct one was the decision; the redirect form belonged to the slice that could look it up.
+
+**Resolved within the same slice, and the resolution is recorded rather than the decision rewritten.** Two
+authoritative sources supplied the missing facts: `https://accounts.google.com/.well-known/openid-configuration`,
+which is **machine-readable** — the server's own published configuration rather than a page's example — and the
+OAuth 2.0 for native apps guide. The flow is now constructed from `authorization_endpoint`, and the registered
+redirect is the **portless** loopback form that `LoopbackRedirect::registered` produces and
+`matches_except_port` compares.
+
+What did **not** get resolved, and is now Unresolved Question 7 in the research record, is narrower and
+different in kind: Google's page shows the *exchange request* using a ported URI and requires an exact match
+against an authorized URI, but does not state which string the Cloud Console accepts as the **registered** value
+for a Desktop-app client. That is one string a human types, not a protocol requirement — and the test asserts
+the comparison that joins the two forms works **while explicitly not claiming** the console accepts the value.
 
 ## Consequences
 

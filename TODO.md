@@ -3017,53 +3017,63 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     constant**. **Six unresolved questions** are listed with impact and blocked capability; **no test for this
     research exists** and the record's Verification Plan names them as `P5-005`'s work.
 - [ ] `P5-005` Implement Google connection setup and Gmail/Calendar read tools with recorded wire fixtures.
-  - **PARTIALLY DONE, so the box stays unchecked.** Done: the connector's declared contract —
-    `crates/jarvis-connectors/src/google.rs` (`GoogleConnector::manifest()`) plus `google_tests.rs` (18 tests,
-    so **160 in the crate**). NOT done: the provider client, the auth flow, **any** operation implementation,
-    and **no wire fixture** — which is the other half of the task. `CompatibilityVerdict::Unverified` says so in
-    the manifest itself, and `is_installable()` is false.
-  - **The slice's substantive finding is a type defect reached from a new direction.** Writing the manifest
-    honestly was **impossible** with `WebhookSupport::Polling`, which carried
-    `minimum_interval_seconds: u32` documented as "the provider's **documented** minimum". Google documents no
-    minimum polling interval for Gmail — its push guide recommends falling back to `history.list` "after a
-    period with no notifications" and states no floor — and `P5-004` established that neither Google push
-    mechanism fits `WebhookSupport::Push`. So the only two ways to declare it were `Documented(60)`, which
-    **asserts a Google fact nothing supports**, or `Unsupported`, whose own doc says "the provider offers
-    neither" and which is therefore false. A `u32` with a documented meaning, at a site where nothing is
-    documented, turns "we did not establish this" into a specific false claim.
-    Fixed with `PollingInterval { Documented(u32), Observed(u32), Unknown }` (`ADR-0057`). The variants
-    **carry** the number rather than sitting beside an `Option`, so a figure contradicting a disclaimer is
-    unrepresentable. `Observed` is separate because an observed floor can move with a provider's backend, and
-    `is_documented()` is deliberately narrower than `seconds().is_some()` for that reason. The scaffold's
-    `_comment` was updated too, because it is the documentation an author reads at the moment they are about to
-    invent a number.
-  - **The second finding is a deferral rather than a guess.** `AuthFlow::new` requires a redirect URI, and
-    `P5-004`'s record does **not** establish which loopback redirect form Google's client registration expects —
-    RFC 8252 §7.3's generic rules are recorded, but Google matches the value **exactly**, so a string here would
-    be a guess at a byte-for-byte comparison. The manifest therefore exposes `authorization_endpoint()` as a
-    bare `https` constant and **constructs no `AuthFlow` at all**, which is recorded as the client slice's first
-    task rather than worked around.
-  - **The manifest's decisions that a reader should check**, each carrying its reason in the code:
-    `classification = Confidential` (the highest level a *mail* connector can hold while
-    `may_reach_a_remote_model()` stays false — and the test asserts the permissive level is genuinely permissive,
-    so it cannot pass vacuously); `residency = Unverified` (the record lists no residency page, so `Verified`
-    would be unsupported and `NotStated` a different unsupported claim); `secret_fields` **empty**, because
-    `OAuthPkce` needs no client secret and a refresh token is what the flow receives rather than what an operator
-    pastes; the rate limit `PerClient` because Google quota is per **Cloud project** and
-    `is_shared_between_accounts()` is true, so one account's exhaustion must not be reported as that account's;
-    and **no `llms_txt` link**, because Google publishes none and the record records the 404.
-  - **One link per `LinkKind` is a real constraint here**: Google publishes separate documentation, quota, and
-    auth pages *per API*, and `DocumentationLinks::new` refuses a duplicate kind. Gmail's contract is the link of
-    record and Calendar's pages are enumerated in the research record instead — recorded rather than resolved by
-    dropping one silently.
-  - **Falsified, two guards in the three-run A-B-A design**: `PollingInterval::Unknown` reporting `Some(0)`, and
-    `Confidential` admitted to `may_reach_a_remote_model`. Each: intact `PASS`, mutant `FAIL`, restored `PASS`,
-    restore byte-identical.
-  - **Limits:** no client, no flow, no operation implementation, **no wire fixture**; operation ids are
-    declarations and no `ToolDefinition` is derived from them, so nothing is callable; the rate limit's `burst`
-    is a **judgement** (`per_window` and the scope come from Google's documented table, the burst does not);
-    `is_documented()` has **no production caller**, which by `P5-001`'s own standard is a predicate whose
-    enforcement is deferred to its first caller.
+  - **PARTIALLY DONE, so the box stays unchecked.** Done: the connector's declared contract and its **auth
+    flow** — `crates/jarvis-connectors/src/google.rs` (`GoogleConnector::manifest()`, `auth_flow()`, the three
+    endpoints, the registered redirect) plus `google_tests.rs`. NOT done: the provider client, **any**
+    operation implementation, and **no wire fixture** — which is the other half of the task.
+    `CompatibilityVerdict::Unverified` says so in the manifest itself, and `is_installable()` is false.
+  - **The declared contract** (`ADR-0057`, previous commit): three read operations at risk 0, `oauth_pkce`, an
+    empty secret list, `Confidential` classification, `Polling { interval: Unknown }`, and the documented Gmail
+    quota as a `PerClient` limit. The one link per `LinkKind` constraint is real for a multi-API connector, so
+    Gmail's contract is the link of record and Calendar's pages live in the research record.
+  - **This round settled the auth flow, which the previous round deliberately refused to guess.**
+    `AuthFlow::new` requires an `https://` authorization endpoint and a redirect URI, and `P5-004`'s record did
+    not establish either — so the previous commit exposed a bare endpoint constant and **constructed no flow**.
+    Two authoritative sources fixed that: **`https://accounts.google.com/.well-known/openid-configuration`**,
+    which is the one source here that is **machine-readable** (the server's own published configuration rather
+    than a page's example), and the OAuth 2.0 for native apps guide.
+  - **Verified endpoint facts**, now in the record with the truncation of
+    `token_endpoint_auth_methods_supported` **recorded rather than glossed**: `authorization_endpoint`
+    `https://accounts.google.com/o/oauth2/v2/auth`, `token_endpoint` `https://oauth2.googleapis.com/token`
+    (**a different host from the consent screen**, which a reader might "fix"), `revocation_endpoint`
+    `https://oauth2.googleapis.com/revoke`, `userinfo_endpoint`, `jwks_uri`, `code_challenge_methods_supported`
+    = `plain`+`S256`, and **`authorization_response_iss_parameter_supported: true`** — which is what gives
+    `AuthorizationTransaction::with_issuer` something to check instead of a permanent `NotSatisfied`.
+  - **The loopback method is the only non-embedded option**: the page calls it the recommended desktop
+    mechanism and states that **custom URI schemes are no longer supported** "due to the risk of app
+    impersonation", with the OOB copy/paste method deprecated. Google's own advice also discourages `localhost`
+    because of client firewalls — a second, independent reason for the refusal `P5-002` already makes.
+  - **Three more facts that change how the connector must behave**, all recorded:
+    **`client_secret` is `Optional`** on both the code exchange and the refresh ("not applicable to requests
+    from clients registered as Android, iOS, or Chrome applications"), which is what the manifest's **empty
+    `secret_fields`** rests on; **refresh-token issuance is limited** so "older refresh tokens will stop
+    working" — a deployment that re-authorizes repeatedly can invalidate the token it was relying on; and
+    **revocation removes the project's grants**, not one account's, taking "some time" to take effect, so a
+    disconnect must not assume its effect is scoped to the account it named.
+  - **`id_token` is expected on the exchange** because the manifest requests `openid`, and `P5-002` records that
+    `nonce` is carried but **not validated**. The discovery document supplies `jwks_uri`, so the verification is
+    now unblocked but still unbuilt; recorded as a limit rather than a capability.
+  - **DPoP is recorded as a decision, not a flag.** Google supports it, recommends it, and (for a code exchange)
+    requires `jti = BASE64URL(SHA256(AUTHORIZATION_CODE))` with a cacheable `DPoP-Nonce`. It binds the **refresh
+    token** to a private key Google advises storing so it "cannot be copied off-device, for example by using
+    TPMs, Secure Enclaves, or other hardware-backed keystores" — which is exactly the sender-constraining
+    `P5-002` records as **not implemented** and whose own ADR calls the strongest argument for the work.
+    Bypassing it is safe because it is optional; adopting it is a slice.
+  - **One fact is still not established, and it is a question rather than a guess.** Google's page shows the
+    *exchange request* using a ported URI (`redirect_uri=http://127.0.0.1:9004`) and requires `redirect_uri` to
+    match an authorized URI **exactly**, but does **not** state which string the console accepts as the
+    **registered** value for a Desktop-app client. Recorded as Unresolved Question 7. The connector uses the
+    **portless** form because that is what `P5-002`'s own rules produce and `matches_except_port` compares, and
+    `the_registered_redirect_is_the_portless_loopback_form` asserts the comparison works **while explicitly not
+    claiming** the console accepts it.
+  - **Falsified, one guard A-B-A**: the redirect comparison joining a registration to a listener
+    (`self.host == other.host && self.path == other.path`), mutated by dropping the path half. Intact `PASS`,
+    mutant `FAIL`, restored `PASS`, restore byte-identical.
+  - **Limits:** no client, no operation implementation, **no wire fixture**; the registered redirect form is
+    unconfirmed against Google's console (Unresolved Question 7); `nonce` is not validated, so the ID token is
+    received but unverified; nothing is callable, because no `ToolDefinition` is derived from the operation ids;
+    and **no token has been exchanged**, so `token_endpoint` and `revocation_endpoint` are transcribed and
+    asserted but never used.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

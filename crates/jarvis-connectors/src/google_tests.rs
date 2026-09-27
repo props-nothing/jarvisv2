@@ -8,8 +8,11 @@
 //! The falsification record for this slice is in `TODO.md`.
 
 use super::*;
+use crate::authorization::{AuthorizationTransaction, LoopbackRedirect};
 use crate::manifest::{ConnectorManifest, WebhookSupport};
 use crate::readiness::{ALL_ITEMS, ReadinessItem};
+use crate::{LoopbackHost, PkceVerifier, SecretValue};
+use jarvis_core::UtcTimestamp;
 
 fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {
@@ -348,6 +351,162 @@ fn the_declared_rate_limit_is_the_shared_project_budget_not_a_per_account_one() 
         limit.burst < limit.per_window,
         "the burst must be the tighter of the two ceilings Google applies, not the project one"
     );
+}
+
+#[test]
+fn the_endpoints_match_the_discovery_document() {
+    // `https://accounts.google.com/.well-known/openid-configuration` is the one source for this connector that
+    // is MACHINE-READABLE, so these are the server's own published values rather than a documentation example.
+    // Pinned as literals because the point is to notice a drift: a future reader changing an endpoint would
+    // have to change this test, which is where they would see the recorded value.
+    assert_eq!(
+        GoogleConnector::authorization_endpoint(),
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    );
+    assert_eq!(
+        GoogleConnector::token_endpoint(),
+        "https://oauth2.googleapis.com/token"
+    );
+    assert_eq!(
+        GoogleConnector::revocation_endpoint(),
+        "https://oauth2.googleapis.com/revoke"
+    );
+    // The two hosts differ, which is deliberate and easy to "fix": the consent screen is on
+    // `accounts.google.com` and the exchange is on `oauth2.googleapis.com`.
+    assert_ne!(
+        GoogleConnector::authorization_endpoint(),
+        GoogleConnector::token_endpoint()
+    );
+}
+
+#[test]
+fn the_flow_is_constructible_from_the_verified_endpoints() {
+    // The test that `P5-004`'s record could not have supported: `AuthFlow::new` requires an `https://`
+    // authorization endpoint, a PKCE method, and a redirect URI, and all three now come from a source rather
+    // than a guess. Asserted through the flow's own accessors so the constructor's checks are exercised.
+    let flow = must(
+        GoogleConnector::auth_flow(),
+        "the flow must be constructible",
+    );
+    assert_eq!(flow.method(), AuthMethod::OAuthPkce);
+    assert_eq!(flow.pkce(), Some(PkceMethod::S256));
+    assert_eq!(
+        flow.authorization_endpoint(),
+        GoogleConnector::authorization_endpoint()
+    );
+}
+
+#[test]
+fn the_registered_redirect_is_the_portless_loopback_form() {
+    // The registered form has NO port, because the client asks the OS for an ephemeral one at request time
+    // (RFC 8252 §7.3). What is deliberately NOT asserted is that Google's console accepts this exact string —
+    // the research record's Unresolved Question 7 records that as unconfirmed, so claiming it here would be
+    // the fabrication this slice exists to avoid.
+    let registered = must(
+        GoogleConnector::registered_redirect(),
+        "a valid loopback redirect",
+    );
+    assert!(
+        registered.is_registrable(),
+        "a registration must not pin a port"
+    );
+    assert_eq!(registered.port(), None);
+    assert_eq!(registered.host(), LoopbackHost::V4);
+    assert_eq!(registered.as_uri(), "http://127.0.0.1/");
+    // The positive control on the comparison that joins a registration to a listener: a listener on some
+    // other port matches, and a different PATH does not. Without the second half, a comparison that ignored
+    // everything would pass.
+    let listening = must(
+        LoopbackRedirect::listening(LoopbackHost::V4, 51_004, "/"),
+        "a valid listening redirect",
+    );
+    assert!(registered.matches_except_port(&listening));
+    assert!(
+        !registered.matches_exactly(&listening),
+        "the port really does differ"
+    );
+    let other_path = must(
+        LoopbackRedirect::listening(LoopbackHost::V4, 51_004, "/callback"),
+        "a valid listening redirect",
+    );
+    assert!(
+        !registered.matches_except_port(&other_path),
+        "a different path must NOT match; loosening this defeats RFC 8252 §8.10"
+    );
+}
+
+#[test]
+fn the_authorization_transaction_matches_its_listener_and_is_consumable_once() {
+    // The end-to-end shape of `P5-002` used through this connector's own flow: a transaction opened for the
+    // registered redirect succeeds against a listener on a different port, and a transaction whose listener is
+    // on a different PATH is refused. The refusal is the one worth pinning, because it is the check that stops
+    // the provider's response arriving somewhere nothing verified.
+    let flow = must(
+        GoogleConnector::auth_flow(),
+        "the flow must be constructible",
+    );
+    let verifier = must(PkceVerifier::generate(), "a generated verifier");
+    let state = must(SecretValue::new("state-value"), "a valid state value");
+    let now = UtcTimestamp::now(&jarvis_core::SystemClock);
+    let listener = must(
+        LoopbackRedirect::listening(LoopbackHost::V4, 51_004, "/"),
+        "a valid listening redirect",
+    );
+    let transaction = must(
+        AuthorizationTransaction::begin(&flow, verifier, state, None, listener, now),
+        "a transaction on the registered path must open",
+    );
+    assert_eq!(transaction.method(), PkceMethod::S256);
+    // The challenge is derived, not stored, so the parameters and the verifier cannot disagree.
+    let parameters = transaction.parameters("client-id", &[SCOPE_GMAIL_READONLY.to_owned()]);
+    let names: Vec<&str> = parameters.iter().map(|(name, _)| *name).collect();
+    assert!(names.contains(&"code_challenge"));
+    assert!(names.contains(&"code_challenge_method"));
+    assert!(names.contains(&"state"));
+    assert!(names.contains(&"redirect_uri"));
+    // And the wrong path is refused, which is the guard.
+    let wrong_listener = must(
+        LoopbackRedirect::listening(LoopbackHost::V4, 51_004, "/elsewhere"),
+        "a valid listening redirect",
+    );
+    let refused = AuthorizationTransaction::begin(
+        &flow,
+        must(PkceVerifier::generate(), "a generated verifier"),
+        must(SecretValue::new("another-state"), "a valid state value"),
+        None,
+        wrong_listener,
+        now,
+    );
+    assert!(
+        refused.is_err(),
+        "a listener on a different path than the flow registered must be refused"
+    );
+}
+
+#[test]
+fn the_requested_scopes_are_the_discovery_documents_supported_ones_plus_the_apis_own() {
+    // The discovery document advertises `openid`, `email`, `profile` — the OIDC scopes — while the Gmail and
+    // Calendar scopes are the APIs' own and are not in that array. So `openid` is corroborated by the
+    // authoritative source and the other two are corroborated by the per-API scope pages; the two kinds of
+    // evidence are different, and the test says which is which rather than treating both as confirmed.
+    let manifest = manifest();
+    let scopes: Vec<String> = manifest
+        .auth_methods()
+        .iter()
+        .flat_map(|method| method.scopes.clone())
+        .collect();
+    assert!(scopes.contains(&SCOPE_OPENID.to_owned()));
+    assert!(scopes.contains(&SCOPE_GMAIL_READONLY.to_owned()));
+    assert!(scopes.contains(&SCOPE_CALENDAR_READONLY.to_owned()));
+    // `email` and `profile` are supported by the discovery document and deliberately NOT requested: this
+    // connector needs an account identity, and `users.getProfile` supplies the address from the API itself,
+    // so asking for profile claims would be requesting more than the connector uses.
+    for unrequested in ["email", "profile"] {
+        assert!(
+            !scopes.contains(&unrequested.to_owned()),
+            "`{unrequested}` is not needed"
+        );
+    }
 }
 
 #[test]
