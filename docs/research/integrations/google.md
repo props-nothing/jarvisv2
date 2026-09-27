@@ -4,7 +4,7 @@ status: researched
 last_verified: 2026-09-27
 owners: []
 selected_spec_version: "Gmail API v1; Calendar API v3 (both unversioned REST revisions, last updated 2026-09-03..18 per page footers)"
-selected_sdk: none (direct HTTP; no official Rust SDK exists for either API)
+selected_sdk: none selected — this record assumes direct HTTP and did NOT check Google's client-library list for a Rust SDK
 ---
 
 # Google Workspace: identity, Gmail, Calendar, push notifications, quotas, restricted scopes
