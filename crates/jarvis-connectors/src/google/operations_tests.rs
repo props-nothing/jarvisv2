@@ -188,12 +188,16 @@ fn a_successful_response_whose_body_is_unreadable_is_unknown_and_not_confirmed()
     assert!(!result.outcome().is_safe_to_repeat_from_outcome());
 }
 
-#[test]
-fn a_calendar_page_carries_both_tokens_separately() {
-    // `nextSyncToken` and `nextPageToken` are different things: the sync token is present only on the last page
-    // and positions a **future** incremental sync, while the page token continues the current walk. Merging them
-    // would store a cursor that expires with the walk.
-    let body = r#"{"items":[{"id":"e1"}],"nextPageToken":"page-1","nextSyncToken":"sync-1"}"#;
+/// Renders one Calendar page and returns the fields the tool declared.
+///
+/// A helper because the two pages below differ **only** in which continuation token they carry, and Google's
+/// documentation states the two are mutually exclusive: `nextPageToken` is "omitted if no further results are
+/// available, in which case nextSyncToken is provided", and `nextSyncToken` is "omitted if further results are
+/// available, in which case nextPageToken is provided". So a body carrying both is one the provider cannot
+/// produce, and a fixture that used one would be asserting behaviour against an impossible input — which
+/// **the first version of this test did**. See the fixtures under `tests/fixtures/google/` for the recorded
+/// shapes.
+fn calendar_page_fields(body: &str) -> serde_json::Value {
     let result = must(
         interpret(
             "google.calendar_events_read",
@@ -205,13 +209,41 @@ fn a_calendar_page_carries_both_tokens_separately() {
     let output = result
         .output()
         .unwrap_or_else(|| panic!("a confirmed read must carry output"));
-    let parsed: serde_json::Value = match serde_json::from_str(output.content()) {
-        Ok(value) => value,
-        Err(error) => panic!("the output must be JSON: {error}"),
-    };
-    assert_eq!(parsed["next_page_token"], "page-1");
-    assert_eq!(parsed["next_sync_token"], "sync-1");
-    assert_ne!(parsed["next_page_token"], parsed["next_sync_token"]);
+    must(
+        serde_json::from_str(output.content()),
+        "the output must be JSON",
+    )
+}
+
+#[test]
+fn a_mid_walk_calendar_page_carries_a_page_token_and_no_sync_token() {
+    // The sync token marks the **end** of a walk, so a page that reports more results cannot carry one. A caller
+    // that treated a page token as a cursor would store a token that expires when the walk finishes — which is
+    // the defect this distinction exists to prevent, and it is invisible unless the two states are tested apart.
+    let fields =
+        calendar_page_fields(r#"{"items":[{"id":"e1"},{"id":"e2"}],"nextPageToken":"page-1"}"#);
+    assert_eq!(fields["event_ids"][0], "e1");
+    assert_eq!(fields["event_ids"][1], "e2");
+    assert_eq!(fields["next_page_token"], "page-1");
+    assert_eq!(
+        fields["next_sync_token"],
+        serde_json::Value::Null,
+        "a page with more results must not carry a sync token"
+    );
+}
+
+#[test]
+fn a_final_calendar_page_carries_a_sync_token_and_no_page_token() {
+    // The last page is the only place a cursor may be taken from, and it reports no page token. Both halves are
+    // asserted, so a change that produced one token from the other would fail here.
+    let fields = calendar_page_fields(r#"{"items":[{"id":"e3"}],"nextSyncToken":"sync-1"}"#);
+    assert_eq!(fields["event_ids"][0], "e3");
+    assert_eq!(
+        fields["next_page_token"],
+        serde_json::Value::Null,
+        "the last page must not carry a page token"
+    );
+    assert_eq!(fields["next_sync_token"], "sync-1");
 }
 
 #[test]

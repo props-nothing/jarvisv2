@@ -1,0 +1,47 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "calendar.events.list (a page mid-walk)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/v3/reference/events/list",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented response shape for a page that is NOT the last one.",
+  "_the_point_of_this_fixture": "Google documents `nextPageToken` and `nextSyncToken` as MUTUALLY EXCLUSIVE: nextPageToken is \"Omitted if no further results are available, in which case nextSyncToken is provided\", and nextSyncToken is \"Omitted if further results are available, in which case nextPageToken is provided\". A page with more results therefore CANNOT carry a sync token. An earlier test of mine asserted a body carrying both, which Google cannot produce.",
+  "_sanitized": "Event identifiers are placeholders. Nothing here comes from a calendar.",
+  "kind": "calendar#events",
+  "etag": "\"p32ofakeetagvalue\"",
+  "summary": "A calendar summary",
+  "description": "A calendar description",
+  "updated": "2026-03-18T10:00:00.000Z",
+  "timeZone": "UTC",
+  "accessRole": "reader",
+  "defaultReminders": [
+    { "method": "popup", "minutes": 30 },
+    { "method": "email", "minutes": 60 }
+  ],
+  "nextPageToken": "CpEBGh0KA2NhbA",
+  "items": [
+    {
+      "kind": "calendar#event",
+      "etag": "\"p32ofakeetagvalue1\"",
+      "id": "0a1b2c3d4e5f6071",
+      "status": "confirmed",
+      "htmlLink": "https://www.google.com/calendar/event?eid=REDACTED",
+      "created": "2026-03-01T09:00:00.000Z",
+      "updated": "2026-03-01T09:00:00.000Z",
+      "summary": "A first event",
+      "start": { "dateTime": "2026-03-18T11:00:00Z" },
+      "end": { "dateTime": "2026-03-18T12:00:00Z" }
+    },
+    {
+      "kind": "calendar#event",
+      "etag": "\"p32ofakeetagvalue2\"",
+      "id": "0a1b2c3d4e5f6072",
+      "status": "confirmed",
+      "created": "2026-03-02T09:00:00.000Z",
+      "updated": "2026-03-02T09:00:00.000Z",
+      "summary": "A second event",
+      "start": { "date": "2026-03-19" },
+      "end": { "date": "2026-03-20" }
+    }
+  ]
+}

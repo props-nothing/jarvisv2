@@ -1,0 +1,30 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "calendar.events.list (the LAST page of a walk)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/v3/reference/events/list",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It is the complement of calendar_events_list_page.json: the final page, which carries the sync token and NO page token.",
+  "_the_point_of_this_fixture": "This is the ONLY page a caller may take a durable cursor from. nextSyncToken is present on the last page alone, so a connector that stored a page token as its cursor would store one that expires when the walk ends.",
+  "_sanitized": "Identifiers are placeholders. Nothing here comes from a calendar.",
+  "kind": "calendar#events",
+  "etag": "\"p32ofakeetagvalue\"",
+  "summary": "A calendar summary",
+  "updated": "2026-03-18T10:05:00.000Z",
+  "timeZone": "UTC",
+  "accessRole": "reader",
+  "nextSyncToken": "CMf8oPz2sPICEMf8oPz2sPICGAU=",
+  "items": [
+    {
+      "kind": "calendar#event",
+      "etag": "\"p32ofakeetagvalue3\"",
+      "id": "0a1b2c3d4e5f6073",
+      "status": "confirmed",
+      "created": "2026-03-03T09:00:00.000Z",
+      "updated": "2026-03-03T09:00:00.000Z",
+      "summary": "A third event",
+      "start": { "dateTime": "2026-03-20T09:00:00Z" },
+      "end": { "dateTime": "2026-03-20T09:30:00Z" }
+    }
+  ]
+}

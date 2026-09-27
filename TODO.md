@@ -3375,6 +3375,56 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     none, so it exists for `P5-009`); **the output rendering is not validated back through the schemas it claims
     to match**; and **nothing constructs the adapter in a binary** — no registry, executor, or route offers
     `google.gmail_messages_list`, so the adapter is reachable from a test and not from a run.
+  - **This round added the wire fixtures — and the interesting part is what they are NOT.** Six files under
+    `crates/jarvis-connectors/tests/fixtures/google/` plus `tests/google_fixtures.rs` (9 new tests, so **262 in
+    the crate**). **`ADR-0063`.**
+  - **⭐⭐ THE FINDING: A HAND-BUILT RESPONSE IS EASY TO MAKE INTERNALLY CONSISTENT AND IMPOSSIBLE TO MAKE
+    REALISTIC IN ITS CONSTRAINTS — AND MY OWN EARLIER TEST PROVED IT.** I had written a test asserting a Calendar
+    page carrying **both** `nextPageToken` and `nextSyncToken`. It passed. **Google cannot produce that body.**
+    The reference page documents the two as **mutually exclusive**: `nextPageToken` is "Omitted if no further
+    results are available, in which case nextSyncToken is provided", and `nextSyncToken` is "Omitted if further
+    results are available, in which case nextPageToken is provided". The constraint lives in the **field
+    description**, not in the sample JSON — so reading the *example* tells you the shape while reading the
+    *prose* tells you what may co-occur. The test now asserts the two states **apart** (a mid-walk page with a
+    page token and no sync token; a last page with a sync token and no page token) and the fixtures are that pair.
+  - **⭐ "WE HAVE FIXTURES" MUST NOT BE READABLE AS "WE HAVE A RECORDING".** The acceptance text says "with
+    recorded wire fixtures", and a directory of clean JSON looks identical whether it was copied from a live
+    response or assembled from documentation. Writing shapes and calling them recordings is the failure mode the
+    ADR exists to prevent, and it is the same shape as `ADR-0056`'s scaffold inventing a completed checklist. So
+    each fixture carries `_not_a_capture: true` and `_shape_documented_at: <url>` **in the data**, the suite
+    **asserts the marker** (a file that dropped it fails rather than passing as an apparent capture), and the
+    research record repeats it. A fixture that was never captured proves the **reader**; only a capture proves
+    the **record**.
+  - **A fixture states its own point, because a reader cannot recover it from the bytes.**
+    `_the_point_of_this_fixture` records *why* a payload exists — that the Calendar pair exists because the
+    tokens are exclusive, and that the two 403 fixtures are a **pair whose only difference is the reason code**.
+    Without that, a maintainer "simplifying" the pair into one file deletes the only test that distinguishes a
+    Workspace administrator's decision from a throttling limit.
+  - **The 403 pair makes the reason-vs-status split falsifiable, and both files are a 403.** One says
+    `domainPolicy` and classifies as permanent; the other says `rateLimitExceeded` and classifies as retryable.
+    The load-bearing assertion is that the two decisions **differ** — a classifier switching on the status alone
+    would give them the same answer. The `domainPolicy` fixture's `message` deliberately invites a retry ("This
+    looks like a transient error…") while its `reason` code forbids one, so a classifier reading prose instead
+    of the code classifies it **wrongly**.
+  - **The error fixture also proves the prose never reaches a decision.** `GmailErrorBody` has no field for
+    `message`, so the fixture's text parses and then becomes **unreachable** — asserted by checking the derived
+    `Debug` does not contain it. That is `P3-008c` as a property of the type rather than a convention.
+  - **⭐ TWO MORE GUARDS FALSIFIED WITH COMPILING MUTANTS.** Flipping `_not_a_capture` to `false` → **3 tests
+    detected**; deleting `nextPageToken` from the mid-walk page → **3 tests detected**. The second is the
+    important one: it shows the mutual-exclusion property is genuinely load-bearing rather than incidentally
+    true. Tree verified clean with `git diff --stat` afterwards.
+  - **The research record's Verification Plan is now auditable.** It had eleven items and said "none exist yet";
+    each is now marked **WRITTEN** or **Not written**, with the one written item named and the six fixtures
+    listed as hand-built. A plan where every line is unmarked reads as done; a plan where every line is marked
+    can be checked. The live smoke test remains **not written**.
+  - **NEW LIMITS:** **no fixture is a capture and no live call has been made** — no credential exists, no Cloud
+    project was created, no Google API was contacted; **a hand-built fixture cannot reveal a constraint nobody
+    documented**, so a rule Google enforces but does not write down would still be invisible; **the fixtures do
+    not cover every declared operation** — `history.list` (the operation Finding 2 most depends on), the batch
+    endpoint, and the `format=metadata` envelope have **no** fixture at all; **the sweep checks provenance and
+    not shape**, so nothing validates a fixture against the output schema `ADR-0059` derives; and
+    **`_shape_documented_at` is a URL nothing re-checks**, so a fixture can drift from the page it cites with no
+    assertion failing.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

@@ -1,0 +1,22 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.messages.list (failure)",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/Error",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented error shape for a 403 whose reason is `domainPolicy`.",
+  "_the_point_of_this_fixture": "`domainPolicy` arrives as a 403, exactly like the two throttling reasons. Its remedy is a conversation with a Workspace administrator, not a retry -- which is why the classifier switches on the REASON and not on the status. The `message` field is present and deliberately does NOT agree with the reason, so a classifier that read the prose instead of the code would classify this wrongly.",
+  "_sanitized": "No real message text, request id, or address appears here.",
+  "error": {
+    "code": 403,
+    "message": "This looks like a transient error and the request can be retried later.",
+    "errors": [
+      {
+        "message": "This looks like a transient error and the request can be retried later.",
+        "domain": "usageLimits",
+        "reason": "domainPolicy"
+      }
+    ],
+    "status": "PERMISSION_DENIED"
+  }
+}

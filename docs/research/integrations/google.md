@@ -432,32 +432,65 @@ quota as **configuration rather than a constant**, and must not hard-code either
 
 ## Verification Plan
 
-`P5-004` is research, so these are the tests `P5-005` must write; **none exist yet**.
+`P5-004` is research, so these are the tests `P5-005` must write. **Status is marked per item**, because a plan
+where every line looks equally done is a plan nobody can audit.
 
 - **Scope-category tests.** A test that a Gmail connector's declared scopes are all *accounted for* against a
   table of Google's categories, so adding a scope forces a decision about the verification burden. The table is
-  a fixture with a date, because Google can recategorise.
+  a fixture with a date, because Google can recategorise. **Not written.**
 - **A quota-cost test.** `users.getProfile` = 1 and `messages.get` = 20 as fixtures, and a computed estimate for
   a full sync of *N* messages (`5 + 20N`) — the cheapest test that would catch a connector that planned its
-  budget from message counts alone.
+  budget from message counts alone. **Not written.**
 - **A full-sync budget test that asserts batching.** A full sync must batch (≤50 per batch) *and* must respect
-  that batches trigger rate limiting, so the test asserts both the batch size and the delay.
+  that batches trigger rate limiting, so the test asserts both the batch size and the delay. **Not written.**
 - **The 404-is-staleness test.** A `history.list` fixture returning 404 must produce "resync from scratch", not
   "account not found" — and a fixture for a genuinely absent account must produce the opposite. **This is the
   cheapest test that would disprove the central assumption of Finding 2**, and it is the one most worth
-  writing first.
-- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error.
+  writing first. **Not written** — the *classification* it would test is decided and tested
+  (`client::gmail_history_status_is_pruned`, `advance_gmail_history`), but no 404 fixture exists.
+- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error. **Not written** as fixtures; the
+  classification is tested (`client::calendar_status_requires_resync`, `advance_calendar_sync`).
 - **A `domainPolicy` test.** A 403 with `reason: domainPolicy` must be `Permanent` and must not be retried,
-  which a status-code-only classifier cannot distinguish from `rateLimitExceeded`.
+  which a status-code-only classifier cannot distinguish from `rateLimitExceeded`. **WRITTEN** — see below.
 - **A recording fixture for the Pub/Sub envelope** — a sanitized delivery with `message.data` Base64URL-decoded
   to `{"emailAddress":…,"historyId":…}` — so the envelope handling is tested without a Pub/Sub subscription.
+  **Not written.**
 - **A Calendar sync-message fixture**, including that it can arrive *before* the `watch` response and that
-  `X-Goog-Message-Number` is `1` for it.
+  `X-Goog-Message-Number` is `1` for it. **Not written.**
 - **An unauthenticated-delivery test** for whichever push mechanism is chosen, asserting the refusal **fails
-  closed** — the same shape as `P5-001`'s falsified guard.
+  closed** — the same shape as `P5-001`'s falsified guard. **Not written.**
 - **A renewal test.** A watch whose lease is near expiry must be renewed before it lapses, and the Gmail 7-day
-  bound must be asserted, because a lapsed watch stops notifications **silently**.
+  bound must be asserted, because a lapsed watch stops notifications **silently**. **Not written.**
 - **Opt-in live smoke test** behind credentials and a cost gate, as `tools-and-connectors.md` requires.
+  **Not written.**
+
+### Fixtures present, and what they are not
+
+`crates/jarvis-connectors/tests/fixtures/google/` holds six files, tested by `tests/google_fixtures.rs`:
+
+| Fixture | Shape source |
+| --- | --- |
+| `gmail_messages_list.json` | `users.messages.list` response |
+| `gmail_messages_get.json` | the `Message` resource |
+| `calendar_events_list_page.json` | `events.list`, a **mid-walk** page |
+| `calendar_events_list_last_page.json` | `events.list`, the **last** page |
+| `gmail_error_403_domain_policy.json` | the error resource, 403 + `domainPolicy` |
+| `gmail_error_403_rate_limit.json` | the error resource, 403 + `rateLimitExceeded` |
+
+**Every one is hand-built, not captured**, and each file says so twice: in `_not_a_capture: true` and in prose.
+The test suite **asserts the marker**, so a file that dropped it fails rather than passing as an apparent
+recording. `docs/development/external-research.md` asks to "validate against official schemas or sanitized real
+wire fixtures"; these are the first kind and not the second, and no live smoke test has run.
+
+**A finding the fixtures produced.** Google documents `nextPageToken` and `nextSyncToken` on `events.list` as
+**mutually exclusive** — `nextPageToken` is "omitted if no further results are available, in which case
+nextSyncToken is provided", and `nextSyncToken` is "omitted if further results are available, in which case
+nextPageToken is provided". A page with more results therefore **cannot** carry a sync token. An earlier version
+of my own test asserted a body carrying both, which the provider cannot produce; it now tests the two states
+apart (a mid-walk page and a last page), and the fixtures are that pair. The lesson generalises: **a hand-built
+response is easy to make internally consistent and impossible to make realistic in its constraints**, so a
+fixture must be checked against the *field's own documentation and not just the example*. The constraint
+lives in the field description ("omitted if…"), not in the sample JSON.
 
 **No live test was run for this slice and none is claimed.** No credentials were used, no Google API was called,
 and no Cloud project was created.

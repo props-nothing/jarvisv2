@@ -1,0 +1,22 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.messages.list (failure)",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/Error",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the documented error shape for a 403 whose reason is `rateLimitExceeded`.",
+  "_the_point_of_this_fixture": "This is the fixture that makes the 403-reason split falsifiable. It is a 403 with a THROTTLING reason, so it must classify as retryable even though a 403 with `domainPolicy` must not. A classifier that switched on the status alone would give these two the same answer.",
+  "_sanitized": "No real message text, request id, or address appears here.",
+  "error": {
+    "code": 403,
+    "message": "User-rate limit exceeded. Retry after 2026-03-18T10:00:00Z.",
+    "errors": [
+      {
+        "message": "User-rate limit exceeded. Retry after 2026-03-18T10:00:00Z.",
+        "domain": "usageLimits",
+        "reason": "rateLimitExceeded"
+      }
+    ],
+    "status": "PERMISSION_DENIED"
+  }
+}

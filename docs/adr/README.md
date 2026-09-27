@@ -80,3 +80,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0060](0060-a-url-query-is-built-from-encoded-parts.md) | A URL's query is built from encoded parts, and the type has no field for a credential | Accepted |
 | [0061](0061-a-credential-cannot-be-rendered-or-serialized.md) | A credential is a type that cannot be rendered, serialized, or reached by accident | Accepted |
 | [0062](0062-an-unanswered-request-is-classified-by-whether-it-reached-the-provider.md) | An unanswered request is classified by whether it may have reached the provider | Accepted |
+| [0063](0063-a-wire-fixture-declares-whether-it-is-a-capture-or-a-shape.md) | A wire fixture declares whether it is a capture or a shape | Accepted |

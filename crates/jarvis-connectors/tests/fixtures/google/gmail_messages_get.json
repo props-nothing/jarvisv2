@@ -1,0 +1,63 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "gmail.users.messages.get",
+  "_shape_documented_at": "https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages#Message",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response: no connector exists yet and no request has been sent. It reproduces the documented `Message` resource shape so that a change to that shape is visible as a fixture change.",
+  "_sanitized": "Identifiers are placeholders and the addresses use the reserved `.invalid` TLD. The message body is a fixed string, not anyone's mail.",
+  "_fields_this_connector_reads": [
+    "id",
+    "threadId",
+    "labelIds",
+    "snippet",
+    "historyId",
+    "internalDate",
+    "sizeEstimate"
+  ],
+  "id": "18f9c0d1e2a3b4c5",
+  "threadId": "18f9c0d1e2a3b4c5",
+  "labelIds": ["UNREAD", "CATEGORY_PERSONAL", "INBOX"],
+  "snippet": "A short part of the message text.",
+  "historyId": "987654",
+  "internalDate": "1774000000000",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [
+      { "name": "From", "value": "sender@example.invalid" },
+      { "name": "To", "value": "recipient@example.invalid" },
+      { "name": "Subject", "value": "A subject line" },
+      { "name": "Date", "value": "Wed, 18 Mar 2026 10:00:00 +0000" }
+    ],
+    "body": { "size": 0 },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/plain; charset=\"UTF-8\"" }
+        ],
+        "body": {
+          "size": 27,
+          "data": "QSBzaG9ydCBib2R5IHRleHQu"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "text/html",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/html; charset=\"UTF-8\"" }
+        ],
+        "body": {
+          "size": 34,
+          "data": "PHA+QSBzaG9ydCBib2R5IHRleHQuPC9wPg=="
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 4096
+}
