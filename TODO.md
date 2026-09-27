@@ -1996,7 +1996,49 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         row stores `decided_by`; the domain type returns only the decision), so it is a domain change rather
         than a call-site one. That is `P3-012c`'s remainder and is where a duplicate delivery would become a
         second effect.
-  - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
+  - [x] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
+        Delivered as four slices, because each step exposed the next gap:
+        - `P3-016` **linked a held call to its approval** (the `approval_id` column existed since `0007` with
+          no writer) and wrote `tool_requested` / `approval_requested` into the run's stream.
+        - `P3-017` made the **decision carry its approver** — `decode_approval` parsed `decided_by`,
+          validated it, and discarded it, so no resume could build an `ApprovalCitation`. `ADR-0043`.
+        - `P3-018` built **the resume path and its route**: `ToolPipeline::resume` and
+          `POST /api/v1/calls/{id}/resume`.
+        - `P3-019` built **`tests/e2e/tests/phase3_gate.rs`**, the roadmap exit gate as a process-level test,
+          and wired it into CI.
+        **The gate drives the real platform end to end**: it configures one real MCP server over stdio (the
+        hand-written `fixture-peer`) with the daemon's **unclassified** posture — risk 3, effects
+        `Write`+`ExternalCommunication`, `ApprovalPolicy::Ask`, which is what an operator gets by naming a
+        server and saying nothing else — holds a call, reads the delivered nonce out of the profile's private
+        store, **kills the daemon**, restarts it, decides the approval, resumes the call, and asserts the
+        second resumption is refused. So the hold comes from the product's own configuration path rather
+        than from a writable test adapter compiled into `jarvisd`.
+        **Falsified end to end**: configuring the server `read-only` instead of unclassified makes the gate
+        fail at the hold step (`409` where `202` is required), because a read is risk 0 and is not held.
+        **⚠ Two recorded limits, and the gate names them rather than papering over them:**
+        1. **An external MCP client cannot yet be admitted.** The daemon builds its served endpoint with
+           `CallerAdmission::local_only()`, and `CallerAdmission::new` — the allowlist that would admit a
+           credential — has **no production caller**: nothing reads one from configuration. `ADR-0038` makes
+           every request over a network listener `Remote`, so no external client can authenticate at all.
+           The gate therefore asserts the half that exists — an unauthenticated remote caller is refused
+           `401` **through the real listener**, the fail-closed direction — and says in its module docs that
+           it is not asserting a `200`. `ADR-0038` records why this is deliberate: a remotely reachable MCP
+           server needs **audience-bound** credentials (RFC 8707), so the allowlist's credential vocabulary
+           belongs to the OAuth slice, and inventing one here would pre-empt a documented decision about a
+           trust boundary.
+        2. **A resume does not re-evaluate policy.** The approval was decided against the policy in force
+           when the call was held. Whether a policy tightened afterwards should refuse a resume is a real
+           question — re-evaluating makes an approval lapse silently; not re-evaluating lets a decided
+           action run under a superseded policy — and it is deliberately unsettled rather than settled by
+           accident.
+        **A falsification that found defence in depth.** Removing the resume's "still `requested`" check
+        left the route test **green** with the adapter still reached once, because `execute_and_record`
+        advances the call before the adapter and `record_tool_outcome` refuses to replace a terminal
+        outcome. So the single-effect property is defended **twice**, and a test written as if one guard
+        carried it would be claiming a guarantee two mechanisms provide. The assertion that carries it is
+        the adapter's own call **count**, which both the route test and the pipeline test now assert.
+        Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero skips**,
+        all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
 
 ## P4: Memory And Context
 

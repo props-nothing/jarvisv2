@@ -186,6 +186,19 @@ jobs:
         run: |
           cargo build --workspace --all-features --locked
           cargo test -p jarvis-acceptance --test phase2_gate --locked -- --nocapture
+      - name: Phase 3 acceptance gate
+        # The Phase 3 gate needs a second artifact: `fixture-peer`, the hand-written MCP
+        # server it configures as a real child process. `--all-features` builds it, and
+        # `ACCEPTANCE_REQUIRE_FIXTURE_PEER` makes its absence a failure rather than a
+        # skip — the same per-artifact rule the workspace test step follows, because a
+        # single variable naming two artifacts is what made the Phase 1 gate red on
+        # every operating system for four pushes (`P3-014`).
+        env:
+          ACCEPTANCE_REQUIRE_BINARIES: "1"
+          ACCEPTANCE_REQUIRE_FIXTURE_PEER: "1"
+        run: |
+          cargo build --workspace --all-features --locked
+          cargo test -p jarvis-acceptance --test phase3_gate --locked -- --nocapture
 
   dependency-policy:
     name: Dependency policy
