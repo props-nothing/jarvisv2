@@ -3123,6 +3123,68 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `RetryGuidance::BackoffSeconds` states a starting delay and a ceiling would need a field the shared type does
     not have; and `SyncAdvance::Refused` is **never constructed**, which by `P5-001`'s standard is a variant that
     reads as a live condition.
+  - **This round derived the model-facing tool definitions from the manifest.**
+    `crates/jarvis-connectors/src/google/definitions.rs` + `definitions_tests.rs` (14 new tests, so **195 in the
+    crate**). **`ADR-0059`.** `definitions()` reads the manifest and produces one `ToolDefinition` per declared
+    operation, so every effect, risk, scope and idempotency value comes from the operation it belongs to and a
+    definition **cannot disagree with the manifest** — the rule `P3-006d` established for a native adapter,
+    extended to a connector. Only what the manifest has no field for is stated here: the schemas, the title,
+    the timeout and the retry policy.
+  - **The identifier prefix is load-bearing.** `google.<operation id>`, because `ToolSource::from_namespace`
+    classifies by the **leading segment** — so the prefix is what makes these `Connector` tools rather than
+    `Native` ones, and a connector tool that could declare itself `Native` would be claiming JARVIS wrote the
+    adapter for a third party's API. A test asserts the classification, which is also what stops a future edit
+    from renaming the namespace.
+  - **The two idempotency vocabularies are mapped explicitly and totally.** The distinction that matters is
+    between the two *safe* variants: `Declared` means the provider makes a repeat a no-op, so **no JARVIS key
+    is needed**, while `ProviderKey` means the caller must supply one. Swapping them would either demand a key
+    the provider ignores or omit one it requires. `Unknown` and `NotIdempotent` both collapse to
+    `Unsupported`, which refuses repeats — safe to collapse, because neither claims a repeat is safe.
+  - **⭐ A retry gate that the existing check does not cover.** `RetryPolicy::blind` refuses a retry only for a
+    **mutating** effect, so a read-only operation passes it whatever its idempotency says — meaning the check
+    alone would let this module retry everything. `retry_declaration` therefore also consults
+    `ProviderIdempotency::permits_automatic_retry`, because **a blind retry is only free when repeating the
+    call is free**. An operation whose provider behaviour is `Unknown` gets no automatic retry however
+    harmless its effect looks.
+  - **⭐ A check and a test were both written and then removed as UNREACHABLE, and the removal is checked.**
+    `definitions.rs` had a risk-ceiling refusal, and its test built an over-ceiling operation directly. But
+    `ValidatedOperation` has **private fields** and is built only by `ConnectorManifest::new`, which already
+    refuses a risk above the platform ceiling — so the refusal could never fire. An unreachable refusal reads
+    as protection while enforcing nothing, the defect `P5-001` and `P5-003` each recorded from a different
+    direction. Its place is taken by a test asserting the **reachable** path still enforces the ceiling, so
+    the deletion is verified rather than asserted.
+  - **⭐ A test's own premise was wrong and the failure surfaced it.** `the_schemas_are_the_2020_12_dialect…`
+    asserted that *every* input schema has a `required` keyword. It failed on `gmail_messages_list` — whose
+    arguments are all legitimately optional, because calling it with nothing means "the newest messages",
+    which the schema's own `query` description says. **The claim was too broad and the schema was right.** It
+    now asserts per operation: the two resource-addressing reads must name their message or calendar, and the
+    list must require **nothing**.
+  - **The schemas are deliberately narrower than the APIs.** `format=raw` is absent, because it returns the
+    unparsed MIME message and nothing in this connector parses it; `max_results` is capped at Gmail's
+    documented 500; `calendar_events_read` takes an opaque `sync_token` whose description records that a 410
+    requires a full resync. `additionalProperties: false` throughout, so a model inventing a field gets a
+    refusal rather than a silent ignore — asserted by validating an accepted and a refused instance.
+  - **Input and output classifications differ on purpose.** A message id is `Internal`; the message is
+    `Confidential`. A single field would have to be the maximum, which would over-restrict the input and hide
+    what the tool consumes, and `ToolSensitivity::ceiling()` is what a placement decision reads.
+  - **Three guards falsified A-B-A with compiling mutants:** the idempotency mapping's `Declared` direction,
+    the retry gate (`permits_automatic_retry()` → `true`), and the title-table fallback (`_ => None` → an
+    invented title). **One of the three first attempts hit the CRLF trap again** — a multi-line here-string
+    probe matched nothing against these LF sources — and was retried with an LF-joined anchor. The trap is the
+    third occurrence in this workspace; it is recorded again because the cost is a whole wasted run.
+  - **The timeout and backoff are recorded as an unfixed problem rather than smoothed over.**
+    `TOOL_TIMEOUT_SECONDS` is 30 (a JARVIS choice; Google documents no per-request deadline) and
+    `TOOL_BACKOFF_CEILING_SECONDS` is 32 (Google's lower published figure), so **two attempts at 32 s cannot
+    both complete inside a 30 s deadline — only the first retry is reachable.** The test states that
+    consequence instead of asserting a comfortable inequality, and the fix (a longer deadline or a smaller
+    ceiling) needs a measured provider latency, which needs a live call.
+  - **Limits:** the definitions are **registered nowhere**, so no model can discover or call them; **no
+    executor** implements `ToolExecutor` for this connector; the schemas are this connector's construction and
+    have never been validated against a real response; `output_schema` describes a normalised JARVIS shape
+    rather than Gmail's message resource, so it cannot be checked against a provider document; and
+    `GoogleToolError::NoSchema` **cannot be reached from a test** because the operation it would be built from
+    cannot be constructed — verified by construction rather than by exercise, which is stated rather than
+    implied.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

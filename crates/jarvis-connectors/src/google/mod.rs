@@ -35,6 +35,7 @@
 //!   Google that no source supports.
 
 pub mod client;
+pub mod definitions;
 
 use crate::auth::{AuthError, AuthFlow, AuthMethod, PkceMethod};
 use crate::authorization::{LoopbackHost, LoopbackRedirect, RedirectError};
