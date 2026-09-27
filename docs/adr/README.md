@@ -64,3 +64,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0044](0044-a-deleted-memory-stores-a-hash-of-its-key.md) | A deleted memory stores a hash of its key, a claim triple is three columns, and the stored status reaches the constructor | Accepted |
 | [0045](0045-a-correction-is-declared-not-inferred.md) | A correction is declared, because a search key cannot detect one | Accepted |
 | [0046](0046-retrieval-filters-then-explains-itself.md) | Retrieval eligibility is a filter, and the ranking's explanation is its arithmetic | Accepted |
+| [0047](0047-a-vector-is-compared-with-its-metadata-or-not-at-all.md) | A vector is compared with its metadata or not at all, and the vector is not a number | Accepted |

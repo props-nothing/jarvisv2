@@ -236,7 +236,7 @@ impl OpenAiCompatibleProvider {
 }
 
 /// Extracts a validated provider request identifier from a response.
-fn provider_request_id(response: &TransportResponse) -> Option<ProviderRequestId> {
+pub(super) fn provider_request_id(response: &TransportResponse) -> Option<ProviderRequestId> {
     response
         .provider_request_id()
         .and_then(|value| ProviderRequestId::new(value).ok())
@@ -246,7 +246,7 @@ fn provider_request_id(response: &TransportResponse) -> Option<ProviderRequestId
 ///
 /// The provider's own message is never carried, because it can echo request content
 /// or interpolate a credential. JARVIS owns the explanation for its own categories.
-fn safe_message_for(kind: ModelErrorKind) -> jarvis_core::SafeMessage {
+pub(super) fn safe_message_for(kind: ModelErrorKind) -> jarvis_core::SafeMessage {
     let text = match kind {
         ModelErrorKind::InvalidRequest => "the provider rejected the request as invalid",
         ModelErrorKind::Authentication => "provider authentication failed",
@@ -268,7 +268,7 @@ fn safe_message_for(kind: ModelErrorKind) -> jarvis_core::SafeMessage {
 }
 
 /// Maps a transport failure onto a normalized model error.
-fn map_transport_error(error: TransportError) -> ModelError {
+pub(super) fn map_transport_error(error: TransportError) -> ModelError {
     let kind = match error {
         TransportError::Connect | TransportError::Io | TransportError::Tls => {
             ModelErrorKind::Transient

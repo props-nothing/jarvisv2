@@ -2254,7 +2254,66 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       Gates: fmt, clippy `-D warnings`, 45 suites with the application binaries absent and **zero skips**
       (1135 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok. `jarvis-core` 196 tests.
-- [ ] `P4-005` Research and implement a provider-neutral embedding adapter with dimension/version metadata.
+- [x] `P4-005` Research and implement a provider-neutral embedding adapter with dimension/version metadata.
+      `docs/research/integrations/embeddings.md` + `crates/jarvis-models/src/vector.rs` (+`vector/tests.rs`) +
+      `crates/jarvis-models/src/embedding.rs` (+`embedding/port_tests.rs`) +
+      `crates/jarvis-models/src/openai/{embedding.rs,wire_embedding.rs}`. `ADR-0047`. 106 `jarvis-models`
+      tests. **Research first, because this is an external integration**: the API index, the embeddings guide,
+      and the create-embeddings reference were fetched live and recorded with the URL, the access date, the
+      limits, and the unresolved questions before any code was written.
+      **The central decision is that a vector is not comparable by itself.** `docs/architecture/storage.md`
+      says "never compare vectors with incompatible metadata" and then lists the fields, which reads as a
+      checklist — and a checklist fails, because the two fields easiest to forget are the two that produce a
+      *plausible* wrong answer. A normalization mismatch does not fail, it ranks wrongly (a dot product over
+      an unnormalized vector returns a number in the right range often enough to look like a score); a
+      dimension mismatch fails as a length error far from the comparison, which reads as a corrupt vector.
+      So `Embedding` holds the vector **and** its metadata, `Embedding::new` is the only constructor and
+      refuses a vector whose length contradicts its declared dimension, and `ensure_comparable_with` is the
+      guard — a method on the pair, returning `IncompatibleMetadata { field }` naming the first field that
+      differed. The rejected alternative is the tempting one: `cosine_similarity(a: &[f32], b: &[f32])`,
+      whose signature cannot see either field. This is the same defect class `ADR-0044` recorded as "two
+      values that must agree with nothing holding both"; here something holds both and the constructor is the
+      only way to make one.
+      **`Normalization::Unknown` is the default, deliberately.** The researched provider documents
+      length-1 vectors, but the port is what a *second* provider has to satisfy, so the dot-product shortcut
+      is taken only when both sides declare `Normalized`. A default is what a caller who did not think about
+      the field gets, and the permissive assumption on a distance is the one that goes wrong quietly.
+      **Vectors are reassembled by the provider's `index`, never by position.** The wire defines `index` as
+      "the index of the embedding in the list of embeddings"; zipping positionally would hold for an in-order
+      response and silently pair every text with somebody else's vector if the provider ever reordered. An
+      out-of-range index and a **duplicated** index are both refused — the duplicate was found while writing
+      the ADR, which claimed the refusal the code did not yet perform; taking the later vector is the same
+      defect class as positional pairing.
+      **`input_hash` and `chunker_version` are stored but deliberately not compared.** The document's list
+      is a set of properties a stored vector must carry, not a set of fields that must be equal for a
+      comparison — two vectors of *different* text are exactly what a search compares, so requiring the hash
+      to match would forbid the only meaningful comparison.
+      **⭐ Three falsifications, all caught.** Disabling `ensure_comparable_with` failed
+      `incompatible_metadata_is_refused_field_by_field`, `a_comparison_across_models_refuses`; disabling the
+      length check in `Embedding::new` failed `a_vector_length_that_contradicts_its_metadata_is_refused`
+      **and** `a_vector_of_the_wrong_length_is_refused` through the adapter path; disabling the
+      duplicate-index refusal failed `a_duplicated_index_is_refused_rather_than_overwritten`. All restored,
+      green.
+      **A fourth thing the compiler caught:** the first scripted transport modelled a *streaming* response,
+      which needed `Box<dyn ResponseBody>`, was not `Send`, and could not be constructed at all. The
+      embedding call is never sent with `streaming: true`, so a test double that could produce one would
+      suggest a reachable path that does not exist — the streaming half is gone and the double returns only a
+      buffered response.
+      **Recorded as limits:** **no provider has been called**, so the record stays `researched` and not
+      `live-verified` — the provider's normalization claim, the per-model default dimensions, and the
+      empty-string refusal are read from documentation, and the live smoke test in the record's verification
+      plan is described rather than run; **nothing writes an embedding to storage** (there is no
+      `memory_embeddings` table and no repository function — vector search and pgvector parity are `P4-009`);
+      **no chunking**, so the 8192-token bound is the caller's problem; no token-count pre-check for the
+      2048-element/300,000-token batch bounds either, because that needs a tokenizer this crate does not have
+      and an estimate used as a *limit* would refuse valid requests while looking like a check; no retry
+      inside the adapter (one attempt, as the Chat Completions record establishes, with the extra note that a
+      retry costs tokens); `chunker_version` is `None` on the memory path where nothing chunks yet; `base64`
+      is unsupported as an unmeasured decode path for provider-supplied data; and **nothing calls the port** —
+      no daemon route, no memory path, no CLI verb — until `P4-006` consumes it.
+      Gates: fmt, clippy `-D warnings` across the workspace, 45 suites with the application binaries absent
+      and **zero skips** (1162 tests), all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1` and
+      `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, `cargo deny` ok after `sha2` was added to `jarvis-models`.
 - [ ] `P4-006` Add hybrid retrieval and explainable scoring; embeddings are an index, not canonical truth.
 - [ ] `P4-007` Integrate memory retrieval into context budgets with provenance and injection-resistant quoting.
 - [ ] `P4-008` Add inspect, search, remember, correct, forget, export, retention, and full user-deletion APIs/CLI.

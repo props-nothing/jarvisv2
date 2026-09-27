@@ -36,6 +36,7 @@
 //! ```
 
 mod capability;
+mod embedding;
 mod error;
 mod identity;
 mod port;
@@ -44,10 +45,18 @@ mod response;
 mod scripted;
 mod stream;
 mod usage;
+mod vector;
 
 pub mod openai;
 
+#[cfg(test)]
+mod testing;
+
 pub use capability::{ModelCapabilities, Placement, Support};
+pub use embedding::{
+    EmbeddingGateway, EmbeddingRequest, EmbeddingResponse, MAX_EMBEDDING_INPUT_BYTES,
+    MAX_EMBEDDING_INPUTS,
+};
 pub use error::{ModelError, ModelErrorKind, ProviderRequestId};
 pub use identity::{IdentityError, MAX_IDENTIFIER_BYTES, ModelId, ProviderId};
 pub use port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
@@ -58,3 +67,7 @@ pub use response::{ChatResponse, FinishReason, OutputContent, ToolCall};
 pub use scripted::{SCRIPTED_PROVIDER, ScriptedCancellation, ScriptedModel, Turn, scripted};
 pub use stream::{StreamEnvelope, StreamEvent, StreamEventError, StreamSummary, StreamValidator};
 pub use usage::TokenUsage;
+pub use vector::{
+    Embedding, EmbeddingDimensions, EmbeddingError, EmbeddingMetadata, EmbeddingVector,
+    EmbeddingVersion, Normalization, cosine_similarity,
+};
