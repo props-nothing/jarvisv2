@@ -564,7 +564,11 @@ async fn a_tool_declaring_an_approval_is_refused_even_where_the_workspace_would_
 }
 
 /// The identifier the approval-declaring fixture registers.
-const APPROVAL_TOOL: &str = "jarvis.test.approval";
+///
+/// Re-exported from the shared fixture module so the two tests that need a **held** call agree on one tool
+/// rather than each building its own. See `approval_fixture` for why the posture is a tool declaration
+/// rather than a workspace threshold.
+const APPROVAL_TOOL: &str = crate::approval_fixture::APPROVAL_TOOL;
 
 /// A well-formed credential fingerprint, used only as a fixture value.
 ///
@@ -572,84 +576,16 @@ const APPROVAL_TOOL: &str = "jarvis.test.approval";
 /// caught locally, and this constant is the shape a real one has rather than something that happens to parse.
 const CALLER_DIGEST: &str = "9f2c41ab77de0355b1c8e0d4a63f29bb8c1740ee5d3a96f2c0b84a1e7d5633aa";
 
-/// The fixture tool's input schema, which the arguments below are validated against.
-const APPROVAL_INPUT_SCHEMA: &str = r#"{
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": { "path": { "type": "string" } },
-    "required": ["path"],
-    "additionalProperties": false
-}"#;
-
-/// The fixture tool's output schema, which no assertion reads: the call is refused before one is produced.
-const APPROVAL_OUTPUT_SCHEMA: &str = r#"{
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": { "content": { "type": "string" } }
-}"#;
-
 /// A tool whose **declaration** asks for an approval, which its workspace would not.
 ///
-/// `ApprovalPolicy::Ask` rather than `Policy`, because the guard refuses everything that is not `Auto` and the
-/// point is that the *declaration* is what triggers it. The declared risk is 0, so the workspace's default
-/// threshold of `Moderate` cannot hold the call — which is what makes the guard the only thing under test.
-///
-/// The field list is copied from `FilesystemReadTool`'s own definition rather than invented, so every value is
-/// one the contract accepts: `EffectSet::single(ToolEffect::ReadOnly)` is what makes risk 0 legal, and
-/// `ToolSensitivity::new` is the two-sided constructor rather than a bare enum.
+/// The definition and its adapter live in `crate::approval_fixture` because the REST approval route needs
+/// the same held call, and two copies of one contract are two things that can disagree.
 fn approval_declaring_definition() -> ToolDefinition {
-    must(ToolDefinition::new(jarvis_tools::ToolDefinitionParts {
-        id: must(jarvis_tools::ToolId::new(APPROVAL_TOOL)),
-        version: "1.0.0".to_owned(),
-        title: "Approval-declaring test tool".to_owned(),
-        description: "A fixture tool that declares an approval its workspace would not ask for."
-            .to_owned(),
-        input_schema: must(jarvis_tools::ToolSchema::parse(APPROVAL_INPUT_SCHEMA)),
-        output_schema: must(jarvis_tools::ToolSchema::parse(APPROVAL_OUTPUT_SCHEMA)),
-        effects: jarvis_tools::EffectSet::single(jarvis_tools::ToolEffect::ReadOnly),
-        risk: 0,
-        required_scopes: jarvis_tools::ScopeSet::none(),
-        approval: jarvis_tools::ApprovalPolicy::Ask,
-        timeout_seconds: 5,
-        retry: jarvis_tools::RetryDeclaration::none(),
-        idempotency: jarvis_tools::Idempotency::Required,
-        source: jarvis_tools::ToolSource::Native,
-        availability: jarvis_tools::Availability::Available,
-        sensitivity: jarvis_tools::ToolSensitivity::new(
-            jarvis_core::Sensitivity::Public,
-            jarvis_core::Sensitivity::Public,
-        ),
-    }))
+    crate::approval_fixture::approval_declaring_definition()
 }
 
-/// An adapter that **counts** its calls, so "it did not run" is observed rather than inferred.
-#[derive(Default)]
-struct ApprovalDeclaringAdapter {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl ApprovalDeclaringAdapter {
-    fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[async_trait::async_trait]
-impl jarvis_tools::ToolExecutor for ApprovalDeclaringAdapter {
-    fn adapter_id(&self) -> &'static str {
-        "approval-fixture"
-    }
-
-    async fn execute(
-        &self,
-        _request: &jarvis_tools::ToolExecutionRequest,
-    ) -> Result<jarvis_tools::ToolCallResult, jarvis_tools::AdapterError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(jarvis_tools::AdapterError::RefusedBeforeReaching {
-            reason: "the approval fixture must never be reached".to_owned(),
-        })
-    }
-}
+/// The counting adapter that must never be reached for a held call.
+use crate::approval_fixture::ApprovalDeclaringAdapter;
 
 /// **The caller policy a deployment configures is the one the endpoint serves under.**
 ///

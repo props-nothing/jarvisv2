@@ -60,6 +60,7 @@ use thiserror::Error;
 use crate::definition::ToolDefinition;
 use crate::effect::ToolEffect;
 use crate::identifier::ToolId;
+use crate::policy::ApprovalPolicy;
 use crate::risk::Risk;
 use crate::scope::ScopeSet;
 
@@ -748,6 +749,22 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     // 7. Approval obligations. The risk threshold needs the strength the level requires; the
     //    external-communication rule does not raise the strength requirement, because the risk
     //    already carries one.
+    //
+    //    `ApprovalPolicy::Ask` is checked **first and unconditionally**, because that is what its own
+    //    documentation says it means: "always ask, whatever policy says". It was previously not consulted
+    //    at all, so a tool that declared `Ask` at a risk the workspace would auto-allow ran without any
+    //    prompt — the declaration was recorded and ignored.
+    //
+    //    That gap was found by a route test rather than by reading: the REST approval route could not
+    //    produce a held call for a risk-0 tool declaring `Ask`, and the reason was this branch missing
+    //    rather than the test being wrong. No existing `evaluate` test caught it because their `Ask`
+    //    fixtures were all risk 2, which the default workspace holds on its own — so the declaration and
+    //    the threshold agreed and the missing check was invisible.
+    //
+    //    `Policy` is deliberately **not** consulted here: it means "the workspace's policy decides",
+    //    which is exactly the threshold below. Treating it as `Ask` would collapse a distinction the
+    //    `ApprovalPolicy` documentation calls out as a real member rather than a synonym.
+    let tool_requires_approval = definition.approval() == ApprovalPolicy::Ask;
     let risk_requires_approval = risk >= request.workspace.approval_threshold();
     let external_requires_approval = request
         .workspace
@@ -756,7 +773,7 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
             .effects()
             .contains(ToolEffect::ExternalCommunication);
 
-    if risk_requires_approval || external_requires_approval {
+    if tool_requires_approval || risk_requires_approval || external_requires_approval {
         // The strength an approval must be supplied with. `Present` for a high-risk action in a
         // workspace that asks for it, which makes the voice ceiling produce the documented outcome:
         // a voice-originated risk-3 call is *held*, not refused, and a desktop approval releases it.
@@ -767,6 +784,12 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
         {
             AuthenticationStrength::Present
         } else {
+            // `required_for` is derived from the **risk**, so a risk-0 tool that declares `Ask` asks for
+            // `ChannelEvidence` rather than `Absent`: an obligation with no strength floor could be
+            // satisfied by an unauthenticated caller, which would make "always ask" mean "ask anyone".
+            // The floor is the level's own requirement, and the declaration raises the *obligation*, not
+            // the strength — raising both would demand `Present` for a read, which an operator cannot
+            // supply over the API channel and which would make the tool unusable.
             AuthenticationStrength::required_for(risk)
         };
         return held(DenyReason::ApprovalRequired, Some(required));
@@ -1055,6 +1078,92 @@ mod tests {
         );
     }
 
+    /// **`ApprovalPolicy::Ask` holds a call the workspace would otherwise allow.**
+    ///
+    /// The declaration means "always ask, whatever policy says" — and until this test existed the engine
+    /// **never read it**. A tool declaring `Ask` at a risk below the workspace threshold ran with no
+    /// prompt at all, so an operator's explicit "this must always be confirmed" was recorded and ignored.
+    ///
+    /// The gap survived because every other `Ask` fixture in this module is risk 2 or 3, where the default
+    /// workspace threshold holds the call on its own — so the declaration and the threshold agreed and the
+    /// missing branch was invisible. This fixture is deliberately **risk 0 and read-only**, the one shape
+    /// where only the declaration can produce a hold, and it was found by a route test that could not
+    /// produce a held call rather than by reading the branch table.
+    ///
+    /// The three assertions are the three ways the fix could be wrong:
+    ///
+    /// - the call is **held**, so the declaration is read;
+    /// - the required strength is the **level's own floor** (`ChannelEvidence` at risk 0), not `Absent` —
+    ///   an obligation with no floor would be satisfiable by an unauthenticated caller, making "always ask"
+    ///   mean "ask anyone";
+    /// - it is **not raised to `Present`** either, because the declaration raises the *obligation* rather
+    ///   than the strength, and demanding user presence to read a public file would make the tool unusable
+    ///   over every channel whose ceiling is below it.
+    #[test]
+    fn a_tool_declaring_always_ask_holds_a_call_the_workspace_would_allow() {
+        let definition = tool(
+            "jarvis.files.read_confirmed",
+            EffectSet::single(ToolEffect::ReadOnly),
+            0,
+            ApprovalPolicy::Ask,
+            ScopeSet::single(scope("files.read")),
+        );
+        let workspace = WorkspacePolicy::default();
+        // The control: this is the *same* posture `Auto` would carry, so a workspace-allow is what the
+        // threshold alone produces. Without it, a hold here could be the threshold rather than the
+        // declaration and the test would pass for the wrong reason.
+        assert!(
+            Risk::Minimal < workspace.approval_threshold(),
+            "the fixture is only meaningful below the workspace's own threshold"
+        );
+        let actor = ActorAuthority::active(ScopeSet::single(scope("files.read")));
+
+        let decision = evaluate(&request(&definition, &workspace, actor));
+
+        assert!(
+            decision.is_held(),
+            "a tool declaring `Ask` must be held even when policy would allow it: {decision:?}"
+        );
+        assert_eq!(decision.reason(), Some(DenyReason::ApprovalRequired));
+        assert_eq!(
+            decision.required_strength(),
+            Some(AuthenticationStrength::ChannelEvidence),
+            "the obligation must carry the level's floor rather than no floor at all"
+        );
+        assert_ne!(
+            decision.required_strength(),
+            Some(AuthenticationStrength::Absent),
+            "an obligation with no strength floor is satisfiable by an unauthenticated caller"
+        );
+    }
+
+    /// **`ApprovalPolicy::Policy` is not `Ask`.** It defers to the workspace, so a risk below the
+    /// threshold runs without a prompt.
+    ///
+    /// The negative control for the test above: without it, folding `Policy` into `Ask` would still pass
+    /// that test while collapsing a distinction `ApprovalPolicy`'s own documentation calls out as a real
+    /// member rather than a synonym.
+    #[test]
+    fn a_tool_deferring_to_policy_runs_below_the_threshold() {
+        let definition = tool(
+            "jarvis.files.read_by_policy",
+            EffectSet::single(ToolEffect::ReadOnly),
+            0,
+            ApprovalPolicy::Policy,
+            ScopeSet::single(scope("files.read")),
+        );
+        let workspace = WorkspacePolicy::default();
+        let actor = ActorAuthority::active(ScopeSet::single(scope("files.read")));
+
+        let decision = evaluate(&request(&definition, &workspace, actor));
+
+        assert_eq!(
+            decision.decision(),
+            Decision::Allow,
+            "`Policy` means the workspace decides, and this workspace allows a risk-0 read: {decision:?}"
+        );
+    }
+
     /// **The voice rule: a voice-originated risk-3 call is held, not refused.**
     ///
     /// `docs/architecture/security.md`: "Voice confirmation alone is insufficient for risk-3 actions
@@ -1092,10 +1201,29 @@ mod tests {
 
     /// The channel ceiling caps a claimed strength, so a client cannot assert what it did not
     /// establish.
+    ///
+    /// # The fixture changed when `Ask` started being honoured, and that is the interesting part
+    ///
+    /// This test's intent is to isolate the **strength** check, so its tool must not incur an approval
+    /// obligation. It previously used `sender()`, which declares `Ask` at risk 2, and leaned on a
+    /// workspace whose threshold was `High` to "skip the approval step" — which worked **only because
+    /// `evaluate` ignored `Ask` entirely**. Once the declaration is honoured, that tool is held by its own
+    /// policy whatever the workspace threshold is, so step 8 is never reached and the test asserts a hold
+    /// where it means to assert a strength refusal.
+    ///
+    /// The fixture is therefore an `Auto`-declaring risk-2 tool: a tool whose *declaration* permits an
+    /// automatic decision, so the only thing left to decide is whether the channel established enough. The
+    /// workspace threshold stays `High` for the same reason as before.
     #[test]
     fn a_channel_ceiling_caps_a_claimed_strength() {
         // A voice channel claiming presence still evaluates as channel evidence.
-        let definition = sender();
+        let definition = tool(
+            "jarvis.mail.send",
+            EffectSet::single(ToolEffect::ExternalCommunication),
+            2,
+            ApprovalPolicy::Auto,
+            ScopeSet::single(scope("mail.send")),
+        );
         // A workspace whose threshold is above the tool's risk, so the approval step is skipped and
         // the strength check is the one that decides.
         let workspace = WorkspacePolicy::new(Risk::High, Risk::High, false, true)

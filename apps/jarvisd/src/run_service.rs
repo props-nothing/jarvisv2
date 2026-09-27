@@ -26,12 +26,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jarvis_core::{
+    ApprovalChannel, ApprovalDecision, ApprovalDecisionOutcome, AuthenticationStrength,
     CorrelationId, ErrorCode, RunId, SafeMessage, SessionId, SystemClock, UtcTimestamp,
 };
-use jarvis_protocol::{RunReply, StartRunRequest, rest_error, safe};
+use jarvis_protocol::{
+    ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalReply, RunReply, StartRunRequest,
+    rest_error, safe,
+};
 use jarvis_storage::{
-    API_SESSION_CHANNEL, DatabaseError, SessionTarget, SqliteDatabase, StartRunInput, find_run,
-    load_local_identity, request_run_cancellation, start_run,
+    API_SESSION_CHANNEL, DatabaseError, SecretStore, SessionTarget, SqliteDatabase, StartRunInput,
+    find_approval, find_run, load_local_identity, record_decision, request_run_cancellation,
+    start_run,
 };
 
 /// A run use-case failure that maps onto a status and the shared error envelope.
@@ -66,13 +71,19 @@ impl IntoResponse for RunServiceError {
 #[derive(Clone)]
 pub struct RunService {
     database: Arc<SqliteDatabase>,
+    /// The store the plaintext decision nonce is taken from.
+    ///
+    /// Held here rather than passed per call so the daemon's own profile state directory is the only
+    /// place a nonce is ever read from: a caller-supplied path would let a client decide an approval
+    /// against a secret of its own choosing.
+    secrets: SecretStore,
 }
 
 impl RunService {
-    /// Creates the service over the daemon's database.
+    /// Creates the service over the daemon's database and nonce store.
     #[must_use]
-    pub fn new(database: Arc<SqliteDatabase>) -> Self {
-        Self { database }
+    pub fn new(database: Arc<SqliteDatabase>, secrets: SecretStore) -> Self {
+        Self { database, secrets }
     }
 
     /// Starts a run.
@@ -182,6 +193,120 @@ impl RunService {
             .await
             .map_err(|error| map_database_error(&error))?;
         Ok(reply::from_stored(&run))
+    }
+
+    /// Decides a pending approval, consuming its one-time nonce.
+    ///
+    /// # The approver is the local identity, taken here and never from the request
+    ///
+    /// `load_local_identity` is the same source the gateway already uses to attribute a run, and it is
+    /// the identity that is **not** the requester. A tool call's requester is the run (`P3-012a`), so a
+    /// decision recorded under the local user is precisely "the human answered the agent's request" — the
+    /// only shape `security.md`'s confused-deputy control recognises.
+    ///
+    /// # The nonce is verified, not taken from the file
+    ///
+    /// The daemon **presents** the caller's nonce to `record_decision`, which compares it against the
+    /// stored digest and — only when the write lands — rotates that digest to the digest of the empty
+    /// string. That rotation is the one-time mechanism (`ADR-0018`, `ADR-0042`), and it is what makes a
+    /// replay fail whether or not any file still exists.
+    ///
+    /// An earlier shape had the daemon `take` the nonce from the file and pass *that*. It was wrong in a
+    /// way worth recording: the file is a **delivery channel**, so a client that has already read it — the
+    /// operator's client, which is the whole point of the channel — would find the daemon consuming a file
+    /// the client had legitimately used, and the decision would be refused as "no nonce pending". Reading
+    /// the file here would also make the route's answer depend on filesystem state rather than on the
+    /// caller's credential, which is not a check at all.
+    ///
+    /// The delivered file is **discarded after a successful decision** so a presentable secret does not sit
+    /// on disk for the remainder of the approval's lifetime. That is defence in depth and not the
+    /// control: a failure to remove it does not make the decision replayable, because the digest has
+    /// already rotated.
+    ///
+    /// # A refused decision does not consume anything
+    ///
+    /// The domain refuses *after* the digest matches, and the guarded `UPDATE` rotates only when the write
+    /// lands, so an honest mistake — deciding as the wrong identity, a lapsed approval — leaves the nonce
+    /// valid and the operator can try again. Burning an approval on a retryable error would turn a typo
+    /// into a re-request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError`] for an unknown approval, a nonce that does not match, an already-decided
+    /// approval, or a decision the domain refuses. Each maps to its own status so a client can tell "you
+    /// are too late" from "you may not answer that".
+    pub async fn decide(
+        &self,
+        id: &str,
+        body: &ApprovalDecisionBody,
+    ) -> Result<ApprovalReply, RunServiceError> {
+        // Read first, so an unknown identifier never reaches the nonce store. Otherwise a caller could
+        // learn whether an approval exists by observing whether a file was consumed. Mapped through the
+        // decision mapper so an unknown identifier is a `404` rather than the generic storage answer.
+        // The value is otherwise unused: `record_decision` re-reads the row inside its own guarded update,
+        // so binding here would be a second copy that can go stale between the read and the write.
+        let _existing = find_approval(&self.database, id)
+            .await
+            .map_err(|error| map_decision_error(&error))?;
+
+        let identity = load_local_identity(&self.database)
+            .await
+            .map_err(|error| map_identity_error(&error))?;
+
+        let now = UtcTimestamp::now(&SystemClock);
+        let decision = ApprovalDecision::new(
+            match body.decision {
+                ApprovalDecisionRequest::Approve => ApprovalDecisionOutcome::Approve,
+                ApprovalDecisionRequest::Deny => ApprovalDecisionOutcome::Deny,
+                ApprovalDecisionRequest::Cancel => ApprovalDecisionOutcome::Cancel,
+            },
+            ApprovalChannel::Cli,
+            // The loopback credential is what this transport actually established, which is the strongest
+            // thing a local API client can claim. It is a **claim** the domain then compares against the
+            // required strength, so a hold needing presence still refuses it — the check is not bypassed by
+            // the claim being high.
+            AuthenticationStrength::Present,
+            now,
+        );
+
+        let decided = record_decision(
+            &self.database,
+            id,
+            identity.user_id(),
+            &body.nonce,
+            &decision,
+        )
+        .await
+        .map_err(|error| map_decision_error(&error))?;
+
+        // The decision is recorded, so the delivered secret has served its purpose. Removing it is
+        // defence in depth: the digest already rotated, so a surviving file cannot decide anything. A
+        // failure to remove is therefore not reported as a failed decision — that would tell an operator a
+        // decision *did not happen* when it did, which is a worse answer than a stale file. It is logged
+        // instead, naming only the approval identifier the caller already supplied in the URL, so the log
+        // cannot become a directory listing for the nonce store.
+        if let Err(error) = self.secrets.discard(id) {
+            tracing::warn!(
+                approval_id = %id,
+                error = %error,
+                "a decided approval's nonce file could not be removed; the decision stands"
+            );
+        }
+
+        Ok(ApprovalReply {
+            approval_id: decided.id().to_string(),
+            run_id: decided.run_id().to_string(),
+            tool: decided.tool().to_owned(),
+            tool_version: decided.tool_version().to_owned(),
+            // The **effective** state at the instant of answering, so an approval decided within its
+            // lifetime but read after the expiry reports `expired` rather than an authority that lapsed.
+            state: decided.state_at(now).as_str().to_owned(),
+            outcome: decided
+                .decision()
+                .map(|decision| decision.outcome().as_str().to_owned()),
+            created_at: decided.created_at(),
+            expires_at: decided.expires_at(),
+        })
     }
 }
 
@@ -305,5 +430,75 @@ fn map_database_error(error: &DatabaseError) -> RunServiceError {
             ErrorCode::Internal,
             "the local database is not available",
         ),
+    }
+}
+
+/// Maps an approval-decision failure onto a status and the shared error envelope.
+///
+/// # Each rule gets its own answer, and the reason is what the caller does next
+///
+/// - A **forged or wrong nonce** is `403`, not `400`: the request was well formed and the caller is not
+///   permitted to answer for this approval. Reporting it as a content error would invite a retry with a
+///   different nonce, which is what a guessing attack looks like.
+/// - An **expired** approval is `409`: the caller was permitted and is now too late. Telling them to fix
+///   their request would send them hunting for a mistake they did not make.
+/// - An **already-decided** approval is `409` too, and that is the property that makes duplicate
+///   delivery safe: a second decision cannot overwrite the first, whatever it says.
+/// - A **self-approval** is `403`: the requester cannot answer for itself, which is the confused-deputy
+///   refusal `security.md` names.
+/// - **Insufficient strength** is `403`: a weaker channel than the action requires did not answer for it.
+///
+/// Every message is a fixed phrase. None of them carries the required strength, the presented value, or
+/// a field's content, so a wrong answer does not teach a caller what the right one would look like.
+fn map_decision_error(error: &DatabaseError) -> RunServiceError {
+    match error {
+        DatabaseError::ApprovalNotFound => RunServiceError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no approval exists for the requested identifier",
+        ),
+        DatabaseError::ApprovalNonceMismatch => RunServiceError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Authorization,
+            // A `403` rather than a `400`: the request was well formed and the caller is not permitted to
+            // answer for this approval. Reporting it as a content error would invite a retry with a
+            // different nonce, which is what a guessing attack looks like.
+            "the decision nonce does not match this approval",
+        ),
+        DatabaseError::ApprovalAlreadyDecided => RunServiceError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "this approval has already been decided",
+        ),
+        DatabaseError::ApprovalConflict => RunServiceError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "another writer decided this approval; re-read it",
+        ),
+        DatabaseError::InvalidApprovalRequest { field } => match *field {
+            // The three refusals a *caller* can act on are separated from the rest, because "your
+            // decision was already too late" and "you may not answer this" are different next steps.
+            "expires_at" => RunServiceError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::Conflict,
+                "this approval expired before the decision arrived",
+            ),
+            "decided_by" => RunServiceError::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::Authorization,
+                "the requester cannot decide its own approval",
+            ),
+            "decision_strength" => RunServiceError::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::Authorization,
+                "this approval requires stronger authentication than this channel establishes",
+            ),
+            _ => RunServiceError::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::Validation,
+                "the decision was not accepted",
+            ),
+        },
+        other => map_database_error(other),
     }
 }

@@ -27,13 +27,24 @@
 //! A tool call cannot name its own approver and cannot read this file through the tool pipeline; the
 //! operator's own client reads it, exactly as it reads the profile credential.
 //!
-//! # The one-time property is enforced by the filesystem
+//! # The one-time property belongs to the digest; the file is delivery and defence in depth
 //!
-//! [`SecretStore::take`] **removes the file before returning the value**. Two concurrent decisions
-//! therefore race on one `remove_file`, and exactly one of them wins — the loser observes `Absent`. That
-//! is stronger than an in-memory flag, because it holds across processes and across a restart, and it
-//! fails **closed**: a crash between the removal and the return loses the nonce, which makes the
-//! approval undecidable rather than reusable.
+//! `record_decision` compares a **presented** nonce against the stored digest and rotates that digest to
+//! the digest of the empty string once the guarded write lands (`ADR-0018`). Nothing can match the rotated
+//! digest again, in any process or across any restart, whether or not a file survives. **That rotation is
+//! the control.**
+//!
+//! [`SecretStore`] removes the delivered file as well, which is deliberate layering: it keeps a
+//! presentable secret from sitting on disk for the remainder of an approval's lifetime, and it makes the
+//! delivery single-read for the operator's client ([`SecretStore::take`]). Both failure directions stay
+//! safe — a lost file makes an approval **undecidable** (recoverable by requesting the action again)
+//! rather than **reusable**, and a file that outlives a decision is inert because its digest has rotated.
+//!
+//! **The daemon does not read the nonce from this file when a decision arrives.** The file is a delivery
+//! channel and the operator's own client is its legitimate reader; a daemon that consumed it first would
+//! refuse a decision the operator had every right to make, and the route's answer would rest on
+//! filesystem state rather than on the caller's credential. The daemon verifies what is **presented** and
+//! discards the file afterwards.
 
 use std::fs;
 use std::io::{self, Write};
@@ -171,13 +182,20 @@ impl SecretStore {
 
     /// Takes the pending nonce for an approval, consuming it.
     ///
-    /// # The removal happens BEFORE the value is returned, and that ordering is the control
+    /// # The removal happens BEFORE the value is returned
     ///
     /// A value returned before its file is removed could be handed out twice if the process died in
-    /// between. Removing first means the failure mode of a crash is "the approval can no longer be
-    /// decided" — which is recoverable by requesting the action again — rather than "the nonce is still
-    /// presentable". It also makes the one-time property a property of the filesystem: two concurrent
-    /// calls race on one `remove_file` and exactly one observes the value.
+    /// between, and removing first makes the crash direction the safe one: the approval becomes
+    /// **undecidable** — recoverable by requesting the action again — rather than **reusable**. It also
+    /// makes the delivery single-read: two concurrent callers race on one `remove_file` and exactly one
+    /// observes the value.
+    ///
+    /// # This is the *client's* read, not the daemon's
+    ///
+    /// The operator's own client reads the delivered nonce this way. The daemon **must not**: the route
+    /// that records a decision verifies the nonce the caller **presents** and then discards the file, so
+    /// that a client which has legitimately read the delivery is not defeated by the daemon having
+    /// consumed it first. See the module header.
     ///
     /// # Errors
     ///

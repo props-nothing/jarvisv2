@@ -44,7 +44,9 @@ use axum::{
     routing::{get, post},
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
-use jarvis_protocol::{MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe};
+use jarvis_protocol::{
+    ApprovalDecisionBody, MAX_STREAM_PAGE, RunEventPageReply, StartRunRequest, rest_error, safe,
+};
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
 
@@ -82,9 +84,13 @@ impl GatewayState {
     /// Used by tests that exercise the transport, so a route test cannot accidentally start
     /// spending a model budget.
     #[must_use]
-    pub fn new(database: Arc<SqliteDatabase>, credential: ClientCredential) -> Self {
+    pub fn new(
+        database: Arc<SqliteDatabase>,
+        credential: ClientCredential,
+        secrets: jarvis_storage::SecretStore,
+    ) -> Self {
         Self {
-            runs: RunService::new(Arc::clone(&database)),
+            runs: RunService::new(Arc::clone(&database), secrets),
             database,
             credential,
             executor: None,
@@ -131,7 +137,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
-        .route("/tools/{tool}/calls", post(call_tool));
+        .route("/tools/{tool}/calls", post(call_tool))
+        .route("/approvals/{id}/decision", post(decide_approval));
 
     Router::new()
         .route("/health/live", get(health_live))
@@ -358,6 +365,35 @@ async fn call_tool(
             ErrorCode::Validation,
             &format!("the tool call could not be completed: {error}"),
         ),
+    }
+}
+
+/// `POST /api/v1/approvals/{id}/decision`
+///
+/// # The three things this handler deliberately does not take from the request
+///
+/// - **The approver.** It is the profile's seeded local identity, read here, not a field. A caller that
+///   could name its own approver would defeat the self-approval refusal in one request field.
+/// - **The nonce's storage location.** It comes from the daemon's own profile state directory, so a
+///   caller cannot point the daemon at a file of its choosing.
+/// - **The intent.** It is re-read from the stored row inside `record_decision`, because the digest is
+///   what a decision binds to and a value the request supplied would be a binding to a claim.
+///
+/// # The order, and why the nonce is taken last
+///
+/// The approval is read first so an unknown identifier is a `404` that never reaches the nonce file —
+/// otherwise a caller could distinguish "no such approval" from "wrong nonce" only by whether a file was
+/// consumed. Then the nonce is taken, then the decision is recorded. A failure between the take and the
+/// record leaves the approval undecidable, which is `ADR-0042`'s chosen failure direction and is
+/// recoverable by asking for the action again.
+async fn decide_approval(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalDecisionBody>,
+) -> Response {
+    match state.runs.decide(&id, &body).await {
+        Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -588,7 +624,11 @@ mod tests {
         let credential = ClientCredential::generate()
             .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
         let presented = credential.expose().to_owned();
-        let state = GatewayState::new(Arc::new(database), credential);
+        let state = GatewayState::new(
+            Arc::new(database),
+            credential,
+            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
+        );
         (router(state), presented, profile)
     }
 
@@ -1123,7 +1163,14 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
 
-        let app = router(GatewayState::new(database, credential).with_tools(Arc::new(pipeline)));
+        let app = router(
+            GatewayState::new(
+                database,
+                credential,
+                jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
+            )
+            .with_tools(Arc::new(pipeline)),
+        );
 
         // A run is the attribution target: the handler reads its **stored** row for the workspace, so
         // the run has to exist for any of this to be exercised.
@@ -1320,6 +1367,265 @@ mod tests {
         assert!(
             body.contains("daemon.tool_workspace_roots"),
             "the refusal must name the key that would enable the tool: {body}"
+        );
+    }
+
+    /// A router, a credential, a profile, and **one pending approval with its nonce already delivered**.
+    ///
+    /// The approval is produced by the real pipeline holding a real risk-2 tool, so the row and the
+    /// nonce file are exactly what a live daemon would leave behind. Building the row by hand would be
+    /// the fixture stating its own assumption about what the pipeline writes, which is the thing the
+    /// route test exists to check.
+    ///
+    /// The nonce is read straight out of the profile's private store, because that is what an operator's
+    /// client does. Nothing in this fixture can obtain it from a response, which is `ADR-0042`'s point.
+    async fn approval_router() -> (Router, String, TempProfile, String, String) {
+        let profile = TempProfile::new();
+        let directory = profile.0.join("workspace");
+        std::fs::create_dir_all(&directory)
+            .unwrap_or_else(|error| panic!("create workspace: {error}"));
+
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate()
+            .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
+        let presented = credential.expose().to_owned();
+        let state_directory = profile.0.join("state");
+        let secrets = jarvis_storage::SecretStore::in_state(&state_directory);
+
+        let roots = jarvis_tools::WorkspaceRoots::new([directory.as_path()])
+            .unwrap_or_else(|error| panic!("grant the workspace root: {error}"));
+        // The hold is produced by a tool that **declares** `ApprovalPolicy::Ask` at risk 0, so the hold
+        // comes from the tool's own declaration rather than from a workspace threshold the fixture
+        // invented. That is a posture a real MCP server can carry, and it holds regardless of the default
+        // workspace policy — which is what makes this fixture's hold stable rather than a coincidence of
+        // the policy defaults.
+        let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
+            Arc::clone(&database),
+            Some(roots),
+            jarvis_tools::WorkspacePolicy::default(),
+            vec![(
+                vec![crate::approval_fixture::approval_declaring_definition()],
+                Arc::new(crate::approval_fixture::ApprovalDeclaringAdapter::default())
+                    as Arc<dyn jarvis_tools::ToolExecutor>,
+            )],
+            secrets.clone(),
+        )
+        .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
+
+        let app = router(
+            GatewayState::new(Arc::clone(&database), credential, secrets.clone())
+                .with_tools(Arc::new(pipeline)),
+        );
+
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/runs",
+                &presented,
+                r#"{"objective":"read a file"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let reply: jarvis_protocol::RunReply = serde_json::from_str(&body_text(created).await)
+            .unwrap_or_else(|error| panic!("decode create: {error}"));
+
+        // A held call needs a tool that declares an approval. The filesystem adapter is read-only and
+        // auto-allowed, so the hold is produced by an MCP-namespaced tool declaring `ApprovalPolicy::Ask`
+        // — a posture an operator can genuinely configure.
+        let held = app
+            .clone()
+            .oneshot(tool_call_request(
+                &presented,
+                crate::approval_fixture::APPROVAL_TOOL,
+                &reply.run_id,
+                &serde_json::json!({ "path": "notes.txt" }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            held.status(),
+            StatusCode::ACCEPTED,
+            "the fixture requires a held call: {}",
+            body_text(held).await
+        );
+        let held_body: serde_json::Value = serde_json::from_str(&body_text(held).await)
+            .unwrap_or_else(|error| panic!("decode hold: {error}"));
+        let approval_id = held_body["approval_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a hold must carry its approval id: {held_body}"))
+            .to_owned();
+
+        // The nonce is read the way an operator's client reads it — straight from the file — and
+        // **deliberately not** through `SecretStore::take`, because `take` is the daemon's consuming read.
+        // A fixture that took it would leave nothing for the route to consume, which is a property of the
+        // store working rather than of the route failing.
+        let nonce =
+            std::fs::read_to_string(profile.0.join("state").join("approvals").join(&approval_id))
+                .unwrap_or_else(|error| panic!("read the delivered nonce: {error}"));
+
+        (app, presented, profile, approval_id, nonce)
+    }
+
+    /// Posts an approval decision.
+    fn decision_request(
+        presented: &str,
+        approval_id: &str,
+        body: &serde_json::Value,
+    ) -> Request<Body> {
+        post_json(
+            &format!("/api/v1/approvals/{approval_id}/decision"),
+            presented,
+            &body.to_string(),
+        )
+    }
+
+    /// **The route that makes a delivered nonce usable: an operator decides a held approval.**
+    ///
+    /// `P3-012a` wrote the approval and `P3-012b` delivered its nonce, and neither made the decision
+    /// reachable. This is the end of that path, and it asserts the three things a route could get wrong:
+    /// the decision lands, the row reports the **effective** state, and the nonce is consumed so a replay
+    /// of the identical request is refused rather than recording a second decision.
+    ///
+    /// The replay is the important one. Without a consumed nonce, the second request would be accepted
+    /// and — depending on the store — could overwrite the first decision. `record_decision` already
+    /// refuses an already-decided row; this asserts the *route* does not defeat it.
+    #[tokio::test]
+    async fn an_operator_can_decide_a_held_approval_exactly_once() {
+        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+
+        let approved = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            approved.status(),
+            StatusCode::OK,
+            "a delivered nonce must decide the approval: {}",
+            body_text(approved).await
+        );
+
+        let decided = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            decided.status(),
+            StatusCode::CONFLICT,
+            "a replayed decision must be refused, and the nonce must be gone: {}",
+            body_text(decided).await
+        );
+    }
+
+    /// **A decision must not be recordable by naming the requester as its approver.**
+    ///
+    /// The approver is the profile's local identity and there is deliberately no field for it, so this
+    /// asserts the *shape* rather than the behaviour: a request that tries to supply one is refused as
+    /// malformed. That is the difference between a field nobody reads and a field nobody can send, and
+    /// only the second one cannot be filled in by a caller that misreads the documentation.
+    #[tokio::test]
+    async fn a_decision_cannot_name_its_own_approver() {
+        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+
+        let response = app
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({
+                    "decision": "approve",
+                    "nonce": nonce,
+                    "approver_id": "0198f000-0000-7000-8000-0000000000c3"
+                }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an unknown field must be refused rather than ignored, because an ignored field reads as an \
+             accepted one"
+        );
+    }
+
+    /// A decision for an identifier that is not an approval is a `404` **before** the nonce store is
+    /// touched, so a caller cannot probe for approvals by watching whether a file was consumed.
+    #[tokio::test]
+    async fn a_decision_for_an_unknown_approval_is_not_found() {
+        let (app, presented, _profile) = test_router().await;
+
+        let response = app
+            .oneshot(decision_request(
+                &presented,
+                "0198f000-0000-7000-8000-0000000000ff",
+                &serde_json::json!({
+                    "decision": "approve",
+                    "nonce": "0".repeat(64)
+                }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// **A wrong nonce is refused and leaves the delivered nonce usable.**
+    ///
+    /// This is the property that separates "the nonce is a credential" from "the nonce is a one-shot
+    /// token the daemon burns on contact". The domain refuses *after* the digest matches, so a mistyped or
+    /// copied-wrong value must not cost the operator the approval — otherwise a typo becomes a fresh tool
+    /// call, which is exactly how an approval flow gets routed around.
+    ///
+    /// It also pins the delivery-channel decision: the daemon verifies what the **caller presents** rather
+    /// than consuming the file it delivered. If the route took the nonce from the file, the first request
+    /// below would *succeed* and this assertion could not tell the difference between "verified" and
+    /// "took whatever was on disk" — the two would be indistinguishable because the file's value is
+    /// always the right one.
+    #[tokio::test]
+    async fn a_wrong_nonce_is_refused_and_the_delivered_nonce_still_decides() {
+        let (app, presented, _profile, approval_id, nonce) = approval_router().await;
+
+        let forged = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": "0".repeat(64) }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            forged.status(),
+            StatusCode::FORBIDDEN,
+            "a nonce that does not match must be refused: {}",
+            body_text(forged).await
+        );
+
+        let approved = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            approved.status(),
+            StatusCode::OK,
+            "a refused attempt must not consume the delivered nonce: {}",
+            body_text(approved).await
         );
     }
 }

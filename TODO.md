@@ -1913,13 +1913,43 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         **⚠ The stale-mtime trap again:** `Copy-Item` restoring a `.bak` restores the **older**
         timestamp, so cargo skipped the rebuild and the restored suite appeared red while the working copy
         was correct. Touch the file before believing a post-restoration failure.
-        **Remaining for `P3-012b`:** nothing consumes the delivered nonce through a **route** — a
-        `POST /approvals/{id}/decision` and the resumption of the held call are the rest of this slice,
-        and resumption is where a duplicate delivery becomes a second effect, which is why it is not
-        rushed in beside the delivery. Gates: fmt, clippy `-D warnings`, 44 suites with the application
-        binaries absent and **zero skips**, both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`,
-        `cargo deny` ok. Limits recorded in `ADR-0042`: the secret is cleartext protected by filesystem
-        permissions only; nothing sweeps a lapsed approval's nonce file.
+        **DELIVERED: the decision route, and it forced a correction to the control itself.**
+        `POST /api/v1/approvals/{id}/decision` (`jarvis-protocol::ApprovalDecisionBody`) closes the slice;
+        the approver is the **local identity**, never a request field, and `deny_unknown_fields` makes an
+        attempt to supply one a `422` rather than a silently ignored value.
+        **⭐ The first cut was wrong, and the failing test is what exposed it.** It had the daemon `take`
+        the nonce from the file and present *that*. But the file is a **delivery channel** — the operator's
+        client is its legitimate reader — so the daemon consuming it would refuse a decision the operator
+        had every right to make, and the route's answer would depend on filesystem state rather than on the
+        caller's credential. Fixed: the daemon now verifies the **presented** nonce via `record_decision`
+        (which compares it to the stored digest and rotates that digest on a landed write) and then
+        `discard`s the file. **The digest rotation is the one-time mechanism; the file removal is defence
+        in depth.** A `discard` failure is **logged, not reported** — telling an operator a decision *did
+        not happen* when it did is a worse answer than a stale file.
+        **A refused decision therefore consumes nothing**: a wrong nonce, a self-approval, or a lapsed
+        approval leaves the nonce valid and the operator retries. Burning an approval on a retryable error
+        turns a typo into a fresh tool call, which is how an approval flow gets routed around.
+        **Falsified through the route, one guard each:** forcing `stored != digest(presented_nonce)` false
+        made a **forged nonce decide an approval** (`200` where `403` was asserted), and removing
+        `deny_unknown_fields` made an `approver_id` field **silently accepted** (`200` where `422` was
+        asserted). Both restored byte-identically (`git status` clean) and re-run green: 81 daemon tests.
+        Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero
+        skips**, both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok. Limits recorded
+        in `ADR-0042`: the secret is cleartext protected by filesystem permissions only; nothing sweeps a
+        lapsed approval's nonce file.
+  - [x] `P3-015` Honor a tool's own `ApprovalPolicy::Ask` declaration (**production defect, found by a test**).
+        `evaluate`'s step 7 consulted the **workspace** policy and the risk threshold but **never the
+        tool's own `approval()`**, so a tool declaring "always ask me" was auto-allowed whenever the
+        workspace did not require approval for that risk. Every existing `Ask` fixture happened to be
+        risk 2 or 3, where the risk threshold holds the call anyway — so the missing check was **masked by
+        the fixtures**, and only a **risk-0 `Ask`** tool exposes it. Found because the route test could not
+        produce a held call from a read-only tool. Fixed: step 7 now ORs the tool's declaration with the
+        risk and external requirements, and `ApprovalPolicy::Policy` is deliberately **not** treated as
+        `Ask` (deferring to policy is the opposite of always asking). Two tests: a tool declaring `Ask` at
+        risk 0 is held; a tool deferring to policy at risk 0 runs. **Falsified**: forcing
+        `tool_requires_approval = false` returns `Decision::Allow` and the new test fails.
+        **The lesson recorded here:** a fixture that shares the bug's assumption cannot catch the bug, and
+        a threshold in front of a check can hide that the check is absent.
   - [ ] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
 
 ## P4: Memory And Context

@@ -14,6 +14,9 @@ mod sse;
 mod tool_actor;
 mod tool_pipeline;
 
+#[cfg(test)]
+mod approval_fixture;
+
 use std::{env, future::Future, io, path::Path, path::PathBuf, process::ExitCode, sync::Arc};
 
 use jarvis_core::{
@@ -660,6 +663,7 @@ impl HttpTransport {
         credential: jarvis_core::ClientCredential,
         executor: Option<Arc<executor::Executor>>,
         tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+        paths: &AppPaths,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
@@ -668,7 +672,14 @@ impl HttpTransport {
             .await
             .map_err(|source| DaemonError::HttpBind { port, source })?;
 
-        let mut state = gateway::GatewayState::new(database, credential);
+        let mut state = gateway::GatewayState::new(
+            database,
+            credential,
+            // The same store the pipeline writes to, so a hold's nonce is read from the profile state
+            // directory it was written to. Two stores would be two directories, and the approval would be
+            // undecidable in the way that looks like a missing file.
+            jarvis_storage::SecretStore::in_state(paths.state()),
+        );
         if let Some(executor) = executor {
             state = state.with_executor(executor);
         }
@@ -836,7 +847,7 @@ where
 {
     let Running {
         health,
-        paths: _paths,
+        paths,
         logging,
         singleton,
         database,
@@ -880,6 +891,7 @@ where
                 credential.clone(),
                 executor,
                 tools,
+                &paths,
             )
             .await?;
             (Some(transport), Some(stop))
