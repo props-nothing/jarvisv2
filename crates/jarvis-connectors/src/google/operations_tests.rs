@@ -280,6 +280,47 @@ fn a_stated_delay_above_the_ceiling_reaches_the_reason_as_a_deferral() {
 }
 
 #[test]
+fn a_calendar_410_reaches_the_reason_as_a_dead_cursor_rather_than_an_unknown() {
+    // **The end-to-end consequence of the API-aware classifier.** A `410` from `calendar_events_read` is the
+    // dead-sync-token state Calendar documents, so a caller reading a stored failed call must see a definite
+    // verdict — not `unknown`, which means "establish what happened before doing anything else" and would send
+    // an operator hunting for a cause the provider already named.
+    let dead_cursor = must(
+        interpret(
+            "google.calendar_events_read",
+            Ok(response(410, r#"{"error":{"code":410}}"#)),
+            now(),
+        ),
+        "a 410 must be a result",
+    );
+    let reason = dead_cursor.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("permanent"),
+        "a Calendar 410 is a known, definite state: {reason}"
+    );
+    assert!(
+        !reason.contains("unknown"),
+        "the defect this fixed: a documented 410 must not read as unclassified: {reason}"
+    );
+
+    // The control, and the one that makes the assertion above about the API rather than about the status: the
+    // SAME status on a Gmail operation stays unclassified, because Gmail's error page documents no 410.
+    let gmail_410 = must(
+        interpret(
+            "google.gmail_messages_list",
+            Ok(response(410, r#"{"error":{"code":410}}"#)),
+            now(),
+        ),
+        "a 410 must be a result",
+    );
+    let reason = gmail_410.record().reason().unwrap_or_default();
+    assert!(
+        reason.contains("unknown"),
+        "Gmail documents no 410, so it stays the fail-closed answer: {reason}"
+    );
+}
+
+#[test]
 fn an_unreadable_refusal_is_classified_by_its_status_and_not_guessed() {
     // A body that cannot be parsed still has a status, and the status is what `classify` switches on when there
     // is no reason. So the class is present either way — the difference between knowing little and knowing

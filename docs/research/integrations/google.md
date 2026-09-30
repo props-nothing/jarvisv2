@@ -31,11 +31,13 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | Gmail push notifications | https://developers.google.com/workspace/gmail/api/guides/push (last updated **2026-09-15**) | 2026-09-27 | `users.watch`, the Pub/Sub handshake, `history.list`, the notification envelope, rate and reliability limits |
 | Gmail sync | https://developers.google.com/workspace/gmail/api/guides/sync (last updated **2026-09-15**) | 2026-09-27 | full vs partial sync, `historyId`, the failure signal |
 | Gmail usage limits | https://developers.google.com/workspace/gmail/api/reference/quota (last updated **2026-09-10**) | 2026-09-27 | quota units, per-method costs, the **May 2026 model change**, the daily billing threshold |
+| Gmail batch requests | https://developers.google.com/workspace/gmail/api/guides/batch (last updated **2026-09-10**) | 2026-09-30 | the **hard** batch limit (100), the **recommended** size (50), and that a batch counts as *n* requests against quota |
 | Gmail scopes | https://developers.google.com/workspace/gmail/api/auth/scopes (last updated **2026-09-10**) | 2026-09-27 | the non-sensitive / sensitive / restricted taxonomy |
-| Gmail error handling | https://developers.google.com/workspace/gmail/api/guides/handle-errors (last updated **2026-09-15**) | 2026-09-27 | the status and `reason` taxonomy, backoff guidance |
+| Gmail error handling | https://developers.google.com/workspace/gmail/api/guides/handle-errors (last updated **2026-09-15**) | 2026-09-30 | the status and `reason` taxonomy, backoff guidance — and that its sections are 400/401/403/404/429/5xx, i.e. it documents **no `410`**, unlike the Calendar page (Finding 6) |
 | Gmail MCP server reference | https://developers.google.com/workspace/gmail/api/reference/mcp (last updated **2026-07-21**) | 2026-09-27 | the first-party MCP endpoint and its toolset |
 | Calendar push notifications | https://developers.google.com/workspace/calendar/api/guides/push (last updated **2026-09-11**) | 2026-09-27 | channel creation, the `X-Goog-*` headers, the sync message, renewal, delivery semantics |
 | Calendar sync | https://developers.google.com/workspace/calendar/api/guides/sync (last updated **2026-09-11**) | 2026-09-27 | `nextSyncToken`, the `410 Gone` signal |
+| Calendar error handling | https://developers.google.com/workspace/calendar/api/guides/errors (last updated **2026-09-11**) | 2026-09-30 | the per-status JSON bodies, **including the three distinct `410` causes** — one of which needs no action |
 | Calendar scopes | https://developers.google.com/workspace/calendar/api/auth (last updated **2026-09-03**) | 2026-09-27 | the Calendar scope list |
 | OAuth consent and scope categories | https://developers.google.com/workspace/guides/configure-oauth-consent (last updated **2026-09-03**) | 2026-09-27 | which review each scope category requires |
 | Cloud Pub/Sub push authentication | https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions (last updated **2026-09-24**) | 2026-09-27 | **the JWT-bearer mechanism** — see Finding 1 |
@@ -242,8 +244,17 @@ part most likely to be stale in any secondary source:
 **Other limits:**
 
 - **500 recipients per email message.**
-- **Batch requests: no more than 50**, and "larger batch sizes can trigger rate limiting" — so batching is
-  required for a full sync *and* is itself a rate-limit trigger.
+- **Batch requests: a hard limit of 100, and a recommended size of 50** — and these are **two different
+  facts**, which an earlier version of this record conflated into one "ceiling of 50". The batch reference
+  says "You're limited to **100** calls in a single batch request. If you must make more calls than that, use
+  multiple batch requests", and separately "Larger batch sizes are likely to trigger rate limiting. We
+  recommend sending batches of no more than **50** requests." So 100 is a **refusal** and 50 is a **slowdown**:
+  a batch of 60 is accepted and merely unwise, while a batch of 101 fails. **Corrected 2026-09-30** — the figure
+  had been attributed to the quota page, which states no batch limit at all, and the batch page was missing
+  from the source table (see `ADR-0080`).
+- **Batching saves connections and no quota.** The same page: "A set of *n* requests batched together counts
+  toward your usage limit as *n* requests, not as one request." A full-sync budget is therefore unchanged by
+  batching, which is worth stating because "batch the sync to make it affordable" is the natural misreading.
 - **Gmail push: a maximum notification rate of one event per second per watched user; "The service drops any
   user notifications exceeding that rate."** Dropping is silent, not a signal.
 - **Gmail push reliability: "in rare situations, notifications might be delayed or dropped."** The documented
@@ -311,12 +322,12 @@ part most likely to be stale in any secondary source:
 | Gmail `historyId` | `SyncCursorKind::MonotonicMarker` | numeric and monotonically increasing |
 | Calendar `nextSyncToken` | `SyncCursorKind::OpaqueToken` | base64-ish, opaque |
 | **Gmail stale cursor (404)** | `CursorError` → require full resync | see Finding 2 — a *404 on a read*, not a dedicated code |
-| **Calendar stale cursor (410)** | `CursorError` → require full resync | see Finding 2 |
+| **Calendar stale cursor (410)** | `CursorError` → require full resync | see Finding 2 — the status alone is not enough; the `reason` decides (`ADR-0081`) |
 | Gmail push (Pub/Sub) | **`WebhookSupport::Push` — cannot be expressed today** | Finding 1 |
 | Calendar push (channels) | **`WebhookSupport::Push` — cannot be expressed today** | Finding 1 |
 | `gmail.readonly` etc. | connector **OAuth** scopes, not JARVIS `Scope`s | `P3-001` draws this line explicitly: a JARVIS scope is `resource.action` and a provider scope is the connector's business |
 | Quota units | `RateLimit { per_window, window_seconds, scope }` | the *project* limits are `Project`-scoped and the *user* limits per-account; a connector must declare both, and the daily threshold is a third |
-| `reason` codes | `RetryClass` | `domainPolicy` → `Permanent`; `rateLimitExceeded`/`userRateLimitExceeded` → `Throttled`; 5xx → `Transient`; 429 → `Throttled` with the stated delay |
+| `reason` codes | `RetryClass` | `domainPolicy` → `Permanent`; `rateLimitExceeded`/`userRateLimitExceeded` → `Throttled`; 5xx → `Transient`; 429 → `Throttled` with the stated delay. **The status is classified per API** (`GoogleApi`), because the two pages document different status sets — see Finding 6 and `ADR-0082` |
 
 ## Decisions
 
@@ -387,7 +398,16 @@ status code alone, from a `history.list` for a mailbox that does not exist — a
 opposite (resync everything vs. the account is gone). `P5-001`'s `SyncCursorKind::can_be_detected_as_stale()`
 already asks this question; this record supplies Gmail's answer as **"only from the response to the read, not
 from the cursor's shape"**, and a connector must classify a 404 on `history.list` specifically as staleness
-rather than as absence. Calendar's 410 has no such ambiguity.
+rather than as absence.
+
+> **Correction (ADR-0081, 2026-09-30).** An earlier version of this paragraph ended *"Calendar's 410 has no such
+> ambiguity."* That was **true of the status and false of the decision**, which is the distinction that matters.
+> The Calendar **errors** page publishes **three** bodies for `410 Gone`, and only two of them resync:
+> `fullSyncRequired` ("wipe the store and re-sync") and `updatedMinTooLongAgo` (same), but also **`deleted`**
+> ("Resource has been deleted"), whose suggested action is **"no further action is necessary"**. So a connector
+> reading the status alone wipes a whole sync store when a user deletes one event. The corrected statement:
+> **a Calendar `410` is unambiguous once the `reason` is read** — and the errors page, which this record's source
+> table did not list for this fact, is where that is established.
 
 **⚠ And the ambiguity cannot be resolved from the response, which took a third pass to establish.** The error
 guide (`handle-errors`, last updated **2026-09-15**) lists `404 - Not Found — The requested resource couldn't be
@@ -450,6 +470,35 @@ were updated"**, that projects used between November 2025 and April 2026 keep th
 exceeding the daily threshold is "planned to incur charges… later in 2026". A connector must therefore treat
 quota as **configuration rather than a constant**, and must not hard-code either the old or the new numbers.
 
+### Finding 6 — The two error pages publish different status sets, so one classifier cannot serve both
+
+Gmail's and Calendar's error handling are documented on **separate pages with separate status summaries**, and
+they do not agree on the set of statuses:
+
+| Status | Gmail page | Calendar page |
+| --- | --- | --- |
+| `400`, `401`, `403`, `429`, `5xx` | documented, by `reason` | documented, by `reason` |
+| `404` | in the summary; states no action | in the summary; **suggests "use exponential backoff"** |
+| `410` | **no subsection at all** | **documented in detail** — three causes, two of which resync |
+
+**A classifier with no API parameter must answer for the less informative case**, and this one did: a Calendar
+`410` fell to the catch-all and reached a caller as *"the provider answered 410 (unknown)"* — `Reconcile`, i.e.
+*establish what happened before doing anything else* — when the provider had already stated what happened and
+what to do. The remedy is to make the API an input to the decision, and to note that the arms the two pages **do**
+share (`401`; the `5xx` family; `403`'s throttling reasons, which the Calendar page explicitly calls
+"functionally similar" across `403` and `429`) are shared **because the pages agree**, not for brevity.
+
+**The second divergence, recorded rather than resolved.** Calendar's page suggests exponential backoff for a
+`404`; Gmail's states no action. The crate keeps `DoNotRetry` for both, on the ground that Calendar's own two
+documented `404` causes are *"the requested resource … has never existed"* and *"accessing a calendar that the
+user can not access"* — and neither is repaired by resending the identical request. The disagreement is asserted
+in a test that names which document the code follows, so a reader comparing the arm with the page meets the
+decision instead of a surprise. See `ADR-0082`.
+
+**Neither fact was obtainable from a secondary source**, and both are the kind of thing a "the Google APIs"
+mental model flattens: the two APIs are separate products with separate error contracts that happen to share a
+host and an OAuth server.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in
@@ -486,7 +535,13 @@ where every line looks equally done is a plan nobody can audit.
   `calendar_events_read` declares `Unstated`, because this page publishes no Calendar cost. See `ADR-0079`,
   which also found that the ceiling figures were being read as **requests** when they are quota units.
 - **A full-sync budget test that asserts batching.** A full sync must batch (≤50 per batch) *and* must respect
-  that batches trigger rate limiting, so the test asserts both the batch size and the delay. **Not written.**
+  that batches trigger rate limiting, so the test asserts both the batch size and the delay. **WRITTEN, and the
+  premise was wrong.** The "≤50" was not a limit: the batch reference states a **hard limit of 100** and a
+  **recommendation of 50**, so `batch_plan(calls, size)` now takes the size and reports both the request count
+  (rounding **up**, so the partial final batch is not dropped) and whether the size is within the recommendation.
+  A 1,001-call first sync is asserted to be 21 requests of 50 with the last holding one. No delay is asserted,
+  because the record states none for a recommended size — it states that throttling is *likely*, which is a risk
+  rather than a figure (see `ADR-0080`).
 - **The 404-is-staleness test.** A `history.list` fixture returning 404 must produce "resync from scratch", not
   "account not found" — and a fixture for a genuinely absent account must produce the opposite. **This is the
   cheapest test that would disprove the central assumption of Finding 2**, and it was the item most worth
@@ -497,10 +552,13 @@ where every line looks equally done is a plan nobody can audit.
   discrimination would need. What replaced it: a fixture asserting the *absence*, and code that resyncs on a
   caller-supplied signal whose wrong reading is self-correcting (see Finding 2). The predicate
   `gmail_history_status_is_pruned`, which claimed the discrimination, was **removed**.
-- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error. **PARTIALLY WRITTEN** — the
-  classification is tested (`client::calendar_status_requires_resync`, `advance_calendar_sync`) and the
-  unreachable `TokenInvalidated` variant is now reachable, but no 410 fixture exists and no 400-is-a-query-error
-  fixture exists.
+- **The 410-is-staleness test** for Calendar, plus 400-is-a-query-error. **WRITTEN.** Three fixtures now
+  exist: `calendar_error_410_full_sync_required.json` and `calendar_error_410_resource_deleted.json` (a
+  **same-status pair with opposite remedies**, which is what makes "every 410 wipes the store" falsifiable) and
+  `calendar_error_400_time_range_empty.json`. The classification is `CalendarGoneReason` with
+  `client::calendar_signal` as its producer, asserted in both directions — and the premise was corrected: the
+  errors page shows **three** `410` causes, not one, and the `deleted` one says *"no further action is
+  necessary"*. See `ADR-0081`.
 - **A `history.list` producer for the staleness signal.** The item `ADR-0066` left open: it made the signal a
   caller's parameter but nothing could *build* one from a response, so the resync remedy was still unreachable
   outside a fixture. **WRITTEN.** `client::gmail_history_signal(status, history_id, refusal)` produces all
@@ -547,7 +605,7 @@ where every line looks equally done is a plan nobody can audit.
 
 ### Fixtures present, and what they are not
 
-`crates/jarvis-connectors/tests/fixtures/google/` holds **nine** files, tested by `tests/google_fixtures.rs`:
+`crates/jarvis-connectors/tests/fixtures/google/` holds **twelve** files, tested by `tests/google_fixtures.rs`:
 
 | Fixture | Shape source |
 | --- | --- |
@@ -560,10 +618,14 @@ where every line looks equally done is a plan nobody can audit.
 | `gmail_history_404_no_reason.json` | `users.history.list`, the 404 (no `reason` code) |
 | `gmail_history_list.json` | `users.history.list`, a **mid-walk** page (both tokens present) |
 | `gmail_history_list_last_page.json` | `users.history.list`, the **last** page (no page token) |
+| `calendar_error_410_full_sync_required.json` | the Calendar error resource, 410 + `fullSyncRequired` (**resync**) |
+| `calendar_error_410_resource_deleted.json` | the Calendar error resource, 410 + `deleted` (**no action**) |
+| `calendar_error_400_time_range_empty.json` | the Calendar error resource, 400 + `timeRangeEmpty` |
 
-The last three were added after the six-file count was first written, and the count is corrected here rather
-than left to drift: a fixture directory whose stated size is stale reads as "nothing changed" to the next
-reader.
+The fixture count has been raised twice as files were added (six, then nine, now twelve), and it is corrected
+each time rather than left to drift: a fixture directory whose stated size is stale reads as "nothing changed"
+to the next reader. The three Calendar error fixtures are a **same-status pair plus a control** — the two `410`s
+have opposite documented remedies, so they are what makes "every 410 wipes the store" falsifiable.
 
 **Every one is hand-built, not captured**, and each file says so twice: in `_not_a_capture: true` and in prose.
 The test suite **asserts the marker**, so a file that dropped it fails rather than passing as an apparent
@@ -659,6 +721,13 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
    portless form and `matches_except_port` joins it to a listening port, so **both sides of the comparison are
    implemented and tested**; what is unverified is one string a human types. It must be confirmed before a live
    smoke test, which is where a mismatch would surface.
+8. **Is Calendar's "use exponential backoff" for a `404` a real transient, or boilerplate?** The errors page
+   lists it in the `404` row while naming two causes — *"has never existed"* and *"accessing a calendar that the
+   user can not access"* — neither of which a retry repairs. So the sentence and the causes disagree, and which
+   one describes observed behaviour is **not verifiable from the documentation**. *Impact:* the crate refuses
+   the retry (`ADR-0082`); if a `404` is genuinely transient, refusing costs a failed sync that a single retry
+   would have fixed. *Blocks:* nothing, because the refusal is the fail-closed direction and a full re-sync is
+   the documented fallback — but it should be settled by the live smoke test rather than by argument.
 
 ## Verification Log
 
@@ -667,7 +736,8 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-27 | `https://developers.google.com/llms.txt` and `https://developers.google.com/gmail/api/llms.txt` fetched | **HTTP 404** for both. No `llms.txt` exists for Google Workspace; recorded as `not found` and the official guide pages used instead, per `external-research.md`. |
 | 2026-09-27 | Gmail push guide fetched and read in full | `users.watch` request/response shapes; the immediate notification on a successful watch; the **7-day renewal bound** with daily recommended; the `PubsubMessage` envelope with `message.data` as **Base64URL-encoded JSON** decoding to `{"emailAddress","historyId"}`; the **1 event/second/user cap with excess dropped**; "notifications might be delayed or dropped"; the polling fallback. |
 | 2026-09-27 | Gmail sync guide fetched | Full vs partial sync; `startHistoryId`; history available "at least one week"; **a `startHistoryId` out of range returns HTTP 404 and requires a full sync**. |
-| 2026-09-27 | Gmail quota page fetched | The **May 2026 model change** and its grandfathering; 1,200,000/min/project, 6,000/min/user/project, 80,000,000/day/project; the **full per-method cost table**; 500 recipients/message; the batch ceiling of 50; the daily threshold cannot be raised; per-user limits cannot be increased; a service account is one user for quota. |
+| 2026-09-27 | Gmail quota page fetched | The **May 2026 model change** and its grandfathering; 1,200,000/min/project, 6,000/min/user/project, 80,000,000/day/project; the **full per-method cost table**; 500 recipients/message; the daily threshold cannot be raised; per-user limits cannot be increased; a service account is one user for quota. **The batch ceiling is NOT on this page** — an earlier version of this row attributed "the batch ceiling of 50" to it, which the re-read below disproved. |
+| 2026-09-30 | Gmail **batch** page fetched (a source the record had **never listed**) | The batch syntax (`multipart/mixed`, one part per call, the nested-request form); **a hard limit of 100 calls per batch** and a **recommendation of no more than 50** because "larger batch sizes are likely to trigger rate limiting"; **a batch counts as *n* requests against quota, not one**; "the server might perform your calls in any order"; a `Content-ID` on a part is echoed as `response-`-prefixed. **Corrected a record defect**: the 50 figure had been filed under the quota page, which does not state it, and the two facts had been merged into one "ceiling". Grounds `GMAIL_BATCH_HARD_LIMIT`/`GMAIL_BATCH_RECOMMENDED` and `ADR-0080`. |
 | 2026-09-27 | Gmail quota page **re-fetched**, specifically for the per-method table and the unit | The page defines quota units as "an abstract unit of measurement representing Gmail resource usage" and publishes the per-method table — `messages.get` **20**, `messages.list` **5**, `history.list` **2**, `getProfile` **1**, `messages.send` **100**, `threads.get` **40**, `watch` **100**. **All recorded costs confirmed correct.** The re-read established the fact the declaration was missing: **the 1,200,000 and 6,000 ceilings are quota units, not requests** — so a request rate needs the per-call cost. Corrected in `ADR-0079`. The page still publishes **no Calendar cost**, so `calendar_events_read` declares `Unstated`. |
 | 2026-09-27 | Gmail scopes page fetched | The non-sensitive/sensitive/restricted split, with **`gmail.readonly` and `gmail.metadata` both restricted** and `gmail.send` sensitive; the rule that storing or transmitting restricted-scope data requires a security assessment; the internal-app exemption. |
 | 2026-09-27 | Gmail error page fetched | The 401/403/429/5xx taxonomy by `reason`; the four 403 reasons; the three distinct causes behind a 429; the exponential-backoff recipe with `max_backoff` 32–64 s; **"You can't assume that a 200 response means the email was successfully sent."** |
@@ -676,11 +746,13 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-27 | Gmail scopes page **re-fetched** for the category tables | The three lists re-read verbatim: **non-sensitive** = `gmail.addons.current.action.compose`, `gmail.addons.current.message.action`, `gmail.labels`; **sensitive** = `gmail.addons.current.message.metadata`, `gmail.addons.current.message.readonly`, `gmail.send`; **restricted** = `mail.google.com/`, `gmail.readonly`, `gmail.compose`, `gmail.insert`, `gmail.modify`, `gmail.metadata`, `gmail.settings.basic`, `gmail.settings.sharing`. The page's own definitions and the rule "**If you store restricted scope data on servers (or transmit), then you must go through a security assessment**" confirmed word-for-word. **The recorded categories were correct**; now enforced as a dated table in `google::scopes` (`ADR-0078`). The page still lists **no category for a Calendar or OpenID scope**, so those remain unaccounted rather than assumed. |
 | 2026-09-27 | Calendar push guide fetched | Channel creation with `id`/`type: web_hook`/`address`/`token`/`expiration`; the full `X-Goog-*` header table; **`X-Goog-Channel-Token` as the anti-spoofing control**; the **zero-length body**; the `sync` message that can arrive before the watch response; success codes `200/201/202/204/102`; 5xx retried; **"no automatic way to renew"** with an expected overlap; "Not 100% reliable. Expect a small percentage of messages to get dropped"; per-calendar vs per-user subscription granularity. |
 | 2026-09-27 | Calendar sync guide fetched | `nextSyncToken`; incremental sync with `syncToken`; **HTTP 410 Gone for an invalidated token** requiring a full wipe; **HTTP 400 for disallowed query restrictions**; the pagination rule of repeating the exact same query with `pageToken`; `modifiedSince` recorded as deprecated in favour of sync tokens. |
+| 2026-09-30 | Calendar **error** guide fetched (a source the record had not listed) | The two-level error structure and a JSON body per status. **The finding: HTTP `410 Gone` has THREE documented causes** — `fullSyncRequired` ("wipe the store and re-sync"), `updatedMinTooLongAgo` (same), and **`deleted` ("Resource has been deleted") whose action is "no further action is necessary"**. Also the `400` example body (`timeRangeEmpty`, "Because this is a permanent error, do not retry"), and that `rateLimitExceeded` "can return either 403 or 429 error codes—currently they are functionally similar". Grounds `CalendarGoneReason`/`calendar_signal` and `ADR-0081`, and **corrects** this record's claim that "Calendar's 410 has no such ambiguity". |
 | 2026-09-27 | Pub/Sub push authentication page fetched | **JWT (RS256) in `Authorization: Bearer`**; the claim set (`aud`, `azp`, `email`, `sub`, `iss`, `exp`, `iat`); validation = signature + **email and audience claims matching the subscription configuration**; tokens "may be up to an hour old"; no body signature. This is the finding that `WebhookSupport::Push` cannot express. |
 | 2026-09-27 | Gmail MCP reference fetched | `https://gmailmcp.googleapis.com/mcp/v1`, **Developer Preview**, ten tools with per-tool query costs; a Calendar MCP server linked from the Calendar navigation. |
 | 2026-09-27 | `https://accounts.google.com/.well-known/openid-configuration` fetched | **Machine-readable**, so the endpoint values are the server's own published configuration rather than documentation examples: `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`, `userinfo_endpoint`, `jwks_uri`; `code_challenge_methods_supported` = `plain`+`S256`; **`authorization_response_iss_parameter_supported: true`**; `token_endpoint_auth_methods_supported` **truncated in capture** and recorded as such. |
 | 2026-09-27 | Google OAuth 2.0 for native apps fetched | Loopback is the **recommended** desktop method and custom schemes are **no longer supported**, so loopback is the only non-embedded option; `redirect_uri` must match an authorized URI **exactly**; **`client_secret` is Optional** on both exchanges; the token response's fields including `refresh_token` "always returned for installed applications" and `id_token` only with an identity scope; **refresh-token limits make older tokens stop working**; the `revocation_endpoint` and its HTTP 200/400 contract; **revocation removes grants for the whole project**; DPoP's key-storage obligation. |
 | 2026-09-27 | Cross-check against `jarvis-connectors` | `AuthFlow::new` requires a **`https://` authorization endpoint** and a redirect URI for an OAuth method, so the discovery document's values are what make the flow constructible. `AuthorizationTransaction::begin` requires the listener's redirect to **match the flow's registration on host and path, ignoring the port** — so the registered form and the listening form are both needed, and the unverified question is what a human types into the console (Unresolved Question 7). |
 | 2026-09-27 | Cross-check against `jarvis-connectors` (webhook and cursor) | `SignatureAlgorithm` has no OIDC/JWT variant and `SignatureScheme` requires a signed body, so **Finding 1 is a contract gap rather than a connector mistake**; `SyncCursorKind` has `MonotonicMarker` and `OpaqueToken`, so both cursor shapes are already representable and only the **staleness signal** (Finding 2) is new. |
+| 2026-09-30 | Gmail error page **re-read against the Calendar errors page**, to compare the two status sets | The two pages are separate with separate summaries and **do not agree**: Gmail's guide has **no `410` subsection** (its sections are 400, 401, 403, 404, 429 and 5xx), while Calendar's documents `410` in detail; and on `404` Calendar suggests "use exponential backoff" where Gmail states no action. The consequence in code was that a Calendar `410` reached a caller as `unknown`/"reconcile", so `classify` now takes the API and carries a `(Calendar, 410)` arm (`ADR-0082`). Also confirmed the shared arms are shared **because the pages agree**: the Calendar page calls `rateLimitExceeded` "functionally similar" across `403` and `429`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

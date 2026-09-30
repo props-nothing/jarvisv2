@@ -97,3 +97,6 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0077](0077-a-bound-that-is-documented-but-not-applied.md) | A bound that is documented but not applied is not a bound | Accepted |
 | [0078](0078-a-scope-category-is-a-review-burden.md) | A scope's category is a review burden, and an unlisted scope is not a cheap one | Accepted |
 | [0079](0079-a-rate-limit-without-its-unit.md) | A rate limit without its unit is a figure read as the wrong thing | Accepted |
+| [0080](0080-a-limit-and-a-recommendation-are-two-facts.md) | A limit and a recommendation are two facts, and a figure with no source is neither | Accepted |
+| [0081](0081-calendars-410-needs-its-reason.md) | Calendar's 410 is unambiguous only once the reason is read | Accepted |
+| [0082](0082-one-classifier-for-two-apis.md) | One classifier for two APIs answered for the less informative one | Accepted |

@@ -1,0 +1,23 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "calendar.events.delete (a delete of an already-deleted event)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/errors",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the THIRD error body the Calendar errors page publishes for HTTP 410 Gone -- the `deleted` reason, whose suggested action is explicitly \"no further action is necessary\".",
+  "_the_point_of_this_fixture": "**THIS IS THE FIXTURE THAT MAKES 'EVERY 410 WIPES THE STORE' FALSIFIABLE.** It is a 410 with the SAME STATUS as `calendar_error_410_full_sync_required.json` and the OPPOSITE remedy: the resource is simply already gone, so there is nothing to resync. A connector that keyed on the status alone would discard a working sync store because a user deleted one event, and -- because the two fixtures are indistinguishable from the status -- the pair is what proves the `reason` is being read rather than the code being decorative.",
+  "_why_the_reason_matters": "The errors page's own suggested action is: 'For the `syncToken` or `updatedMin` parameters, wipe the store and re-sync. For already deleted events, no further action is necessary.' So the two 410s have different remedies, and only the `reason` separates them.",
+  "_the_ambiguity_this_records": "The research record previously asserted that \"Calendar's 410 has no such ambiguity\" (contrasting it with Gmail's unclassifiable 404). That assertion was about the STATUS being unambiguous, and the errors page shows the status alone is NOT sufficient to choose a remedy: three documented causes share it. The corrected statement is that a 410 is unambiguous once the `reason` is read.",
+  "_sanitized": "No real message text, request id, address, or calendar id appears here.",
+  "error": {
+    "code": 410,
+    "message": "Resource has been deleted",
+    "errors": [
+      {
+        "domain": "global",
+        "reason": "deleted",
+        "message": "Resource has been deleted"
+      }
+    ]
+  }
+}

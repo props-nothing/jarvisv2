@@ -1,0 +1,29 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "calendar.events.list (an incremental sync with an invalidated syncToken)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/errors",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the FIRST of the three error bodies the Calendar errors page publishes for HTTP 410 Gone -- the `fullSyncRequired` reason, which is the one the sync guide means by \"wipe the store and re-sync\".",
+  "_the_point_of_this_fixture": "IT IS THE 410 THAT REALLY MEANS 'WIPE THE STORE'. The errors page publishes THREE distinct bodies for HTTP 410, and only two of them concern a sync token: `fullSyncRequired` (this one) and `updatedMinTooLongAgo`. The third, `deleted`, says \"no further action is necessary\" -- so a connector that treats every 410 as a resync destroys a working store when the user deletes a single event. This fixture is the positive control for that distinction: a 410 whose `reason` IS a sync-token cause must resync, and the connector must not have made the reason irrelevant by keying on the status alone.",
+  "_the_three_documented_410_causes": [
+    "fullSyncRequired: 'Sync token is no longer valid, a full sync is required.' -- wipe and resync",
+    "updatedMinTooLongAgo: 'The requested minimum modification time lies too far in the past.' -- wipe and resync",
+    "deleted: 'Resource has been deleted' -- 'no further action is necessary'"
+  ],
+  "_why_the_reason_matters": "The sync guide says a 410 'should trigger a full wipe of the client's store and a new full sync', and the errors page qualifies that: the suggestion is 'For the `syncToken` or `updatedMin` parameters, wipe the store and re-sync. For already deleted events, no further action is necessary.' So the STATUS is not the whole answer and the `reason` is load-bearing, which is the same shape as the Gmail 403 domainPolicy case but with a much more expensive wrong reading.",
+  "_sanitized": "No real message text, request id, address, or calendar id appears here.",
+  "error": {
+    "code": 410,
+    "message": "Sync token is no longer valid, a full sync is required.",
+    "errors": [
+      {
+        "domain": "calendar",
+        "reason": "fullSyncRequired",
+        "message": "Sync token is no longer valid, a full sync is required.",
+        "locationType": "parameter",
+        "location": "syncToken"
+      }
+    ]
+  }
+}

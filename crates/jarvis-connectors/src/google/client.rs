@@ -58,11 +58,28 @@ pub const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 /// silently returns fewer, so a caller that assumed it had the page size it requested would mis-plan a sync.
 pub const GMAIL_MAX_RESULTS_CAP: u32 = 500;
 
-/// The largest batch Gmail accepts.
+/// The most calls Gmail **accepts** in one batch request.
 ///
-/// Two documented facts, in tension: batching is what makes a full sync affordable, and "larger batch sizes
-/// can trigger rate limiting". So this is the ceiling the provider states and a caller must *also* pace.
-pub const GMAIL_BATCH_LIMIT: u32 = 50;
+/// A **hard** limit, and the batch reference's own words are unambiguous: "You're limited to 100 calls in a
+/// single batch request. If you must make more calls than that, use multiple batch requests." Exceeding it is
+/// a refusal rather than a slowdown, so a caller must chunk against this figure.
+pub const GMAIL_BATCH_HARD_LIMIT: u32 = 100;
+
+/// The batch size Gmail **recommends**, because a batch is itself a rate-limit trigger.
+///
+/// The same page: "Larger batch sizes are likely to trigger rate limiting. We recommend sending batches of no
+/// more than 50 requests." A **recommendation**, not a ceiling — nothing is refused for exceeding it, so a
+/// caller that treats it as a limit is merely conservative, while one that treats [`GMAIL_BATCH_HARD_LIMIT`] as
+/// a target risks throttling a whole batch.
+///
+/// # Why these are two constants rather than one
+///
+/// The two were **one constant of 50**, documented as "the largest batch Gmail accepts" — which is false, and
+/// conflates a refusal with a slowdown. The distinction decides the failure mode: exceeding the hard limit
+/// fails the request, exceeding the recommendation degrades throughput. A single figure cannot express both,
+/// and naming it after the wrong one sends a caller to the wrong remedy — a batch of 60 is *permitted* and
+/// merely unwise, while a batch of 101 is refused.
+pub const GMAIL_BATCH_RECOMMENDED: u32 = 50;
 
 /// The longest page token accepted, in characters.
 ///
@@ -97,14 +114,14 @@ pub const GOOGLE_RETRY_FLOOR_SECONDS: u32 = 1;
 /// `P3-008c`'s rule: a classification must not be derived from message text, and a type that cannot hold the
 /// text cannot derive anything from it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct GmailErrorBody {
+pub struct GoogleErrorBody {
     /// The error object.
-    pub error: GmailErrorObject,
+    pub error: GoogleErrorObject,
 }
 
 /// The `error` object of a Gmail error response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct GmailErrorObject {
+pub struct GoogleErrorObject {
     /// The HTTP status, repeated in the body.
     pub code: u16,
     /// The machine-readable reasons.
@@ -112,12 +129,12 @@ pub struct GmailErrorObject {
     /// An array because the documented samples show one entry per error; `default` because a body without one
     /// is still a body, and a missing reason must degrade to "unclassified" rather than to a parse failure.
     #[serde(default)]
-    pub errors: Vec<GmailErrorEntry>,
+    pub errors: Vec<GoogleErrorEntry>,
 }
 
 /// One entry of a Gmail error's `errors` array.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct GmailErrorEntry {
+pub struct GoogleErrorEntry {
     /// The machine-readable reason, which is what a classifier switches on.
     ///
     /// Optional on purpose: the documentation's own samples do not all carry one, and an absent reason must
@@ -126,7 +143,7 @@ pub struct GmailErrorEntry {
     pub reason: Option<String>,
 }
 
-impl GmailErrorBody {
+impl GoogleErrorBody {
     /// Returns the first reason the body states, if any.
     ///
     /// The **first** rather than a set, because the retry decision is one decision: a response naming several
@@ -149,7 +166,7 @@ impl GmailErrorBody {
 /// [`Self::Unrecognised`] rather than a new variant, which keeps the vocabulary a property of this crate
 /// rather than of the provider's next release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GmailErrorReason {
+pub enum GoogleErrorReason {
     /// `dailyLimitExceeded` — the project's daily quota is spent.
     ///
     /// **Permanent**, which is the classification that matters most here: the documentation says the daily
@@ -179,7 +196,7 @@ pub enum GmailErrorReason {
     Unrecognised,
 }
 
-impl GmailErrorReason {
+impl GoogleErrorReason {
     /// Parses a reason string.
     ///
     /// An unrecognised string is [`Self::Unrecognised`] rather than an error, because a reason is data and a
@@ -229,10 +246,43 @@ impl GmailErrorReason {
     }
 }
 
+/// Which Google API a response came from.
+///
+/// # Why the classifier needs to be told, and why it could not infer it
+///
+/// This connector talks to **two** APIs, and Google documents them on **separate** error pages with
+/// **different status sets**:
+///
+/// - The **Gmail** page's status summary lists `200`, `400`, `401`, `403`, `404`, `429` and the `5xx` family.
+///   It has **no `410` subsection at all**.
+/// - The **Calendar** page documents `410 Gone` in detail, as a **dead sync token** whose remedy is "wipe the
+///   store and re-sync".
+///
+/// So the same status is a documented, definite state for one API and an unclassified one for the other. A
+/// classifier that could not tell them apart had to answer for the **less** informative case, and it did: a
+/// Calendar `410` reached a caller as `unknown`/"reconcile" — *"establish what happened before doing anything
+/// else"* — when the provider had said exactly what happened.
+///
+/// # Why this is a parameter rather than two classifiers
+///
+/// Two tables would duplicate every arm that the APIs **do** share (`401`, the `5xx` family, and `403`'s
+/// throttling reasons, which Calendar's page confirms behave the same: "`rateLimitExceeded` errors can return
+/// either `403` or `429` error codes—currently they are functionally similar"). A duplicated table drifts, and
+/// the phase has found that defect repeatedly. So there is **one** table and the API is an input, exactly as
+/// `status` and `reason` are.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoogleApi {
+    /// Gmail `v1`.
+    Gmail,
+    /// Calendar `v3`.
+    Calendar,
+}
+
 /// Classifies a Google error response.
 ///
-/// `status` is the HTTP status and `reason` the parsed `errors[0].reason`. `retry_after` is the provider's
-/// stated delay **in the form it was stated in**, which a 429 does.
+/// `api` is which of the two APIs answered, because their documented status sets differ; `status` is the HTTP
+/// status and `reason` the parsed `errors[0].reason`. `retry_after` is the provider's stated delay **in the form
+/// it was stated in**, which a 429 does.
 ///
 /// # The two decisions worth reading
 ///
@@ -243,32 +293,63 @@ impl GmailErrorReason {
 /// - **An unrecognised status becomes `Unknown`, whose guidance is `Reconcile` and whose class refuses any
 ///   retry.** That is the fail-closed direction: a status this connector has no case for is one whose effect is
 ///   unknown, and `RetryClass::Unknown` already encodes that an unanswered question must not be read as a yes.
+/// - **A `410` is a known state for Calendar and an unclassified one for Gmail.** See [`GoogleApi`]; the
+///   per-API arm is the reason this function takes an API at all.
 /// - **A stated delay that cannot be read is not the same as no stated delay.** `retry_after` distinguishes
 ///   *absent* (`None`) from *stated but unreadable* ([`RetryAfter::NotSeconds`]), and the `429` arm keeps them
 ///   apart (`ADR-0076`).
 #[must_use]
 pub fn classify(
+    api: GoogleApi,
     status: u16,
-    reason: GmailErrorReason,
+    reason: GoogleErrorReason,
     retry_after: Option<RetryAfter>,
     provider_request_id: Option<ProviderRequestId>,
 ) -> RetryDecision {
-    let (class, guidance) = match status {
-        // A refusal that was not carried out, so there is nothing to reconcile and nothing to retry. A 404 is
-        // included because a missing resource is not an invitation to try again.
-        400 | 404 => (RetryClass::Permanent, RetryGuidance::DoNotRetry),
-        401 => (RetryClass::Authentication, RetryGuidance::Reauthenticate),
-        403 => match reason {
-            GmailErrorReason::RateLimitExceeded | GmailErrorReason::UserRateLimitExceeded => (
+    let (class, guidance) = match (api, status) {
+        // **Two different routes to one verdict, so this is one arm.** The verdict is
+        // `Permanent`/`DoNotRetry`; the two routes reach it for unrelated reasons, and the reasons are kept
+        // side by side because a reader deciding whether either route applies needs both.
+        //
+        // **Route one — Calendar's `410 Gone` — is the reason this function takes an API at all.** The
+        // Calendar error page documents `410` as a dead sync token — "wipe the store and re-sync" — while the
+        // Gmail page has **no `410` subsection at all**, so the same status is a known remedy for one API and
+        // an unclassified one for the other. Before this pattern existed, a Calendar `410` fell to the
+        // catch-all below and reached a caller as `unknown`/"reconcile", which told it to *establish what
+        // happened* when the provider had already said: the cursor is dead, resync.
+        //
+        // The class is `Permanent` because a resync is not a *retry of this request* — the request cannot
+        // succeed with this token however often it is sent. `DoNotRetry` is therefore correct here and does
+        // **not** contradict the remedy: the caller's next action is a fresh full sync, which is a different
+        // request. Reading the guidance as "give up on the sync" would be the mistake, so the distinction is
+        // spelled out rather than implied.
+        //
+        // **Route two — a `400` or `404` — is a refusal that was not carried out**, so there is nothing to
+        // reconcile and nothing to retry. A 404 is included because a missing resource is not an invitation to
+        // try again.
+        //
+        // **A documented divergence, kept deliberately.** Calendar's error page suggests "use exponential
+        // backoff" for a `404`, while Gmail's summary states no action. The crate follows neither literally:
+        // it keeps `DoNotRetry`, because Calendar's own two documented causes are "the requested resource …
+        // has never existed" and "accessing a calendar that the user can not access", and neither is repaired
+        // by sending the same request again — a retry would fail identically until it gave up. The divergence
+        // is asserted in a test and recorded in the research record rather than silently resolved, so the next
+        // reader meets the decision instead of the discrepancy (`ADR-0082`).
+        (GoogleApi::Calendar, 400 | 404 | 410) | (_, 400 | 404) => {
+            (RetryClass::Permanent, RetryGuidance::DoNotRetry)
+        }
+        (_, 401) => (RetryClass::Authentication, RetryGuidance::Reauthenticate),
+        (_, 403) => match reason {
+            GoogleErrorReason::RateLimitExceeded | GoogleErrorReason::UserRateLimitExceeded => (
                 RetryClass::Throttled,
                 RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS),
             ),
             // `authError` as a 403 is not a documented combination — it is documented as a 401 — but a 403
             // whose reason says the credential is the problem must not be retried as if it were transient.
-            GmailErrorReason::AuthError => {
+            GoogleErrorReason::AuthError => {
                 (RetryClass::Authentication, RetryGuidance::Reauthenticate)
             }
-            GmailErrorReason::BackendError => (
+            GoogleErrorReason::BackendError => (
                 RetryClass::ProviderFault,
                 RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS),
             ),
@@ -283,10 +364,10 @@ pub fn classify(
             // effect happened when the status already says it did not. A new *throttling* reason appearing as
             // a 403 is the cost of that choice, and it fails in the direction that cannot cause a second
             // effect.
-            GmailErrorReason::DailyLimitExceeded
-            | GmailErrorReason::DomainPolicy
-            | GmailErrorReason::BadRequest
-            | GmailErrorReason::Unrecognised => (RetryClass::Permanent, RetryGuidance::DoNotRetry),
+            GoogleErrorReason::DailyLimitExceeded
+            | GoogleErrorReason::DomainPolicy
+            | GoogleErrorReason::BadRequest
+            | GoogleErrorReason::Unrecognised => (RetryClass::Permanent, RetryGuidance::DoNotRetry),
         },
         // A 429 conflates three documented causes — the sending limit, the bandwidth limit, and per-user
         // concurrency — and the remedy for all three is the same: wait the stated time. The response carries a
@@ -303,7 +384,7 @@ pub fn classify(
         // response rather than a hypothetical: the work is deferred, because clamping would retry sooner than
         // the provider asked and honouring it in the loop would hold a worker for the whole window
         // (`ADR-0077`).
-        429 => (
+        (_, 429) => (
             RetryClass::Throttled,
             match retry_after {
                 Some(RetryAfter::Seconds(seconds)) => RetryGuidance::for_stated_delay(seconds),
@@ -313,13 +394,14 @@ pub fn classify(
                 None => RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS),
             },
         ),
-        500 | 502 | 503 | 504 => (
+        (_, 500 | 502 | 503 | 504) => (
             RetryClass::ProviderFault,
             RetryGuidance::BackoffSeconds(GOOGLE_RETRY_FLOOR_SECONDS),
         ),
-        // Every remaining status is unclassified, including 5xx codes Google does not document. `Unknown`
-        // rather than a guess, and its guidance is to reconcile — never to retry.
-        _ => (RetryClass::Unknown, RetryGuidance::Reconcile),
+        // Every remaining status is unclassified, including 5xx codes Google does not document and a `410`
+        // from an API that does not publish one. `Unknown` rather than a guess, and its guidance is to
+        // reconcile — never to retry.
+        (_, _) => (RetryClass::Unknown, RetryGuidance::Reconcile),
     };
     RetryDecision {
         class,
@@ -337,6 +419,100 @@ pub enum PageTokenError {
         /// What is wrong.
         reason: &'static str,
     },
+}
+
+/// Why a call count could not be planned into batches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BatchPlanError {
+    /// No batch size may be zero, because a zero-sized batch would never make progress.
+    #[error("a batch size must be at least one call")]
+    EmptyBatch,
+    /// A batch size above the hard limit would be refused by the provider.
+    #[error("a batch of {requested} calls exceeds Gmail's hard limit of {maximum}")]
+    AboveHardLimit {
+        /// The requested size.
+        requested: u32,
+        /// [`GMAIL_BATCH_HARD_LIMIT`].
+        maximum: u32,
+    },
+}
+
+/// How a set of calls divides into batch requests.
+///
+/// # Why this is a type rather than two `u32`s at a call site
+///
+/// The research record's Verification Plan asks for "a full-sync budget test that asserts batching", and the
+/// two facts a caller needs are different in kind: **how many requests to send** (a division against a hard
+/// limit) and **whether the size is the recommended one** (a comparison against a recommendation that is not
+/// enforced). Returning them together means a caller cannot take the request count and lose the fact that the
+/// size it chose invites throttling — the arrangement `RetryDecision` already uses for a class and its
+/// guidance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchPlan {
+    /// The size each batch request may carry.
+    pub batch_size: u32,
+    /// How many batch requests the calls divide into.
+    ///
+    /// Rounded **up**, because the last batch may be partial and a caller that under-counted would drop it:
+    /// 101 calls at 50 per batch is three requests, not two.
+    pub requests: u32,
+    /// The size of the final, possibly partial batch — zero when the calls divide evenly.
+    ///
+    /// Carried rather than left to arithmetic because the partial batch is the one a naive planner drops, and
+    /// because `calls % batch_size` recomputed at a call site is a second answer to a question this type has
+    /// already settled.
+    pub final_batch_size: u32,
+}
+
+impl BatchPlan {
+    /// Returns whether the size is the provider's **recommendation** rather than the hard limit.
+    ///
+    /// The predicate that keeps the two figures distinct at a call site: `true` means the plan is within the
+    /// size Google recommends when a batch is itself a rate-limit trigger; `false` does not mean the plan is
+    /// refused — a size between the recommendation and [`GMAIL_BATCH_HARD_LIMIT`] is permitted and merely
+    /// invites throttling.
+    #[must_use]
+    pub const fn is_within_recommendation(self) -> bool {
+        self.batch_size <= GMAIL_BATCH_RECOMMENDED
+    }
+}
+
+/// Divides a number of calls into batch requests of a given size.
+///
+/// The two bounds are checked against the **documented pair**, and the direction of each refusal is the point:
+/// a size above [`GMAIL_BATCH_HARD_LIMIT`] is refused because the provider would reject the request, while a
+/// size above [`GMAIL_BATCH_RECOMMENDED`] is **allowed** and reported instead — throttling is a risk, not a
+/// refusal, and refusing it would be stricter than the provider.
+///
+/// # Errors
+///
+/// Returns [`BatchPlanError::EmptyBatch`] for a zero size, and [`BatchPlanError::AboveHardLimit`] for a size
+/// above [`GMAIL_BATCH_HARD_LIMIT`]. A zero **call count** is not an error: nothing to send is no requests,
+/// with a zero-sized final batch.
+///
+/// # Errors
+///
+/// See the two variants above.
+pub const fn batch_plan(calls: u32, batch_size: u32) -> Result<BatchPlan, BatchPlanError> {
+    if batch_size == 0 {
+        return Err(BatchPlanError::EmptyBatch);
+    }
+    if batch_size > GMAIL_BATCH_HARD_LIMIT {
+        return Err(BatchPlanError::AboveHardLimit {
+            requested: batch_size,
+            maximum: GMAIL_BATCH_HARD_LIMIT,
+        });
+    }
+    // `calls.div_ceil(batch_size)` is the rounded-up division; it is not const-stable on the pinned toolchain,
+    // so the arithmetic is spelled out. Zero calls makes this zero rather than one, which is right: there is
+    // nothing to send.
+    let remainder = calls % batch_size;
+    let requests = calls / batch_size + if remainder == 0 { 0 } else { 1 };
+    Ok(BatchPlan {
+        batch_size,
+        requests,
+        final_batch_size: remainder,
+    })
 }
 
 /// Returns the next page's token, validated.
@@ -535,9 +711,18 @@ pub fn advance_gmail_history(
 
 /// Advances a Calendar sync cursor from what the provider's answer **signalled**.
 ///
-/// Calendar's staleness signal is unambiguous where Gmail's is not: **410 Gone** invalidates the token and
-/// requires a full wipe, while **400** is a disallowed query restriction — a caller's mistake, not a stale
-/// token — so it is refused through [`SyncSignal::Refused`] rather than triggering a resync.
+/// **410 Gone** invalidates the token and requires a full wipe, while **400** is a disallowed query
+/// restriction — a caller's mistake, not a stale token — so it is refused through [`SyncSignal::Refused`]
+/// rather than triggering a resync.
+///
+/// # The status alone is not the whole answer, and this function cannot see the rest
+///
+/// A `410` has **three** documented causes and only two of them resync — see [`CalendarGoneReason`]. This
+/// function takes the caller's [`SyncSignal`], so the caller does the reading: one that consults
+/// [`CalendarGoneReason::requires_resync`] will not send [`SyncSignal::CursorUnusable`] for a `deleted`, which
+/// is the difference between a resync and a discarded store. The shape is the same one `ADR-0066` established
+/// for Gmail — the **inference** belongs to the caller and the **decision** to this function — because only the
+/// caller knows which method it called and what the body said.
 ///
 /// # Errors
 ///
@@ -586,12 +771,86 @@ pub fn advance_calendar_sync(
     })
 }
 
+/// What a Calendar **`410 Gone`** means for the sync store.
+///
+/// # Why a status is not enough, on the call where it matters most
+///
+/// The Calendar errors page publishes **three** distinct bodies for `410 Gone`, and they do not share a
+/// remedy:
+///
+/// | `reason` | Message | Suggested action |
+/// | --- | --- | --- |
+/// | `fullSyncRequired` | "Sync token is no longer valid, a full sync is required." | wipe the store and re-sync |
+/// | `updatedMinTooLongAgo` | "The requested minimum modification time lies too far in the past." | wipe the store and re-sync |
+/// | `deleted` | "Resource has been deleted" | **"no further action is necessary"** |
+///
+/// So a connector that reads the **status alone** wipes the whole sync store when a user deletes one event —
+/// and a resync is the expensive mistake, not the cheap one. The research record had asserted that "Calendar's
+/// `410` has no such ambiguity" (contrasting it with Gmail's unclassifiable `404`); the errors page shows the
+/// status alone does not choose a remedy, and the corrected statement is that a `410` is unambiguous **once
+/// the `reason` is read**. Same shape as the Gmail `403`: one status, several remedies, and the reason decides.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CalendarGoneReason {
+    /// The sync token or `updatedMin` is no longer valid, so the store must be wiped and resynced.
+    ///
+    /// Covers both documented sync-token causes (`fullSyncRequired`, `updatedMinTooLongAgo`) because they
+    /// share a remedy, and the distinction between them is a detail for a diagnostic rather than for the
+    /// decision — the same reasoning `GoogleErrorReason::needs_a_person` records for its own grouping.
+    FullSyncRequired,
+    /// The resource was already deleted, so **there is nothing to resync**.
+    ///
+    /// The variant that stops a deleted event from costing a whole store.
+    ResourceAlreadyDeleted,
+    /// A `410` whose `reason` this crate does not recognise.
+    ///
+    /// **Resyncs**, and that is the fail-safe direction for a *cursor*: an unrecognised `410` might be a new
+    /// sync-token cause, and the failure mode of resyncing needlessly is a slower next sync, while the failure
+    /// mode of *not* resyncing a genuinely dead token is a store that never syncs again and never says so. The
+    /// record's own rule for `Unknown` retry classes is the opposite because it protects a **non-idempotent
+    /// effect**; here the protected thing is a store's liveness.
+    Unrecognised,
+}
+
+impl CalendarGoneReason {
+    /// Parses the `reason` from a Calendar `410` body.
+    ///
+    /// `None` — a body with no reason at all — is [`Self::Unrecognised`], because an absent reason is not a
+    /// statement that the token is valid.
+    #[must_use]
+    pub fn parse(reason: Option<&str>) -> Self {
+        match reason {
+            Some("fullSyncRequired" | "updatedMinTooLongAgo") => Self::FullSyncRequired,
+            Some("deleted") => Self::ResourceAlreadyDeleted,
+            Some(_) | None => Self::Unrecognised,
+        }
+    }
+
+    /// Returns whether the sync store must be wiped and resynced.
+    ///
+    /// The predicate the caller acts on. `false` for [`Self::ResourceAlreadyDeleted`] — the case the status
+    /// alone gets wrong, and the reason this type exists.
+    #[must_use]
+    pub const fn requires_resync(self) -> bool {
+        matches!(self, Self::FullSyncRequired | Self::Unrecognised)
+    }
+}
+
 /// Returns whether a Calendar incremental-sync status requires a full resync.
 ///
 /// Separated from [`advance_calendar_sync`] because it answers a question about a **failure** while that
 /// function answers one about a success, and a caller needs both: it will see the 410 in its own error path.
 /// The result is what the caller passes as [`SyncSignal::CursorUnusable`], so the inference and the decision
 /// stay adjacent rather than one being hidden inside the other.
+///
+/// # Use [`CalendarGoneReason`] where the body is readable
+///
+/// This predicate is the **status-only** answer, and it is deliberately permissive: every `410` resyncs, so a
+/// caller that has only a status — or a body it could not parse — still recovers a dead token. A caller that
+/// **can** read the reason must use [`CalendarGoneReason::requires_resync`] instead, because one of the three
+/// documented `410` causes (`deleted`) says "no further action is necessary" and a resync there discards a
+/// working store over a single deleted event. The two are not redundant: this one cannot be made stricter
+/// without losing the unparseable-body case, and that one cannot be made more permissive without losing the
+/// distinction.
 #[must_use]
 pub const fn calendar_status_requires_resync(status: u16) -> bool {
     status == 410
@@ -656,6 +915,49 @@ pub fn gmail_history_signal(
     if status == 200 {
         return SyncSignal::Advanced {
             history_id: history_id.map(str::to_owned),
+        };
+    }
+    SyncSignal::Refused(refusal)
+}
+
+/// Turns a Calendar `events.list` answer into the signal [`advance_calendar_sync`] consumes.
+///
+/// The producer that makes [`SyncAdvance::TokenInvalidated`] reachable **for the right reason**. A caller that
+/// used [`calendar_status_requires_resync`] alone would send [`SyncSignal::CursorUnusable`] for every `410`
+/// including a `deleted` — which is a status the page says needs **no action** — so this function reads the
+/// reason where the caller can supply one and falls back to the status-only answer where it cannot.
+///
+/// # The three outcomes
+///
+/// - **`410` whose reason is a sync-token cause, or unreadable** — the cursor is unusable; wipe and resync.
+///   The unreadable case is included deliberately and its direction is argued on
+///   [`CalendarGoneReason::Unrecognised`].
+/// - **`410` whose reason is `deleted`** — the cursor is **fine**. The event is simply gone, so this is a
+///   refusal for the *call* rather than a resync, and the store survives.
+/// - **`200`** — the read succeeded, so the provider's `nextSyncToken` (when the response carried one)
+///   advances the cursor; a `200` with no token means nothing changed, which [`advance_calendar_sync`] handles
+///   by keeping the previous cursor.
+/// - **anything else** — carried with the caller's classification rather than swallowed. A `400` in particular
+///   arrives here rather than being read as staleness, which is the distinction the sync guide draws.
+#[must_use]
+pub fn calendar_signal(
+    status: u16,
+    next_sync_token: Option<&str>,
+    gone_reason: Option<&str>,
+    refusal: RetryDecision,
+) -> SyncSignal {
+    if status == 410 {
+        return match CalendarGoneReason::parse(gone_reason) {
+            reason if reason.requires_resync() => SyncSignal::CursorUnusable,
+            // `ResourceAlreadyDeleted` reaches here: no resync, and the call is refused rather than pretended
+            // to have succeeded — a delete of an already-deleted event did not do what was asked, even though
+            // nothing needs repairing.
+            _ => SyncSignal::Refused(refusal),
+        };
+    }
+    if status == 200 {
+        return SyncSignal::Advanced {
+            history_id: next_sync_token.map(str::to_owned),
         };
     }
     SyncSignal::Refused(refusal)

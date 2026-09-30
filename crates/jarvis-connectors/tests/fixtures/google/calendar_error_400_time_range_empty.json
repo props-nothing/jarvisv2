@@ -1,0 +1,28 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "calendar.events.list (a query with a disallowed restriction on an incremental sync)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/errors",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the Calendar errors page's own 400 Bad Request body, whose documented example reason is `timeRangeEmpty`.",
+  "_the_point_of_this_fixture": "A 400 ON AN INCREMENTAL SYNC IS NOT A STALE CURSOR, AND THE DIFFERENCE IS THE WHOLE REASON THE 410 EXISTS. The sync guide says the response code for list queries \"containing disallowed restrictions is 400\", while a 410 means the sync token is invalid. The remedies are opposites: 400 is the CALLER's mistake -- the same query must not be repeated -- and 410 is a full wipe. A connector that resynced on any incremental-sync failure would discard a working store because it sent a bad filter; one that refused on 410 would loop forever on a dead token.",
+  "_why_the_reason_matters": "The page states plainly: \"Because this is a permanent error, do not retry. Read the error message instead and change your request accordingly.\" So this fixture also pins that the connector must not treat a 400 as retryable -- and, separately, that it must not resync.",
+  "_the_two_documented_400_reasons": [
+    "timeRangeEmpty: 'The specified time range is empty.' (locationType: parameter, location: timeMax) -- the example this fixture reproduces",
+    "the page's prose also covers a missing required field, an invalid value, and an invalid field combination, all with the same remedy"
+  ],
+  "_sanitized": "No real message text, request id, address, or calendar id appears here.",
+  "error": {
+    "code": 400,
+    "message": "The specified time range is empty.",
+    "errors": [
+      {
+        "domain": "calendar",
+        "reason": "timeRangeEmpty",
+        "message": "The specified time range is empty.",
+        "locationType": "parameter",
+        "location": "timeMax"
+      }
+    ]
+  }
+}

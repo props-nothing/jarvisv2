@@ -103,6 +103,13 @@ offered, which is exactly what `SyncCursorKind::OpaqueToken` documents.
   makes a full sync affordable *and* is itself a rate-limit trigger. Confusing the two would ask for 500
   sub-requests at once.
 
+  > **Correction (ADR-0080, 2026-09-30).** `GMAIL_BATCH_LIMIT = 50` was **wrong in name and value**: the batch
+  > reference states a **hard limit of 100** and *recommends* no more than 50 to avoid throttling, so one
+  > constant conflated a refusal with a slowdown and was set to the recommendation while being documented as
+  > "the largest batch Gmail accepts". It is now `GMAIL_BATCH_HARD_LIMIT` (100) and `GMAIL_BATCH_RECOMMENDED`
+  > (50). The figure was also attributed to the quota page, which states no batch limit; the batch page is now
+  > in the research record's source table.
+
 ## Limits
 
 - **No request has been sent.** `classify`, `next_page`, `advance_gmail_history` and `advance_calendar_sync` are

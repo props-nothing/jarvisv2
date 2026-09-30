@@ -12,7 +12,6 @@ use crate::google::transport::RetryAfter;
 use crate::manifest::{ConnectorVersion, ProviderIdempotency};
 use crate::ratelimit::{RetryClass, RetryGuidance};
 use crate::{AccountReference, SyncCursorKind};
-
 fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {
         Ok(value) => value,
@@ -59,14 +58,32 @@ fn cursor() -> SyncCursor {
 fn a_403_is_classified_by_its_reason_and_not_its_status() {
     // The table that justifies this function's existence. Four documented reasons share one status and have
     // three different remedies, so a status-only classifier gets a real case wrong.
-    let throttled = classify(403, GmailErrorReason::RateLimitExceeded, None, None);
+    let throttled = classify(
+        GoogleApi::Gmail,
+        403,
+        GoogleErrorReason::RateLimitExceeded,
+        None,
+        None,
+    );
     assert_eq!(throttled.class, RetryClass::Throttled);
     assert!(throttled.guidance.permits_retry());
 
-    let user_throttled = classify(403, GmailErrorReason::UserRateLimitExceeded, None, None);
+    let user_throttled = classify(
+        GoogleApi::Gmail,
+        403,
+        GoogleErrorReason::UserRateLimitExceeded,
+        None,
+        None,
+    );
     assert_eq!(user_throttled.class, RetryClass::Throttled);
 
-    let limit = classify(403, GmailErrorReason::DailyLimitExceeded, None, None);
+    let limit = classify(
+        GoogleApi::Gmail,
+        403,
+        GoogleErrorReason::DailyLimitExceeded,
+        None,
+        None,
+    );
     assert_eq!(
         limit.class,
         RetryClass::Permanent,
@@ -74,7 +91,13 @@ fn a_403_is_classified_by_its_reason_and_not_its_status() {
     );
     assert!(!limit.guidance.permits_retry());
 
-    let policy = classify(403, GmailErrorReason::DomainPolicy, None, None);
+    let policy = classify(
+        GoogleApi::Gmail,
+        403,
+        GoogleErrorReason::DomainPolicy,
+        None,
+        None,
+    );
     assert_eq!(policy.class, RetryClass::Permanent);
     assert_eq!(policy.guidance, RetryGuidance::DoNotRetry);
     // The positive control: the same status DOES yield a retry for other reasons, so this test is not passing
@@ -86,11 +109,11 @@ fn a_403_is_classified_by_its_reason_and_not_its_status() {
 fn a_domain_policy_refusal_is_permanent_and_needs_a_person() {
     // `domainPolicy` is "the domain administrators have disabled Gmail apps" — a decision by a human that no
     // amount of retrying can change, and the documented remedy is to ask that human.
-    assert!(GmailErrorReason::DomainPolicy.needs_a_person());
-    assert!(GmailErrorReason::DailyLimitExceeded.needs_a_person());
+    assert!(GoogleErrorReason::DomainPolicy.needs_a_person());
+    assert!(GoogleErrorReason::DailyLimitExceeded.needs_a_person());
     // And the throttling reasons do not, which is what makes the predicate discriminating rather than "true".
-    assert!(!GmailErrorReason::RateLimitExceeded.needs_a_person());
-    assert!(!GmailErrorReason::UserRateLimitExceeded.needs_a_person());
+    assert!(!GoogleErrorReason::RateLimitExceeded.needs_a_person());
+    assert!(!GoogleErrorReason::UserRateLimitExceeded.needs_a_person());
 }
 
 #[test]
@@ -99,15 +122,22 @@ fn a_429_honours_a_stated_delay_and_falls_back_to_the_documented_floor() {
     // time is the provider's own answer, so it is used; an absent one falls back to the documented floor of at
     // least one second rather than to zero, which is the value the guidance explicitly rules out.
     let stated = classify(
+        GoogleApi::Gmail,
         429,
-        GmailErrorReason::Unrecognised,
+        GoogleErrorReason::Unrecognised,
         Some(RetryAfter::Seconds(37)),
         None,
     );
     assert_eq!(stated.class, RetryClass::Throttled);
     assert_eq!(stated.guidance, RetryGuidance::RetryAfterSeconds(37));
 
-    let unstated = classify(429, GmailErrorReason::Unrecognised, None, None);
+    let unstated = classify(
+        GoogleApi::Gmail,
+        429,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
     assert_eq!(unstated.class, RetryClass::Throttled);
     assert_eq!(
         unstated.guidance,
@@ -119,8 +149,9 @@ fn a_429_honours_a_stated_delay_and_falls_back_to_the_documented_floor() {
     // what makes the distinction observable. A `BackoffSeconds` here would tell an operator the provider stated
     // nothing when it stated a time (`ADR-0076`), and the failure message would name the wrong document.
     let unreadable = classify(
+        GoogleApi::Gmail,
         429,
-        GmailErrorReason::Unrecognised,
+        GoogleErrorReason::Unrecognised,
         Some(RetryAfter::NotSeconds),
         None,
     );
@@ -147,11 +178,23 @@ fn a_429_honours_a_stated_delay_and_falls_back_to_the_documented_floor() {
 #[test]
 fn a_server_fault_backs_off_and_a_bad_request_does_not() {
     for status in [500, 502, 503, 504] {
-        let decision = classify(status, GmailErrorReason::BackendError, None, None);
+        let decision = classify(
+            GoogleApi::Gmail,
+            status,
+            GoogleErrorReason::BackendError,
+            None,
+            None,
+        );
         assert_eq!(decision.class, RetryClass::ProviderFault, "{status}");
         assert!(decision.guidance.permits_retry(), "{status}");
     }
-    let bad = classify(400, GmailErrorReason::BadRequest, None, None);
+    let bad = classify(
+        GoogleApi::Gmail,
+        400,
+        GoogleErrorReason::BadRequest,
+        None,
+        None,
+    );
     assert_eq!(bad.class, RetryClass::Permanent);
     assert_eq!(bad.guidance, RetryGuidance::DoNotRetry);
 }
@@ -160,7 +203,13 @@ fn a_server_fault_backs_off_and_a_bad_request_does_not() {
 fn an_expired_token_reauthenticates_rather_than_retrying() {
     // `authError` is documented as a 401 and "refresh the access token", so the class is `Authentication` and
     // the guidance is never a retry — retrying a request with the same expired token just spends the budget.
-    let decision = classify(401, GmailErrorReason::AuthError, None, None);
+    let decision = classify(
+        GoogleApi::Gmail,
+        401,
+        GoogleErrorReason::AuthError,
+        None,
+        None,
+    );
     assert_eq!(decision.class, RetryClass::Authentication);
     assert_eq!(decision.guidance, RetryGuidance::Reauthenticate);
     assert!(!decision.guidance.permits_retry());
@@ -172,7 +221,13 @@ fn an_unrecognised_status_becomes_unknown_and_never_permits_a_retry() {
     // The fail-closed direction. A status this connector has no case for is one whose effect is unknown, and
     // `Unknown`'s whole content is that an unanswered question must not be read as a yes — so it refuses a
     // retry even for an operation the manifest declares idempotent.
-    let decision = classify(418, GmailErrorReason::Unrecognised, None, None);
+    let decision = classify(
+        GoogleApi::Gmail,
+        418,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
     assert_eq!(decision.class, RetryClass::Unknown);
     assert_eq!(decision.guidance, RetryGuidance::Reconcile);
     assert!(!decision.guidance.permits_retry());
@@ -196,7 +251,13 @@ fn a_provider_request_id_is_carried_and_never_the_error_text() {
     // decision carries the id, and the body type has **no field for the message** — which is the structural
     // form of `P3-008c`'s "do not derive a safety flag from message text".
     let id = must(ProviderRequestId::new("request-abc"), "a valid request id");
-    let decision = classify(503, GmailErrorReason::BackendError, None, Some(id));
+    let decision = classify(
+        GoogleApi::Gmail,
+        503,
+        GoogleErrorReason::BackendError,
+        None,
+        Some(id),
+    );
     assert_eq!(
         decision
             .provider_request_id
@@ -210,7 +271,7 @@ fn a_provider_request_id_is_carried_and_never_the_error_text() {
 fn an_error_body_yields_its_reason_and_tolerates_its_absence() {
     // Real bodies vary: the documentation's own samples are not all consistent, so a missing `reason` must
     // leave the caller able to classify from the status rather than making the body unparseable.
-    let body: GmailErrorBody = match serde_json::from_str(
+    let body: GoogleErrorBody = match serde_json::from_str(
         r#"{"error":{"code":403,"errors":[{"domain":"usageLimits","reason":"userRateLimitExceeded"}]}}"#,
     ) {
         Ok(body) => body,
@@ -218,11 +279,11 @@ fn an_error_body_yields_its_reason_and_tolerates_its_absence() {
     };
     assert_eq!(body.reason(), Some("userRateLimitExceeded"));
     assert_eq!(
-        GmailErrorReason::parse("userRateLimitExceeded"),
-        GmailErrorReason::UserRateLimitExceeded
+        GoogleErrorReason::parse("userRateLimitExceeded"),
+        GoogleErrorReason::UserRateLimitExceeded
     );
 
-    let without: GmailErrorBody =
+    let without: GoogleErrorBody =
         match serde_json::from_str(r#"{"error":{"code":403,"errors":[{"domain":"global"}]}}"#) {
             Ok(body) => body,
             Err(error) => panic!("a reasonless body must still parse: {error}"),
@@ -230,16 +291,16 @@ fn an_error_body_yields_its_reason_and_tolerates_its_absence() {
     assert_eq!(without.reason(), None);
 
     // An empty `errors` array parses too, and an unknown reason becomes `Unrecognised` rather than a failure.
-    let empty: GmailErrorBody = match serde_json::from_str(r#"{"error":{"code":403}}"#) {
+    let empty: GoogleErrorBody = match serde_json::from_str(r#"{"error":{"code":403}}"#) {
         Ok(body) => body,
         Err(error) => panic!("a body with no errors must parse: {error}"),
     };
     assert_eq!(empty.reason(), None);
     assert_eq!(
-        GmailErrorReason::parse("somethingNewIn2027"),
-        GmailErrorReason::Unrecognised
+        GoogleErrorReason::parse("somethingNewIn2027"),
+        GoogleErrorReason::Unrecognised
     );
-    assert_eq!(GmailErrorReason::Unrecognised.as_str(), None);
+    assert_eq!(GoogleErrorReason::Unrecognised.as_str(), None);
 }
 
 #[test]
@@ -247,12 +308,12 @@ fn a_reason_is_matched_exactly_and_never_case_insensitively() {
     // A case-insensitive match would accept `DailyLimitExceeded`, which Google never sends, and fold it into
     // the documented case — inventing agreement with a response the provider does not produce.
     assert_eq!(
-        GmailErrorReason::parse("DailyLimitExceeded"),
-        GmailErrorReason::Unrecognised
+        GoogleErrorReason::parse("DailyLimitExceeded"),
+        GoogleErrorReason::Unrecognised
     );
     assert_eq!(
-        GmailErrorReason::parse("dailyLimitExceeded"),
-        GmailErrorReason::DailyLimitExceeded
+        GoogleErrorReason::parse("dailyLimitExceeded"),
+        GoogleErrorReason::DailyLimitExceeded
     );
 }
 
@@ -299,8 +360,136 @@ fn a_gmail_history_404_carries_no_information_that_could_distinguish_two_causes(
     // And the ambiguity is real rather than theoretical, which is why it cannot be resolved by a predicate:
     // the classifier reads the SAME status as permanent, so nothing in this crate invents a reason code for it.
     assert_eq!(
-        classify(404, GmailErrorReason::Unrecognised, None, None).class,
+        classify(
+            GoogleApi::Gmail,
+            404,
+            GoogleErrorReason::Unrecognised,
+            None,
+            None
+        )
+        .class,
         RetryClass::Permanent
+    );
+}
+
+#[test]
+fn a_410_is_a_known_state_for_calendar_and_unclassified_for_gmail() {
+    // **The finding this change is about.** The two APIs publish different status sets: Calendar's error page
+    // documents `410 Gone` as a dead sync token whose remedy is "wipe the store and re-sync", while Gmail's
+    // page has **no `410` subsection at all**. Before the classifier took an API, a Calendar `410` fell to the
+    // catch-all and reached a caller as `unknown`/"reconcile" — telling it to *establish what happened* when
+    // the provider had already said exactly what had.
+    let calendar = classify(
+        GoogleApi::Calendar,
+        410,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    assert_eq!(
+        calendar.class,
+        RetryClass::Permanent,
+        "a dead sync token is a known, definite state for Calendar"
+    );
+    assert_ne!(
+        calendar.class,
+        RetryClass::Unknown,
+        "the whole defect: a Calendar 410 must not read as unclassified"
+    );
+    assert_eq!(calendar.guidance, RetryGuidance::DoNotRetry);
+
+    // And the same status from the other API stays unclassified, because nothing documents it there. This is
+    // the control that makes the assertion above about the API rather than about the status.
+    let gmail = classify(
+        GoogleApi::Gmail,
+        410,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    assert_eq!(
+        gmail.class,
+        RetryClass::Unknown,
+        "Gmail documents no 410, so it stays the fail-closed answer"
+    );
+    assert_eq!(gmail.guidance, RetryGuidance::Reconcile);
+    assert_ne!(
+        calendar, gmail,
+        "the same status must classify differently for the two APIs"
+    );
+    // Neither permits a retry, so the divergence is about the *diagnosis* a caller reads rather than about a
+    // retry that one would allow and the other refuse.
+    assert!(!calendar.guidance.permits_retry());
+    assert!(!gmail.guidance.permits_retry());
+}
+
+#[test]
+fn the_shared_arms_do_not_depend_on_the_api_because_the_pages_agree_where_they_overlap() {
+    // The other half of the change: taking an API must not fork everything. `401`, the `5xx` family and the
+    // throttling reasons are documented the same way by both pages — Calendar's own error page says
+    // "`rateLimitExceeded` errors can return either `403` or `429` error codes—currently they are functionally
+    // similar" — so both APIs must give the same answer there. A table per API would have silently allowed
+    // these to drift.
+    for api in [GoogleApi::Gmail, GoogleApi::Calendar] {
+        for status in [401u16, 429, 500, 502, 503, 504] {
+            let decision = classify(api, status, GoogleErrorReason::Unrecognised, None, None);
+            let other = classify(
+                if api == GoogleApi::Gmail {
+                    GoogleApi::Calendar
+                } else {
+                    GoogleApi::Gmail
+                },
+                status,
+                GoogleErrorReason::Unrecognised,
+                None,
+                None,
+            );
+            assert_eq!(
+                decision, other,
+                "{api:?} and the other API must agree on {status}, which both pages document the same way"
+            );
+        }
+        // And the 403 reason split is shared too, which is the one the classifier was built around.
+        let throttled = classify(api, 403, GoogleErrorReason::RateLimitExceeded, None, None);
+        assert_eq!(throttled.class, RetryClass::Throttled, "{api:?}");
+        let policy = classify(api, 403, GoogleErrorReason::DomainPolicy, None, None);
+        assert_eq!(policy.guidance, RetryGuidance::DoNotRetry, "{api:?}");
+    }
+}
+
+#[test]
+fn a_calendar_404_keeps_the_documented_divergence_rather_than_splitting_the_arm() {
+    // **A divergence recorded rather than resolved silently.** Calendar's error page suggests "use exponential
+    // backoff" for a `404`; Gmail's summary states no action. The crate keeps `DoNotRetry` for both, because
+    // Calendar's own two documented causes are "the requested resource … has never existed" and "accessing a
+    // calendar that the user can not access" — and neither is repaired by sending the identical request again,
+    // so a retry would fail the same way until its budget ran out.
+    //
+    // Asserting the divergence HERE is what makes it a decision: if either page's guidance changed, or if a
+    // future reader "fixed" the arm to match Calendar's sentence, this test names which document wins.
+    let calendar = classify(
+        GoogleApi::Calendar,
+        404,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    let gmail = classify(
+        GoogleApi::Gmail,
+        404,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    assert_eq!(
+        calendar, gmail,
+        "the arm is deliberately shared despite the pages differing"
+    );
+    assert_eq!(calendar.class, RetryClass::Permanent);
+    assert!(
+        !calendar.guidance.permits_retry(),
+        "the 404 arm refuses a retry even though Calendar's page suggests backoff: retrying an identical \
+         request against a missing resource fails identically, and the divergence is recorded in `ADR-0082`"
     );
 }
 
@@ -310,12 +499,19 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
     // a 404 would be a caller's explicit act — but nothing could BUILD the signal from a status, so the
     // `CursorUnusable` remedy (and so `SyncAdvance::HistoryPruned`) was still unreachable outside a fixture.
     let refused = classify(
+        GoogleApi::Gmail,
         429,
-        GmailErrorReason::Unrecognised,
+        GoogleErrorReason::Unrecognised,
         Some(RetryAfter::Seconds(30)),
         None,
     );
-    let not_found = classify(404, GmailErrorReason::Unrecognised, None, None);
+    let not_found = classify(
+        GoogleApi::Gmail,
+        404,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
 
     // A 404 is the dead-cursor signal, and it is the SAME status the classifier reads as permanent — so the
     // two are asserted together, because that coincidence is exactly the ambiguity the predicate names.
@@ -343,8 +539,9 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
     // status carried into `Refused` preserves the classification rather than swallowing it.
     for status in [400, 403, 429, 500, 502, 503, 504] {
         let decision = classify(
+            GoogleApi::Gmail,
             status,
-            GmailErrorReason::Unrecognised,
+            GoogleErrorReason::Unrecognised,
             Some(RetryAfter::Seconds(30)),
             None,
         );
@@ -362,7 +559,13 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
             &gmail_history_signal(
                 404,
                 None,
-                classify(404, GmailErrorReason::Unrecognised, None, None),
+                classify(
+                    GoogleApi::Gmail,
+                    404,
+                    GoogleErrorReason::Unrecognised,
+                    None,
+                    None,
+                ),
             ),
             &account(),
             &version(),
@@ -383,7 +586,14 @@ fn a_calendar_410_requires_a_resync_and_a_400_does_not() {
     assert!(!calendar_status_requires_resync(400));
     assert!(!calendar_status_requires_resync(200));
     assert_eq!(
-        classify(400, GmailErrorReason::BadRequest, None, None).class,
+        classify(
+            GoogleApi::Gmail,
+            400,
+            GoogleErrorReason::BadRequest,
+            None,
+            None
+        )
+        .class,
         RetryClass::Permanent
     );
 }
@@ -502,8 +712,9 @@ fn a_refused_advance_carries_the_decision_and_no_cursor() {
     // A refusal is neither an advance nor a dead cursor, and the decision is carried so a caller can report
     // *why*. No cursor is returned, so a caller cannot store a new position on the strength of a failure.
     let decision = classify(
+        GoogleApi::Gmail,
         429,
-        GmailErrorReason::Unrecognised,
+        GoogleErrorReason::Unrecognised,
         Some(RetryAfter::Seconds(30)),
         None,
     );
@@ -567,9 +778,10 @@ fn a_calendar_token_is_treated_as_opaque_so_no_ordering_is_invented() {
 #[test]
 fn the_declared_bounds_are_googles_own_numbers() {
     // These are transcribed values, so pinning them makes a change deliberate. A silent edit to the batch
-    // limit or the page cap would change what a full sync costs without anything failing.
+    // limits or the page cap would change what a full sync costs without anything failing.
     assert_eq!(GMAIL_MAX_RESULTS_CAP, 500);
-    assert_eq!(GMAIL_BATCH_LIMIT, 50);
+    assert_eq!(GMAIL_BATCH_HARD_LIMIT, 100);
+    assert_eq!(GMAIL_BATCH_RECOMMENDED, 50);
     assert_eq!(GOOGLE_MAX_BACKOFF_SECONDS, 64);
     assert_eq!(GOOGLE_RETRY_FLOOR_SECONDS, 1);
     assert_eq!(GOOGLE_API_HOST, "www.googleapis.com");
@@ -578,14 +790,107 @@ fn the_declared_bounds_are_googles_own_numbers() {
 }
 
 #[test]
-fn the_batch_limit_is_below_the_page_cap_and_both_are_bounded() {
-    // Batching is what makes a full sync affordable AND is itself a rate-limit trigger, so the two numbers
-    // must not be confused: a batch of 500 would be the page cap used as a batch size. Bound to locals first,
-    // because `assert!` on two constants is a *constant assertion* — the trap this workspace records.
-    let batch = GMAIL_BATCH_LIMIT;
+fn the_batch_recommendation_is_below_the_hard_limit_and_the_hard_limit_below_the_page_cap() {
+    // **The two batch figures are not interchangeable, and neither is the page cap.** The batch reference
+    // states a hard ceiling of 100 and *recommends* no more than 50 because larger batches trigger throttling;
+    // a single 50 constant documented as "the largest Gmail accepts" conflated a **refusal** with a
+    // **slowdown**, and a caller reading it as the ceiling would never use the 50–100 range that is permitted.
+    //
+    // Bound to locals first, because `assert!` on two constants is a *constant assertion* — the trap this
+    // workspace records.
+    let recommended = GMAIL_BATCH_RECOMMENDED;
+    let hard = GMAIL_BATCH_HARD_LIMIT;
     let page = GMAIL_MAX_RESULTS_CAP;
     assert!(
-        batch < page,
+        recommended < hard,
+        "the recommendation must be strictly below the hard limit, or it says nothing"
+    );
+    assert!(
+        hard < page,
         "a batch is not a page; confusing them would ask for 500 sub-requests at once"
     );
+    // And the recommendation is exactly half the hard limit, which is the documented pair rather than a
+    // coincidence: a change to either figure alone should be a deliberate edit.
+    assert_eq!(
+        hard,
+        recommended * 2,
+        "the published pair is 100 accepted and 50 recommended"
+    );
+}
+
+#[test]
+fn a_batch_size_above_the_hard_limit_is_refused_and_one_above_the_recommendation_is_not() {
+    // **The distinction between the two figures, asserted in both directions.** A size above the hard limit
+    // is refused because the provider would reject the request; a size above the recommendation is
+    // **permitted** and merely invites throttling, so refusing it would be stricter than Google and would hide
+    // the 50–100 range the API actually accepts.
+    assert!(matches!(batch_plan(1, 0), Err(BatchPlanError::EmptyBatch)));
+    assert!(matches!(
+        batch_plan(1, GMAIL_BATCH_HARD_LIMIT + 1),
+        Err(BatchPlanError::AboveHardLimit { .. })
+    ));
+    // Exactly the hard limit is accepted — the boundary is inclusive, which is what "limited to 100" means.
+    assert!(batch_plan(1, GMAIL_BATCH_HARD_LIMIT).is_ok());
+
+    // Above the recommendation is allowed and **reported**, not refused.
+    let unwise = must(
+        batch_plan(101, 100),
+        "100 is the hard limit and is permitted",
+    );
+    assert!(!unwise.is_within_recommendation());
+    assert_eq!(unwise.batch_size, 100);
+    // The control: a size at the recommendation reports itself as within it, so the predicate is not
+    // false for everything.
+    let recommended = must(
+        batch_plan(101, GMAIL_BATCH_RECOMMENDED),
+        "50 is recommended",
+    );
+    assert!(recommended.is_within_recommendation());
+}
+
+#[test]
+fn the_batch_plan_counts_the_partial_final_batch_rather_than_dropping_it() {
+    // **The arithmetic a naive planner gets wrong.** 101 calls at 50 per batch is three requests, not two, and
+    // the third is partial. A planner that used floor division would drop the remainder's request and silently
+    // skip part of a sync.
+    let plan = must(batch_plan(101, 50), "a valid plan");
+    assert_eq!(
+        plan.requests, 3,
+        "101 calls at 50 per batch is three requests"
+    );
+    assert_eq!(
+        plan.final_batch_size, 1,
+        "the last batch holds the remainder"
+    );
+
+    // An exact division has no partial batch, reported as zero rather than as a repeated full one.
+    let exact = must(batch_plan(100, 50), "a valid plan");
+    assert_eq!(exact.requests, 2);
+    assert_eq!(exact.final_batch_size, 0);
+
+    // One and zero calls are the boundaries: one call is one request, and nothing to send is no requests.
+    let single = must(batch_plan(1, 50), "a valid plan");
+    assert_eq!(single.requests, 1);
+    assert_eq!(single.final_batch_size, 1);
+    let empty = must(batch_plan(0, 50), "a valid plan");
+    assert_eq!(empty.requests, 0);
+    assert_eq!(empty.final_batch_size, 0);
+
+    // And a full first sync's shape, using the record's own `5 + 20N` framing: 1,000 messages means 1,001
+    // calls once the listing call is counted, which is 21 requests of 50 with the last holding one.
+    let sync = must(batch_plan(1_001, GMAIL_BATCH_RECOMMENDED), "a valid plan");
+    assert_eq!(sync.requests, 21);
+    assert_eq!(sync.final_batch_size, 1);
+    assert!(sync.is_within_recommendation());
+}
+
+#[test]
+fn a_batch_of_one_is_permitted_because_chopping_is_a_caller_choice() {
+    // The lower boundary, asserted so the two upper bounds are not the only ones in play: a size of 1 is
+    // within the recommendation and divides `n` calls into `n` requests. A caller pacing very conservatively
+    // is permitted to do that, and this test is what keeps a future lower bound from being added silently.
+    let singles = must(batch_plan(3, 1), "a valid plan");
+    assert_eq!(singles.requests, 3);
+    assert_eq!(singles.final_batch_size, 0);
+    assert!(singles.is_within_recommendation());
 }

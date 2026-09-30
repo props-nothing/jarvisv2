@@ -4125,6 +4125,111 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `QuotaCost::is_documented()` have **test-only consumers** — the same shape `ADR-0057` already records for
     `PollingInterval::is_documented`, since nothing schedules yet. Stated rather than left for a reader to
     discover: their callers appear when a scheduler consumes the conversion, not before.
+- [ ] `P5-005` **(continued — a limit and a recommendation are two facts)**: `GMAIL_BATCH_LIMIT` (50, "the
+  largest batch Gmail accepts") splits into `GMAIL_BATCH_HARD_LIMIT` (100) and `GMAIL_BATCH_RECOMMENDED` (50),
+  with `BatchPlan`/`batch_plan` as the producer. **3 new tests (so 348 in the crate).** **`ADR-0080`.** Two
+  guards falsified A-B-A with compiling mutants. **Writes the record's "full-sync budget test that asserts
+  batching" item, and corrects its premise.**
+  - **⭐⭐ THE FINDING: A FIGURE FROM A PAGE THE RECORD NEVER LISTED, FILED UNDER ONE THAT DOES NOT STATE IT.**
+    The record's "Other limits" said "**Batch requests: no more than 50**", and its Verification Log attributed
+    "the batch ceiling of 50" to the **quota page** — which states **no batch limit at all**. The **batch
+    reference** (`guides/batch`) was **absent from the source table entirely**. Re-fetched: it says "You're
+    limited to **100** calls in a single batch request" and separately "We recommend sending batches of no more
+    than **50**". So the number was real, **half-right in value and half-right in meaning, attached to the wrong
+    document** — the quietest form of the failure `external-research.md` warns about: not an invented number, but
+    a real one from an unrecorded source. A reader checking the record against the quota page would not find it.
+  - **⭐ ONE CONSTANT COLLAPSED A REFUSAL INTO A SLOWDOWN.** "Two documented facts, in tension" was the old doc's
+    own words, and it resolved the tension by picking one figure and calling it a ceiling. But exceeding **100**
+    *fails the request* while exceeding **50** *degrades throughput* — different failures, different remedies —
+    so a caller holding one number cannot know whether a size between them is a bug or a trade-off. The names now
+    carry it: `HARD_LIMIT` is refused above, `RECOMMENDED` is **allowed and reported**.
+  - **`batch_plan` rounds the request count UP, and that is the arithmetic a naive planner gets wrong.** 101
+    calls at 50 per batch is **three** requests, not two; floor division **drops the remainder's request** and
+    therefore skips part of a sync *while reporting success*. `final_batch_size` is carried so the partial batch
+    is a value rather than a recomputation.
+  - **A size above the recommendation is permitted, not refused.** Refusing it would be stricter than Google and
+    would hide the 50–100 range the API accepts. `is_within_recommendation()`'s `false` means "invites
+    throttling", and it is asserted in both directions so it is not false for everything — the defect `ADR-0078`
+    found in its own first draft.
+  - **The batch page states a fact that changes how a sync is sized: batching saves connections and NO quota.**
+    "A set of *n* requests batched together counts toward your usage limit as *n* requests, not as one request."
+    Worth recording because "batch the sync to make it affordable" is the natural misreading, and the record's
+    own `5 + 20N` estimate is **unchanged** by batching.
+  - **`ADR-0058` was annotated**, because it introduced the wrong constant and credited it with being a
+    provider fact rather than a correction.
+  - **NEW LIMITS:** `batch_plan` is arithmetic and a type, not a scheduler — nothing yet *paces* batches, so
+    `is_within_recommendation()` has a **test-only consumer**, the same pipeline-side gap `ADR-0075` records for
+    `provider_request_id`. No delay is asserted for a recommended-size batch because the record states **no
+    figure** for it, only that throttling is *likely* — a risk rather than a number, and inventing one would be
+    the defect this slice is about.
+- [ ] `P5-005` **(continued — Calendar's 410 needs its reason)**: `CalendarGoneReason`
+  (`FullSyncRequired`/`ResourceAlreadyDeleted`/`Unrecognised`) plus `client::calendar_signal` as the producer;
+  three Calendar error fixtures, including a **same-status 410 pair with opposite remedies**. **4 new tests (so
+  348 in the crate; the fixture suite went 11 → 15).** **`ADR-0081`.** Two guards falsified A-B-A with compiling
+  mutants. **Writes the record's "410-is-staleness test" item and corrects its premise.**
+  - **⭐⭐ THE FINDING: "CALENDAR'S 410 HAS NO SUCH AMBIGUITY" WAS TRUE OF THE STATUS AND FALSE OF THE DECISION.**
+    The record asserted it while contrasting Calendar with Gmail's unclassifiable 404. The Calendar **errors**
+    page — a page the record's source table did not list for this fact — publishes **three** bodies for
+    `410 Gone` and only two resync: `fullSyncRequired` ("wipe the store and re-sync"), `updatedMinTooLongAgo`
+    (same), and **`deleted`**, whose suggested action is **"no further action is necessary"**. So a connector
+    reading the status alone **wipes a whole sync store when a user deletes one event** — and `advance_calendar_sync`
+    maps `CursorUnusable` to a full wipe with **no cursor**, so the wrong branch is the destructive one.
+  - **⭐ THE `deleted` CASE IS A REFUSAL, NOT A SUCCESS.** A delete of an already-deleted event did not do what
+    was asked, even though nothing needs repairing — so it is carried as `SyncSignal::Refused` rather than
+    pretending the call succeeded. Same rule as `P3-005` for an outcome the adapter could not establish.
+  - **⭐ AN UNREADABLE 410 STILL RESYNCS, AND THAT IS THE OPPOSITE OF THE CRATE'S USUAL RULE — deliberately.**
+    `RetryClass::Unknown` refuses because a retry could send a **second effect**; here the thing at risk is a
+    **store's liveness**. Resyncing needlessly costs a slower next sync; *not* resyncing a genuinely dead token
+    costs a store that never syncs again and never says so. The direction is argued on the variant so a reader
+    meets the reasoning rather than inferring a contradiction.
+  - **The status-only predicate SURVIVES with its competence narrowed.** It cannot be deleted (an unparseable
+    body still needs a recovery path) and cannot be made strict (that regresses the unreadable case), so two
+    functions answer the same question for callers holding different information — normally a defect, and here
+    the difference is exactly which facts the caller has. Both are asserted, including that they disagree on
+    `deleted`.
+  - **The fixture pair is what makes the claim falsifiable.** Two files with the **same status** and opposite
+    remedies: a connector reading the status gives them the same answer, and the test asserts they differ. The
+    three Calendar fixtures also completed the record's fixture table (corrected **nine → twelve**).
+  - **NEW LIMITS:** `calendar_signal` is a producer with **no production caller** — there is no `events.list`
+    request to obtain a status and body from — so the tests are what currently hold the distinction in place;
+    the same pipeline-side gap `ADR-0075` records for `provider_request_id`. The record still lists **no source
+    for `updatedMinTooLongAgo` beyond the errors page**, and the two sync-token causes share one variant because
+    they share a remedy, so a diagnostic cannot distinguish them from the type alone.
+- [ ] `P5-005` **(continued — one classifier for two APIs)**: `classify` takes the API, and the error vocabulary
+  is renamed for what it is. **4 new tests (so 352 in the crate).** **`ADR-0082`.** Two guards falsified A-B-A
+  with compiling mutants. **Adds Finding 6 to the record.**
+  - **⭐⭐ THE FINDING: THE TWO ERROR PAGES PUBLISH DIFFERENT STATUS SETS, AND ONE CLASSIFIER ANSWERED FOR THE
+    LESS INFORMATIVE ONE.** `GmailErrorReason`/`GmailError`* were named for Gmail but parsed **every** error body
+    — Calendar's included — and `classify` had no API parameter. Gmail's error guide documents **no `410`
+    subsection at all**; Calendar's documents `410 Gone` in detail. So a Calendar `410` — the dead sync token
+    `ADR-0081` had just built a reason vocabulary around — fell to the catch-all and reached a caller as
+    *"the provider answered 410 (unknown)"*, i.e. `Reconcile`, *establish what happened before doing anything
+    else*, when the provider had already stated the cause and the remedy.
+  - **The API is an input, not a second table.** Two tables would duplicate every arm the pages **do** agree on
+    (`401`; the `5xx` family; `403`'s throttling reasons, which the Calendar page itself calls "functionally
+    similar" across `403` and `429`). A duplicated table drifts, which is the defect this crate has found
+    repeatedly, so `classify(api, status, …)` carries the API beside the status exactly as the status sits
+    beside the reason.
+  - **A Calendar `410` is `Permanent`/`DoNotRetry` and that does not contradict the resync remedy.** A resync is
+    not a retry of *this* request — the same token cannot succeed — so the refusal is right, and the comment
+    spells the distinction out because `DoNotRetry` read as "give up on the sync" is the mistake it prevents.
+  - **The second divergence is recorded, not silently resolved.** Calendar's page suggests "use exponential
+    backoff" for a `404`; Gmail's states no action. The crate keeps `DoNotRetry` for both — Calendar's own two
+    `404` causes are a resource that never existed and a calendar the user cannot access, neither repaired by
+    resending — and
+    **asserts the divergence in a test that names which document wins** (`ADR-0081`'s technique applied to a
+    documented disagreement). Logged as Unresolved Question 8, because the page's sentence and its own causes
+    disagree and only a live call can settle it.
+  - **The API is derived, not passed beside the operation name.** `api_of` reads the `gmail_`/`calendar_` prefix
+    the manifest already uses, so `calendar_events_read` + `GoogleApi::Gmail` — the pairing that would
+    reintroduce the defect — is unrepresentable rather than merely discouraged. The rename is part of the fix:
+    a type named `GmailErrorReason` that Calendar responses are parsed into is a false statement about scope.
+  - **NEW LIMITS:** the refusal message for an unparsed Calendar `410` renders `"the provider answered 410
+    (permanent)"` and does **not** name the dead sync token — the class is right and the explanation is thin,
+    because the words come from `reason` and a `410` need not carry one. `api_of` derives from the operation-id
+    prefix, so a future operation not following that convention would silently get `Gmail`. Nothing outside
+    `jarvis-connectors` consumes `RetryDecision` yet — the recurring pipeline-side gap also recorded for
+    `provider_request_id`, `batch_plan` and `calendar_signal`.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

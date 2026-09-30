@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use jarvis_connectors::google::client::{self, GmailErrorBody, GmailErrorReason};
+use jarvis_connectors::google::client::{self, GoogleApi, GoogleErrorBody, GoogleErrorReason};
 use jarvis_connectors::google::request;
 use serde_json::Value;
 
@@ -181,17 +181,17 @@ fn a_403_whose_reason_is_an_administrators_decision_is_permanent() {
     // retrying changes a person's decision. A classifier reading the prose would retry forever.
     let text = fixture("gmail_error_403_domain_policy.json");
     assert_declared_shape(&text);
-    let body: GmailErrorBody = match serde_json::from_str(&text) {
+    let body: GoogleErrorBody = match serde_json::from_str(&text) {
         Ok(body) => body,
         Err(error) => panic!("the documented error shape must parse: {error}"),
     };
-    let reason = GmailErrorReason::parse(
+    let reason = GoogleErrorReason::parse(
         body.reason()
             .unwrap_or_else(|| panic!("the fixture states a reason")),
     );
-    assert_eq!(reason, GmailErrorReason::DomainPolicy);
+    assert_eq!(reason, GoogleErrorReason::DomainPolicy);
     assert!(reason.needs_a_person(), "an administrator must be involved");
-    let decision = client::classify(403, reason, None, None);
+    let decision = client::classify(GoogleApi::Gmail, 403, reason, None, None);
     assert!(
         !decision.guidance.permits_retry(),
         "a domain policy is permanent, whatever the message text invites"
@@ -210,17 +210,17 @@ fn a_403_whose_reason_is_throttling_is_retryable_and_shares_the_status() {
     // together, and the assertion that carries the weight is that the two decisions DIFFER.
     let text = fixture("gmail_error_403_rate_limit.json");
     assert_declared_shape(&text);
-    let body: GmailErrorBody = match serde_json::from_str(&text) {
+    let body: GoogleErrorBody = match serde_json::from_str(&text) {
         Ok(body) => body,
         Err(error) => panic!("the documented error shape must parse: {error}"),
     };
-    let throttled = GmailErrorReason::parse(
+    let throttled = GoogleErrorReason::parse(
         body.reason()
             .unwrap_or_else(|| panic!("the fixture states a reason")),
     );
-    assert_eq!(throttled, GmailErrorReason::RateLimitExceeded);
+    assert_eq!(throttled, GoogleErrorReason::RateLimitExceeded);
 
-    let disabled = GmailErrorReason::parse("domainPolicy");
+    let disabled = GoogleErrorReason::parse("domainPolicy");
     assert_ne!(
         throttled, disabled,
         "the two reasons must be distinguishable"
@@ -230,8 +230,8 @@ fn a_403_whose_reason_is_throttling_is_retryable_and_shares_the_status() {
         "the fixture carries the status in the body as the provider does"
     );
 
-    let retryable = client::classify(403, throttled, None, None);
-    let permanent = client::classify(403, disabled, None, None);
+    let retryable = client::classify(GoogleApi::Gmail, 403, throttled, None, None);
+    let permanent = client::classify(GoogleApi::Gmail, 403, disabled, None, None);
     assert!(
         retryable.guidance.permits_retry(),
         "a throttling limit may be retried"
@@ -241,12 +241,19 @@ fn a_403_whose_reason_is_throttling_is_retryable_and_shares_the_status() {
     // response that carried none (`ADR-0076`). This is the case the fixture suite can assert without a
     // socket, because the distinction lives entirely in the classifier's input.
     let unreadable = client::classify(
+        GoogleApi::Gmail,
         429,
-        GmailErrorReason::Unrecognised,
+        GoogleErrorReason::Unrecognised,
         Some(jarvis_connectors::google::transport::RetryAfter::NotSeconds),
         None,
     );
-    let absent = client::classify(429, GmailErrorReason::Unrecognised, None, None);
+    let absent = client::classify(
+        GoogleApi::Gmail,
+        429,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
     assert_eq!(unreadable.class, jarvis_connectors::RetryClass::Throttled);
     assert!(
         unreadable.guidance.permits_retry(),
@@ -272,7 +279,7 @@ fn the_error_type_cannot_hold_the_prose_it_parsed() {
     // that has no field for the text -- so the fixture's `message` and `status` fields parse and then become
     // unreachable, and nothing downstream can quote them into a reason or a decision.
     let text = fixture("gmail_error_403_domain_policy.json");
-    let body: GmailErrorBody = match serde_json::from_str(&text) {
+    let body: GoogleErrorBody = match serde_json::from_str(&text) {
         Ok(body) => body,
         Err(error) => panic!("{error}"),
     };
@@ -313,7 +320,7 @@ fn the_gmail_history_404_fixture_carries_no_reason_code() {
 
     // The consequence: this crate's classifier reads the status as permanent and the reason as unrecognised,
     // so nothing invents the `reason` the response does not carry.
-    let body: GmailErrorBody = match serde_json::from_str(&text) {
+    let body: GoogleErrorBody = match serde_json::from_str(&text) {
         Ok(body) => body,
         Err(error) => panic!("{error}"),
     };
@@ -323,7 +330,13 @@ fn the_gmail_history_404_fixture_carries_no_reason_code() {
         None,
         "there is no reason code, which is the whole point"
     );
-    let decision = client::classify(404, GmailErrorReason::Unrecognised, None, None);
+    let decision = client::classify(
+        GoogleApi::Gmail,
+        404,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
     assert_eq!(
         decision.guidance,
         jarvis_connectors::RetryGuidance::DoNotRetry
@@ -376,6 +389,191 @@ fn the_history_fixture_pair_separates_the_page_token_from_the_durable_cursor() {
         last.next_page_token.is_none() && last.history_id.is_some(),
         "a durable cursor comes from the field that survives the end of the walk"
     );
+}
+
+#[test]
+fn two_410s_with_one_status_and_opposite_remedies_are_told_apart_by_the_reason() {
+    // **The pair that makes "every 410 wipes the store" falsifiable.** The Calendar errors page publishes three
+    // bodies for HTTP 410 Gone: `fullSyncRequired` and `updatedMinTooLongAgo` say "wipe the store and re-sync",
+    // while `deleted` says "no further action is necessary". Both fixtures below are a 410, so a connector
+    // keying on the status alone gives them the same answer -- and the wrong one costs a whole sync store when
+    // a user deletes a single event.
+    let requires = fixture("calendar_error_410_full_sync_required.json");
+    let deleted = fixture("calendar_error_410_resource_deleted.json");
+    assert_declared_shape(&requires);
+    assert_declared_shape(&deleted);
+
+    let parse_reason = |text: &str| -> String {
+        let body: GoogleErrorBody = match serde_json::from_str(text) {
+            Ok(body) => body,
+            Err(error) => panic!("the documented 410 shape must parse: {error}"),
+        };
+        assert_eq!(body.error.code, 410, "both fixtures are a 410");
+        body.reason()
+            .unwrap_or_else(|| panic!("a 410 fixture states a reason"))
+            .to_owned()
+    };
+    let full_sync = parse_reason(&requires);
+    let deleted_reason = parse_reason(&deleted);
+    assert_ne!(
+        full_sync, deleted_reason,
+        "the two 410s must differ in the field the decision reads, or the pair proves nothing"
+    );
+
+    // The classification, using the reason each body carries.
+    assert_eq!(
+        client::CalendarGoneReason::parse(Some(&full_sync)),
+        client::CalendarGoneReason::FullSyncRequired
+    );
+    assert_eq!(
+        client::CalendarGoneReason::parse(Some(&deleted_reason)),
+        client::CalendarGoneReason::ResourceAlreadyDeleted
+    );
+    // And the decisions genuinely oppose each other.
+    assert!(
+        client::CalendarGoneReason::FullSyncRequired.requires_resync(),
+        "an invalid sync token must wipe the store"
+    );
+    assert!(
+        !client::CalendarGoneReason::ResourceAlreadyDeleted.requires_resync(),
+        "a deleted resource must NOT wipe the store; the page says no further action is necessary"
+    );
+
+    // The status-only predicate still resyncs both, which is why it cannot be the only reader: it cannot see
+    // the body. Asserted so the two functions' relationship is a recorded fact rather than an accident.
+    assert!(client::calendar_status_requires_resync(410));
+    let refusal = client::classify(
+        GoogleApi::Gmail,
+        410,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    assert_eq!(
+        client::calendar_signal(410, None, Some(&full_sync), refusal.clone()),
+        client::SyncSignal::CursorUnusable
+    );
+    assert_eq!(
+        client::calendar_signal(410, None, Some(&deleted_reason), refusal.clone()),
+        client::SyncSignal::Refused(refusal),
+        "a deleted resource is a refusal for the call, not a dead cursor"
+    );
+}
+
+#[test]
+fn a_400_on_an_incremental_sync_is_a_callers_mistake_and_never_a_stale_cursor() {
+    // The other half of the 410 distinction, and the reason the 410 exists at all: the sync guide says a list
+    // query "containing disallowed restrictions" answers **400**, and a 410 means the token is invalid. The
+    // remedies are opposites -- 400 must not be retried and must not resync, because the same query would fail
+    // the same way and the store is fine -- so a connector that treated any incremental failure as staleness
+    // would discard a working store over its own bad filter.
+    let text = fixture("calendar_error_400_time_range_empty.json");
+    assert_declared_shape(&text);
+    let body: GoogleErrorBody = match serde_json::from_str(&text) {
+        Ok(body) => body,
+        Err(error) => panic!("the documented 400 shape must parse: {error}"),
+    };
+    assert_eq!(body.error.code, 400);
+    assert_eq!(
+        body.reason(),
+        Some("timeRangeEmpty"),
+        "the page's own 400 example carries this reason"
+    );
+
+    // **Not a dead cursor.** The status-only predicate is false for it, so the resync path is unreachable from
+    // a 400 by construction rather than by a caller remembering.
+    assert!(!client::calendar_status_requires_resync(400));
+    let decision = client::classify(
+        GoogleApi::Gmail,
+        400,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    assert!(
+        !decision.guidance.permits_retry(),
+        "the page says plainly: 'this is a permanent error, do not retry'"
+    );
+    assert_eq!(
+        client::calendar_signal(400, None, None, decision.clone()),
+        client::SyncSignal::Refused(decision),
+        "a 400 is carried as a refusal, never as staleness"
+    );
+}
+
+#[test]
+fn a_410_whose_reason_cannot_be_read_still_resyncs_because_the_alternative_is_a_dead_store() {
+    // The direction of the unreadable case, asserted because it is the opposite of the crate's usual
+    // fail-closed rule and a reader should be able to see the reasoning rather than infer it. An unrecognised
+    // 410 might be a new sync-token cause, and resyncing needlessly costs a slower next sync while *not*
+    // resyncing a genuinely dead token costs a store that never syncs again and never says so.
+    for reason in [None, Some("somethingNew"), Some("")] {
+        let parsed = client::CalendarGoneReason::parse(reason);
+        assert_eq!(
+            parsed,
+            client::CalendarGoneReason::Unrecognised,
+            "{reason:?}"
+        );
+        assert!(
+            parsed.requires_resync(),
+            "{reason:?}: an unreadable 410 must still resync"
+        );
+        let refusal = client::classify(
+            GoogleApi::Gmail,
+            410,
+            GoogleErrorReason::Unrecognised,
+            None,
+            None,
+        );
+        assert_eq!(
+            client::calendar_signal(410, None, reason, refusal),
+            client::SyncSignal::CursorUnusable,
+            "{reason:?}"
+        );
+    }
+    // The control: a `deleted` reason does NOT resync, so the assertions above are about the unreadable case
+    // rather than about `requires_resync` being true for everything.
+    assert!(!client::CalendarGoneReason::parse(Some("deleted")).requires_resync());
+}
+
+#[test]
+fn a_successful_calendar_read_advances_the_cursor_from_the_sync_token() {
+    // The positive control for every refusal above: without it, a `calendar_signal` that refused everything
+    // would pass all of them.
+    let refusal = client::classify(
+        GoogleApi::Gmail,
+        500,
+        GoogleErrorReason::BackendError,
+        None,
+        None,
+    );
+    assert_eq!(
+        client::calendar_signal(200, Some("CPDAlvWDx70C="), None, refusal.clone()),
+        client::SyncSignal::Advanced {
+            history_id: Some("CPDAlvWDx70C=".to_owned())
+        }
+    );
+    // A 200 with no token is an unchanged calendar -- ordinary, and distinguishable from an absent response.
+    assert_eq!(
+        client::calendar_signal(200, None, None, refusal.clone()),
+        client::SyncSignal::Advanced { history_id: None }
+    );
+    // And a retryable status is carried rather than read as staleness, which is the mistake that discards a
+    // working store on a transient failure.
+    for status in [429, 500, 503] {
+        let decision = client::classify(
+            GoogleApi::Gmail,
+            status,
+            GoogleErrorReason::Unrecognised,
+            None,
+            None,
+        );
+        assert_eq!(
+            client::calendar_signal(status, None, None, decision.clone()),
+            client::SyncSignal::Refused(decision),
+            "{status}"
+        );
+    }
 }
 
 #[test]

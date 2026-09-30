@@ -39,7 +39,7 @@
 use jarvis_core::{ToolOutcome, ToolOutcomeRecord, UtcTimestamp};
 use jarvis_tools::{AdapterError, BoundedOutput, ProviderEvidence, ToolCallResult};
 
-use crate::google::client::{self, GmailErrorReason};
+use crate::google::client::{self, GoogleErrorReason};
 use crate::google::credential::AccessToken;
 use crate::google::request::{self, MessageFormat, RequestError};
 use crate::google::transport::{GoogleTransport, HttpMethod, TransportFailure, TransportResponse};
@@ -115,6 +115,25 @@ pub fn request_for(
 /// Returns the name segment of a canonical tool identifier.
 fn segment_of(tool: &str) -> &str {
     tool.rsplit('.').next().unwrap_or(tool)
+}
+
+/// Returns which Google API an operation belongs to.
+///
+/// Derived from the operation's own name rather than passed in alongside it, because the two must agree: a
+/// caller that named `calendar_events_read` and declared `GoogleApi::Gmail` would classify a dead sync token
+/// as an unclassified status, which is the defect `ADR-0082` removes. Deriving it makes that pairing
+/// unrepresentable instead of merely discouraged.
+///
+/// The prefix is the connector's own naming convention — `gmail_*` for mail, `calendar_*` for Calendar — which
+/// the manifest's operation ids already follow, so a new operation gets the right API by being named
+/// consistently. An unrecognised segment is `Gmail`, but it cannot be reached: `interpret_response` refuses an
+/// unknown segment before any classification happens.
+fn api_of(segment: &str) -> client::GoogleApi {
+    if segment.starts_with("calendar_") {
+        client::GoogleApi::Calendar
+    } else {
+        client::GoogleApi::Gmail
+    }
 }
 
 /// Returns an optional string argument.
@@ -253,7 +272,7 @@ fn interpret_response(
         });
     }
     if !response.is_success() {
-        return refusal(response, now);
+        return refusal(api_of(segment), response, now);
     }
     // A 200 whose body cannot be read is **not** a success. The status says the request was answered and the
     // body says nothing about what it produced, so `Unknown` is the honest reading — and it is reachable only
@@ -333,21 +352,26 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
 
 /// Builds a `Failed` result for a provider refusal.
 ///
+/// Takes the **API** rather than deriving it, because the caller has already derived it from the operation
+/// and re-deriving it here would be a second answer to one question — the defect this crate records for every
+/// duplicated rule.
+///
 /// # Errors
 ///
 /// Returns [`AdapterError::AmbiguousAfterReaching`] if the outcome cannot be recorded, which is a defect in
 /// this module rather than a provider condition.
 fn refusal(
+    api: client::GoogleApi,
     response: &TransportResponse,
     now: UtcTimestamp,
 ) -> Result<ToolCallResult, AdapterError> {
     // The reason code, never the message. A body that cannot be parsed still yields a reason, because the
     // status is a fact even when the body is not readable.
-    let reason = serde_json::from_str::<client::GmailErrorBody>(&response.body)
+    let reason = serde_json::from_str::<client::GoogleErrorBody>(&response.body)
         .ok()
         .as_ref()
-        .and_then(client::GmailErrorBody::reason)
-        .map_or(GmailErrorReason::Unrecognised, GmailErrorReason::parse);
+        .and_then(client::GoogleErrorBody::reason)
+        .map_or(GoogleErrorReason::Unrecognised, GoogleErrorReason::parse);
     // # `classify` is called here, and until now it was not called in production at all
     //
     // `client::classify` is the retry table `ADR-0058` was written around — the one whose case for existing is
@@ -359,6 +383,7 @@ fn refusal(
     // Wiring it in is what makes the table observable, and the class is appended to the reason so a reader of a
     // stored failed call can tell "throttled, retry after 30s" from "an administrator disabled this".
     let decision = client::classify(
+        api,
         response.status,
         reason,
         response.retry_after,
