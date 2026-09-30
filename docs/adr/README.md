@@ -106,3 +106,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0086](0086-a-refusal-names-the-argument-the-caller-sent.md) | A refusal names the argument the caller sent, and a declared bound equals the one enforced | Accepted |
 | [0087](0087-a-lease-that-lapses-silently.md) | A lease that lapses silently needs a code that can say so | Accepted |
 | [0088](0088-a-field-google-declares-two-encodings-for.md) | A field Google declares two encodings for | Accepted |
+| [0089](0089-a-rule-from-another-context.md) | A rule from another context, and the observable axis | Accepted |
+| [0090](0090-a-refusal-keeps-the-cursor.md) | A refusal keeps the cursor, because the position was never rejected | Accepted |

@@ -708,9 +708,16 @@ fn a_gmail_cursor_that_cannot_be_used_requires_a_resync_and_carries_no_cursor() 
 }
 
 #[test]
-fn a_refused_advance_carries_the_decision_and_no_cursor() {
-    // A refusal is neither an advance nor a dead cursor, and the decision is carried so a caller can report
-    // *why*. No cursor is returned, so a caller cannot store a new position on the strength of a failure.
+fn a_refused_advance_carries_the_decision_and_keeps_the_previous_cursor() {
+    // A refusal is neither an advance nor a dead cursor. The **decision** is carried so a caller can report
+    // *why* — and the **previous cursor is kept**, because a refusal says the request failed, not that the
+    // position is unusable.
+    //
+    // **This test used to assert the opposite**, and its old comment justified it as "so a caller cannot store a
+    // new position on the strength of a failure". That reasoning is sound for a *new* position and wrong here:
+    // the previous cursor is not a new position, it is the caller's existing one, and a transient `429` said
+    // nothing about it. Dropping it restarts the sync — which for Calendar is a full wipe of the sync token, and
+    // with a `429` on a push-driven incremental sync that is routine rather than exceptional (`ADR-0090`).
     let decision = classify(
         GoogleApi::Gmail,
         429,
@@ -718,9 +725,10 @@ fn a_refused_advance_carries_the_decision_and_no_cursor() {
         Some(RetryAfter::Seconds(30)),
         None,
     );
+    let previous = cursor();
     let outcome = must(
         advance_gmail_history(
-            &cursor(),
+            &previous,
             &SyncSignal::Refused(decision.clone()),
             &account(),
             &version(),
@@ -729,7 +737,153 @@ fn a_refused_advance_carries_the_decision_and_no_cursor() {
         "a refusal is an outcome, not an error",
     );
     assert_eq!(outcome.advance, SyncAdvance::Refused(decision));
-    assert!(outcome.cursor.is_none());
+    assert_eq!(
+        outcome.cursor.as_ref(),
+        Some(&previous),
+        "a refusal must not discard a cursor the provider never rejected"
+    );
+}
+
+#[test]
+fn the_three_gmail_signals_differ_in_whether_they_carry_a_cursor_forward() {
+    // **The three outcomes together, because the distinction is what carries the weight.** Asserted in one test
+    // so a change that collapsed two of them is visible: a dead cursor carries **nothing**, a refusal carries
+    // the **previous** one, and an advance carries the provider's new one. Collapsing `Refused` into
+    // `CursorUnusable` discards a working store; collapsing `CursorUnusable` into `Refused` resumes from a
+    // position the provider rejected, which is the defect `ADR-0066` was written around.
+    let previous = cursor();
+
+    let usable = must(
+        advance_gmail_history(
+            &previous,
+            &SyncSignal::CursorUnusable,
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a dead cursor is an outcome",
+    );
+    assert_eq!(usable.advance, SyncAdvance::HistoryPruned);
+    assert!(
+        usable.cursor.is_none(),
+        "a rejected position must not be carried forward"
+    );
+
+    let refused = must(
+        advance_gmail_history(
+            &previous,
+            &SyncSignal::Refused(classify(
+                GoogleApi::Gmail,
+                503,
+                GoogleErrorReason::BackendError,
+                None,
+                None,
+            )),
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a refusal is an outcome",
+    );
+    assert!(matches!(refused.advance, SyncAdvance::Refused(_)));
+    assert_eq!(refused.cursor.as_ref(), Some(&previous));
+
+    let advanced = must(
+        advance_gmail_history(
+            &previous,
+            &SyncSignal::Advanced {
+                history_id: Some("1234567891".to_owned()),
+            },
+            &account(),
+            &version(),
+            now(),
+        ),
+        "an advance is an outcome",
+    );
+    assert_eq!(advanced.advance, SyncAdvance::Advanced);
+    assert_ne!(
+        advanced.cursor.as_ref().and_then(|cursor| cursor.token()),
+        previous.token(),
+        "an advance must store the provider's new position, not the old one"
+    );
+
+    // And the unchanged-mailbox case, which is the fourth shape: no new position means the previous cursor is
+    // kept verbatim — the same answer as a refusal, for the same reason (nothing was learned about the
+    // position), which is why both carry it rather than only one.
+    let unchanged = must(
+        advance_gmail_history(
+            &previous,
+            &SyncSignal::Advanced { history_id: None },
+            &account(),
+            &version(),
+            now(),
+        ),
+        "an unchanged mailbox is an outcome",
+    );
+    assert_eq!(unchanged.advance, SyncAdvance::Advanced);
+    assert_eq!(unchanged.cursor.as_ref(), Some(&previous));
+}
+
+#[test]
+fn a_refused_calendar_advance_keeps_the_sync_token() {
+    // The Calendar half of `ADR-0090`, and it matters more here than for Gmail: discarding the token costs a
+    // **full wipe and resync** of the store, so a single throttled incremental sync would discard everything the
+    // walk had built. A refusal says the request failed; it says nothing about the token.
+    let account = account();
+    let version = version();
+    let now = UtcTimestamp::from_unix_nanos(1_774_000_000_500_000_000)
+        .unwrap_or_else(|_| panic!("a representable instant"));
+    let opaque = must(
+        SyncCursor::new(
+            SyncCursorKind::OpaqueToken,
+            Some("CPDAlvWDx70CEPDAlvWDx70CGAU=".to_owned()),
+            account.clone(),
+            "1.0.0",
+            now,
+        ),
+        "a valid opaque cursor",
+    );
+    let decision = classify(
+        GoogleApi::Calendar,
+        429,
+        GoogleErrorReason::Unrecognised,
+        Some(RetryAfter::Seconds(30)),
+        None,
+    );
+    let outcome = must(
+        advance_calendar_sync(
+            &opaque,
+            &SyncSignal::Refused(decision.clone()),
+            &account,
+            &version,
+            now,
+        ),
+        "a refusal is an outcome, not an error",
+    );
+    assert_eq!(outcome.advance, SyncAdvance::Refused(decision));
+    assert_eq!(
+        outcome.cursor.as_ref(),
+        Some(&opaque),
+        "a throttled incremental sync must not cost the whole sync token"
+    );
+
+    // The control: a **410** still discards it, so the change above is about a refusal and not about keeping
+    // tokens generally. Without this a function that always returned `Some(previous)` would pass.
+    let invalidated = must(
+        advance_calendar_sync(
+            &opaque,
+            &SyncSignal::CursorUnusable,
+            &account,
+            &version,
+            now,
+        ),
+        "a dead token is an outcome",
+    );
+    assert_eq!(invalidated.advance, SyncAdvance::TokenInvalidated);
+    assert!(
+        invalidated.cursor.is_none(),
+        "an invalidated token must not be carried forward"
+    );
 }
 
 #[test]

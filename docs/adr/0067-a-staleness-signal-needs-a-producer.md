@@ -61,6 +61,11 @@ fixture-constructed. A remedy that is reachable only from a test is a remedy a d
 | `200` | `Advanced { history_id }` | advance, or keep the previous cursor when the mailbox was unchanged |
 | anything else | `Refused(decision)` | carry the classification; **never** a resync |
 
+> **Clarified by `ADR-0090`.** "Never a resync" is a statement about the **signal**, but the code turned it into
+> a resync anyway by returning `cursor: None` for `Refused` — the caller then lost a position the provider had
+> never rejected, and its next sync restarted from scratch. A refusal now **keeps** the previous cursor, for the
+> same reason `Advanced { None }` does: nothing was learned about the position.
+
 The predicate is checked **first**, so the retryable family (`429`, `5xx`) can never fall into the dead-cursor
 arm. That asymmetry is the load-bearing part: a resync on a transient failure discards a working store — the
 opposite mistake from the one the 404 heuristic tolerates, and a far more expensive one.

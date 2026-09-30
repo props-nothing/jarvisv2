@@ -670,7 +670,14 @@ pub fn advance_gmail_history(
         SyncSignal::Refused(decision) => {
             return Ok(CursorOutcome {
                 advance: SyncAdvance::Refused(decision.clone()),
-                cursor: None,
+                // **The previous cursor is carried forward, and this is the opposite of the `CursorUnusable`
+                // arm above for a reason.** A refusal says the *request* failed — a `429`, a `5xx`, a `403` —
+                // and says **nothing about the position**, so the previous cursor is still exactly as valid as
+                // it was before the call. Discarding it would restart the whole sync over one throttled
+                // request, which is the "discards a working store" mistake this module warns against for the
+                // `404` heuristic. `CursorUnusable` is the arm where the provider *did* reject the position,
+                // and it is the only one where resuming from it would be wrong (`ADR-0090`).
+                cursor: Some(previous.clone()),
             });
         }
     };
@@ -745,7 +752,11 @@ pub fn advance_calendar_sync(
         SyncSignal::Refused(decision) => {
             return Ok(CursorOutcome {
                 advance: SyncAdvance::Refused(decision.clone()),
-                cursor: None,
+                // The previous token, for the reason the Gmail arm records: a refusal is a statement about the
+                // *request*, not about the sync position, so the stored token is as usable as it was. A `429`
+                // on an incremental sync must not cost the whole sync — and with push delivery a throttled
+                // request is routine rather than exceptional (`ADR-0090`).
+                cursor: Some(previous.clone()),
             });
         }
     };

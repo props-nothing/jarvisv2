@@ -41,8 +41,7 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | Calendar scopes | https://developers.google.com/workspace/calendar/api/auth (last updated **2026-09-03**) | 2026-09-27 | the Calendar scope list |
 | OAuth consent and scope categories | https://developers.google.com/workspace/guides/configure-oauth-consent (last updated **2026-09-03**) | 2026-09-27 | which review each scope category requires |
 | Cloud Pub/Sub push authentication | https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions (last updated **2026-09-24**) | 2026-09-27 | **the JWT-bearer mechanism** — see Finding 1 |
-| Cloud Pub/Sub push subscriptions | https://cloud.google.com/pubsub/docs/push | 2026-09-27 | the envelope and the acknowledgement rule |
-| Cloud Pub/Sub `PubsubMessage` | https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage (last updated **2026-05-14**) | 2026-09-30 | the envelope's field **types** — including `data`'s, which **contradicts** the Gmail guide (`ADR-0088`) |
+| Cloud Pub/Sub push subscriptions | https://docs.cloud.google.com/pubsub/docs/push (last updated **2026-09-24**) | 2026-09-30 | the wrapped envelope, **at-least-once delivery**, the **five** acknowledging statuses, unwrapped delivery, push backoff — and the **padded** example that corrects Finding 11 (`ADR-0089`) || Cloud Pub/Sub `PubsubMessage` | https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage (last updated **2026-05-14**) | 2026-09-30 | the envelope's field **types** — including `data`'s, which **contradicts** the Gmail guide (`ADR-0088`) |
 | Google OIDC discovery document | https://accounts.google.com/.well-known/openid-configuration | 2026-09-27 | **machine-readable**: every endpoint, the PKCE methods, and whether the `iss` response parameter is supported |
 | Google OAuth 2.0 for native apps | https://developers.google.com/identity/protocols/oauth2/native-app (last updated **2026-09-14**) | 2026-09-27 | the installed-app flow: the loopback method, the token and refresh exchanges, the response fields, DPoP, revocation |
 | Gmail `users.history.list` method reference | https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list (page footer: last updated **2026-04-15**) | 2026-09-27 | the incremental-sync read: **the query parameters, the required `startHistoryId`, and the response body `{ history[], nextPageToken, historyId }`** — the shape the `gmail_history_list` fixtures reproduce |
@@ -637,6 +636,32 @@ real delivery can settle the question rather than leaving it resolved in the pro
 **values**, not prose, and the test that catches it is one whose input forces the difference — not the
 provider's convenient example, which is chosen to be readable rather than discriminating.
 
+### Finding 12 — The push payload is **padded** base64, delivery is **at-least-once**, and only five statuses acknowledge
+
+Three facts from the push page, each of which changes behaviour, and one of which **corrects Finding 11**.
+
+**The payload is padded, and the code refused it.** The page's own minimum-value example of `message.data` is
+`SGVsbG8gQ2xvdWQgUHViL1N1YiEgSGVyZSBpcyBteSBtZXNzYWdlIQ==` — it ends in `==` and decodes to
+`Hello Cloud Pub/Sub! Here is my message!`. So the field is **padded standard** base64, not the bare "Base64URL"
+Finding 11 recorded from the Gmail guide, and a decoder that refused padding would have **refused Google's own
+example**. Finding 11's alphabet contradiction stands; its implied *padding* reading did not, and the cause was
+that **RFC 7636's no-padding rule is an OAuth rule applied to a Pub/Sub field** (`ADR-0089`).
+
+**Delivery is at-least-once, so `messageId` is required.** *"A non-success response indicates that Pub/Sub must
+resend the messages"* and *"If you send a negative acknowledgment or the acknowledgment deadline expires,
+Pub/Sub resends the message."* A repeat is therefore normal rather than exceptional, and the envelope's
+`messageId` — *"Guaranteed to be unique within the topic"* — is what distinguishes a redelivery from a new
+change. The page's own examples show it both as `messageId` **and** as `message_id`, and `publishTime`
+**and** `publish_time`, so a parser must read either spelling; `deliveryAttempt` is **top-level** beside
+`message` rather than inside it.
+
+**Only five status codes acknowledge: `102`, `200`, `201`, `202`, `204`.** *"To send a negative acknowledgment
+for the message, return any other status code."* So a `203` or `206` — successes by HTTP's classification —
+are **negative acknowledgements** here and cause a redelivery. The page also documents **unwrapped** delivery
+(`payload-unwrapping`), in which the raw payload is the whole body and there is no `data` field at all, and
+`push backoff` (100 ms–60 s, triggered by negative acknowledgements, global to the subscription) which is
+independent of the subscription retry policy.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in
@@ -903,5 +928,6 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-30 | Audit of this record's own **input** facts against the connector's schemas — no page fetched, a cross-check of what is already recorded | The record establishes `timeMin`/`timeMax` as "datetime … **Must be an RFC3339 timestamp with mandatory time zone offset**" (from the `events.list` reference), so a time bound is a bounded *instant* and **not** a search string. That distinction was missing from the code: `time_min`/`time_max` were validated by the Gmail **search-query** validator, which bounded them at 512 characters and reported the failing argument as **`query`** — an argument `calendar_events_read` does not have. Google publishes **no length limit** for `timeMin`/`timeMax`, so the 64-character bound the fix introduces is a **JARVIS** figure and is recorded as one (`ADR-0086`). No source change; the connector's declared input bounds are now asserted equal to the constants that enforce them. |
 | 2026-09-30 | Gmail **push guide** re-fetched (last updated **2026-09-15**) for the notification envelope and the renewal rule, and the **`users.watch` method reference** fetched (last updated **2026-04-15**) for the response type | The envelope verbatim: a `POST` whose body is `{ message: { data, messageId, publishTime }, subscription }` where **`message.data` is a Base64URL-encoded string** decoding to `{"emailAddress": …, "historyId": …}`. The renewal rule's two figures: **"at least once every 7 days"** (the bound) and **"We recommend calling `watch` once per day"** (the recommendation). And the response: `{ "historyId": string, "expiration": string (int64 format) }` where `expiration` is **"epoch millis"** — a **string** carrying **milliseconds**, both of which a naive parser gets wrong while still producing a valid-looking instant. Implemented as `google::watch`, with the unit pinned by a test against the reference's own example value (`ADR-0087`). Also confirmed from the same page: a successful `watch` **immediately sends a notification**, so the first delivery is not a change. |
 | 2026-09-30 | Cloud Pub/Sub **`PubsubMessage` reference** fetched (`docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage`, last updated **2026-05-14**) to check the envelope's field types, since the Gmail guide links to it | **The contradiction**: `data` is typed `string (bytes format)` and described as **"A base64-encoded string"**, while the Gmail push guide (one page over) calls the same field **"Base64URL"**. The two alphabets differ in `+`/`/` versus `-`/`_`, so the disagreement is invisible on any value containing neither — **including the guide's own example**, which was decoded and confirmed to yield `{"emailAddress": "user@example.com", "historyId": "1234567890"}`. A sweep of all 95 printable ASCII characters at all four base64 alignments found only **three** (`>`, `?`, `~`, after a one-character offset) that force the difference, so the connector decodes under **both** alphabets, URL-safe first, and reports which matched (`ADR-0088`). Also recorded: `messageId`, `publishTime` (RFC 3339) and `attributes`, none of which this path reads yet. |
+| 2026-09-30 | Cloud Pub/Sub **push page** fetched (`docs.cloud.google.com/pubsub/docs/push`, last updated **2026-09-24**) for the envelope shape and the acknowledgement contract | **Corrects Finding 11's padding reading.** The page's minimum-value example of `message.data` is `SGVsbG8gQ2xvdWQgUHViL1N1YiEgSGVyZSBpcyBteSBtZXNzYWdlIQ==` — **padded**, decoding to `Hello Cloud Pub/Sub! Here is my message!` — so the field is padded standard base64 and a decoder refusing padding would refuse Google's own example. **At-least-once**: "A non-success response indicates that Pub/Sub must resend the messages" and a negative ack or an expired deadline causes a resend, so `messageId` is the deduplication key. **Both spellings** appear in the page's own examples (`messageId`/`message_id`, `publishTime`/`publish_time`), and `deliveryAttempt` is **top-level** beside `message`. **Acknowledgement is five codes** — `102`, `200`, `201`, `202`, `204`; "any other status code" is a negative acknowledgement, so a `203` or `206` requests redelivery. Also documented: **unwrapped** delivery (`payload-unwrapping`) has no `data` field, and **push backoff** (100 ms–60 s, global, triggered by negative acks) is independent of the retry policy. Grounds `PubsubDelivery`, `ACKNOWLEDGING_STATUSES` and `ADR-0089`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

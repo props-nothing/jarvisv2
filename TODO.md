@@ -4437,6 +4437,82 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `messageId`, `publishTime`, `subscription` and the attributes map are not read, so there is no dedupe key and
     no ordering yet. `crate::base64` has no padded standard decoder, so a caller needing one must add it with a
     caller rather than as a spare function.
+- [ ] `P5-005` **(continued — a rule from another context)**: padding is now **observed** rather than requested;
+  the delivery envelope is parsed, with at-least-once dedupe and the five acknowledging statuses. **4 new tests
+  (so 384 in the crate).** **`ADR-0089`.** Two guards falsified A-B-A with compiling mutants. **Adds Finding 12,
+  which corrects Finding 11.**
+  - **⭐⭐ THE FINDING: A RULE FROM ANOTHER CONTEXT WAS APPLIED TO A VALUE IT DOES NOT GOVERN.** `ADR-0088`
+    refused `=` padding, justified by *"RFC 7636 requires padding omitted"* — an **OAuth PKCE** rule about the
+    code verifier. But `message.data` is a **Cloud Pub/Sub** field, and the push page's **own minimum-value
+    example** is `SGVsbG8gQ2xvdWQgUHViL1N1YiEgSGVyZSBpcyBteSBtZXNzYWdlIQ==` — **padded**, decoding to
+    `Hello Cloud Pub/Sub! Here is my message!`. So the connector would have **refused Google's own published
+    example**, which on a notification path is a **missed change**.
+  - **⭐⭐ THE FIX REVEALS AN ASYMMETRY WORTH KEEPING: OBSERVABLE vs UNOBSERVABLE FACTS.** The alphabet needs to be
+    a *parameter* because it is **unobservable** (the two differ in two characters, so a value containing neither
+    decodes identically either way). The padding must **not** be a parameter because it is **observable** — it is
+    the `=` at the end. Trying both paddings was *searching for something visible*, and it **cannot work**: a
+    value whose unpadded length is already a multiple of four is valid either way, so the padded attempt is
+    indistinguishable and can fail on a value that is legal. `decode_with(input, alphabet)` takes one axis;
+    `Padding::of` reads the other.
+  - **⭐ TWO DOCUMENTED FORMS ARE PREDICATES, NOT VARIANTS.** `PubsubData { alphabet, padding }` with
+    `GMAIL_GUIDE = {UrlSafe, Absent}` and `PUBSUB_FIELD_TYPE = {Standard, Present}` as associated constants — a
+    four-variant enum would make the documents into cases when they are points in one space.
+  - **⭐ THE ENVELOPE, AND WHY `messageId` MATTERS.** Delivery is **at-least-once**: "A non-success response
+    indicates that Pub/Sub must resend the messages", and a negative ack or an expired deadline resends. So
+    `messageId` — "Guaranteed to be unique within the topic" — is the deduplication key, and **both spellings**
+    (`messageId`/`message_id`, `publishTime`/`publish_time`) must be read, because the page's own examples show
+    both and a `#[serde(default)]` field matching neither is `None` **with no error**.
+  - **⭐ FIVE STATUSES ACKNOWLEDGE, NOT "2xx"**: `102`, `200`, `201`, `202`, `204`. A `203` or `206` is a success
+    by HTTP's classification and a **negative acknowledgement** here, so a handler returning
+    two-hundred-and-something would silently request redelivery of everything. `acknowledges_delivery` **fails
+    closed**. Also recorded: **unwrapped** delivery (`payload-unwrapping`) has no `data` field, so it is refused
+    as a shape rather than read as "no change".
+  - **⭐ A FIELD IN THE WRONG PLACE IS SILENT.** The first attempt put `messageId`/`publishTime` at the **top
+    level**; the provider puts them inside `message` (only `deliveryAttempt` and `subscription` are beside it).
+    Every lookup returned `None` — silently, because these fields are `#[serde(default)]`. The test caught it by
+    asserting `Some(...)` for the provider's own example rather than merely that the body parses.
+  - **⭐ THE FIRST MUTANT SURVIVED, AND THAT WAS THE USEFUL PART.** Dropping the standard alphabet still passed
+    the padded-example test, because `PUBSUB_PAGE_EXAMPLE` uses only `A-Za-z0-9` and decodes under **either**
+    alphabet. The regression test now **forces the alphabet** as well, so a mutant cannot hide behind the
+    provider's convenient example — the same lesson as Finding 11's sweep, applied to the test rather than the
+    decoder. A dead-code smell was removed too: `decode_with` computed the padding and discarded it, so the first
+    `Padding::of` mutant changed nothing.
+  - **NEW LIMITS:** no delivery has been received, so which alphabet and padding a live subscription uses is
+    **unknown** (which is what reporting `PubsubData` leaves open). `attributes` and `orderingKey` are not
+    modelled — nothing in the Gmail path filters on an attribute and order is opt-in. `publish_time` is carried
+    as **text**, not parsed, because nothing reads it and a parsed type would invite ordering logic the provider
+    does not guarantee. Push **backoff** (100 ms–60 s, global, triggered by negative acks) is recorded in the
+    research record but **not implemented**, since it is the provider's behaviour rather than a caller decision.
+- [ ] `P5-005` **(continued — a refusal keeps the cursor)**: a refused cursor advance no longer discards the
+  position. **2 new tests and 1 rewritten (so 386 in the crate).** **`ADR-0090`.** Two guards falsified A-B-A
+  with compiling mutants, the second caught by **three** tests including a pre-existing one.
+  - **⭐⭐ THE FINDING: A TRANSIENT FAILURE DISCARDED A WORKING CURSOR, SO A `429` COST THE WHOLE SYNC.**
+    Both `advance_gmail_history` and `advance_calendar_sync` returned `cursor: None` for
+    `SyncSignal::Refused(decision)` — a shape **copied from the `CursorUnusable` arm above them**, where it is
+    right (the provider rejected the position) and here is wrong (the *request* failed and said nothing about the
+    position). So a `429` on an incremental sync left the caller with no cursor: for Gmail a full resync of the
+    mailbox, for Calendar a **full wipe of the store**.
+  - **⭐⭐ AND IT IS THE EXACT MISTAKE `ADR-0067` WARNS AGAINST, COMMITTED IN THE ARM THAT HANDLES IT.**
+    ADR-0067: *"a resync on a transient failure discards a working store, which is the opposite mistake and a
+    much more expensive one."* That sentence is about the `404` heuristic; the `Refused` arm did worse, on the
+    retryable family the sentence names. **The project's own table row contradicted the code**: it says
+    `Refused` should "carry the classification; **never** a resync" — and dropping the cursor is what caused one.
+  - **⭐ A TEST PINNED IT, WITH A COMMENT THAT WAS SOUND ABOUT THE WRONG SUBJECT.** The old test asserted
+    `cursor.is_none()` justifying it as *"so a caller cannot store a new position on the strength of a failure"*.
+    Correct reasoning, wrong referent: the previous cursor is **not a new position** — it is the caller's
+    existing one, unchanged, and returning it unchanged satisfies the concern exactly. The test was
+    **rewritten** with the old comment preserved so a reader sees why it changed.
+  - **⭐ A REFUSAL AND AN UNCHANGED MAILBOX NOW GIVE THE SAME ANSWER, FOR ONE REASON.** `Refused` and
+    `Advanced { None }` both return `Some(previous.clone())` because in both cases **nothing was learned about
+    the position**. The three arms are now distinguishable and each is named: `CursorUnusable` → **none** (the
+    position is dead), `Refused` → **the previous one** (the request failed), `Advanced { None }` → **the
+    previous one** (nothing changed).
+  - **⭐ A `429` HERE IS ROUTINE, NOT AN EDGE CASE.** `ADR-0089` established that push delivery is at-least-once
+    and the push page documents backoff triggered by negative acknowledgements — so the arm that discarded the
+    cursor sits on the common path of the feature this connector exists for.
+  - **NEW LIMITS:** nothing consumes `CursorOutcome` outside this crate, so the benefit is proved by tests rather
+    than observed in a deployment (the recurring pipeline-side gap). `Refused` still carries `RetryGuidance`
+    inside it but **nothing reads the delay**, so a caller must schedule the retry itself.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

@@ -40,14 +40,91 @@ pub enum Base64Error {
         "a base64 value may hold only `A-Z`, `a-z`, `0-9`, and the alphabet's two extra characters"
     )]
     Alphabet,
-    /// Padding was present, which neither form this crate accepts carries.
-    #[error("a base64 value must not be padded; this crate decodes the unpadded form only")]
-    Padded,
+    /// The padding was present but malformed.
+    ///
+    /// Padding is **observable** in the string — it is the `=` at the end — so it is validated rather than
+    /// searched for, and a value whose padding is wrong is a corrupt value rather than one in an unexpected
+    /// form. A count above two, or a padded length that is not a multiple of four, lands here.
+    #[error("a base64 value's padding is malformed: at most two `=` and only after a whole group")]
+    Padding,
     /// The length could not be a whole number of base64 groups.
     #[error(
         "a base64 value's length is impossible: a value of `n + 1` characters cannot encode `n` bytes"
     )]
     Length,
+}
+
+/// Which of RFC 4648's two alphabets a value is written in.
+///
+/// The two differ in exactly two characters (`+`/`/` versus `-`/`_`), which is why a decoder has to be **told**
+/// which one it is reading rather than guessing: a value containing neither decodes identically either way, so
+/// a guess cannot be checked against the result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Alphabet {
+    /// RFC 4648 §5, which uses `-` and `_`.
+    UrlSafe,
+    /// RFC 4648 §4, which uses `+` and `/`.
+    Standard,
+}
+
+impl Alphabet {
+    /// Returns the alphabet's stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UrlSafe => "base64url",
+            Self::Standard => "base64",
+        }
+    }
+
+    /// Returns the alphabet's 64 characters.
+    const fn characters(self) -> &'static [u8; 64] {
+        match self {
+            Self::UrlSafe => URL_SAFE,
+            Self::Standard => STANDARD,
+        }
+    }
+}
+
+/// Whether a value carried `=` padding.
+///
+/// **A property of the value, not a parameter to the decoder.** Padding is *observable* — it is the `=` at the
+/// end of the string — unlike the alphabet, which needs no marker and so cannot be read off a value that
+/// happens to use neither of the two characters that distinguish them. So this is reported rather than
+/// requested: a decoder told to expect padding would have to decide what an unpadded value means, while a
+/// decoder that *looks* simply knows.
+///
+/// It is still worth reporting, because it is the axis that separates the two published forms of the same
+/// field: the Gmail guide's example is unpadded and Cloud Pub/Sub's own is padded (`ADR-0089`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Padding {
+    /// The value carried no `=`. Either it needed none, or its producer omitted them.
+    Absent,
+    /// The value ended with one or two `=`, which is Google's convention for a `bytes` field.
+    Present,
+}
+
+impl Padding {
+    /// Returns the padding's stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "unpadded",
+            Self::Present => "padded",
+        }
+    }
+
+    /// Returns which padding a value carries, from the value alone.
+    ///
+    /// The only way to be wrong here is to misread the string, which is why this is a lookup and not a guess.
+    #[must_use]
+    pub fn of(input: &str) -> Self {
+        if input.ends_with('=') {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
 }
 
 /// The longest base64 value this crate will decode, in characters.
@@ -98,42 +175,50 @@ fn encode(input: &[u8], alphabet: &[u8; 64]) -> String {
 /// value. **Padding is refused rather than tolerated**, because the caller that uses this is a PKCE verifier
 /// comparing against a value the provider normalised — and accepting padded input there would let a verifier
 /// and its challenge disagree about which bytes they mean.
-pub fn decode_url_safe(input: &str) -> Result<Vec<u8>, Base64Error> {
-    decode(input, URL_SAFE)
-}
-
-/// Decodes an **unpadded standard** base64 value (RFC 4648 §4).
+/// Decodes `input` in a stated alphabet, reading the padding from the value.
+///
+/// # Why the alphabet is a parameter and the padding is not
+///
+/// The two are different kinds of fact. **Padding is observable**: it is the `=` at the end, so a decoder can
+/// look. **The alphabet is not**: the two differ in exactly two characters (`+`/`/` versus `-`/`_`), so a value
+/// containing neither decodes identically either way and no inspection can recover which was intended. A
+/// parameter is therefore needed for the unobservable one, and asking for the observable one would let a caller
+/// claim a padding the value does not have — a refusal invented rather than found (`ADR-0089`).
 ///
 /// # Errors
 ///
-/// As [`decode_url_safe`]. Padding is refused here too, for the same reason: a decoder that quietly stripped
-/// `=` would accept two spellings of one value, and the caller cannot then say which it received.
-pub fn decode_standard(input: &str) -> Result<Vec<u8>, Base64Error> {
-    decode(input, STANDARD)
-}
-
-/// Decodes `input` with a given alphabet, refusing padding.
-fn decode(input: &str, alphabet: &[u8; 64]) -> Result<Vec<u8>, Base64Error> {
+/// Returns [`Base64Error::Padding`] for malformed padding, [`Base64Error::Alphabet`] for a character outside the
+/// stated alphabet, [`Base64Error::Length`] for an impossible length, and [`Base64Error::TooLong`] past the
+/// bound.
+pub fn decode_with(input: &str, alphabet: Alphabet) -> Result<Vec<u8>, Base64Error> {
     if input.len() > MAX_BASE64_CHARS {
         return Err(Base64Error::TooLong {
             maximum: MAX_BASE64_CHARS,
         });
     }
-    if input.contains('=') {
-        return Err(Base64Error::Padded);
-    }
+    // Padding is validated, not searched for. A `=` is not in either alphabet, so it is stripped **before** the
+    // character loop — and a value whose padding is malformed is refused here rather than reported as an
+    // alphabet fault, which would name the wrong problem (`ADR-0086`'s defect in a different place).
+    //
+    // The padding itself is **discarded** rather than returned: it does not change the arithmetic (the decoder
+    // stops emitting bytes when fewer than eight bits remain, so trailing `=` could only repeat a byte already
+    // emitted), and a caller that wants to know it asks [`Padding::of`]. Returning it here would put the same
+    // fact in two places, one of which a mutation could change without any test noticing.
+    let (body, _) = split_padding(input)?;
     // A base64 group is four characters, so a remainder of one is impossible: no whole number of bytes encodes
-    // to a single leftover character. The other three remainders are legal and mean 1, 2 and 3 output bytes.
-    if input.len() % 4 == 1 {
+    // to a single leftover character. The other three remainders are legal and mean 1, 2 and 3 output bytes
+    // (or 2 and 1 once padding is accounted for).
+    if body.len() % 4 == 1 {
         return Err(Base64Error::Length);
     }
-    let mut output = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let characters = alphabet.characters();
+    let mut output = Vec::with_capacity(body.len() / 4 * 3 + 3);
     // Six bits are taken at a time into a 24-bit accumulator; every four characters (or the trailing partial
     // group) flush the whole bytes they completed.
     let mut accumulator: u32 = 0;
     let mut bits: u32 = 0;
-    for character in input.bytes() {
-        let value = index_of(character, alphabet).ok_or(Base64Error::Alphabet)?;
+    for character in body.bytes() {
+        let value = index_of(character, characters).ok_or(Base64Error::Alphabet)?;
         accumulator = (accumulator << 6) | u32::from(value);
         bits += 6;
         if bits >= 8 {
@@ -145,6 +230,23 @@ fn decode(input: &str, alphabet: &[u8; 64]) -> Result<Vec<u8>, Base64Error> {
         }
     }
     Ok(output)
+}
+
+/// Splits a value into its unpadded body and which padding it carried.
+///
+/// Validates that padding is at most two `=` **and only at the end**, which is what RFC 4648 §4 permits: a
+/// padded value's length is always a multiple of four, so a value with padding anywhere else is corrupt rather
+/// than in an unexpected form.
+fn split_padding(input: &str) -> Result<(&str, Padding), Base64Error> {
+    let body = input.trim_end_matches('=');
+    let padding = input.len() - body.len();
+    if padding == 0 {
+        return Ok((input, Padding::Absent));
+    }
+    if padding > 2 || !input.len().is_multiple_of(4) {
+        return Err(Base64Error::Padding);
+    }
+    Ok((body, Padding::Present))
 }
 
 /// Returns a character's value in an alphabet, or `None` when it is not in it.
