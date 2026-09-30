@@ -262,6 +262,78 @@ fn the_read_only_scope_is_requested_rather_than_a_wider_gmail_scope() {
 }
 
 #[test]
+fn the_profile_operation_is_declared_because_the_identity_requirement_had_no_consumer() {
+    // **The finding, as a test.** `tools-and-connectors.md` requires an account's identity to be "verified
+    // from the provider, not user-entered labels", and `P5-004`'s record names `users.getProfile`'s
+    // `emailAddress` as the value that satisfies it. The connector declared **no** operation that returned it,
+    // so a `VerifiedAccount` had no provider-supplied identifier to carry and the requirement was
+    // unimplementable. The presence of this operation is what closes that, so the assertion is on the
+    // manifest's declarations rather than on a shape.
+    let manifest = manifest();
+    let profile = manifest
+        .operations()
+        .iter()
+        .find(|operation| operation.id() == "gmail_profile_read")
+        .unwrap_or_else(|| {
+            panic!("the identity read must be declared, or the requirement is unmet again")
+        });
+    assert_eq!(
+        profile.required_scopes(),
+        ["mail.read"],
+        "the profile read is a mail read, and its JARVIS scope is the same one the other Gmail reads require"
+    );
+    assert!(
+        profile.effects().to_vec() == [ToolEffect::ReadOnly],
+        "reading the account's own address changes nothing"
+    );
+    // **The cost is the provider's `1`, and it is asserted rather than trusted.** `getProfile` is the
+    // cheapest call in this connector, which is why the identity read is cheap enough to make on connect;
+    // a reader who saw no cost here would reasonably assume it was free.
+    assert_eq!(profile.quota_cost(), QuotaCost::Documented(1));
+}
+
+#[test]
+fn the_requested_openid_scope_is_not_what_makes_the_profile_readable() {
+    // **The correction this slice records.** `SCOPE_OPENID`'s doc claimed `users.getProfile` was "the
+    // operation this scope exists for". The `users.getProfile` reference requires one of `mail.google.com/`,
+    // `gmail.modify`, `gmail.compose`, `gmail.readonly`, `gmail.metadata` — and **`openid` is not among
+    // them**, so a caller holding only `openid` would be refused. The Gmail read scope is what the profile
+    // needs, and this test asserts the operation carries it rather than the OIDC scope.
+    let manifest = manifest();
+    let profile = manifest
+        .operations()
+        .iter()
+        .find(|operation| operation.id() == "gmail_profile_read")
+        .unwrap_or_else(|| panic!("the identity read must be declared"));
+    assert!(
+        !profile
+            .required_scopes()
+            .iter()
+            .any(|scope| scope == "openid"),
+        "the JARVIS-side scope for the profile read is a mail read, never the OIDC scope"
+    );
+    // And the granted scopes contain BOTH the Gmail read (which makes the profile readable) and `openid`
+    // (whose only consumer is the unbuilt id-token check). The two are requested for **different reasons**,
+    // which is the distinction the old comment collapsed.
+    let granted: Vec<String> = manifest
+        .auth_methods()
+        .iter()
+        .flat_map(|method| method.scopes.clone())
+        .collect();
+    assert!(
+        granted.contains(&SCOPE_GMAIL_READONLY.to_owned()),
+        "the Gmail read scope is what makes `users.getProfile` answer"
+    );
+    assert!(
+        granted.contains(&SCOPE_OPENID.to_owned()),
+        "`openid` is requested for the id token, which the exchange receives"
+    );
+    // They are different strings in different vocabularies — one an OIDC name, one a Gmail URL — so a reader
+    // cannot conclude that requesting one grants the other.
+    assert_ne!(SCOPE_OPENID, SCOPE_GMAIL_READONLY);
+}
+
+#[test]
 fn a_pkce_public_client_has_no_secret_field() {
     // The absence is the control: `OAuthPkce::requires_client_secret()` is false, so a `ClientSecret` field
     // here would be asking an operator to paste something the flow never uses — and a field that exists gets

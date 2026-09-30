@@ -31,6 +31,8 @@
 //! applicable to the other and nothing about the token itself says so — `P3-008a`'s lesson that a value must
 //! be accompanied by what it denotes.
 
+use std::fmt;
+
 use jarvis_core::UtcTimestamp;
 
 use crate::account::AccountReference;
@@ -116,13 +118,42 @@ impl SyncCursorKind {
 /// connector version that issued it. Both bindings are the point: a token alone says nothing about which
 /// mailbox it belongs to, and a provider that answers a foreign token *differently* rather than refusing it
 /// is exactly the case a caller cannot detect unaided.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SyncCursor {
     kind: SyncCursorKind,
     token: Option<String>,
     account: AccountReference,
     connector_version: String,
     observed_at: UtcTimestamp,
+}
+
+impl fmt::Debug for SyncCursor {
+    /// Redacts the token, because a cursor is provider-issued text that can address another account's data.
+    ///
+    /// **Hand-written rather than derived, and the crate's own diagnostics module already said why.**
+    /// `DiagnosticField::CursorObservedAt` records that "the token itself is never a field, because a cursor is
+    /// provider-issued text that can address another account's data" — so the policy was written down and the
+    /// type printed it anyway, for as long as this was derived. A `{:?}` on a cursor reaches a log line, and a
+    /// log line is one of the places `security.md` forbids token material (`ADR-0091`).
+    ///
+    /// The **kind, account, version and instant are kept**, because they are what a diagnostic needs and none
+    /// names a position: the account is an [`AccountReference`], which is JARVIS's own local identifier rather
+    /// than the provider's account id, so it discloses nothing about the mailbox.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncCursor")
+            .field("kind", &self.kind)
+            .field(
+                "token",
+                // `None` is printed as `None` rather than as a redaction: "this cursor kind carries no token"
+                // is a fact worth seeing, and a marker would make a start cursor look like a redacted one.
+                &self.token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("account", &self.account)
+            .field("connector_version", &self.connector_version)
+            .field("observed_at", &self.observed_at)
+            .finish()
+    }
 }
 
 impl SyncCursor {
@@ -350,7 +381,7 @@ pub enum CursorError {
 /// `P3-006a` established the pattern: two values that must agree, with nothing holding both, is a defect
 /// class that lives only between two correct modules. A cursor token and the account it came from are exactly
 /// that pair, so the parts travel together and [`SyncCursor::new`] is the only way to assemble them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SyncCursorParts {
     /// The cursor kind.
     pub kind: SyncCursorKind,
@@ -362,6 +393,34 @@ pub struct SyncCursorParts {
     pub connector_version: String,
     /// When it was observed.
     pub observed_at: UtcTimestamp,
+}
+
+impl fmt::Debug for SyncCursorParts {
+    /// Redacts the token for the same reason [`SyncCursor`] does, and this type is the one that makes the
+    /// reason easy to miss.
+    ///
+    /// **A sibling type is not covered by its sibling's redaction.** `SyncCursor` hides the token, but `From`
+    /// moves the token into *this* struct and `into()` inlines it — so `{:?}` on a converted cursor printed
+    /// the value directly, past the redaction written one screen up. The policy and the constructor both said
+    /// "a cursor token must not reach a log", and this type derived `Debug` anyway (`ADR-0091`).
+    ///
+    /// **The fix is here rather than in a caller that avoids `into()`**, because the safe use of a type cannot
+    /// depend on every caller choosing it; `Parts` exists to be moved around, and moving is exactly when the
+    /// value is most likely to be printed while debugging.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncCursorParts")
+            .field("kind", &self.kind)
+            .field(
+                "token",
+                // `None` as `None`, matching `SyncCursor`: the absence of a token is a fact, not a redaction.
+                &self.token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("account", &self.account)
+            .field("connector_version", &self.connector_version)
+            .field("observed_at", &self.observed_at)
+            .finish()
+    }
 }
 
 impl SyncCursorParts {

@@ -35,6 +35,7 @@
 //!   Google that no source supports.
 
 pub mod client;
+pub mod connection;
 pub mod credential;
 pub mod definitions;
 pub mod http;
@@ -42,7 +43,9 @@ pub mod operations;
 pub mod pubsub;
 pub mod request;
 pub mod revocation;
+pub mod routing;
 pub mod scopes;
+pub mod teardown;
 pub mod token;
 pub mod transport;
 pub mod watch;
@@ -95,11 +98,39 @@ pub const SCOPE_CALENDAR_READONLY: &str = "https://www.googleapis.com/auth/calen
 /// The `OpenID` Connect identity scope, used to verify the account from the provider.
 ///
 /// `tools-and-connectors.md` requires "account identity verified from the provider, not user-entered
-/// labels". The `users.getProfile` response carries an `emailAddress`, and that is the operation this scope
-/// exists for — **but that operation is not declared here yet**: the four operations below are the mail and
-/// calendar reads, and the profile read that would consume this scope is a later addition. The scope is
-/// requested now because it is what makes the granting account's *identity* available alongside its content,
-/// and the research record's cost table already carries its `1` unit cost.
+/// labels". [`SCOPE_GMAIL_READONLY`] and [`GoogleConnector::operations`] (the `gmail_profile_read` operation)
+/// are what satisfy that requirement: the `users.getProfile` response carries an `emailAddress`, and that
+/// operation is declared above and reads it.
+///
+/// # `openid` is **not** what makes the profile readable, and this doc said it was
+///
+/// An earlier version of this comment read "*the `users.getProfile` response carries an `emailAddress`, and
+/// that is the operation this scope exists for*". That is wrong, and the `users.getProfile` reference is
+/// explicit about it: the operation requires *"one of the following OAuth scopes"* — `mail.google.com/`,
+/// `gmail.modify`, `gmail.compose`, `gmail.readonly`, `gmail.metadata` — and **`openid` is not among them**.
+/// So a caller holding only `openid` would be refused by `getProfile`, and the identity the doc promised would
+/// not arrive. The Gmail read scope is what the profile read needs; `openid` is requested for a different
+/// reason, recorded below (`ADR-0096`).
+///
+/// # So what is this scope for, and why is it still requested
+///
+/// It is an **OIDC** scope rather than a Gmail one, and requesting it changes the token response: Google
+/// returns an `id_token`, which [`crate::token::TokenResponse::has_id_token`] records arriving and
+/// [`crate::google::token`] deliberately does **not** verify. Two facts about it, both of which are limits
+/// rather than capabilities:
+///
+/// - The `id_token` is **received and unverified**. What would verify it is `jwks_uri` from the discovery
+///   document, and no code does that.
+/// - `openid` is requested together with the `nonce` [`AuthorizationTransaction`] already generates, which is
+///   what makes a *future* ID-token check possible — the `nonce` is carried to the grant for exactly that
+///   reason and nothing compares it today. So the pairing is a **prepared seam, not a working feature**, and
+///   this comment says which so a reader does not mistake one for the other.
+///
+/// Requesting a scope whose only consumer is unbuilt is a real cost — it is one more thing on the consent
+/// screen — and it is kept because dropping it would remove the `nonce`'s purpose and make a later ID-token
+/// check impossible without a fresh consent for every existing account.
+///
+/// [`AuthorizationTransaction`]: crate::authorization::AuthorizationTransaction
 pub const SCOPE_OPENID: &str = "openid";
 
 /// Gmail's published scope categories, transcribed from the scopes page read on
@@ -186,12 +217,15 @@ impl GoogleConnector {
 
     /// Returns the operations this connector declares.
     ///
-    /// Four read operations, each mapped from a documented Gmail or Calendar method. The `id` is a
+    /// Five read operations, each mapped from a documented Gmail or Calendar method. The `id` is a
     /// **JARVIS name segment** and not the provider's method name, because policy binds to the canonical
     /// identifier; the provider's method is named in the description so a reader can find it.
     ///
     /// Every one is `ReadOnly` at risk 0, which is `tools-and-connectors.md`'s own guidance for "read
-    /// calendar, search mail metadata" and makes all three `auto when scoped`. No write operation is
+    /// calendar, search mail metadata" and makes them all `auto when scoped`. The fifth is
+    /// `gmail_profile_read`, and it is the one that makes the account-identity requirement satisfiable: the
+    /// four mail and calendar reads return *content*, and none of them says **which mailbox** answered, so
+    /// without it a `VerifiedAccount` had no provider-supplied identifier to carry. No write operation is
     /// declared: `P5-009` owns them "behind policy and approval", and `P5-004` recorded that a Gmail send
     /// returning HTTP 200 does **not** mean the mail was sent — a fact that needs its own declaration
     /// (`ProviderIdempotency::Unknown` at minimum) rather than being added here as an afterthought.
@@ -259,6 +293,23 @@ impl GoogleConnector {
                 // exists to prevent.
                 quota_cost: QuotaCost::Unstated,
                 rate_limit: None,
+            },
+            ConnectorOperation {
+                id: "gmail_profile_read".to_owned(),
+                description: "Read the authenticated mailbox's own address and current history position. \
+                              Wraps `users.getProfile`; this is the operation that supplies the account \
+                              identity `tools-and-connectors.md` requires to come from the provider rather \
+                              than from a user-entered label."
+                    .to_owned(),
+                effects: vec![ToolEffect::ReadOnly],
+                risk: 0,
+                required_scopes: vec!["mail.read".to_owned()],
+                idempotency: ProviderIdempotency::Declared,
+                // 1 unit: the cheapest call this connector makes, and the figure the research record's cost
+                // table already carries for `getProfile`. Recorded here with the same evidence discipline as
+                // the other three — the number is the provider's.
+                quota_cost: QuotaCost::Documented(1),
+                rate_limit: Some(gmail_rate_limit()),
             },
         ]
     }

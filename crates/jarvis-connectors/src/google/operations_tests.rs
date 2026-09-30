@@ -739,6 +739,65 @@ fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
 }
 
 #[test]
+fn the_profile_read_renders_the_identity_every_declared_field_of_it() {
+    // **The identity read end to end through the operation layer**, which is the layer `ADR-0083` found a gap
+    // in: an output schema promised fields the renderer never produced. Here the schema declares two, so both
+    // must be asserted — the address always, and the position when the provider sent one.
+    let result = must(
+        interpret(
+            "google.gmail_profile_read",
+            Ok(response(
+                200,
+                r#"{"emailAddress":"user@example.com","messagesTotal":42,"threadsTotal":7,"historyId":"1234567890"}"#,
+            )),
+            now(),
+        ),
+        "a profile read must be a result",
+    );
+    let output = result
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_output_matches_declared_schema("google.gmail_profile_read", output);
+    assert!(
+        output.contains("\"email_address\":\"user@example.com\""),
+        "the declared identity field must be rendered: {output}"
+    );
+    assert!(
+        output.contains("\"history_id\":\"1234567890\""),
+        "the declared position field must be rendered: {output}"
+    );
+    // **The two fields this connector does not declare are not rendered.** `messagesTotal` and `threadsTotal`
+    // are mailbox counts the connector's output schema deliberately omits, and rendering them anyway would
+    // reintroduce `ADR-0083`'s defect in the other direction — a value in the output that no declared field
+    // promises.
+    assert!(
+        !output.contains("messagesTotal") && !output.contains("threadsTotal"),
+        "the output must carry only the fields the schema declares: {output}"
+    );
+
+    // And the identity-only case: `history_id` is optional in the schema, so a profile without one must still
+    // validate rather than failing a `required` check it never promised.
+    let identity_only = must(
+        interpret(
+            "google.gmail_profile_read",
+            Ok(response(200, r#"{"emailAddress":"user@example.com"}"#)),
+            now(),
+        ),
+        "an identity-only profile is still a result",
+    );
+    let rendered = identity_only
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_output_matches_declared_schema("google.gmail_profile_read", rendered);
+    assert!(
+        !rendered.contains("history_id"),
+        "an absent position must be omitted rather than rendered as null: {rendered}"
+    );
+}
+
+#[test]
 fn a_sync_token_with_a_time_range_is_refused_by_the_operation_layer() {
     // The operation layer is what a model's arguments pass through, so this is where the impossible pairing
     // must be stopped — by `request_for`, **before** a transport call is built. The refusal is a

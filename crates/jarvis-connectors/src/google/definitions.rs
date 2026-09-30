@@ -93,6 +93,7 @@ fn input_schema(operation: &str) -> Option<&'static str> {
         "gmail_messages_list" => Some(GMAIL_LIST_INPUT),
         "gmail_history_list" => Some(GMAIL_HISTORY_INPUT),
         "gmail_messages_read" => Some(GMAIL_READ_INPUT),
+        "gmail_profile_read" => Some(GMAIL_PROFILE_INPUT),
         "calendar_events_read" => Some(CALENDAR_READ_INPUT),
         _ => None,
     }
@@ -104,6 +105,7 @@ fn output_schema(operation: &str) -> Option<&'static str> {
         "gmail_messages_list" => Some(GMAIL_LIST_OUTPUT),
         "gmail_history_list" => Some(GMAIL_HISTORY_OUTPUT),
         "gmail_messages_read" => Some(GMAIL_READ_OUTPUT),
+        "gmail_profile_read" => Some(GMAIL_PROFILE_OUTPUT),
         "calendar_events_read" => Some(CALENDAR_READ_OUTPUT),
         _ => None,
     }
@@ -115,6 +117,7 @@ fn title(operation: &str) -> Option<&'static str> {
         "gmail_messages_list" => Some("List Gmail messages"),
         "gmail_history_list" => Some("List Gmail changes since a position"),
         "gmail_messages_read" => Some("Read a Gmail message"),
+        "gmail_profile_read" => Some("Identify the connected Gmail account"),
         "calendar_events_read" => Some("Read calendar events"),
         _ => None,
     }
@@ -373,6 +376,64 @@ const GMAIL_HISTORY_OUTPUT: &str = r#"{
     }
   },
   "required": ["message_ids"],
+  "additionalProperties": false
+}"#;
+
+/// The input schema of `gmail_profile_read`.
+///
+/// # Why this schema has no properties at all
+///
+/// Every other input here declares arguments, so an empty one reads as an omission. It is not: the operation
+/// asks about **the credential that is calling**, and `users.getProfile`'s path parameter is documented as
+/// *"The user's email address. The special value `me` can be used to indicate the authenticated user."* The
+/// connector always sends `me`, so a `user_id` argument would be a field a caller could fill with another
+/// mailbox — a request the caller's own token does not authorise, and one whose refusal would arrive as a
+/// `403` rather than as a schema error. Leaving the properties out makes that call unrepresentable, which is
+/// the same move the request builder makes by taking no arguments.
+///
+/// `additionalProperties: false` is what keeps the emptiness meaningful rather than merely undocumented: a
+/// model that invented a field is refused rather than having it silently dropped, which is the failure
+/// `ADR-0093` names for an argument the provider would ignore.
+const GMAIL_PROFILE_INPUT: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}"#;
+
+/// The output schema of `gmail_profile_read`.
+///
+/// # Both fields are the provider's own statement about the account
+///
+/// The `users.getProfile` reference gives the response as `{ "emailAddress": string, "messagesTotal": integer,
+/// "threadsTotal": integer, "historyId": string }`. This connector declares the two it renders: the address,
+/// which is the identity `tools-and-connectors.md` requires to be "verified from the provider, not
+/// user-entered labels", and the position, which a caller can use to seed a first sync.
+///
+/// **`messagesTotal` and `threadsTotal` are deliberately absent, not overlooked.** They are mailbox *counts* —
+/// metadata about the account's size — and nothing in this connector consumes them. Declaring a field no
+/// renderer produces is the defect `ADR-0083` records: a schema promising a value the tool never returns reads
+/// as unreliable output. They can be added when something reads them.
+///
+/// **`email_address` is required and `history_id` is not**, matching `parse_profile`: a profile with no address
+/// establishes nothing and is refused, while the reference documents `historyId` as a separate field a
+/// caller may not need. The address is a person's mailbox, so it is rendered here under `Confidential` output
+/// classification like the mail this connector reads — and it is the same class of value
+/// `PubsubNotification` and `VerifiedAccount` both redact in `Debug` (`ADR-0091`).
+const GMAIL_PROFILE_OUTPUT: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "email_address": {
+      "type": "string",
+      "description": "The connected mailbox's address, as the provider stated it. This is the account's verified identity, not a label a caller chose."
+    },
+    "history_id": {
+      "type": ["string", "null"],
+      "description": "The mailbox's position at the time of this read. Omitted when the provider did not return it. This is a mailbox POSITION and not the identity; it is also not the position a sync ends at."
+    }
+  },
+  "required": ["email_address"],
   "additionalProperties": false
 }"#;
 

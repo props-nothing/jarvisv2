@@ -268,3 +268,59 @@ fn the_cursor_parts_travel_with_what_they_denote() {
     assert_eq!(cursor.connector_version(), "1.0.0");
     assert_eq!(cursor.observed_at(), at(1_700_000_000));
 }
+
+#[test]
+fn the_cursor_parts_do_not_print_the_token_the_cursor_hides() {
+    // **The redaction has to follow the value, and `into()` is where it did not.** `SyncCursor` hides its
+    // token, but `From<SyncCursor> for SyncCursorParts` moves the token into a second type that derived
+    // `Debug` — so converting and printing printed what the redaction two definitions up was for. This test
+    // is the crate's marker-plus-control shape, and it asserts the *parts* because that is the type that
+    // leaked (`ADR-0091`).
+    let cursor = must(
+        SyncCursor::new(
+            SyncCursorKind::MonotonicMarker,
+            Some("9876543210".to_owned()),
+            reference("acct-1"),
+            "1.0.0",
+            at(1_700_000_000),
+        ),
+        "a cursor",
+    );
+    let parts: SyncCursorParts = cursor.into();
+    let rendered = format!("{parts:?}");
+    assert!(
+        !rendered.contains("9876543210"),
+        "the parts must not print the token the cursor redacts: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the token must be redacted rather than omitted, so a reader sees a value was hidden: {rendered}"
+    );
+    // The control: the fields a diagnostic actually needs are still printed. A `Debug` that redacted
+    // everything would pass the assertion above and make the type useless to debug.
+    assert!(
+        rendered.contains("acct-1")
+            && rendered.contains("MonotonicMarker")
+            && rendered.contains("1.0.0"),
+        "the non-sensitive fields must still be printed: {rendered}"
+    );
+    // And a start cursor's absent token prints as `None`, not as a marker — see `SyncCursor`'s own test for
+    // why the two situations must render differently. Reached through the validating constructor, so the
+    // parts are the ones a `start` cursor actually produces.
+    let start = must(
+        SyncCursor::new(
+            SyncCursorKind::Start,
+            None,
+            reference("acct-1"),
+            "1.0.0",
+            at(1_700_000_000),
+        ),
+        "a start cursor",
+    );
+    let start_parts: SyncCursorParts = start.into();
+    let start_rendered = format!("{start_parts:?}");
+    assert!(
+        start_rendered.contains("token: None"),
+        "an absent token must print as `None` rather than as a redaction: {start_rendered}"
+    );
+}

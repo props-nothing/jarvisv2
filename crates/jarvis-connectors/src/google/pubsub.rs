@@ -52,6 +52,8 @@
 //! tests prove this module implements the *record* and the record's example — not that a live subscription
 //! delivers what the guide says.
 
+use std::fmt;
+
 use crate::base64::{Alphabet, Base64Error, Padding, decode_with};
 
 /// The field a Gmail push payload carries its mailbox and position in.
@@ -117,12 +119,33 @@ impl PubsubData {
 /// The values are kept as text rather than converted: `history_id` becomes a cursor through
 /// `SyncCursor::new`, which applies its own bound, and `email_address` is an identity the caller matches against
 /// its connected accounts rather than a value this module validates as an address.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PubsubNotification {
     /// The mailbox that changed, as the provider named it.
     pub email_address: String,
     /// The mailbox's **new** position, which is where an incremental sync advances to.
     pub history_id: String,
+}
+
+impl fmt::Debug for PubsubNotification {
+    /// Redacts the mailbox address, which is a person's.
+    ///
+    /// **Hand-written rather than derived, and the crate is of two minds about this field otherwise.**
+    /// `VerifiedAccount` already redacts its provider account identifier with the note that it "is usually an
+    /// email address and a diagnostic that printed it would leak the account's owner", and `AccessToken` and
+    /// `FormRequest` follow the same pattern — while this type, which holds an address the provider sent over a
+    /// public endpoint, printed it. A `{:?}` reaches a log line, and `security.md` forbids token material and
+    /// account content there (`ADR-0091`).
+    ///
+    /// **The history id is kept**, and the asymmetry is deliberate: it is a mailbox *position*, so it names no
+    /// person, and it is exactly what a diagnostic about a stuck sync needs to show.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PubsubNotification")
+            .field("email_address", &"[REDACTED]")
+            .field("history_id", &self.history_id)
+            .finish()
+    }
 }
 
 /// Why a push notification's `data` could not be read.
@@ -252,6 +275,135 @@ pub const fn acknowledges_delivery(status: u16) -> bool {
     false
 }
 
+/// How a handler answered one delivery, and therefore what the *subscription* does next.
+///
+/// # Why this is not a `bool`, and why it is not the status code either
+///
+/// [`acknowledges_delivery`] answers "was this code in the list", which is a fact about one response. It does
+/// **not** say what the answer costs, and the push page makes that the operative question: a negative
+/// acknowledgement does not merely cause this one message to be redelivered, it is also an input to a
+/// **subscription-global** delay.
+///
+/// > "If a push subscriber sends too many negative acknowledgments, Pub/Sub might start delivering messages
+/// > using a push backoff. When Pub/Sub uses a push backoff, it stops delivering messages for a predetermined
+/// > amount of time. This time span can range between 100 milliseconds to 60 seconds."
+///
+/// and, among the considerations the page lists:
+///
+/// > "• Push backoff can't be turned on or off. You also can't modify the values used to calculate the delay.
+/// > • Push backoff triggers on the following actions: When a negative acknowledgment is received. When the
+/// > acknowledgment deadline of a message expires. • **Push backoff applies to all the messages in a
+/// > subscription (global).**"
+///
+/// So one delivery's answer is paid for by **every** delivery on the subscription, for up to a minute, and the
+/// subscriber cannot opt out. That is the fact a bare `bool` erases: `false` from [`acknowledges_delivery`]
+/// reads as "this one message will be retried" while it also means "and nothing else will be delivered for a
+/// while". A caller deciding what to answer a delivery it cannot process needs the second half, and it is the
+/// half that decides between "refuse again" and "record it somewhere and accept it".
+///
+/// # Why a decision rather than the raw status
+///
+/// A `u16` would let a caller invent a code and re-derive [`acknowledges_delivery`] at the call site — the
+/// duplication this type removes. It also keeps the *reason* legible: [`Self::Retry`] and
+/// [`Self::AbandonAndAcknowledge`] may both be sent as a negative code and an acknowledging one respectively,
+/// but they mean opposite things about the message, and a reader of a call site should not have to infer which
+/// from an integer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryAck {
+    /// The delivery was processed. Answer with a code that acknowledges it.
+    Accept,
+    /// The delivery **could not be processed** and should come back, and the handler can afford the backoff.
+    ///
+    /// For a transient cause — the store is locked, a token refresh is in flight — where a redelivery is the
+    /// documented remedy.
+    Retry,
+    /// The delivery can **never** be processed by this handler, so it is acknowledged rather than refused.
+    ///
+    /// # The decision this variant exists for, and its cost
+    ///
+    /// A negative acknowledgement is the one answer that is charged to the whole subscription: it triggers a
+    /// backoff that "applies to all the messages in a subscription (global)" and that cannot be turned off. So
+    /// for a delivery the handler will *never* accept — a payload shape this connector does not read, a mailbox
+    /// that is no longer connected — refusing it does not merely redeliver a message that will fail again, it
+    /// **slows delivery for every other account on the subscription** for up to a minute, and keeps doing so
+    /// for as long as the bad message is retried. The redelivery is not bounded by the handler; it is bounded by
+    /// the subscription's retry policy, and the page notes that a push subscriber "can't modify the
+    /// acknowledgment deadline of individual messages".
+    ///
+    /// So the honest answer to a permanently unprocessable delivery is to acknowledge it and **record that it
+    /// was dropped**, rather than to refuse it forever. That is a choice with a real downside — the message is
+    /// gone from the queue — which is exactly why it is a named variant with the reasoning attached instead of a
+    /// default a caller falls into. `security.md`'s "missing or stale evidence fails closed" does not decide
+    /// this one: both answers are closed against *acting* on the delivery, and the question is only whether the
+    /// cost lands on this message or on the subscription.
+    AbandonAndAcknowledge,
+}
+
+impl DeliveryAck {
+    /// Returns whether this answer acknowledges the delivery.
+    ///
+    /// `Accept` and `AbandonAndAcknowledge` both do, for opposite reasons — one because the work is done, one
+    /// because the work can never be done. **Refusing is the exception**, and it is the only arm that costs the
+    /// subscription.
+    #[must_use]
+    pub const fn acknowledges(self) -> bool {
+        match self {
+            Self::Accept | Self::AbandonAndAcknowledge => true,
+            Self::Retry => false,
+        }
+    }
+}
+
+/// Decides what to answer a delivery this handler could not process, from the failure's **retryability** and
+/// the provider's own attempt count.
+///
+/// # The two inputs, and why the caller supplies the first
+///
+/// `retryable` is the caller's reading of *why* the delivery failed, because only the caller knows: a store
+/// error is transient while a payload this connector does not decode is not, and this module sees neither. It
+/// is the same inference/decision split `ADR-0066` establishes for a cursor — the component with the evidence
+/// reads it, and the component with the policy decides.
+///
+/// `delivery_attempt` is the provider's [`PubsubDelivery::delivery_attempt`] value **verbatim**, which is the
+/// field the push page increments per attempt (`"deliveryAttempt": 5`), and **`0` when the provider did not
+/// report one**. Absent is not the same as first, and the direction matters: `0` is below
+/// [`MAX_RETRY_ATTEMPTS`], so an unreported attempt still gets a retry — the reading that keeps a possibly-new
+/// delivery alive, where treating absent as "already retried too often" would abandon a first delivery that
+/// merely arrived without the optional field.
+///
+/// # Why a bound on attempts rather than on time
+///
+/// There is no per-message deadline to read: the push page says a subscriber "can't modify the acknowledgment
+/// deadline of individual messages that you receive from push subscriptions". What *is* readable is
+/// `deliveryAttempt`, so the count is the only per-message fact available.
+#[must_use]
+pub const fn decide_acknowledgement(retryable: bool, delivery_attempt: u32) -> DeliveryAck {
+    // **Not retryable is not the same as retryable-but-out-of-budget**, and the two arms are kept apart on
+    // purpose: the first says the delivery can never be processed, the second says it might have been and did
+    // not within the budget. Both acknowledge, but a reader should see which is which from the reason.
+    if !retryable {
+        return DeliveryAck::AbandonAndAcknowledge;
+    }
+    if delivery_attempt >= MAX_RETRY_ATTEMPTS {
+        return DeliveryAck::AbandonAndAcknowledge;
+    }
+    DeliveryAck::Retry
+}
+
+/// The `deliveryAttempt` value at which a **retryable** failure stops being refused, and why it is small.
+///
+/// **A JARVIS bound, not a provider figure**, and named as such: the page publishes the backoff range and the
+/// global scope but no retry count a subscriber should use. It is compared against the provider's
+/// `deliveryAttempt` verbatim, so a value of `3` means the third attempt is the last refused and the fourth is
+/// abandoned — one comparison with no off-by-one to re-derive.
+///
+/// Three, because the page's own backoff reaches 60 seconds and grows with the count of negative
+/// acknowledgements: a handful of attempts spans the transient causes (a held store, an in-flight token
+/// refresh) without holding the whole subscription down through a full backoff cycle for each. The figure is
+/// deliberately small and stated, because the alternative — refusing without a bound — is not a policy but the
+/// absence of one, and its cost is paid by every other mailbox on the subscription.
+pub const MAX_RETRY_ATTEMPTS: u32 = 3;
+
 /// One push delivery, as the `POST` body carries it.
 ///
 /// # At-least-once, which is why `message_id` is here
@@ -269,6 +421,13 @@ pub const fn acknowledges_delivery(status: u16) -> bool {
 /// sends is not established — and a parser that read only one spelling would find `None` for the other while
 /// reporting no error at all. [`Self::message_id`] is therefore populated from either, with the camelCase
 /// preferred because it is the spelling the `PubsubMessage` reference documents.
+///
+/// # Why the derived `Debug` is safe here
+///
+/// The only sensitive value this type holds is inside [`PubsubMessageBody::data`], whose own `Debug` is
+/// **hand-written to redact it** — so the derive prints a redaction rather than a mailbox. That is the shape to
+/// check when a struct's `Debug` is derived: not "does this struct hold a secret" but "does every field it
+/// holds print one", and the answer changes when a neighbour's `Debug` changes (`ADR-0091`).
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 pub struct PubsubDelivery {
     /// The subscription that delivered this, as a full resource name.
@@ -313,7 +472,7 @@ impl PubsubDelivery {
 /// `#[serde(default)]` field is **silent**, so the deduplication key would simply have been absent on every
 /// delivery with nothing reporting it. The test that caught it asserts the field is `Some` for the provider's
 /// own example rather than merely that the body parses.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
 pub struct PubsubMessageBody {
     /// The base64 payload, in either alphabet [`ALPHABETS`] covers.
     #[serde(default)]
@@ -326,6 +485,30 @@ pub struct PubsubMessageBody {
     /// explicitly does not guarantee (`orderingKey` exists precisely because order is opt-in).
     #[serde(default, rename = "publishTime", alias = "publish_time")]
     pub publish_time: Option<String>,
+}
+
+impl fmt::Debug for PubsubMessageBody {
+    /// Redacts `data`, which **is** the address: its bytes decode to `{"emailAddress":…}`.
+    ///
+    /// This is the subtler of the two redactions in this module, because the field looks like an opaque base64
+    /// blob rather than like a person's address — so a reader could reasonably assume it is safe to print. It is
+    /// not: the value carries no credential, but it names a mailbox, which is the same disclosure
+    /// [`PubsubNotification`] redacts. The **length** is printed instead, because a diagnostic that shows the
+    /// payload arrived at all, and roughly how large it was, is the useful part (`ADR-0091`).
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PubsubMessageBody")
+            .field(
+                "data",
+                &self
+                    .data
+                    .as_ref()
+                    .map(|data| format!("[REDACTED], {} chars", data.len())),
+            )
+            .field("message_id", &self.message_id)
+            .field("publish_time", &self.publish_time)
+            .finish()
+    }
 }
 
 /// Why a delivery body could not be read.

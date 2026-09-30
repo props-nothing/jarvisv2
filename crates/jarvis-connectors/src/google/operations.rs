@@ -99,6 +99,10 @@ pub fn request_for(
             required(arguments, "message_id")?,
             format_of(arguments)?,
         )?),
+        // **No arguments, because the operation asks about the calling credential itself.** The builder sends
+        // `me` for the same reason every other builder on this path does, so there is nothing to validate and
+        // no pairing to refuse — which is the whole shape of this request rather than a simplification.
+        "gmail_profile_read" => Ok(request::gmail_profile()),
         "calendar_events_read" => Ok(request::calendar_events_list(
             required(arguments, "calendar_id")?,
             text(arguments, "time_min")?,
@@ -269,6 +273,7 @@ fn interpret_response(
         "gmail_messages_list"
             | "gmail_history_list"
             | "gmail_messages_read"
+            | "gmail_profile_read"
             | "calendar_events_read"
     ) {
         return Err(AdapterError::NotImplemented {
@@ -375,6 +380,20 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
                     value.to_string()
                 })
         }
+        // **The identity read, and the address is required.** The output declares `email_address` as required
+        // because `parse_profile` refuses a profile without one, so a body that parses always renders both
+        // fields the schema promises — no declared field is unreachable (`ADR-0083` in the output direction).
+        // `history_id` is rendered only when the provider sent one, for the reason every other optional field
+        // here is: an absent key is the honest rendering of a value that did not arrive.
+        "gmail_profile_read" => request::parse_profile(response.status, &response.body)
+            .ok()
+            .map(|profile| {
+                let mut value = serde_json::json!({ "email_address": profile.email_address });
+                if let Some(history_id) = profile.history_id {
+                    value["history_id"] = serde_json::Value::String(history_id);
+                }
+                value.to_string()
+            }),
         _ => None,
     }
 }

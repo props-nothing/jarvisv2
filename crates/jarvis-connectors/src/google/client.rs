@@ -278,6 +278,44 @@ pub enum GoogleApi {
     Calendar,
 }
 
+/// How a `users.watch` request's `labelIds` list is read: as a requirement or an exclusion.
+///
+/// # Why this type exists rather than a pair of booleans or a free string
+///
+/// The `users.watch` reference types this field `enum (LabelFilterAction)` and names its two values `include`
+/// and `exclude`: `include` is *"Only get push notifications for message changes relating to labelIds
+/// specified"* and `exclude` is *"Get push notifications for all message changes except those relating to
+/// labelIds specified"*. So it is a **closed two-value vocabulary**, and a caller that sent a typo or a
+/// different casing would be sending a value the provider does not define — the closed-vocabulary reasoning
+/// [`crate::google::definitions`] uses for its declared operation ids.
+///
+/// # The deprecated sibling, and why it is not here
+///
+/// The reference also carries `labelFilterAction`, typed the same way, and marks it *"deprecated because it
+/// caused incorrect behavior in some cases; use `labelFilterBehavior` instead"* — adding that if
+/// `labelFilterBehavior` is set, `labelFilterAction` **"is ignored"**. So the old spelling still parses at the
+/// provider and does two different wrong things depending on whether the new one accompanies it. **This type
+/// has one name and produces one field**, so the old spelling is not merely discouraged but unrepresentable: a
+/// caller cannot reach `labelFilterAction` through it, and an accidental duplicate cannot be produced by
+/// sending "both spellings" the way a bare string field would invite (`ADR-0093`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LabelFilterBehavior {
+    /// Notifications only for changes to the listed labels.
+    Include,
+    /// Notifications for every change except those to the listed labels.
+    Exclude,
+}
+
+impl LabelFilterBehavior {
+    /// Returns the value the request body carries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Include => "include",
+            Self::Exclude => "exclude",
+        }
+    }
+}
 /// Classifies a Google error response.
 ///
 /// `api` is which of the two APIs answered, because their documented status sets differ; `status` is the HTTP

@@ -4513,6 +4513,347 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **NEW LIMITS:** nothing consumes `CursorOutcome` outside this crate, so the benefit is proved by tests rather
     than observed in a deployment (the recurring pipeline-side gap). `Refused` still carries `RetryGuidance`
     inside it but **nothing reads the delay**, so a caller must schedule the retry itself.
+- [ ] `P5-005` **(continued — a value redacted in one place and printed in another)**: four types stop printing
+  what three other types already redact. **4 new tests (so 390 in the crate).** **`ADR-0091`.** Three guards
+  falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE CRATE HAD A REDACTION CONVENTION AND LATER TYPES OPTED OUT OF IT BY DEFAULT.**
+    `AccessToken`, `FormRequest` and `VerifiedAccount` each hand-write `Debug` to print `[REDACTED]`/`<redacted>`,
+    each with a test asserting the marker — and `PubsubNotification` (a **mailbox address**),
+    `PubsubMessageBody` (base64 whose bytes **decode to** that address), `SyncCursor` (the **token**) and
+    `SyncCursorParts` (the same token) all **derived** `Debug` and printed their sensitive field.
+    `#[derive(Debug)]` is the default and hiding a field is a deliberate act, so nothing made the omission
+    visible.
+  - **⭐⭐ AND THE POLICY WAS ALREADY WRITTEN DOWN IN ANOTHER MODULE.** `DiagnosticField::CursorObservedAt`:
+    *"the token itself is never a field, because a cursor is provider-issued text that can address another
+    account's data."* The rule existed; the type printed it under `{:?}` anyway, which is how a token reaches a
+    log line. **A rule recorded in one module and violated in another is not a rule** — the fix is a test per
+    sensitive type, not a note.
+  - **⭐⭐ FIXING THE THREE KNOWN TYPES WAS NOT ENOUGH — AUDIT BY SHAPE, NOT BY THE OFFENDER LIST.**
+    `SyncCursorParts` (the parts struct `P3-006a` introduced, with the token **moved into it** by
+    `From<SyncCursor>`) is not `SyncCursor`, so it was not covered by the redaction one screen up — and it is
+    reached by the crate's own advertised idiom, `let parts: SyncCursorParts = cursor.into();`, which the
+    existing test uses verbatim. **A sibling type is not covered by its sibling's redaction**, and it was found
+    by grepping for `Debug`-deriving structs with a token-shaped field — a query naming none of the three.
+  - **⭐ THE SUBTLEST ONE LOOKED SAFE.** `PubsubMessageBody::data` is base64 — an opaque-looking blob carrying no
+    credential — so a reader could reasonably print it. Its bytes decode to `{"emailAddress": …}`, so the
+    disclosure is exactly the one the decoded form is redacted for. **Opacity is not safety**, and the *name* of
+    a field is no guide to what it carries.
+  - **⭐ THE REDACTION IS ASYMMETRIC ON PURPOSE.** `PubsubNotification` hides the address and **keeps
+    `history_id`**, because a position names nobody and is what an operator debugging a stuck sync needs.
+    `PubsubMessageBody` hides `data` and prints its **length**, matching `AccessToken`'s `chars: N`. A `Debug`
+    that redacted everything would pass "the value is absent" and make every diagnostic useless — `A10` requires
+    diagnostics to *"remain useful"* as well as redacted, which is why every test here has a **control** asserting
+    the non-sensitive fields are still printed.
+  - **⭐ `None` PRINTS AS `None`, NOT AS A REDACTION.** `SyncCursor::new` refuses a token on a `Start` cursor, so
+    "this kind carries no token" is a fact worth seeing; a marker would make a start cursor look like a redacted
+    one — the "two situations, one rendering" defect in miniature.
+  - **⭐ THE DERIVED `Debug` THAT STAYS HAS A COMMENT SAYING WHY.** `PubsubDelivery`'s derive is safe **because
+    its only sensitive field is inside the redacted `PubsubMessageBody`** — so the comment records the property
+    to re-check ("does every field it holds refuse to print one"), not the conclusion, because it changes when a
+    neighbour changes.
+  - **NEW LIMITS:** this is a **convention with tests, not a mechanism** — nothing stops the next struct deriving
+    `Debug` while holding a sensitive field, and the remedy is one test per type rather than a lint (a lint
+    cannot tell which fields are sensitive). And `SyncCursor`/`SyncCursorParts` now print `kind`/`account`/
+    `version`/`instant`, which is deliberate: the account is an `AccountReference`, JARVIS's own local identifier
+    rather than the provider's id, so it names nothing about the mailbox.
+- [ ] `P5-005` **(continued — a response field with no reader)**: a `users.watch` response carries **two** facts;
+  only the lease was read. **3 new tests (so 393 in the crate).** **`ADR-0092`.** Two guards falsified A-B-A with
+  compiling mutants, one of them the original defect re-introduced.
+  - **⭐⭐ THE FINDING: THE WATCH RESPONSE'S `historyId` — THE ANCHOR A FIRST SYNC STARTS FROM — HAD NO READER.**
+    The reference gives the response as `{ "historyId": string, "expiration": string (int64 format) }`; the module
+    read `expiration` (with its two traps) and read past `historyId` entirely. The push guide says what it is for:
+    *"The response contains the current mailbox `historyId` … Your client receives notifications for all changes
+    **after** that `historyId`."* So a caller using the crate's one watch reader got a **lease with no anchor** —
+    the first sync after a `watch` had nowhere documented to start, and there was no function to call and no
+    error to handle. **A reader named for one field is not a reader for its response**: the name
+    `parse_watch_expiration` is accurate, so nothing looked mislabelled — the gap was in the *shape of the API*.
+  - **⭐⭐ AND THE GUIDE'S WORKED EXAMPLE USES TWO DIFFERENT NUMBERS, WHICH IS WHAT MAKES THE CONFUSION
+    FALSIFIABLE.** *"Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist
+    `9876543210` as the last known `historyId`"* — the response's id at one end, the post-sync position at the
+    other, both strings, both spelled `historyId`. **A one-value example cannot falsify a conflation of two
+    same-typed fields: every reading of it type-checks.** The test asserts the anchor is `1234567890` **and**
+    `assert_ne!`s it against `9876543210`. Worth re-reading a guide for its **example** rather than only its
+    field list — that is where the second number was.
+  - **⭐ THE FAILURE MODE WOULD NOT TERMINATE.** Reading the response's id as "the new position" produces a
+    plausible `historyId` and satisfies every assertion written against a single-number fixture — and an anchor
+    does **not move when the mailbox does**, so a sync that stored it as the position would re-read the same
+    window on every run. `advance_gmail_history` already computes the real successor, which is why the anchor is
+    named `anchor` and not `history_id`: the API's own name is ambiguous between the two ends.
+  - **⭐ THE STRUCT IS THE FIX, NOT THE SECOND READER.** `WatchResponse { anchor, expires_at }` with
+    `parse_watch_response` as the reader to use; the two field readers stay public because each has traps worth
+    testing in isolation. A caller holding a `WatchResponse` **has read both fields**, because the only way to
+    build one is the function that reads both — so the omission cannot recur without changing the type.
+  - **⭐ TWO NEW ERRORS, AND THE ORDER OF THE TWO READS IS A DECISION.** `MissingHistoryId`/`HistoryIdNotAString`
+    are separate from the expiration's, because the remedies differ (an absent anchor makes the first sync
+    unanchorable; an absent expiration makes the lease unreadable). `parse_watch_response` reads `expiration`
+    **first**: a caller that cannot tell when the lease ends cannot use the anchor either.
+  - **⭐ A MISSING ANCHOR IS REFUSED, NOT DEFAULTED.** Treating "no anchor" as "sync from the beginning" takes
+    the most expensive path exactly when the provider failed to supply the cheap one — the fail-open direction.
+  - **NEW LIMITS:** **no `users.watch` request is built**, so the anchor's consumer is still a future sync loop —
+    this makes the anchor *available and correct*, not read in production. The anchor is also unvalidated as a
+    cursor: `SyncCursor::new` applies the empty/oversized/control-character bound, and nothing here calls it, so
+    an unusable `historyId` is caught at the cursor rather than at the response.
+- [ ] `P5-005` **(continued — a request the provider accepts and ignores)**: the `users.watch` **request** — the
+  crate's first body-bearing operation. **4 new tests (so 397 in the crate).** **`ADR-0093`.** Two guards
+  falsified A-B-A with compiling mutants; a third issue was found by a **failing test**, not by review.
+  - **⭐⭐ THE FINDING: THE DANGEROUS ARGUMENT IS THE ONE THE PROVIDER ACCEPTS.** `POST …/users/me/watch` carries
+    a JSON body whose `labelFilterAction` the reference calls *"deprecated because it caused incorrect behavior
+    in some cases"* and says is *"ignored"* when `labelFilterBehavior` is set — so sending the stale spelling is
+    a **`200`**, not a `4xx`. And `labelFilterBehavior` is the *"filtering behavior of `labelIds` list
+    specified"*, so sent with **no** list it governs nothing: the provider registers an **unfiltered** watch
+    rather than refusing. A connector would then receive **every** change while believing it scoped the set —
+    valid notifications, a healthy-looking lease (`historyId` + `expiration`), and only the *set* wrong. **A
+    `400` is self-reporting; a `200` that ignored what you sent is not.**
+  - **⭐⭐ THE REMEDY FOR A DEPRECATED SPELLING IS UNREACHABILITY, NOT DISFAVOUR.** `LabelFilterBehavior` is a
+    two-variant enum producing exactly one field name, and `gmail_watch` has **no parameter** that reaches
+    `labelFilterAction` — so it cannot be sent by accident, by a duplicated call, or by a "send both to be
+    safe" habit a bare `Option<String>` would invite. **An absent parameter cannot be passed; a refused value
+    can later be widened — and the absence is asserted** (the tests parse the body and check the field is
+    absent, in the unfiltered *and* the filtered case, where sending it would look most plausible).
+  - **⭐⭐ A CHECK AND A NORMALIZATION ON THE SAME VALUE MUST BE ORDERED DELIBERATELY — AND THIS WAS FOUND BY A
+    FAILING TEST.** `watch_json_body` did `trim()` and **then** `is_control()` on the result, so a trailing
+    `\n` was **deleted before the check looked for it** and `"projects/p/topics/t\n"` was silently accepted and
+    sent as the clean string. **The check that exists to catch a newline must run before the operation that
+    deletes one.** Trim is right for the emptiness/length checks and wrong as the input to the control check;
+    the fix moved the check to the **raw** value, and the test was left as it was.
+  - **⭐ A NEW ERROR VARIANT, BECAUSE THE FAILURE IS NEW.** `RequestError::Ignored` is distinct from `Argument`
+    and `DisallowedCombination`: both of those describe requests the provider **rejects**, and this one it
+    accepts. The message names the argument and the remedy (send labels, or omit the filter).
+  - **⭐ AN EMPTY LIST IS REFUSED, NOT READ AS "NO FILTER".** After the emptiness check both render the same
+    body, so accepting the empty one would equate a **loop-over-zero-labels** mistake with a deliberate choice.
+    "No filter" is expressed by *omitting* the argument — the one rendering that cannot be produced by accident.
+  - **⭐ A SECOND REQUEST TYPE BECAUSE THE CREDENTIAL BOUNDARY IS THE AXIS, NOT THE BODY.** `WatchRequest` holds
+    a URL and a rendered JSON body and **no header map** (so no field could hold a bearer token — the `ADR-0060`
+    property). It is **not** `FormRequest`: that type's whole justification is the credential its body carries,
+    which is why its `Debug` redacts. A watch body holds a topic name in the caller's own project and Gmail's
+    label vocabulary, so redacting it would make every watch diagnostic useless while protecting nothing.
+  - **NEW LIMITS:** **no request is sent**, so whether Google accepts this body rests on the live smoke test that
+    does not exist; the topic name's **shape** is not validated — the reference requires
+    `projects/{project}/topics/{topic}` whose project *"must exactly match your Google developer project id"*,
+    and checking the second needs a project id the connector does not hold; and a **host discrepancy** between
+    two official sources (`gmail.googleapis.com` in the method reference vs `www.googleapis.com` in this
+    record's Verified Contract) is **recorded and deliberately not resolved**, because moving a base on one
+    page's example rendering is churn.
+- [ ] `P5-005` **(continued — a negative acknowledgement is charged to the subscription)**: the push handler's
+  **answer** becomes a decision with a cost. **4 new tests (so 401 in the crate).** **`ADR-0094`.** Two guards
+  falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE ANSWER TO ONE DELIVERY IS PAID FOR BY EVERY DELIVERY ON THE SUBSCRIPTION.** The push
+    page: *"Push backoff applies to all the messages in a subscription (global)"*, *"Push backoff can't be
+    turned on or off"*, range **100 ms – 60 s**, *"calculated based on the number of negative acknowledgments"*.
+    So `acknowledges_delivery → bool` read as "false: this one retries" while `false` also means **"and nothing
+    else is delivered for up to a minute"**. A handler refusing a message it will *never* accept does not retry
+    a message — it **slows every other mailbox on the subscription**, indefinitely, because the retry count is
+    the subscription's policy and a push subscriber *"can't modify the acknowledgment deadline of individual
+    messages"*. **Ask not "does this code acknowledge" but "who pays for this code".**
+  - **⭐⭐ TWO TRIGGERS, AND ONE IS NOT A RESPONSE AT ALL.** An **expired acknowledgment deadline** triggers the
+    same backoff — so a *slow* handler is indistinguishable, to the backoff, from a refusing one. That is why
+    the decision type is about the delivery's fate rather than about a status code: the cost can be incurred
+    without answering at all.
+  - **⭐ `DeliveryAck` IS THREE ANSWERS, NOT A `bool`.** `Accept` / `Retry` / `AbandonAndAcknowledge` — exactly
+    **one** of which refuses, which the test counts so a merge or a flipped arm fails loudly. A `u16` would let
+    a caller re-derive `acknowledges_delivery` at the call site and hide the *reason* behind an integer.
+  - **⭐ ABANDONING IS A NAMED CHOICE WITH ITS DOWNSIDE WRITTEN DOWN.** Acknowledge-and-record-the-drop loses
+    the message — real cost — which is why it is a variant with the reasoning attached and not a default a
+    caller falls into. `security.md`'s "fails closed" does not decide it: both answers are closed against
+    *acting*, and the question is only whether the cost lands on this message or on the subscription.
+  - **⭐ THE BOUND IS ON `deliveryAttempt`, AND `0` MEANS "NOT REPORTED" — NOT "EXHAUSTED".** No per-message
+    deadline is readable, so the provider's own incremented count is the only per-message fact. Absent is not
+    first, and **the direction is chosen**: `0` still gets a retry, keeping a possibly-new delivery alive,
+    where the opposite reading would abandon a first delivery that merely arrived without an optional field.
+    The push page's **minimum-value example omits `deliveryAttempt`**, so this is a shape that occurs.
+  - **⭐ `MAX_RETRY_ATTEMPTS = 3` IS A JARVIS FIGURE AND SAYS SO.** The page publishes the backoff range and its
+    global scope but **no retry count**, so this is this platform's policy — small and stated, because
+    refusing without a bound is not a policy but the absence of one, paid for by every other mailbox.
+  - **⭐ THE MIRROR OF `ADR-0093`, AND WORTH PAIRING.** There, an argument the provider **accepts and ignores**
+    was dangerous because nothing reports it. Here, an answer the provider **honours** has a cost the sender
+    cannot see — the same "real, untraceable from the call site" failure, from opposite directions.
+  - **NEW LIMITS:** **nothing sends a response** — `DeliveryAck`/`decide_acknowledgement` are the *decision*, and
+    the handler that maps a decision to a status code does not exist, so `acknowledges()` says *whether* to
+    acknowledge and not *which* of the five codes to send (deliberate: they are interchangeable, and choosing
+    one belongs with the response object); and **no dead-letter mechanism** is configured, so
+    `AbandonAndAcknowledge` has nowhere to *send* the dropped delivery beyond recording it.
+- [ ] `P5-005` **(continued — stopping notifications needs the grant that revoking destroys)**: account teardown
+  is **two** operations with a forced order. **5 new tests (so 406 in the crate).** **`ADR-0095`.** Two guards
+  falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE REVOKE SUCCEEDS AND THE STOP THAT FOLLOWS IS THE CALL THAT FAILS — ONE STEP LATER,
+    INVISIBLY.** `users.stop` is an ordinary authenticated API call (the reference lists the **same four
+    scopes** `users.watch` needs), while revocation **removes exactly those scopes** (the identity page: it
+    *"removes all OAuth 2.0 scopes previously granted to a project"*). So **stop then revoke** works and
+    **revoke then stop** does not — and the reversed order fails at the *second* call, where a reader is
+    looking at a different operation. **Same shape as `ADR-0094` (report and cost in different places), in a
+    sequence rather than one call.**
+  - **⭐⭐ AND THE DAMAGE IS A SILENT PRIVACY EXPOSURE, NOT A FAILED CALL.** `stop`'s *"All new notifications
+    should stop within a few minutes"* only applies if the stop **happened**. With the watch still registered
+    and the grant gone, nothing ends the stream but **the lease lapsing** — `WATCH_RENEWAL_BOUND_SECONDS`, i.e.
+    **up to seven days** of the mailbox address arriving at an endpoint the user believes is disconnected, with
+    **no credential left to turn it off**. The leaked value is exactly what `PubsubNotification` redacts
+    (`ADR-0091`).
+  - **⭐ THE RULE IS A PAIRING FUNCTION, NOT A SEQUENCE.** `may_precede(first, second)` refuses exactly one
+    pairing — a step that `withdraws_access()` before one that `needs_a_live_grant()` — and permits the rest
+    (including a step before itself), so a **third** step (Calendar `channels.stop`, a subscription deletion)
+    is checked by the same rule rather than by a reader remembering a comment. `TEARDOWN_PLAN` is the safe
+    order and a test asserts **the rule and the plan agree**.
+  - **⭐ THE ASYMMETRY THAT MAKES THE MISTAKE EASY:** `needs_a_live_grant()` is `true` for `StopWatch` and
+    **`false` for `RevokeGrant`** — revocation accepts an already-dead token (RFC 7009 §2.2's `200` covers
+    "the client submitted an invalid token"). So a caller that revoked first sees its revoke **succeed** and
+    gets **no signal** that it has just made the next step impossible.
+  - **⭐ THE TWO HALVES CARRY DIFFERENT FAILURE POLICIES, AND THE ASYMMETRY IS ARGUED.** `StopWatch` is
+    `BestEffort` (a failed stop costs a bounded privacy window; aborting would leave a **working credential**
+    because a *notification preference* could not be changed — the larger harm to avoid the smaller);
+    `RevokeGrant` is `Required` (a failed revoke means the account is **not** disconnected, so the caller is
+    told).
+  - **⭐ `notification_exposure` IS AN ENUM BECAUSE ONLY ONE ANSWER IS A FIGURE THIS CRATE MAY STATE.** With the
+    stop accepted the provider says *"within a few minutes"* — **no number**, so inventing seconds would
+    fabricate a provider rule. Without the stop the exposure is the lease's bound, which Google **does** state,
+    and it is **reused from `watch`** rather than restated so the two cannot drift.
+  - **⭐ A GENERALISATION: WHEN TWO TEARDOWN STEPS EXIST, ASK WHICH ONE THE OTHER DISABLES.** And narrower: *a
+    cleanup you cannot retry after you remove access must happen before you remove access* — the window between
+    them is the exposure, and its length is a provider figure the crate already holds.
+  - **NEW LIMITS:** **no request is sent and nothing calls this plan** — the teardown executor does not exist
+    (as the push handler and sync loop do not), so the ordering is a **value with tests, not a mechanism**: a
+    caller that ignored `TEARDOWN_PLAN` and revoked first would get no refusal from this module, only a plan to
+    read; and **deleting the Cloud Pub/Sub subscription** is not modelled — it is shared by every watched
+    account, so silencing one mailbox that way would stop notifications for all of them (a candidate
+    **connector-level** third step).
+- [ ] `P5-005` **(continued — a requirement with no consumer)**: the account-identity requirement had no
+  operation that returned it. **5 new tests (so 411 in the crate).** **`ADR-0096`.** Two guards falsified A-B-A
+  with compiling mutants.
+  - **⭐⭐ THE FINDING: `tools-and-connectors.md` REQUIRED PROVIDER-VERIFIED IDENTITY AND NOTHING RETURNED IT.**
+    The requirement is "account identity verified from the provider, not user-entered labels", `P5-004`'s
+    mapping names `users.getProfile`'s `emailAddress` as the value — and the connector declared **no operation
+    that reads a profile**, only four that return mail and calendar *content*, none of which says **which
+    mailbox answered**. So `VerifiedAccount::new`'s required `provider_account_id` had **no producer** and the
+    requirement was **unimplementable, not merely unimplemented**. The gap was invisible because it was an
+    **absence**: no wrong field, no failing test, just a requirement nothing could satisfy.
+  - **⭐⭐ AND A COMMENT DISCHARGED THE WORK THE CODE HAD NOT DONE.** `SCOPE_OPENID`'s doc said *"the
+    `users.getProfile` response carries an `emailAddress`, and that is the operation **this scope exists for**"*
+    — while the `users.getProfile` reference accepts `mail.google.com/`, `gmail.modify`, `gmail.compose`,
+    `gmail.readonly`, `gmail.metadata` and **NOT `openid`**. A reader following the comment concludes the
+    identity path needs nothing more. **A plausible statement substituted for a working link** — the same shape
+    as `ADR-0092` (a reader named for one field while its sibling went unread), one level up.
+  - **⭐⭐ GENERALISATION: A REQUIREMENT'S EVIDENCE IS THE OPERATION THAT RETURNS IT, NOT THE DOCUMENTATION
+    THAT NAMES IT.** "Operation X satisfies requirement Y" is a claim to verify against the API's own **scope
+    and response tables** — here it was false about the *scope* as well as absent about the *operation*.
+  - **⭐ THE SCOPE IS CORRECTED, NOT DELETED.** `openid` *is* requested and *does* have an effect — it makes
+    Google return an `id_token`, which the exchange receives and deliberately does not verify — so removing the
+    constant would remove a real declaration to hide a false explanation. The doc now says `getProfile` does not
+    accept it, that the Gmail read scope is what makes the profile readable, and that the ID-token check is
+    **unbuilt: a prepared seam, not a working feature** (the `nonce` `P5-002` carries is what a future check
+    would compare).
+  - **⭐ NAMING ANOTHER MAILBOX IS UNREPRESENTABLE, NOT DISCOURAGED.** `gmail_profile()` takes **no argument**
+    — it hardcodes `me`, because a `user_id` field would let a caller aim at a mailbox its own token cannot
+    address, refused as a `403` rather than as an error naming the argument. The input schema is
+    `"properties": {}` with `additionalProperties: false`, so an invented field is refused rather than dropped.
+  - **⭐ THE ADDRESS IS REQUIRED AND THE COUNTS ARE NOT DECLARED.** `parse_profile` refuses a response with no
+    usable address — including a **whitespace-only** one, which satisfies "the field was present" while
+    denoting nothing — because the operation exists to establish *which* mailbox answered. `messagesTotal` and
+    `threadsTotal` are deliberately **absent** from both the output schema and the renderer: they are mailbox
+    counts nothing reads, and declaring them is `ADR-0083`'s defect. A test asserts the output contains
+    **neither**, so the omission is checked in both directions.
+  - **⭐ TWO NEW TESTS ASSERT THE CORRECTION, NOT JUST THE FIX.** One asserts the profile operation carries no
+    `openid` JARVIS scope and that the granted scopes contain both the Gmail read (which makes the profile
+    answer) and `openid` (for the id token), with `assert_ne!` on the two strings — the divergence-assertion
+    shape the revocation module uses. The other asserts the **declaration** (exists, `mail.read`, `ReadOnly`,
+    cost `Documented(1)`) so a future edit removing it fails with the reason it must not be removed.
+  - **NEW LIMITS:** **no request is sent and nothing calls the operation** — the connect-time identity flow
+    (call `gmail_profile_read`, build `VerifiedAccount`, store `AccountReference`) does not exist, so the
+    requirement is now *satisfiable* rather than *satisfied in production*; and the `id_token` remains
+    **received and unverified** — this closes the *identity* gap, **not** the *token-verification* one, and the
+    ADR says so rather than conflating them.
+- [ ] `P5-005` **(continued — a delivery names a mailbox and nothing mapped it to an account)**: the push
+  path's missing join, as a pure function. **7 new tests (so 418 in the crate).** **`ADR-0097`.** Two guards
+  falsified A-B-A with compiling mutants (the first caught by **four** tests).
+  - **⭐⭐ THE FINDING: EVERY PIECE OF THE PUSH PATH EXISTED AND THE JOIN DID NOT.** A delivery could be
+    **decoded** (`parse_delivery`), its lease **read** (`watch::parse_watch_response`), its answer **decided**
+    (`pubsub::decide_acknowledgement`), a stale cursor **classified** (`advance_gmail_history`) — and nothing
+    connected the payload's `emailAddress` to one of the connector's accounts. So a delivery said "a mailbox
+    changed" with no way to learn **which of yours**, and the sync it triggers needs one account's stored
+    credential. **An unattributable notification is an unactionable one.**
+  - **⭐⭐ AND THE VALUE THAT MUST BE JOINED ON IS UNTRUSTED.** Finding 1: neither Google mechanism fits
+    `WebhookSupport::Push` (OIDC bearer JWT; echoed channel token over a zero-length body), so the connector
+    **cannot authenticate a delivery at all** — the address is a string from whoever posts to the endpoint. Two
+    facts bound what a forged delivery can do, and both are load-bearing: the route selects **a mailbox to
+    read, never a credential to use** (the sync uses that account's own token, so it reaches only mailboxes
+    already authorised), and the notified `historyId` is **not a position the sync trusts** (`history.list`
+    runs from the **stored** cursor, so a too-high forged id cannot cause a **missed** change). **An identifier
+    arriving over an unauthenticated channel may SELECT but must not AUTHORISE.**
+  - **⭐ BYTE-EXACT, AND THAT IS SECURITY RATHER THAN STRICTNESS.** Six near-misses are asserted, each of which
+    defeats a looser rule: a prefix (`starts_with`), a superstring (`contains`), a suffix-domain, a different
+    local part, and leading/trailing whitespace (trimming). The control asserts the exact value **does** route.
+  - **⭐ A CASE-ONLY NEAR-MATCH IS A STATE, NOT A MATCH.** Addresses are case-insensitive in practice, so
+    `Person@example.invalid` is *probably* the same mailbox — but Google publishes **no canonicalisation rule**
+    for `emailAddress` in a push payload, and if the two spellings were two accounts then applying the route
+    reads the wrong mailbox. `DeliveryRoute::CaseDiffers { accounts }` reports it and a person decides.
+  - **⭐ FOUR VARIANTS, NOT AN `Option`.** `Exact(AccountReference)` / `Ambiguous { accounts }` /
+    `CaseDiffers { accounts }` / `Unknown` — an `Option` has two states and the decision has four, and a reader
+    of `None` could not tell "not my account" from "my account, spelled differently". **`Exact` is the only
+    variant carrying a reference**; `Ambiguous` and `CaseDiffers` carry **counts**, so no accessor can return an
+    arbitrarily chosen account (picking first/oldest/most-recent would sync one mailbox under another's
+    identity).
+  - **⭐ EVERY UNROUTABLE DELIVERY IS ACKNOWLEDGED, AND `Retry` IS UNREACHABLE HERE.** None of the three is
+    repaired by another attempt — the account set is a **local** fact — and `ADR-0094` makes that decisive: a
+    negative acknowledgement triggers a **subscription-global** backoff of up to 60 seconds, so refusing would
+    slow **every other mailbox on the subscription** for a message that can never become routable.
+    `unroutable_acknowledgement()` is `AbandonAndAcknowledge` for all three and `None` for `Exact` (the latter
+    because a routable delivery **can** be processed, not that it **was**).
+  - **⭐ THE ARGUMENT IS `&[VerifiedAccount]`, NOT ADDRESSES.** The address and the reference must belong to the
+    **same** account; a `&[(AccountReference, String)]` would let a caller pair one account's reference with
+    another's address and route to the wrong mailbox with nothing able to notice. `VerifiedAccount` is the type
+    that already binds the two, so it is the argument.
+  - **NEW LIMITS:** **no delivery has been received and no account connected**, so routing runs on types the
+    crate owns rather than observed data; and the **authentication gap is untouched** — this makes a forged
+    delivery's consequence **small and bounded**, it does **not** make forging impossible (Unresolved
+    Question 1, which needs a contract change or an OIDC/JWKS verifier `P5-001` kept out of a pure path
+    deliberately).
+- [ ] `P5-005` **(continued — one address, one account)**: the connect-time step that `ADR-0096` and `ADR-0097`
+  both named as unbuilt, and where the router's `Ambiguous` is prevented. **6 new tests (so 424 in the crate).**
+  **`ADR-0098`.** Two guards falsified A-B-A with compiling mutants; a **third** defect was found by a failing
+  test rather than by review.
+  - **⭐⭐ THE FINDING: THE TWO ENDS OF ONE STEP WERE MISSING, AND THE STATE THE ROUTER CANNOT ACT ON IS CREATED
+    THERE.** `ADR-0096` produced an identity (`gmail_profile_read` → `emailAddress`) and named the connect flow
+    as unbuilt; `ADR-0097`'s router consumes stored identities and named `Ambiguous` as caused by "a reconnect
+    that mints a new reference without retiring the old row". Nothing turned one into the other, so **this step
+    is where `Ambiguous` is prevented or created** — which is why its rule is a refusal, not a deduplication.
+    A duplicate makes routing **undecidable** (every notification for that mailbox stops being acted on until a
+    person resolves it) while being **invisible** (two cursors, two schedules, a quota budget paid twice look
+    exactly like two mailboxes).
+  - **⭐⭐ THE CASE COMPARISON RUNS THE OPPOSITE WAY, AND BOTH ARE THE SAME RESTRAINT.** `ADR-0097` refuses to
+    **act** on a case-only near-match (no canonicalisation rule is published; acting could read the wrong
+    mailbox). This refuses to **create** one, for the same uncertainty and because the directions differ in
+    cost — refusing asks a person (recoverable), a duplicate is silent. **Neither acts on an uncertain
+    case-match.** One test asserts **both halves against one pair of spellings**, so loosening either shows up
+    as a contradiction rather than as policy drift.
+  - **⭐⭐ A THIRD DEFECT, FOUND BY A FAILING TEST AND IT IS `ADR-0091`'s CLASS AGAIN: REDACTION APPLIED IN ONE
+    PLACE IS NOT REDACTION APPLIED IN ANOTHER — AND THE SECOND PLACE IS USUALLY AN ERROR PATH.** The
+    `IdentityUnusable` refusal first carried `error.to_string()`, propagating `ConnectorError::Identifier`'s
+    `Display` — which is `"the connector identifier `{value}` is unusable: {reason}"`, **interpolating the
+    value it rejected**. So an unstoreable address would have been printed in full by the refusal that says an
+    identity could not be *stored* — while `VerifiedAccount`'s `Debug` **redacts that same value**. The test
+    asserting the refusal does not contain the address caught it; the fix was to carry the error's
+    **`&'static str` `reason`** instead of its rendering, making the leak **unrepresentable** (a `&'static str`
+    has nowhere to put a runtime value). **The move is structural, not a rule about not printing.**
+  - **⭐ A SEPARATE REFUSAL VARIANT, BECAUSE THE SUBJECT DIFFERS.** `IdentityUnusable` ≠
+    `AddressAlreadyConnected`: one is about the account set, one about the identity, and the remedies differ
+    (retire an account vs. look at the provider response). Reporting the second as the first sends a person
+    hunting for a duplicate that does not exist. `holder()` returns `Option` — `None` here — rather than
+    fabricating a holder to make the signature uniform.
+  - **⭐ THE COUNTERFACTUAL IS DEMONSTRATED, NOT DESCRIBED.** The duplicate test constructs the duplicate
+    **directly** and asserts the same notification becomes `Ambiguous`, so the consequence the refusal prevents
+    is shown through the router rather than claimed in prose.
+  - **⭐ NO DISPLAY NAME, BECAUSE THE PROVIDER SENDS NONE.** `users.getProfile` returns `emailAddress`,
+    `messagesTotal`, `threadsTotal`, `historyId` — passing the address as a display name would invent a
+    provider statement, which is the field `VerifiedAccount` exists to keep honest.
+  - **⭐ `resume_from` CARRIES THE CURSOR'S KIND WITH ITS POSITION.** The kinds differ in exactly the way this
+    matters: a `MonotonicMarker` has detectable staleness and a defined recovery; an `OpaqueToken` may not be
+    validated at all and only the provider's refusal is authoritative — so a caller need not remember which API
+    it holds. A `Start` cursor is `FullSync` rather than an error (`SyncCursorKind::Start`: a full sync "is a
+    decision with consequences … an absent value would make it the default a caller stumbles into"), and its
+    **two documented causes are deliberately not separated**, because the cursor cannot support the
+    discrimination and the caller that discarded the position already knows why (`ADR-0067`'s restraint).
+  - **NEW LIMITS:** **nothing calls `establish_account` or `resume_from`** — no account store, no executor, no
+    sync loop — so both are decisions with tests rather than enforced behaviour (the "convention with tests,
+    not a mechanism" limit `ADR-0091`/`ADR-0095` carry); the duplicate check is a **scan of a slice** rather
+    than a store uniqueness constraint; and the two causes of `FullSync` stay unseparated by design.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

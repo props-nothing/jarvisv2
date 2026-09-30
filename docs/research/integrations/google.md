@@ -662,6 +662,206 @@ are **negative acknowledgements** here and cause a redelivery. The page also doc
 `push backoff` (100 ms–60 s, triggered by negative acknowledgements, global to the subscription) which is
 independent of the subscription retry policy.
 
+**And the envelope is a *sensitive* value, which the page does not say.** The payload is *"a JSON object
+containing the email address and the new mailbox history ID"* — a mailbox address, i.e. a person's identity,
+arriving at a **public HTTP endpoint**. The connector treats it accordingly: `PubsubNotification` redacts the
+address in `Debug`, and so does `PubsubMessageBody` for `data`, whose bytes decode to the same address — a
+field that looks like a harmless opaque blob and is not (`ADR-0091`). The `historyId` beside it is a *position*
+and stays printable, because a diagnostic about a stuck sync needs it and it names nobody.
+
+### Finding 13 — A `watch` response carries two facts, and the guide's worked example uses a different number for each
+
+The `users.watch` response is `{ "historyId": string, "expiration": string (int64 format) }` — two fields, and
+the push guide says what the first is for:
+
+> "The response contains the current mailbox `historyId` for the user. **Your client receives notifications for
+> all changes after that `historyId`.**"
+
+So the response's `historyId` is the **anchor** a first sync starts from — a `startHistoryId` — and not a
+position the mailbox has reached. The guide then makes the distinction concrete with its own worked example,
+whose two sentences use **two different numbers**:
+
+> "Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist `9876543210` as the
+> last known `historyId` for future use cases."
+
+`1234567890` is the watch response's `historyId`; `9876543210` is the position the resulting `history.list`
+reached. **The two ends of one operation, both spelled `historyId`, both strings, both plausible as the other.**
+Reading the response's id as "the new position" type-checks and is wrong, and it fails without terminating: an
+anchor does not move when the mailbox changes, so a sync that stored it as the position would re-read the same
+window on every run.
+
+**Why the example is the load-bearing part.** A one-value example cannot falsify a conflation of two
+same-typed fields — every reading of it passes. The `1234567890`/`9876543210` pair can, which is why the
+connector's test asserts the anchor is the first **and** `assert_ne!`s it against the second. The
+`google::watch` module had a reader for `expiration` and none for `historyId` at all, so a caller using the
+crate's one watch reader got a lease with no anchor; both fields are now read together (`ADR-0092`).
+
+### Finding 14 — The `watch` **request** advertises a deprecated field the provider does not reject, and a filter that governs nothing without a label list
+
+`POST /gmail/v1/users/{userId}/watch` is the only operation in `P5-005` that carries a **JSON body**, and the
+reference publishes two fields whose misuse produces a `200` rather than an error. The reference's body shape:
+
+```json
+{ "labelIds": [ string ], "labelFilterAction": enum (LabelFilterAction),
+  "labelFilterBehavior": enum (LabelFilterAction), "topicName": string }
+```
+
+**The deprecated spelling is accepted and ignored, not refused.** The reference says of `labelFilterAction`:
+*"deprecated because it caused incorrect behavior in some cases; use `labelFilterBehavior` instead"*, and of the
+newer field: *"This field replaces `labelFilterAction`; if set, `labelFilterAction` is ignored."* So sending the
+old field is not a `4xx` — it is either **ignored** (when the new one is present) or produces the "incorrect
+behavior" the provider itself names. Neither is reportable downstream.
+
+**And the filter is relative to a list, with no error when the list is absent.** `labelIds` is the thing that
+*"dictates which labels are required for a push notification to be generated"*, and `labelFilterBehavior` is the
+*"filtering behavior of `labelIds` list specified"*. So `include`/`exclude` sent with no list select nothing —
+and the provider registers an **unfiltered** watch rather than refusing. A connector would then receive every
+change while believing it had scoped the set, with valid notifications and a healthy-looking lease
+(`historyId` and `expiration` as usual); only the *set* would be wrong.
+
+**Two values per enum**, both named in the reference: `include` — *"Only get push notifications for message
+changes relating to labelIds specified"* — and `exclude` — *"Get push notifications for message changes except
+those relating to labelIds specified"*. The connector models the closed vocabulary and produces only the new
+field name, so the deprecated spelling is unreachable rather than discouraged (`ADR-0093`).
+
+**A host discrepancy between two official sources, recorded rather than resolved.** The method reference gives
+the request as `POST https://gmail.googleapis.com/gmail/v1/users/{userId}/watch`, while this record's Verified
+Contract and the API's error pages use `https://www.googleapis.com/gmail/v1`. Both hosts serve the API, so
+neither reading is wrong — and the connector's base is `www.googleapis.com` ([`GMAIL_API_BASE`]), which is the
+host the rest of this record was verified against. **Not changed here**, because moving a base on the strength
+of one page's example rendering — against a source that does not contradict the host the other pages use — is
+churn; recorded so a reader comparing the two pages knows the difference was seen and deliberately left.
+
+### Finding 15 — A negative acknowledgement is charged to the **whole subscription**, and the subscriber cannot opt out
+
+The push page's acknowledgement rule is one sentence, and this record already carries half of it: *"To
+acknowledge the message, return one of the following status codes: `102`, `200`, `201`, `202`, `204`."* The
+other half is what makes the answer a **decision** rather than a verdict on one message:
+
+> "If a push subscriber sends too many negative acknowledgments, Pub/Sub might start delivering messages using
+> a push backoff. When Pub/Sub uses a push backoff, it stops delivering messages for a predetermined amount of
+> time. This time span can range between 100 milliseconds to 60 seconds."
+
+and, in the page's own list of considerations:
+
+> "• Push backoff can't be turned on or off. You also can't modify the values used to calculate the delay.
+> • Push backoff triggers on the following actions: When a negative acknowledgment is received. When the
+> acknowledgment deadline of a message expires.
+> • **Push backoff applies to all the messages in a subscription (global).**"
+
+**Four facts, and each has a consequence:**
+
+- **Global.** One delivery's answer delays *every* account on the subscription, so the cost of refusing is not
+  bounded by the message. A connector watching several mailboxes pays for one bad payload with all of them.
+- **100 ms – 60 s, exponential**, *"calculated based on the number of negative acknowledgments that push
+  subscribers send"* — so a message refused forever keeps the delay near its ceiling rather than decaying.
+- **Not modifiable.** There is no subscription setting to disable it, unlike the retry policy, which the page
+  notes is a **separate** feature whose delay **adds** to the backoff's ("the total delay is the maximum
+  combined value of both").
+- **Two triggers**, and one of them is not a response at all: an **expired acknowledgment deadline** also
+  triggers it — so a *slow* handler that never answers is indistinguishable, to the backoff, from one that
+  refuses. And a push subscriber *"can't modify the acknowledgment deadline of individual messages"*.
+
+**What this forces.** A delivery whose payload this connector will never decode — an unwrapped subscription, a
+changed shape — fails identically on every attempt, so a refuse-and-retry handler answers a negative code every
+time and holds the subscription's backoff up indefinitely. The bounded answer is to **acknowledge it and record
+the drop**, which loses the message but not the subscription. The connector models the three answers as
+`DeliveryAck::{Accept, Retry, AbandonAndAcknowledge}` and bounds `Retry` by the provider's own
+`deliveryAttempt` (`ADR-0094`). The bound is a **JARVIS figure**, because the page publishes the backoff range
+and the global scope but no retry count a subscriber should use — the distinction this record keeps elsewhere.
+
+### Finding 16 — `users.stop` requires an authorization that revocation destroys, so teardown has a forced order
+
+Disconnecting a mailbox is **two** operations, and their order is not a preference. `users.stop`:
+
+> "Turn off push notification delivery for the given user mailbox. … `POST
+> https://gmail.googleapis.com/gmail/v1/users/{userId}/stop`"
+
+It requires *"one of the following OAuth scopes"*: `mail.google.com/`, `gmail.modify`, `gmail.readonly`,
+`gmail.metadata` — **the same four `users.watch` needs**, so it is an ordinary authenticated call. Revocation,
+whose project-wide effect this record already carries, **removes exactly those scopes**. So:
+
+- **stop then revoke** — both succeed;
+- **revoke then stop** — revocation succeeds (RFC 7009 §2.2's `200` covers a dead token), and the stop goes out
+  with an invalidated token and fails.
+
+**And the failure is a silent privacy exposure, not a failed call.** `stop`'s own page says *"All new
+notifications should stop within a few minutes"* — but that only applies if the stop happened. With the watch
+still registered and the grant gone, nothing ends the stream but **the lease lapsing**: the push guide's
+*"at least once every 7 days"*, i.e. up to a week of the mailbox's address arriving at an endpoint the user
+believes is disconnected, with no credential left to turn it off. The connector models this as a **plan** with
+the ordering rule enforced by a function, the stop best-effort and the revoke required (`ADR-0095`).
+
+### Finding 17 — `users.getProfile` supplies the account identity, and it accepts **no OIDC scope**
+
+The JARVIS Mapping above names the account identity as `VerifiedAccount` from `users.getProfile`, and that
+operation is what makes `tools-and-connectors.md`'s "account identity verified from the provider, not
+user-entered labels" satisfiable. The method reference:
+
+> "Gets the current user's Gmail profile. … `GET https://gmail.googleapis.com/gmail/v1/users/{userId}/profile`"
+
+with the response as `{ "emailAddress": string, "messagesTotal": integer, "threadsTotal": integer,
+"historyId": string }` and `emailAddress` described as *"The user's email address"*.
+
+**Its authorization is where a plausible reading goes wrong.** The reference requires *"one of the following
+OAuth scopes"*: `mail.google.com/`, `gmail.modify`, `gmail.compose`, `gmail.readonly`, `gmail.metadata` —
+**`openid` is not among them.** So the scope the connector requested "so that the granting account's *identity*
+is available" is not the scope that makes the identity available: a caller holding only `openid` would be
+refused by `getProfile`. The Gmail read scope the connector already has is what the profile read needs.
+
+`openid` is still requested, for a different reason than the one recorded: it is what makes Google return an
+`id_token`, which the token exchange receives and this crate deliberately does not verify — and the `nonce`
+`P5-002` already generates and carries is what a future ID-token check would compare, so the pairing is a
+**prepared seam, not a working feature** (`ADR-0096`).
+
+**The profile response carries a mailbox position as well as an identity.** `historyId` is *"The ID of the
+mailbox's current history record"*, so a profile read yields a sync anchor without consuming a message — the
+same *kind* of value `users.watch`'s response supplies, and like that one it is the mailbox's position at the
+moment of the read rather than the position a sync ends at (Finding 13). `messagesTotal` and `threadsTotal` are
+mailbox counts, and neither the operation's output schema nor its renderer declares them because nothing reads
+them.
+
+### Finding 18 — a notification's only routing key is a mailbox address, on a channel that cannot be authenticated
+
+The push payload is `{"emailAddress": "user@example.com", "historyId": "9876543210"}` — and **`emailAddress` is
+the only field that names a mailbox**. Nothing else in the delivery identifies the account: `messageId` is
+*"a Cloud Pub/Sub message ID, unrelated to Gmail messages"*, `historyId` is a position that is meaningful only
+*within* a mailbox, and the envelope carries **no message content and no change detail**. So attributing a
+delivery to one of the connector's accounts means matching that address against the addresses it holds.
+
+**And the channel it arrives on cannot be authenticated.** Finding 1 establishes that neither Google mechanism
+fits `WebhookSupport::Push` (an OIDC bearer JWT, and an echoed channel token over a zero-length body), so the
+address is **untrusted input**. The consequence is bounded by two facts rather than by the address being
+trustworthy: the route selects **which mailbox to read** (the sync uses that account's own stored token, so a
+forged delivery reaches only mailboxes the connector was already authorised to read), and the notified
+`historyId` is **not trusted as a position** (`history.list` runs from the stored cursor, so a forged id cannot
+make the connector skip changes) — `ADR-0097`.
+
+**The address is matched byte-exactly, and a case-only near-match is reported rather than applied.** Google
+publishes no canonicalisation rule for `emailAddress`, so `User@example.com` against a stored
+`user@example.com` is *evidence* about identity and not identity; promoting it would read the wrong mailbox if
+the two spellings were two accounts.
+
+### Finding 19 — one address, one account: the duplicate that makes a delivery unroutable
+
+The connect-time flow the previous two findings named is where a stored identity is created, and **the profile's
+`emailAddress` becomes the account's `provider_account_id`** — the value Finding 18's router matches a
+notification against. So this step decides whether that lookup is single-valued, and a second account for one
+address is **refused** rather than allowed. The cost of allowing it is not tidiness: once two rows carry one
+address the router answers `Ambiguous`, which may not be applied without a person, so every notification for
+that mailbox stops being acted on — while the duplicate itself looks exactly like two mailboxes (two cursors,
+two schedules, a quota budget paid twice).
+
+**The comparison ignores ASCII case, which is deliberately the opposite direction from routing.** Finding 18
+refuses to *act* on a case-only near-match because no canonicalisation rule is published; this refuses to
+*create* one, for the same uncertainty and because the directions differ in cost — refusing asks a person
+(recoverable), while creating a duplicate is silent and needs one to be undone. **Both are the same restraint:
+neither acts on an uncertain case-match.**
+
+**And the profile carries no display name.** `users.getProfile` returns `emailAddress`, `messagesTotal`,
+`threadsTotal` and `historyId` — so the account is stored with a `None` display name rather than the address
+passed as one, which would be inventing a provider statement. Both facts are `ADR-0098`.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in
@@ -929,5 +1129,13 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-30 | Gmail **push guide** re-fetched (last updated **2026-09-15**) for the notification envelope and the renewal rule, and the **`users.watch` method reference** fetched (last updated **2026-04-15**) for the response type | The envelope verbatim: a `POST` whose body is `{ message: { data, messageId, publishTime }, subscription }` where **`message.data` is a Base64URL-encoded string** decoding to `{"emailAddress": …, "historyId": …}`. The renewal rule's two figures: **"at least once every 7 days"** (the bound) and **"We recommend calling `watch` once per day"** (the recommendation). And the response: `{ "historyId": string, "expiration": string (int64 format) }` where `expiration` is **"epoch millis"** — a **string** carrying **milliseconds**, both of which a naive parser gets wrong while still producing a valid-looking instant. Implemented as `google::watch`, with the unit pinned by a test against the reference's own example value (`ADR-0087`). Also confirmed from the same page: a successful `watch` **immediately sends a notification**, so the first delivery is not a change. |
 | 2026-09-30 | Cloud Pub/Sub **`PubsubMessage` reference** fetched (`docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage`, last updated **2026-05-14**) to check the envelope's field types, since the Gmail guide links to it | **The contradiction**: `data` is typed `string (bytes format)` and described as **"A base64-encoded string"**, while the Gmail push guide (one page over) calls the same field **"Base64URL"**. The two alphabets differ in `+`/`/` versus `-`/`_`, so the disagreement is invisible on any value containing neither — **including the guide's own example**, which was decoded and confirmed to yield `{"emailAddress": "user@example.com", "historyId": "1234567890"}`. A sweep of all 95 printable ASCII characters at all four base64 alignments found only **three** (`>`, `?`, `~`, after a one-character offset) that force the difference, so the connector decodes under **both** alphabets, URL-safe first, and reports which matched (`ADR-0088`). Also recorded: `messageId`, `publishTime` (RFC 3339) and `attributes`, none of which this path reads yet. |
 | 2026-09-30 | Cloud Pub/Sub **push page** fetched (`docs.cloud.google.com/pubsub/docs/push`, last updated **2026-09-24**) for the envelope shape and the acknowledgement contract | **Corrects Finding 11's padding reading.** The page's minimum-value example of `message.data` is `SGVsbG8gQ2xvdWQgUHViL1N1YiEgSGVyZSBpcyBteSBtZXNzYWdlIQ==` — **padded**, decoding to `Hello Cloud Pub/Sub! Here is my message!` — so the field is padded standard base64 and a decoder refusing padding would refuse Google's own example. **At-least-once**: "A non-success response indicates that Pub/Sub must resend the messages" and a negative ack or an expired deadline causes a resend, so `messageId` is the deduplication key. **Both spellings** appear in the page's own examples (`messageId`/`message_id`, `publishTime`/`publish_time`), and `deliveryAttempt` is **top-level** beside `message`. **Acknowledgement is five codes** — `102`, `200`, `201`, `202`, `204`; "any other status code" is a negative acknowledgement, so a `203` or `206` requests redelivery. Also documented: **unwrapped** delivery (`payload-unwrapping`) has no `data` field, and **push backoff** (100 ms–60 s, global, triggered by negative acks) is independent of the retry policy. Grounds `PubsubDelivery`, `ACKNOWLEDGING_STATUSES` and `ADR-0089`. |
+| 2026-09-30 | **Cross-check of this record's sensitivity facts against the connector's types** — no page fetched, an audit of what the record already establishes | The Gmail push guide says the payload decodes to *"the email address and the new mailbox history ID"*, so the record already establishes that a **person's address arrives over a public endpoint** — a sensitive value. Three types built on this record did not act on it: `PubsubNotification` (the address), `PubsubMessageBody` (`data`, whose bytes decode to the address — a field that *looks* like a harmless opaque blob) and `SyncCursor` (the token) all **derived `Debug`** and printed their sensitive field, while `AccessToken`, `FormRequest` and `VerifiedAccount` hand-write theirs to print a marker instead. A shape-based sweep found a **fourth**, `SyncCursorParts` — the parts struct with the token moved into it by `From<SyncCursor>`, so the crate's own advertised way to move a cursor printed the value past the redaction. `DiagnosticField::CursorObservedAt` had already written the rule — *"the token itself is never a field, because a cursor is provider-issued text that can address another account's data"* — and the types printed it anyway. All four now redact, each with the crate's marker-plus-control test (`ADR-0091`). |
+| 2026-09-30 | Gmail **push guide** and **sync guide** re-fetched (push last updated **2026-09-15**, sync the same) for the **`watch` response's `historyId`** and what it anchors | The response's first field is described in the push guide as *"the current mailbox `historyId`"* with *"Your client receives notifications for all changes **after** that `historyId`"* — so it is a `startHistoryId`, not a position reached. And the guide's worked example uses **two different numbers**: *"Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist `9876543210` as the last known `historyId`"* — the response's id at one end, the post-sync position at the other. The sync guide confirms the position comes from the sync: a full sync stores *"the `historyId` of the most recent message"*. So the anchor the response supplies had **no reader** in this crate, and the two-number example is the fixture that can falsify their conflation. Both fields are now read together (`ADR-0092`). Also re-confirmed: history *"typically available for at least one week"*, and a `startHistoryId` outside it returns **HTTP 404** → full sync. |
+| 2026-09-30 | `users.watch` **method reference** fetched (`developers.google.com/workspace/gmail/api/reference/rest/v1/users/watch`, last updated **2026-04-15**) for the **request** side of the watch — the body and its fields | The request is `POST …/users/me/watch` with a JSON body of `topicName` (required) plus optional `labelIds`, `labelFilterAction` and `labelFilterBehavior`. **Two fields produce a `200` rather than an error when misused**: `labelFilterAction` is *"deprecated because it caused incorrect behavior in some cases"* and is *"ignored"* when `labelFilterBehavior` is set; and `labelFilterBehavior` is the *"filtering behavior of `labelIds` list specified"*, so with no `labelIds` it governs nothing and the watch is registered unfiltered. The enum's two values are `include`/`exclude`. Also confirmed: `topicName` must be the fully qualified `projects/{project}/topics/{topic}` whose project *"must exactly match your Google developer project id"*; the endpoint is on the `gmail.googleapis.com` host **and** the four accepted scopes include `gmail.metadata`. The deprecated field is made unreachable and the pairing refused locally (`ADR-0093`). |
+| 2026-09-30 | Cloud Pub/Sub **push page** re-fetched (last updated **2026-09-24**) for the **cost of a negative acknowledgement** | **Push backoff is subscription-global and cannot be disabled**: *"Push backoff applies to all the messages in a subscription (global)"*, *"Push backoff can't be turned on or off"*, and it ranges **100 ms to 60 s**, *"calculated based on the number of negative acknowledgments"*. Two triggers, one of which is not a response: a negative acknowledgement **or an expired acknowledgment deadline** — so a *slow* handler looks the same as a refusing one, and *"You can't modify the acknowledgment deadline of individual messages that you receive from push subscriptions."* The **retry policy is separate** and its delay **adds** to the backoff's. Also confirmed the delivery-rate window: a **slow-start** algorithm, and *"After 3,000 outstanding messages per region, the window increases linearly"* (decreases when a subscriber acknowledges < 99% of requests). So refusing one message is paid for by every account on the subscription, and the connector now bounds it by `deliveryAttempt` (`ADR-0094`). |
+| 2026-09-30 | `users.stop` **method reference** fetched (`developers.google.com/workspace/gmail/api/reference/rest/v1/users/stop`, last updated **2026-04-15**) for the operation that ends a watch | *"Turn off push notification delivery for the given user mailbox"*, `POST …/users/me/stop`, **"The request body must be empty"**, and a success is *"an empty JSON object"*. Its four authorization scopes are the **same four `users.watch` requires** — `mail.google.com/`, `gmail.modify`, `gmail.readonly`, `gmail.metadata` — so it needs a **live grant**, while revocation (this record's other finding) removes exactly those scopes. Hence the forced order: revoking first makes the stop impossible, and with the watch still registered nothing ends the stream but the lease — up to seven days. The push guide supplies the timing for the successful case, *"All new notifications should stop within a few minutes"*, which has **no number in it**. Modelled as an ordered, policy-carrying plan (`ADR-0095`). |
+| 2026-09-30 | `users.getProfile` **method reference** fetched (`developers.google.com/workspace/gmail/api/reference/rest/v1/users/getProfile`, last updated **2026-04-15**) for the account-identity operation | *"Gets the current user's Gmail profile"*, `GET …/users/me/profile`, **empty request body**, response `{ "emailAddress": string, "messagesTotal": integer, "threadsTotal": integer, "historyId": string }`. **Its accepted scopes are `mail.google.com/`, `gmail.modify`, `gmail.compose`, `gmail.readonly`, `gmail.metadata` — `openid` is NOT among them**, which corrects a comment in this repo that named `openid` as "the operation this scope exists for". So the Gmail read scope is what makes the profile readable, and `openid` is requested for the `id_token` the exchange receives (unverified). `historyId` is *"The ID of the mailbox's current history record"*, so this is a second way to obtain a sync anchor, of the same kind as the watch response's (Finding 13). Declared as `gmail_profile_read`, 1 quota unit (`ADR-0096`). |
+| 2026-09-30 | **Audit of what the record already establishes about routing a delivery**, not a new page fetch — cross-checking Findings 1 and 12 against the connector's types | `emailAddress` is the **only** field in a push payload that names a mailbox (`messageId` is *"unrelated to Gmail messages"*; `historyId` is meaningful only within one mailbox), so attribution means matching that address against the addresses the connector holds. The channel cannot be authenticated (Finding 1), so the address is untrusted — and the consequence is bounded by two facts rather than by trust: a route selects **which mailbox to read** (the sync uses that account's own token), and the notified `historyId` is **not trusted as a position** (`history.list` runs from the stored cursor, so a forged id cannot cause a *missed* change). Byte-exact matching with a **reported-not-applied** case-only near-match, since Google publishes no canonicalisation rule for `emailAddress` (`ADR-0097`). |
+| 2026-10-01 | **Audit of the record's identity facts against the connect-time step**, not a new page fetch — Findings 17 and 18 read together | `users.getProfile`'s `emailAddress` becomes the account's `provider_account_id`, which is the value a push delivery is matched against, so the connect step decides whether that lookup is single-valued. A second account for one address is refused, because two rows carrying one address make the router answer `Ambiguous` (unactionable without a person) and the duplicate is invisible — it looks like two mailboxes. Case-insensitive comparison **in this direction** (refuse to create) is the opposite of the router's (refuse to act), and both are the same restraint: neither acts on an uncertain case-match. The profile carries no display name, so the account stores `None` rather than the address as one (`ADR-0098`). |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

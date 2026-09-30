@@ -288,6 +288,25 @@ fn the_schemas_are_the_2020_12_dialect_and_refuse_unknown_arguments() {
                     "an incremental sync must name the position it starts from"
                 );
             }
+            "gmail_profile_read" => {
+                // **No arguments at all, and that is the operation's contract rather than an omission.** The
+                // request asks about the calling credential, and the builder hardcodes `me` — so a `user_id`
+                // argument would be a field a caller could fill with another mailbox, producing a request its
+                // own token does not authorise. `required` is absent because there is nothing to require.
+                assert!(
+                    required.is_none(),
+                    "identifying the connected account takes no arguments"
+                );
+                assert!(
+                    definition
+                        .input_schema()
+                        .document()
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(serde_json::Map::is_empty),
+                    "the profile tool must declare no arguments at all, so a caller cannot name another mailbox"
+                );
+            }
             other => panic!("`{other}` has no declared argument contract"),
         }
     }

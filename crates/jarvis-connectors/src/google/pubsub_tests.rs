@@ -8,6 +8,8 @@
 
 use super::*;
 use crate::base64::{Alphabet, Padding, decode_with, url_safe_no_pad};
+use crate::{AccountReference, SyncCursor, SyncCursorKind};
+use jarvis_core::UtcTimestamp;
 
 /// The Gmail push guide's own example value, verbatim.
 ///
@@ -415,4 +417,222 @@ fn only_the_five_documented_statuses_acknowledge_a_delivery() {
     assert!(!acknowledges_delivery(203));
     assert!(acknowledges_delivery(102));
     assert_eq!(ACKNOWLEDGING_STATUSES.len(), 5);
+}
+
+#[test]
+fn a_decoded_notification_does_not_print_the_mailbox_address() {
+    // **The redaction is hand-written, so it needs a test — the crate's own idiom for every value it hides.**
+    // `AccessToken`, `FormRequest` and `VerifiedAccount` each redact through a hand-written `Debug` with a test
+    // asserting the marker, and this type holds the same class of value: an address that names a person, sent
+    // by the provider over a public endpoint. A `{:?}` on it reaches a log line (`ADR-0091`).
+    let (notification, _) = must(
+        decode_notification(GUIDE_EXAMPLE),
+        "the guide's own example must decode",
+    );
+    let rendered = format!("{notification:?}");
+    assert!(
+        !rendered.contains("user@example.com"),
+        "the mailbox address must not be printable: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the address must be redacted rather than omitted, so a reader sees a value was hidden: {rendered}"
+    );
+    // **The control: the non-sensitive field IS still printed.** A `Debug` that redacted everything would pass
+    // the two assertions above, and it would also make the diagnostic useless — the history id is a position
+    // that names nobody, and it is what an operator debugging a stuck sync needs.
+    assert!(
+        rendered.contains("1234567890"),
+        "the history id names no person and must stay visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("PubsubNotification"),
+        "the type name must be present: {rendered}"
+    );
+}
+
+#[test]
+fn a_delivery_body_does_not_print_the_base64_payload_that_decodes_to_the_address() {
+    // **The subtler leak, because the field looks like an opaque blob.** `message.data` is base64 — a reader
+    // could reasonably assume it is safe to print, and the value carries no credential. It does name a mailbox
+    // though, which is the same disclosure the decoded form is redacted for, so it is redacted too.
+    let (delivery, _, _) = must(
+        parse_delivery(&format!(
+            r#"{{"message":{{"data":"{GUIDE_EXAMPLE}","messageId":"2070443601311540"}},"subscription":"projects/p/subscriptions/s"}}"#
+        )),
+        "a wrapped delivery must parse",
+    );
+    let rendered = format!("{delivery:?}");
+    assert!(
+        !rendered.contains(GUIDE_EXAMPLE),
+        "the base64 payload must not be printable, because its bytes decode to the address: {rendered}"
+    );
+    assert!(
+        !rendered.contains("user@example.com"),
+        "and neither may an already-decoded copy appear: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the payload must be redacted rather than omitted: {rendered}"
+    );
+    // The **length** is kept, because "the payload arrived and was this big" is the useful diagnostic and it
+    // discloses nothing. Asserted so a change to the redaction cannot quietly drop the useful half.
+    assert!(
+        rendered.contains(&format!("{} chars", GUIDE_EXAMPLE.len())),
+        "the payload's length is not sensitive and is what a diagnostic needs: {rendered}"
+    );
+    // And the metadata beside it stays, including through the **derived** `Debug` on the delivery — which is
+    // safe only because the inner type redacts, the property a reader should check rather than assume.
+    assert!(rendered.contains("2070443601311540"), "{rendered}");
+    assert!(
+        rendered.contains("projects/p/subscriptions/s"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_cursor_does_not_print_its_token() {
+    // **A cursor token is provider-issued text that can address another account's data**, which is the crate's
+    // own recorded reason for never putting one in a diagnostic field. The type printed it anyway while its
+    // `Debug` was derived: the policy was written down and the `{:?}` ignored it (`ADR-0091`).
+    let cursor = must(
+        SyncCursor::new(
+            SyncCursorKind::OpaqueToken,
+            Some("CPDAlvWDx70CEPDAlvWDx70CGAU=".to_owned()),
+            must(
+                AccountReference::new("example-account"),
+                "a valid reference",
+            ),
+            "1.0.0",
+            UtcTimestamp::from_unix_nanos(1_774_000_000_500_000_000)
+                .unwrap_or_else(|_| panic!("a representable instant")),
+        ),
+        "a valid opaque cursor",
+    );
+    let rendered = format!("{cursor:?}");
+    assert!(
+        !rendered.contains("CPDAlvWDx70CEPDAlvWDx70CGAU="),
+        "a cursor token must not be printable: {rendered}"
+    );
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    // The controls: the kind and the account reference stay, because neither names a position and both are what
+    // a diagnostic is about. The account reference is JARVIS's own local identifier, not the provider's id.
+    assert!(rendered.contains("OpaqueToken"), "{rendered}");
+    assert!(rendered.contains("example-account"), "{rendered}");
+    assert!(rendered.contains("1.0.0"), "{rendered}");
+    // A start cursor carries no token, and that is printed as `None` rather than as a redaction — so a reader
+    // can tell "this kind has no token" from "a token was hidden".
+    let start = must(
+        SyncCursor::new(
+            SyncCursorKind::Start,
+            None,
+            must(
+                AccountReference::new("example-account"),
+                "a valid reference",
+            ),
+            "1.0.0",
+            UtcTimestamp::from_unix_nanos(1_774_000_000_500_000_000)
+                .unwrap_or_else(|_| panic!("a representable instant")),
+        ),
+        "a valid start cursor",
+    );
+    assert!(
+        format!("{start:?}").contains("None"),
+        "a start cursor must read as carrying no token, not as one being hidden"
+    );
+}
+
+#[test]
+fn refusing_a_delivery_costs_the_whole_subscription_so_it_is_an_explicit_decision() {
+    // **The fact the slice is built around**, from the push page: a negative acknowledgement triggers a push
+    // backoff that "applies to all the messages in a subscription (global)" and that "can't be turned on or
+    // off". So the three answers are not three shades of one verdict — exactly one of them costs every other
+    // mailbox on the subscription, and a `bool` from `acknowledges_delivery` cannot say so.
+    assert!(!DeliveryAck::Retry.acknowledges());
+    assert!(DeliveryAck::Accept.acknowledges());
+    // The two acknowledging answers mean opposite things about the message, which is why they are not one
+    // variant: one is "done", the other is "never, and recorded as dropped".
+    assert_ne!(DeliveryAck::Accept, DeliveryAck::AbandonAndAcknowledge);
+    // And the enum is exhaustive over the three situations, each named, so a reader of a call site sees which
+    // cost the caller chose rather than an integer.
+    assert_eq!(
+        [
+            DeliveryAck::Accept,
+            DeliveryAck::Retry,
+            DeliveryAck::AbandonAndAcknowledge
+        ]
+        .into_iter()
+        .filter(|ack| ack.acknowledges())
+        .count(),
+        2,
+        "exactly one of the three answers refuses the delivery: `Retry` is the only one that costs the \
+         subscription a global backoff"
+    );
+}
+
+#[test]
+fn a_delivery_that_can_never_be_processed_is_abandoned_rather_than_refused_forever() {
+    // The choice this variant exists for: refusing a payload this connector will never decode does not merely
+    // redeliver it, it slows **every** other account on the subscription for up to a minute and keeps doing so
+    // for as long as the bad message is retried. Acknowledging and recording the drop is the bounded cost.
+    assert_eq!(
+        decide_acknowledgement(false, 0),
+        DeliveryAck::AbandonAndAcknowledge,
+        "a failure that no number of attempts repairs must not be refused"
+    );
+    // The control: the **same attempt count** with a retryable cause is refused, so the arm is about the
+    // retryability and not about the count being high.
+    assert_eq!(
+        decide_acknowledgement(true, 0),
+        DeliveryAck::Retry,
+        "the same attempt count with a transient cause must still be retried"
+    );
+}
+
+#[test]
+fn a_retryable_delivery_is_refused_only_within_its_budget_and_the_bound_is_pinned() {
+    // The bound is a **JARVIS figure**, so it is asserted literally rather than derived: above it, refusing
+    // further holds the whole subscription down through a backoff cycle (up to 60 seconds) for a message that
+    // has already failed this many times.
+    assert_eq!(MAX_RETRY_ATTEMPTS, 3, "the bound is a stated JARVIS figure");
+    // At the bound the delivery is abandoned — one comparison against the provider's own count, so the third
+    // attempt is the last refused and the fourth is dropped. Walked across the boundary in both directions
+    // because an off-by-one here is invisible anywhere else.
+    assert_eq!(decide_acknowledgement(true, 0), DeliveryAck::Retry);
+    assert_eq!(decide_acknowledgement(true, 1), DeliveryAck::Retry);
+    assert_eq!(decide_acknowledgement(true, 2), DeliveryAck::Retry);
+    assert_eq!(
+        decide_acknowledgement(true, MAX_RETRY_ATTEMPTS),
+        DeliveryAck::AbandonAndAcknowledge,
+        "at the bound the delivery is abandoned rather than refused again"
+    );
+    assert_eq!(
+        decide_acknowledgement(true, MAX_RETRY_ATTEMPTS + 10),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+}
+
+#[test]
+fn an_absent_delivery_attempt_is_read_as_new_rather_than_as_already_exhausted() {
+    // `deliveryAttempt` is `Option` because the push page's minimum-value example omits it, so a caller with no
+    // value passes `0`. The direction matters: a retry is still offered, which keeps a possibly-new delivery
+    // alive — whereas reading absent as "already retried too often" would abandon a first delivery that merely
+    // arrived without an optional field. Asserted here so the caller's documented convention has a test.
+    assert_eq!(
+        decide_acknowledgement(true, 0),
+        DeliveryAck::Retry,
+        "an unreported attempt count must still permit a retry"
+    );
+    // And the absent case is genuinely reachable: the provider's own minimum example carries no
+    // `deliveryAttempt`, so a delivery with `None` is a shape that occurs rather than a hypothetical.
+    let (delivery, _notification, _data) = must(
+        parse_delivery(
+            r#"{"message":{"data":"eyJlbWFpbEFkZHJlc3MiOiJ1c2VyQGV4YW1wbGUuY29tIiwiaGlzdG9yeUlkIjoiMTIzNDU2Nzg5MCJ9"}}"#,
+        ),
+        "the push page's minimum-value delivery must parse",
+    );
+    assert_eq!(
+        delivery.delivery_attempt, None,
+        "the minimum-value example omits deliveryAttempt, which is why the caller supplies 0 for it"
+    );
 }

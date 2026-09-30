@@ -65,6 +65,21 @@ pub const MAX_RESOURCE_ID_CHARS: usize = 256;
 /// a query, which is both the wrong noun and the wrong field name (`ADR-0086`).
 pub const MAX_TIME_BOUND_CHARS: usize = 64;
 
+/// The longest a Cloud Pub/Sub topic name may be, in characters.
+///
+/// A JARVIS bound, like [`MAX_RESOURCE_ID_CHARS`]: a fully qualified name is
+/// `projects/{project}/topics/{topic}`, where Google caps a project id at 30 characters and a topic name at
+/// 255, so the documented maximum is under 300 and this bound admits it with room to refuse an unbounded
+/// model-supplied string.
+pub const MAX_TOPIC_NAME_CHARS: usize = 512;
+
+/// The most label identifiers a watch may be scoped to.
+///
+/// A JARVIS bound. Gmail has no published cap on `labelIds` in this request, and a label's own id is short, so
+/// the purpose is to refuse a list whose size is really an attempt at an unbounded body rather than to model
+/// a provider figure.
+pub const MAX_WATCH_LABEL_IDS: usize = 64;
+
 /// The `Accept` header value both APIs expect for a JSON body.
 pub const JSON_ACCEPT: &str = "application/json";
 
@@ -108,6 +123,19 @@ pub enum RequestError {
     /// A page token is unusable.
     #[error(transparent)]
     PageToken(#[from] client::PageTokenError),
+    /// A deprecated field was supplied, or an argument was sent that the provider would **silently ignore**.
+    ///
+    /// Distinct from [`Self::Argument`] and [`Self::DisallowedCombination`], and the difference is the failure
+    /// mode: a disallowed combination is a `400` the caller sees, while an ignored argument is a request that
+    /// **succeeds and does something else**. That is the class this variant exists for — nothing downstream
+    /// reports it, so the only place it can be caught is before the request is sent.
+    #[error("`{field}` would be ignored by the provider: {reason}")]
+    Ignored {
+        /// Which argument.
+        field: &'static str,
+        /// Why the provider ignores it, and what to send instead.
+        reason: &'static str,
+    },
 }
 
 /// A request to perform: a method, a URL, and ordered query parameters.
@@ -605,6 +633,242 @@ pub fn gmail_history_list(
     })
 }
 
+/// Builds the `users.getProfile` request: **who the credential belongs to.**
+///
+/// # Why this operation exists at all
+///
+/// `tools-and-connectors.md` requires an account's identity to be "verified from the provider, not user-entered
+/// labels", and `P5-004`'s JARVIS Mapping names `users.getProfile`'s `emailAddress` as the value that satisfies
+/// it. Nothing in the connector read it, so the requirement was **unimplementable** — an account could be
+/// `VerifiedAccount`-shaped only if something supplied a provider account identifier, and no operation did.
+///
+/// # It takes no arguments, and that is the API's shape rather than a simplification
+///
+/// The reference gives the path as `/users/{userId}/profile` with `userId` documented as *"The user's email
+/// address. The special value `me` can be used to indicate the authenticated user"*, and the **request body
+/// must be empty**. The connector sends `me` — a constant, like every other builder on this path — because a
+/// caller that could name another mailbox would be building a request its own token does not authorise. So
+/// there is no `user_id` argument to validate and no combination to refuse: the only way to build this request
+/// is to be the account it asks about.
+///
+/// # The cost, and why it is recorded on the operation rather than here
+///
+/// `getProfile` costs **1** quota unit, the cheapest call in this connector, and the reference's own quota
+/// table is where that figure lives. The request builder states the URL; the operation declaration carries the
+/// cost.
+#[must_use]
+pub fn gmail_profile() -> HttpRequest {
+    HttpRequest {
+        method: "GET",
+        // `me`, spelled here rather than taken from an argument: see the doc above. No query parameters, so
+        // `url_with_query` returns the path unchanged.
+        url: format!("{GMAIL_API_BASE}/users/me/profile"),
+        query: Vec::new(),
+        accept: JSON_ACCEPT,
+    }
+}
+
+/// A `POST` whose body is JSON, and authenticated by a bearer header.
+///
+/// # Why this is the first such type here, and what it is not
+///
+/// [`HttpRequest`] has **no body** on purpose — every operation it builds is a `GET`, and it documents that a
+/// body field "would be a shape nothing uses". `users.watch` is the operation that disproves the general claim:
+/// the reference gives it as `POST …/users/me/watch` with a JSON request body carrying `topicName` and
+/// optionally `labelIds`/`labelFilterBehavior`. So this crate needed a second request shape, and it is **not**
+/// [`FormRequest`] — that type exists for the token endpoint, whose body carries the `code` and the
+/// `refresh_token`, is `application/x-www-form-urlencoded`, and authenticates by its body's `client_id`. A
+/// watch body carries a topic name and label ids and authenticates by the caller's **bearer header**, so
+/// reusing `FormRequest` would have put a non-credential body into a type whose whole justification is the
+/// credential it holds.
+///
+/// # What this type deliberately does not hold
+///
+/// **No header map, and therefore no credential in a field.** `HttpRequest` has no header field for the same
+/// reason (`ADR-0060`): the bearer token is supplied by the transport binding at send time
+/// ([`AUTHORIZATION_HEADER`]), so a request value cannot carry one. The only header a watch `POST` needs beyond
+/// that is `Content-Type: application/json`, which is a constant returned by [`Self::content_type`] rather than
+/// a field — a fact about the call rather than an argument to it.
+///
+/// # The body is already rendered
+///
+/// `body` holds JSON text produced by [`watch_json_body`] from values whose shape was checked first, so the
+/// body is rendered **once** and by the function that also owns the field names. There is no `Serialize` here:
+/// the body is a string, so the set of fields sent is visible in one place rather than spread across attributes
+/// on a struct — which is what makes the deprecated-field rule below checkable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchRequest {
+    url: String,
+    body: String,
+}
+
+impl WatchRequest {
+    /// Returns the absolute URL. It carries no query parameters: the watch takes its arguments in the body.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the rendered JSON body.
+    ///
+    /// **Not redacted, and that is a decision rather than an oversight.** This body holds a topic name and
+    /// label ids: the topic name is a resource in the caller's own Cloud project, and the label ids are Gmail's
+    /// own vocabulary (`INBOX`, `UNREAD`) rather than message content. There is no credential here — unlike
+    /// [`FormRequest::rendered_body`], whose type exists to hide one — so rendering it in a diagnostic shows
+    /// what was sent without disclosing anything the caller did not already know. The body is bounded by the
+    /// validators below, so it also cannot become an unbounded log line.
+    #[must_use]
+    pub fn rendered_body(&self) -> &str {
+        &self.body
+    }
+
+    /// Returns the `Content-Type` the body is sent as.
+    #[must_use]
+    pub const fn content_type(&self) -> &'static str {
+        JSON_ACCEPT
+    }
+}
+
+/// Builds the `users.watch` request body.
+///
+/// # The three rules, and why each is enforced here rather than left to a caller
+///
+/// **1. A label filter only means something with a label list.** The reference: `labelIds` "dictates which
+/// labels are required for a push notification to be generated", and `labelFilterBehavior` is "filtering
+/// behavior of `labelIds` list specified". So `include`/`exclude` **govern a list, and with no list there is
+/// nothing to govern** — the field is meaningless, and a request that sent it alone would be read by the
+/// provider as an unfiltered watch while the caller believed it was filtered. That is a *silent* mistake: the
+/// request succeeds, and the connector then receives every change when it asked for some. Refused with
+/// [`RequestError::Ignored`], because that is exactly the failure mode.
+///
+/// **2. The deprecated field is refused outright.** The reference types `labelFilterAction` as
+/// `enum (LabelFilterAction)` and says it is *"deprecated because it caused incorrect behavior in some
+/// cases; use `labelFilterBehavior` instead"*, and of the newer field: *"This field replaces `labelFilterAction`;
+/// if set, `labelFilterAction` is ignored."* So the two coexist in the schema, and sending the old one is not
+/// an error at the provider — it is ignored when the new one is present and *incorrect* when it is not. The
+/// builder therefore has **no parameter for it**: there is no way to ask this function to send it, which is
+/// stronger than refusing a value, because a refusal can be widened by a later edit while an absent parameter
+/// cannot be passed. The rule is documented here so a reader who noticed the schema field learns why it is
+/// unreachable rather than assuming an omission.
+///
+/// **3. An empty label list is refused** rather than omitted, so "no filter" is expressed by passing `None` and
+/// not by passing an empty `Vec`. The two would send the same request body (`labelIds` absent either way) after
+/// the emptiness check below, so accepting the empty one would silently equate a value the caller built by
+/// mistake with a deliberate choice — the "two situations, one rendering" defect this repository keeps
+/// recording. An empty list is the shape a loop over zero labels produces, which is the case worth catching.
+///
+/// # Errors
+///
+/// Returns [`RequestError::Argument`] for an empty, oversized, or control-bearing topic name, or a list that is
+/// empty or over [`MAX_WATCH_LABEL_IDS`], or a label id that is unusable; and [`RequestError::Ignored`] for a
+/// filter behaviour supplied without a label list.
+fn watch_json_body(
+    topic_name: &str,
+    label_ids: Option<&[String]>,
+    filter: Option<client::LabelFilterBehavior>,
+) -> Result<String, RequestError> {
+    let topic = topic_name.trim();
+    // A whitespace-only name is refused as well as an empty one: it satisfies "supplied" while denoting nothing,
+    // and the same reading `account::VerifiedAccount::new` takes for a provider identifier.
+    if topic.is_empty() || topic.chars().count() > MAX_TOPIC_NAME_CHARS {
+        return Err(RequestError::Argument {
+            field: "topic_name",
+            reason: "a Cloud Pub/Sub topic name is 1 to 512 characters and not only whitespace, because it \
+                     becomes a request body field and a log line",
+        });
+    }
+    // **The control check is against the raw value, not the trimmed one, and this test found the difference.** A
+    // validator that trims first and checks second removes a trailing `\n` before looking for one, so
+    // `"projects/p/topics/t\n"` is silently accepted and sent as the clean string — the newline that the check
+    // exists to catch is the one the trim deletes. Trimming is normalization and is right for the emptiness and
+    // length checks; refusing any control character in what the caller actually supplied is the stricter
+    // reading, and a topic name has no legitimate whitespace for it to reject.
+    if topic_name.chars().any(char::is_control) {
+        return Err(RequestError::Argument {
+            field: "topic_name",
+            reason: "a topic name may not hold a control character, because it becomes a request body field \
+                     and a log line where a newline forges a record",
+        });
+    }
+    // A label filter with no list to filter is the silent case: the provider generates notifications for every
+    // change while the caller believes it scoped them.
+    if filter.is_some() && label_ids.is_none() {
+        return Err(RequestError::Ignored {
+            field: "label_filter_behavior",
+            reason: "it filters a `label_ids` list, so with no labels it governs nothing and the provider \
+                     watches every change; send label ids, or omit the filter",
+        });
+    }
+    let mut value = serde_json::json!({ "topicName": topic });
+    match label_ids {
+        None => {}
+        Some(ids) => {
+            if ids.is_empty() {
+                return Err(RequestError::Argument {
+                    field: "label_ids",
+                    reason: "an empty label list means \"no filter\", which is what omitting the argument \
+                             says; pass no labels rather than an empty list, so a filter the caller did not \
+                             choose cannot render as one they did",
+                });
+            }
+            if ids.len() > MAX_WATCH_LABEL_IDS {
+                return Err(RequestError::Argument {
+                    field: "label_ids",
+                    reason: "a watch may be scoped to at most 64 labels",
+                });
+            }
+            let mut validated = Vec::with_capacity(ids.len());
+            for id in ids {
+                let id = resource_id("label_ids", id)?;
+                validated.push(serde_json::Value::String(id.to_owned()));
+            }
+            value["labelIds"] = serde_json::Value::Array(validated);
+            // The behaviour is written **only** when it can govern a list, which the check above guarantees is
+            // the case here — so the body can never carry a filter with nothing to filter.
+            if let Some(behaviour) = filter {
+                value["labelFilterBehavior"] =
+                    serde_json::Value::String(behaviour.as_str().to_owned());
+            }
+        }
+    }
+    Ok(value.to_string())
+}
+
+/// Builds the `users.watch` request that registers a mailbox and starts a notification lease.
+///
+/// # What this is for
+///
+/// The push guide: *"To configure Gmail accounts to send notifications to your Cloud Pub/Sub topic, use your
+/// Gmail API client to call the `watch` method on the Gmail user mailbox."* So this is the call that makes push
+/// delivery exist at all, and its response is the one [`crate::google::watch::parse_watch_response`] reads: the
+/// `historyId` anchor and the lease `expiration`.
+///
+/// # The three traps, and where each is handled
+///
+/// The **body** is a `POST` with JSON, which is why this returns [`WatchRequest`] rather than the GET-only
+/// [`HttpRequest`]. The **deprecated `labelFilterAction`** has no parameter, so it is unreachable. And the
+/// **filter-without-a-list** pairing is refused in [`watch_json_body`] rather than sent, because the provider
+/// does not treat it as an error.
+///
+/// # Errors
+///
+/// Returns [`RequestError`] for an unusable topic name, label list, or filter pairing — see
+/// [`watch_json_body`] for each rule.
+pub fn gmail_watch(
+    topic_name: &str,
+    label_ids: Option<&[String]>,
+    filter: Option<client::LabelFilterBehavior>,
+) -> Result<WatchRequest, RequestError> {
+    let body = watch_json_body(topic_name, label_ids, filter)?;
+    Ok(WatchRequest {
+        // Gmail's own base, and `me` because the connector authenticates as the account it watches. The
+        // identifier is a constant here rather than an argument, because a caller that could name another
+        // mailbox would be building a request the token does not authorise — a `403` rather than a watch.
+        url: format!("{GMAIL_API_BASE}/users/me/watch"),
+        body,
+    })
+}
+
 /// A `POST` whose body is a form, which is what the token endpoint requires.
 ///
 /// # Why this is a separate type from [`HttpRequest`], and why it has no credential
@@ -725,6 +989,85 @@ struct MessagesListBody {
 #[derive(Clone, Debug, Deserialize)]
 struct MessageIdEntry {
     id: String,
+}
+
+/// The `users.getProfile` response, read for the fields this connector's output declares.
+///
+/// # Why `historyId` is read here as well as from `history.list`
+///
+/// The reference gives the profile as `{ "emailAddress": string, "messagesTotal": integer, "threadsTotal":
+/// integer, "historyId": string }` — so a profile read yields **the mailbox's current position** without
+/// consuming a message. That makes it an alternative way to establish a sync anchor, though *not* the same
+/// one [`crate::google::watch::parse_watch_anchor`] supplies: both are the mailbox's position at the moment
+/// they were read, and the sync guide's rule is that a full sync may store "the `historyId` of the most recent
+/// message" — so **either** can seed a first sync, and neither is the position a sync *ends* at.
+///
+/// `emailAddress` is the field a caller needs and the one that must be present: it is what
+/// `tools-and-connectors.md` requires "verified from the provider, not user-entered labels", and the response
+/// is the provider's own statement of it. The three other fields are optional here because this connector
+/// declares only the two it renders, and reading a field it does not promise would be parsing for a shape it
+/// has no contract for.
+#[derive(Clone, Debug, Deserialize)]
+struct ProfileBody {
+    #[serde(default, rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(default, rename = "historyId")]
+    history_id: Option<String>,
+}
+
+/// The parsed `users.getProfile` response, reduced to the fields this connector's output declares.
+///
+/// **The address is the identity and is the only required field**, so a body without one is refused rather
+/// than returned with a `None`: the operation exists to establish *which* mailbox answered, and a profile with
+/// no address establishes nothing. `history_id` stays optional because the reference documents it as a
+/// separate field and a caller may want only the identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailProfile {
+    /// The mailbox's address, as the provider stated it.
+    pub email_address: String,
+    /// The mailbox's position at the time of the read, when the provider returned one.
+    pub history_id: Option<String>,
+}
+
+/// Parses a `users.getProfile` response.
+///
+/// # Errors
+///
+/// Returns [`RequestError`] when the status is not a success or the body is not JSON carrying an
+/// `emailAddress`. The status is checked first, for the reason [`parse_id_page`] records: parsing a body
+/// before checking the status is how an error document becomes an empty result.
+///
+/// **The address is not validated as an email address here.** Google's `emailAddress` is a string the provider
+/// asserts about its own account; a local RFC 5322 parser would reject a valid-but-unusual address and turn a
+/// successful read into a failure. What the connector does with the value is
+/// [`crate::account::VerifiedAccount::new`]'s business, and that type applies the bound a *stored identifier*
+/// needs.
+pub fn parse_profile(status: u16, body: &str) -> Result<GmailProfile, RequestError> {
+    if status != 200 {
+        return Err(RequestError::Argument {
+            field: "status",
+            reason: "a profile response may only be parsed from a 200; every other status is an outcome for \
+                     `client::classify` rather than an identity",
+        });
+    }
+    let parsed: ProfileBody = serde_json::from_str(body).map_err(|_| RequestError::Argument {
+        field: "body",
+        reason: "a profile response must be a JSON object",
+    })?;
+    let email_address = parsed
+        .email_address
+        .filter(|address| !address.trim().is_empty())
+        .ok_or(RequestError::Argument {
+            field: "emailAddress",
+            // A whitespace-only address is refused as well as an absent one: the operation exists to say which
+            // mailbox answered, and a blank answers nothing while satisfying "the field was present".
+            reason: "a profile must carry a non-empty `emailAddress`, because that value is the account's \
+                     verified identity and a profile without one establishes nothing",
+        })?;
+    Ok(GmailProfile {
+        email_address,
+        history_id: parsed.history_id.filter(|id| !id.trim().is_empty()),
+    })
 }
 
 /// The `messages.get` response body, read for the fields this connector's output declares.

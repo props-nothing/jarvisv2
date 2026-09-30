@@ -219,3 +219,95 @@ fn every_state_except_not_yet_asks_for_a_renewal() {
         "a fresh watch must be left alone"
     );
 }
+
+#[test]
+fn the_watch_response_anchors_the_first_sync_and_the_guide_uses_two_different_ids() {
+    // **The load-bearing test for this slice.** The push guide's `watch` response is
+    // `{ "historyId": "1234567890", "expiration": "1431990098200" }`, and two paragraphs later the guide's
+    // worked example is: *"Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can
+    // persist `9876543210` as the last known `historyId`"*.
+    //
+    // So the response's id is the **anchor** a first sync starts from (`1234567890`), and `9876543210` is a
+    // *different* number: the position that sync ended at. A reader that returned the response's id as "the new
+    // position" would store a value that never moves as the mailbox changes, and a sync from it would re-read
+    // the same window forever. The two numbers in the guide are what let this test distinguish them, so both are
+    // written out rather than one being derived from the other.
+    let response = must(
+        parse_watch_response(r#"{"historyId": "1234567890", "expiration": "1431990098200"}"#),
+        "the documented watch response must parse as both fields",
+    );
+    assert_eq!(
+        response.anchor, "1234567890",
+        "the anchor is the response's historyId — the startHistoryId the guide passes to history.list"
+    );
+    assert_ne!(
+        response.anchor, "9876543210",
+        "the anchor must not be the position the resulting sync ends at; the guide uses a different number for \
+         that, and conflating the two inverts the direction of a sync"
+    );
+    // And the expiration is read from the same body, so the struct is not one field read twice.
+    assert_eq!(
+        response.expires_at.unix_nanos() / 1_000_000_000,
+        1_431_990_098
+    );
+}
+
+#[test]
+fn the_anchor_is_read_from_the_same_body_as_the_lease_and_each_missing_field_is_its_own_error() {
+    // The response's two fields live in one body, so the combined reader must demand both — which is the whole
+    // point of the slice: reading only the lease is what dropped the anchor. Each omission gets its own error,
+    // because "the anchor is absent" and "the expiration is absent" are different problems with different
+    // remedies, and a caller debugging one must not be pointed at the other.
+    assert_eq!(
+        parse_watch_response(r#"{"expiration": "1431990098200"}"#),
+        Err(WatchError::MissingHistoryId),
+        "a response with no historyId cannot anchor a sync, so it is refused rather than defaulted"
+    );
+    assert_eq!(
+        parse_watch_response(r#"{"historyId": "1234567890"}"#),
+        Err(WatchError::MissingExpiration),
+        "a response with no expiration cannot be renewed by, so it is refused"
+    );
+    // Both absent: the expiration is reported first, because a caller that cannot tell when the lease ends
+    // cannot use the anchor either.
+    assert_eq!(
+        parse_watch_response("{}"),
+        Err(WatchError::MissingExpiration)
+    );
+    // A JSON null is absent, not a wrong type — the same reading the expiration reader takes, asserted here so
+    // the two fields cannot drift apart on this decision.
+    assert_eq!(
+        parse_watch_response(r#"{"historyId": null, "expiration": "1431990098200"}"#),
+        Err(WatchError::MissingHistoryId)
+    );
+}
+
+#[test]
+fn a_history_id_that_is_not_a_string_is_refused_rather_than_coerced() {
+    // The reference types `historyId` as a string, and the trap is the mirror of the expiration's: a JSON number
+    // is *not* the documented form. Coercing it would accept a response the reference says cannot occur, and it
+    // would hide a provider shape change — which is the class of change this whole module exists to surface.
+    assert_eq!(
+        parse_watch_anchor(r#"{"historyId": 1234567890}"#),
+        Err(WatchError::HistoryIdNotAString)
+    );
+    assert_eq!(
+        parse_watch_anchor(r#"{"historyId": ["1"]}"#),
+        Err(WatchError::HistoryIdNotAString)
+    );
+    // The control: the documented string form IS accepted, so the refusal above is about the type and not about
+    // the reader refusing everything.
+    assert_eq!(
+        must(
+            parse_watch_anchor(r#"{"historyId": "1234567890"}"#),
+            "the documented string form must be accepted"
+        ),
+        "1234567890"
+    );
+    // A body that is not JSON at all is reported as a JSON problem rather than as a missing field, so the layer
+    // to check is named.
+    assert!(matches!(
+        parse_watch_anchor("not json"),
+        Err(WatchError::NotJson { .. })
+    ));
+}

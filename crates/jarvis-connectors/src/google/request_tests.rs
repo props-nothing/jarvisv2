@@ -752,3 +752,254 @@ fn a_page_token_and_a_sync_token_are_sent_together_to_walk_an_incremental_sync()
         "a page token must go through the same length bound as every other token"
     );
 }
+
+#[test]
+fn the_profile_request_addresses_the_calling_credential_and_takes_no_arguments() {
+    // **The shape that makes naming another mailbox unrepresentable.** `users.getProfile`'s path parameter is
+    // documented as "The user's email address. The special value `me` can be used to indicate the
+    // authenticated user", and this builder always sends `me` — so the request cannot be aimed at an account
+    // the caller's token does not authorise, which is why there is no `user_id` argument to validate.
+    let request = gmail_profile();
+    assert_eq!(request.method(), "GET");
+    assert_eq!(
+        request.url(),
+        "https://www.googleapis.com/gmail/v1/users/me/profile"
+    );
+    // No query parameters: the request body "must be empty" and there is nothing to put in a query either, so
+    // `url_with_query` is the path unchanged. Asserted because a stray parameter would be a fact about a
+    // method that takes none.
+    assert!(request.query().is_empty());
+    assert_eq!(request.url_with_query(), request.url());
+    assert_eq!(request.accept(), JSON_ACCEPT);
+}
+
+#[test]
+fn a_profile_response_must_carry_an_address_because_that_is_the_whole_point() {
+    // The reference gives the response as `{ "emailAddress": string, "messagesTotal": integer,
+    // "threadsTotal": integer, "historyId": string }`. This connector reads two of the four — the identity and
+    // the position — and the **address is required** because the operation exists to establish *which* mailbox
+    // answered, so a profile without one establishes nothing.
+    let profile = must(
+        parse_profile(
+            200,
+            r#"{"emailAddress":"user@example.com","messagesTotal":42,"threadsTotal":7,"historyId":"1234567890"}"#,
+        ),
+        "the reference's profile must parse",
+    );
+    assert_eq!(profile.email_address, "user@example.com");
+    assert_eq!(profile.history_id.as_deref(), Some("1234567890"));
+
+    // An absent address is refused rather than returned as `None`, and a **whitespace-only** one is too: the
+    // second satisfies "the field was present" while denoting nothing, which is the same mistake as an empty
+    // value and the failure direction that would store an identity naming no account.
+    for body in [
+        r#"{"messagesTotal":1}"#,
+        r#"{"emailAddress":null,"historyId":"1"}"#,
+        r#"{"emailAddress":"   ","historyId":"1"}"#,
+        r#"{"emailAddress":"","historyId":"1"}"#,
+    ] {
+        assert!(
+            matches!(
+                parse_profile(200, body),
+                Err(RequestError::Argument {
+                    field: "emailAddress",
+                    ..
+                })
+            ),
+            "`{body}` has no usable address and must be refused as the address rather than as a shape"
+        );
+    }
+    // The position is optional, so a profile with only an identity is a valid result — the reference documents
+    // `historyId` as its own field and a caller may want only to know which account this is.
+    let identity_only = must(
+        parse_profile(200, r#"{"emailAddress":"user@example.com"}"#),
+        "an identity-only profile must parse",
+    );
+    assert_eq!(identity_only.history_id, None);
+    // And a non-200 is refused **before** the body is read, so an error document cannot become an identity.
+    assert!(parse_profile(403, r#"{"emailAddress":"user@example.com"}"#).is_err());
+    // A body that is not a JSON object at all is refused as a body rather than as a missing address, so the
+    // layer to check is named.
+    assert!(matches!(
+        parse_profile(200, "not json"),
+        Err(RequestError::Argument { field: "body", .. })
+    ));
+}
+
+#[test]
+fn a_watch_body_carries_the_topic_and_only_the_filter_fields_that_govern_something() {
+    // The `users.watch` reference: a JSON body of `topicName` plus optionally `labelIds` and
+    // `labelFilterBehavior`. Asserted by **parsing the rendered body**, because the substance is which fields
+    // are present — a string-containment check would pass on a body that also carried the deprecated spelling.
+    let plain = must(
+        gmail_watch("projects/p/topics/t", None, None),
+        "a watch with no filter must build",
+    );
+    assert_eq!(
+        plain.url(),
+        "https://www.googleapis.com/gmail/v1/users/me/watch"
+    );
+    assert_eq!(plain.content_type(), "application/json");
+    let body: serde_json::Value = must(
+        serde_json::from_str(plain.rendered_body()),
+        "the body is JSON",
+    );
+    assert_eq!(body["topicName"], "projects/p/topics/t");
+    assert_eq!(
+        body.get("labelIds"),
+        None,
+        "an unfiltered watch must not send a label list at all, rather than an empty one"
+    );
+    // **The deprecated field is absent, and this is the assertion that would fail if someone added it back.**
+    // The reference says `labelFilterAction` is ignored when the new field is set and caused "incorrect
+    // behavior in some cases" when it is not, so its presence would be a silent change of meaning.
+    assert_eq!(
+        body.get("labelFilterAction"),
+        None,
+        "the deprecated `labelFilterAction` must never be sent — `labelFilterBehavior` replaces it"
+    );
+
+    // With labels and a behaviour, both fields are present and the behaviour is the documented spelling.
+    let scoped = must(
+        gmail_watch(
+            "projects/p/topics/t",
+            Some(&["INBOX".to_owned()]),
+            Some(crate::google::client::LabelFilterBehavior::Include),
+        ),
+        "a scoped watch must build",
+    );
+    let scoped_body: serde_json::Value = must(
+        serde_json::from_str(scoped.rendered_body()),
+        "the body is JSON",
+    );
+    assert_eq!(scoped_body["labelIds"], serde_json::json!(["INBOX"]));
+    assert_eq!(scoped_body["labelFilterBehavior"], "include");
+    // And the deprecated spelling is still absent in the filtered case, which is the one where sending it would
+    // look most plausible.
+    assert_eq!(scoped_body.get("labelFilterAction"), None);
+    let excluded = must(
+        gmail_watch(
+            "projects/p/topics/t",
+            Some(&["SPAM".to_owned()]),
+            Some(crate::google::client::LabelFilterBehavior::Exclude),
+        ),
+        "an excluding watch must build",
+    );
+    let excluded_body: serde_json::Value = must(
+        serde_json::from_str(excluded.rendered_body()),
+        "the body is JSON",
+    );
+    assert_eq!(excluded_body["labelFilterBehavior"], "exclude");
+}
+
+#[test]
+fn a_label_filter_with_nothing_to_filter_is_refused_because_the_provider_would_succeed_anyway() {
+    // **The silent case this variant exists for.** `labelFilterBehavior` is documented as the "filtering
+    // behavior of `labelIds` list specified", so with no list it governs nothing — and the provider does not
+    // treat a filter with no list as an error, it simply watches every change. So the failure would be a
+    // connector that asked for some labels and received all of them, with no error anywhere to notice.
+    // Refused here because this is the only layer that can catch it.
+    assert_eq!(
+        gmail_watch(
+            "projects/p/topics/t",
+            None,
+            Some(crate::google::client::LabelFilterBehavior::Include)
+        ),
+        Err(RequestError::Ignored {
+            field: "label_filter_behavior",
+            reason: "it filters a `label_ids` list, so with no labels it governs nothing and the provider \
+                     watches every change; send label ids, or omit the filter",
+        }),
+        "a filter with no list must be refused rather than sent"
+    );
+    // The control: the SAME behaviour is accepted as soon as a list is present, so the refusal is about the
+    // pairing and not about the behaviour being unacceptable.
+    assert!(
+        gmail_watch(
+            "projects/p/topics/t",
+            Some(&["INBOX".to_owned()]),
+            Some(crate::google::client::LabelFilterBehavior::Include)
+        )
+        .is_ok(),
+        "the same filter must be accepted when it has a list to govern"
+    );
+}
+
+#[test]
+fn an_empty_label_list_is_refused_rather_than_read_as_no_filter() {
+    // An empty list and an absent list render to the same body, so accepting the empty one would equate a value
+    // a caller built by mistake (a loop over zero labels) with a deliberate choice. "No filter" is expressed by
+    // passing `None`; the two situations must not render the same.
+    assert_eq!(
+        gmail_watch("projects/p/topics/t", Some(&[]), None),
+        Err(RequestError::Argument {
+            field: "label_ids",
+            reason: "an empty label list means \"no filter\", which is what omitting the argument \
+                     says; pass no labels rather than an empty list, so a filter the caller did not \
+                     choose cannot render as one they did",
+        })
+    );
+    // The control: an absent list still builds the unfiltered watch, so the refusal above is about the empty
+    // list and not about the unfiltered case being unreachable.
+    assert!(gmail_watch("projects/p/topics/t", None, None).is_ok());
+}
+
+#[test]
+fn a_watch_topic_name_goes_through_the_same_bounds_as_every_other_resource_identifier() {
+    // The topic name becomes a request body field and a log line, so it is bounded like a resource id: empty,
+    // whitespace-only, control-bearing and oversized are each refused, and the field is named so a caller knows
+    // which argument to fix.
+    for (topic, what) in [
+        ("", "an empty topic name"),
+        ("   ", "a whitespace-only topic name"),
+        ("projects/p/topics/t\n", "a control character"),
+    ] {
+        assert!(
+            matches!(
+                gmail_watch(topic, None, None),
+                Err(RequestError::Argument {
+                    field: "topic_name",
+                    ..
+                })
+            ),
+            "{what} must be refused as the topic name"
+        );
+    }
+    assert!(
+        matches!(
+            gmail_watch(&"a".repeat(MAX_TOPIC_NAME_CHARS + 1), None, None),
+            Err(RequestError::Argument {
+                field: "topic_name",
+                ..
+            })
+        ),
+        "an oversized topic name must be refused"
+    );
+    // And a label id goes through the same `resource_id` validator as every other identifier, including the
+    // empty case, so the new request body is not a hole in the validation the query parameters go through.
+    assert!(
+        matches!(
+            gmail_watch("projects/p/topics/t", Some(&[String::new()]), None),
+            Err(RequestError::Argument {
+                field: "label_ids",
+                ..
+            })
+        ),
+        "an empty label id must be refused by the shared resource-id validator"
+    );
+    // The list's own cap, which is a JARVIS bound rather than a provider figure.
+    assert!(
+        matches!(
+            gmail_watch(
+                "projects/p/topics/t",
+                Some(&vec!["INBOX".to_owned(); MAX_WATCH_LABEL_IDS + 1]),
+                None
+            ),
+            Err(RequestError::Argument {
+                field: "label_ids",
+                ..
+            })
+        ),
+        "a label list over the cap must be refused"
+    );
+}

@@ -108,3 +108,11 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0088](0088-a-field-google-declares-two-encodings-for.md) | A field Google declares two encodings for | Accepted |
 | [0089](0089-a-rule-from-another-context.md) | A rule from another context, and the observable axis | Accepted |
 | [0090](0090-a-refusal-keeps-the-cursor.md) | A refusal keeps the cursor, because the position was never rejected | Accepted |
+| [0091](0091-a-value-redacted-in-one-place.md) | A value redacted in one place and printed in another | Accepted |
+| [0092](0092-a-response-field-with-no-reader.md) | A response field with no reader, and a worked example that uses two numbers | Accepted |
+| [0093](0093-a-request-the-provider-accepts-and-ignores.md) | A request the provider accepts and silently ignores | Accepted |
+| [0094](0094-a-negative-acknowledgement-is-charged-to-the-subscription.md) | A negative acknowledgement is charged to the subscription | Accepted |
+| [0095](0095-stopping-notifications-needs-the-grant-revoking-destroys.md) | Stopping notifications needs the grant that revoking destroys | Accepted |
+| [0096](0096-a-requirement-with-no-consumer.md) | A requirement with no consumer, and a scope justified by the wrong operation | Accepted |
+| [0097](0097-a-delivery-names-a-mailbox-and-nothing-mapped-it.md) | A delivery names a mailbox, and nothing mapped it to an account | Accepted |
+| [0098](0098-one-address-one-account.md) | One address, one account — and the opposite direction from routing | Accepted |
