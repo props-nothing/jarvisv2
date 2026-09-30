@@ -100,3 +100,9 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0080](0080-a-limit-and-a-recommendation-are-two-facts.md) | A limit and a recommendation are two facts, and a figure with no source is neither | Accepted |
 | [0081](0081-calendars-410-needs-its-reason.md) | Calendar's 410 is unambiguous only once the reason is read | Accepted |
 | [0082](0082-one-classifier-for-two-apis.md) | One classifier for two APIs answered for the less informative one | Accepted |
+| [0083](0083-a-declared-field-is-bounded-by-what-can-return-it.md) | A declared output field is bounded by what the request can return | Accepted |
+| [0084](0084-an-argument-pair-the-provider-forbids.md) | An argument pair the provider forbids is refused before it is sent | Accepted |
+| [0085](0085-a-rendered-token-needs-an-input-that-consume-it.md) | A token the output renders needs an input that can consume it | Accepted |
+| [0086](0086-a-refusal-names-the-argument-the-caller-sent.md) | A refusal names the argument the caller sent, and a declared bound equals the one enforced | Accepted |
+| [0087](0087-a-lease-that-lapses-silently.md) | A lease that lapses silently needs a code that can say so | Accepted |
+| [0088](0088-a-field-google-declares-two-encodings-for.md) | A field Google declares two encodings for | Accepted |

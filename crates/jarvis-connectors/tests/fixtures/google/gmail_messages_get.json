@@ -9,12 +9,16 @@
   "_fields_this_connector_reads": [
     "id",
     "threadId",
-    "labelIds",
+    "labelIds"
+  ],
+  "_fields_deliberately_not_read": [
     "snippet",
     "historyId",
     "internalDate",
-    "sizeEstimate"
+    "sizeEstimate",
+    "payload"
   ],
+  "_why_not_snippet": "The Format page says `minimal` returns only the ID and labels and `metadata` only the ID, labels and headers, so this tool's output does not declare `snippet`, `historyId`, `internalDate`, `sizeEstimate` or `payload` either. They are present in the fixture so a future slice reads a real shape; none is declared as output today (ADR-0083).",
   "id": "18f9c0d1e2a3b4c5",
   "threadId": "18f9c0d1e2a3b4c5",
   "labelIds": ["UNREAD", "CATEGORY_PERSONAL", "INBOX"],

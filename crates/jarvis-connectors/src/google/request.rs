@@ -32,7 +32,6 @@
 use std::fmt;
 
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::google::CONNECTOR_ID;
 use crate::google::client::{self, CALENDAR_API_BASE, GMAIL_API_BASE, GMAIL_MAX_RESULTS_CAP};
@@ -56,6 +55,15 @@ pub const MAX_QUERY_CHARS: usize = 512;
 /// A JARVIS bound for the same reason: the identifiers Google issues are far shorter, and a bound is what
 /// stops a model-supplied string from becoming an unbounded URL.
 pub const MAX_RESOURCE_ID_CHARS: usize = 256;
+
+/// The longest a Calendar time bound may be, in characters.
+///
+/// **A JARVIS bound and a tight one, not [`MAX_QUERY_CHARS`].** An RFC 3339 instant is about 25 characters and
+/// at most about 30 with fractional seconds and an offset, so a bound of 64 admits every valid instant with
+/// room to spare while still refusing a string that is obviously not a timestamp. A time bound is not a search
+/// query: it was previously checked against the query's 512-character limit and refused with a message about
+/// a query, which is both the wrong noun and the wrong field name (`ADR-0086`).
+pub const MAX_TIME_BOUND_CHARS: usize = 64;
 
 /// The `Accept` header value both APIs expect for a JSON body.
 pub const JSON_ACCEPT: &str = "application/json";
@@ -82,6 +90,20 @@ pub enum RequestError {
         requested: u32,
         /// The API's documented cap.
         maximum: u32,
+    },
+    /// Two arguments were supplied that the provider **refuses together**.
+    ///
+    /// Distinct from [`Self::Argument`], which is about one value being malformed. Here both values may be
+    /// perfectly valid and the **combination** is what the provider rejects — a class of mistake that a model,
+    /// reading an input schema which advertises both fields, has no way to anticipate.
+    #[error("`{field}` cannot be combined with `{other}`: {reason}")]
+    DisallowedCombination {
+        /// The argument that is fine on its own.
+        field: &'static str,
+        /// The argument it cannot be sent with.
+        other: &'static str,
+        /// Why the provider refuses the pair.
+        reason: &'static str,
     },
     /// A page token is unusable.
     #[error(transparent)]
@@ -248,22 +270,61 @@ fn resource_id<'a>(field: &'static str, value: &'a str) -> Result<&'a str, Reque
 
 /// Validates a Gmail search query.
 ///
+/// # Why it takes the field name
+///
+/// It was hard-coded to `"query"` and had **three** callers: the Gmail list's `q` parameter and Calendar's
+/// `time_min` and `time_max`. So an oversized time bound produced *"the `query` argument is unusable"* for an
+/// argument the caller never sent, and called an RFC 3339 instant "a search query". The field name is now an
+/// argument, so the only thing that names the failing field is the caller that knows which one it is
+/// (`ADR-0086`).
+///
 /// # Errors
 ///
 /// Returns [`RequestError::Argument`] when the query is oversized or holds a control character. An empty
 /// query is **accepted** and means "the newest messages", so it is not refused — the schema's own description
 /// says so, and refusing it would make a legitimate request impossible.
-fn search_query(value: &str) -> Result<&str, RequestError> {
+fn search_query<'a>(field: &'static str, value: &'a str) -> Result<&'a str, RequestError> {
     if value.chars().count() > MAX_QUERY_CHARS {
         return Err(RequestError::Argument {
-            field: "query",
+            field,
             reason: "a search query may be at most 512 characters",
         });
     }
     if value.chars().any(char::is_control) {
         return Err(RequestError::Argument {
-            field: "query",
+            field,
             reason: "a search query may not hold a control character",
+        });
+    }
+    Ok(value)
+}
+
+/// Validates an RFC 3339 time bound.
+///
+/// **A separate validator from [`search_query`] and not a reuse of it**, because the two are different kinds
+/// of value and the refusal must say so. A time bound was previously run through `search_query`, which meant an
+/// oversized `time_min` was refused with a message about *"a search query"* that named the argument
+/// `query` — a field the caller had not supplied. The bound is the same figure by coincidence (both are
+/// bounded by [`MAX_QUERY_CHARS`]), and the *reason* is what differs: a timestamp is a bounded string entering
+/// a URL and a log line, not a provider's search syntax (`ADR-0086`).
+///
+/// # Errors
+///
+/// Returns [`RequestError::Argument`] when the bound is oversized or holds a control character. An empty bound
+/// is accepted here and refused by the provider as `timeRangeEmpty`, so this does not duplicate that check —
+/// the provider's own reason is the diagnostic.
+fn time_bound<'a>(field: &'static str, value: &'a str) -> Result<&'a str, RequestError> {
+    if value.chars().count() > MAX_TIME_BOUND_CHARS {
+        return Err(RequestError::Argument {
+            field,
+            reason: "a time bound may be at most 64 characters",
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(RequestError::Argument {
+            field,
+            reason: "a time bound may not hold a control character, because it becomes a URL query value \
+                     and a log field",
         });
     }
     Ok(value)
@@ -310,7 +371,7 @@ pub fn gmail_messages_list(
         push(
             &mut parameters,
             "q",
-            Some(percent_encode(search_query(text)?)),
+            Some(percent_encode(search_query("query", text)?)),
         );
     }
     if let Some(value) = max_results_value {
@@ -382,32 +443,95 @@ pub fn gmail_messages_get(
     })
 }
 
+/// Why a time range and a sync token cannot be combined, as the refusal's explanation.
+///
+/// A constant because the two checks below share one reason, and the wording names **both remedies**: a caller
+/// has a real choice (drop the bounds to continue the sync, or drop the token for a filtered full read) rather
+/// than only a mistake to undo.
+const TIME_RANGE_WITH_SYNC_TOKEN: &str = "the provider refuses a time range together with a sync token, \
+     because an incremental sync must repeat the initial request's filters; drop the time bounds to continue \
+     the sync, or drop the sync token to do a filtered full read";
+
 /// Builds the `events.list` request.
+///
+/// # A page token is required to continue a large incremental sync
+///
+/// The sync guide: "In cases where a large number of resources have changed since the last incremental sync
+/// request, you may find a `pageToken` instead of a `syncToken` in the list result. In these cases you'll need
+/// to perform the exact same list query as was used for retrieval of the first page in the incremental sync
+/// (with the exact same `syncToken`), append the `pageToken` to it and paginate through all the following
+/// requests until you find another `syncToken` on the last page."
+///
+/// So a page token and a sync token are sent **together** for the middle pages of an incremental walk, which is
+/// the opposite of the `timeMin`/`timeMax` restriction below — the two parameters belong to different rules and
+/// only one of them is a conflict. Without this parameter a large sync was **uncontinuable**: the renderer
+/// emits `next_page_token`, the caller is told to fetch more, and no argument existed to do it with
+/// (`ADR-0085`).
+///
+/// # A time range and a sync token cannot be sent together
+///
+/// The `events.list` reference lists the parameters that "cannot be specified together with nextSyncToken to
+/// ensure consistency of the client state": `iCalUID`, `orderBy`, `privateExtendedProperty`, `q`,
+/// `sharedExtendedProperty`, **`timeMin`**, **`timeMax`** and `updatedMin`. This builder offers two of those
+/// eight — a time range — so it refuses the pairing rather than sending a request the provider documents as a
+/// `400`. Of the other six, none is offered by [`calendar_events_list`]: it sends `calendarId`, `timeMin`,
+/// `timeMax`, `maxResults`, `pageToken` and `syncToken` only, and `pageToken` is not on the restriction list.
+///
+/// **The refusal is local because the call could never succeed.** A `400` is a caller mistake that
+/// `client::classify` already treats as permanent, so sending it would spend a request and a quota unit to
+/// learn what the provider had already stated — and the caller would still not know which argument to drop. A
+/// model reading the input schema sees both fields advertised, so the pairing is something it can plausibly
+/// choose, and the honest answer is a refusal that names the pair (`ADR-0084`).
 ///
 /// # Errors
 ///
-/// Returns [`RequestError`] for an unusable calendar identifier, `max_results`, or sync token.
+/// Returns [`RequestError`] for an unusable calendar identifier, `max_results`, page token or sync token, and
+/// [`RequestError::DisallowedCombination`] for a time range sent with a sync token.
 pub fn calendar_events_list(
     calendar_id: &str,
     time_min: Option<&str>,
     time_max: Option<&str>,
     max_results_value: Option<u32>,
+    page_token: Option<&str>,
     sync_token: Option<&str>,
 ) -> Result<HttpRequest, RequestError> {
     let calendar = resource_id("calendar_id", calendar_id)?;
+    // Validated before the tokens so a caller learns about the unusable pair without a token having to be
+    // parsed first — and because the pair is the more surprising fault of the two.
+    let token = client::next_page(sync_token)?;
+    // The page token is bounded for the same reason every token is: it becomes the next request's parameter,
+    // and an oversized or control-bearing value would address a different page than the cursor records.
+    let next_page_token = client::next_page(page_token)?;
+    // The two checks are separate rather than one `matches!` over a tuple, so the refusal names **which** of the
+    // two bounds conflicts. A single message saying "a time range" would leave a caller who sent only `timeMax`
+    // wondering which argument to remove.
+    if token.is_some() && time_min.is_some() {
+        return Err(RequestError::DisallowedCombination {
+            field: "time_min",
+            other: "sync_token",
+            reason: TIME_RANGE_WITH_SYNC_TOKEN,
+        });
+    }
+    if token.is_some() && time_max.is_some() {
+        return Err(RequestError::DisallowedCombination {
+            field: "time_max",
+            other: "sync_token",
+            reason: TIME_RANGE_WITH_SYNC_TOKEN,
+        });
+    }
     let mut parameters = Vec::new();
     if let Some(value) = time_min {
         push(
             &mut parameters,
             "timeMin",
-            Some(percent_encode(search_query(value)?)),
+            Some(percent_encode(time_bound("time_min", value)?)),
         );
     }
     if let Some(value) = time_max {
         push(
             &mut parameters,
             "timeMax",
-            Some(percent_encode(search_query(value)?)),
+            Some(percent_encode(time_bound("time_max", value)?)),
         );
     }
     if let Some(value) = max_results_value {
@@ -417,10 +541,18 @@ pub fn calendar_events_list(
             Some(max_results(value, CALENDAR_MAX_RESULTS_CAP)?),
         );
     }
+    // The page token is pushed **before** the sync token, matching the Gmail builders' order (`maxResults`,
+    // `pageToken`) so the walk parameters appear together — and because the sync guide's own pagination example
+    // is `…&syncToken=…&pageToken=…`, which is the shape a reader compares this against.
+    push(
+        &mut parameters,
+        "pageToken",
+        next_page_token.map(|token| percent_encode(&token)),
+    );
     push(
         &mut parameters,
         "syncToken",
-        client::next_page(sync_token)?.map(|token| percent_encode(&token)),
+        token.map(|token| percent_encode(&token)),
     );
     Ok(HttpRequest {
         method: "GET",
@@ -593,6 +725,29 @@ struct MessagesListBody {
 #[derive(Clone, Debug, Deserialize)]
 struct MessageIdEntry {
     id: String,
+}
+
+/// The `messages.get` response body, read for the fields this connector's output declares.
+///
+/// A private struct rather than inline `Value` lookups, so the three field names and their `serde` renames
+/// appear once — and so a field the resource renames is a compile-visible change to this struct rather than a
+/// silently-`None` lookup.
+///
+/// `id` is `Option` so that a JSON body which is well-formed but **carries no `id`** is refused with a reason
+/// about the missing field rather than one about the body not being JSON. Those are different defects and the
+/// old parser kept them apart.
+#[derive(Clone, Debug, Deserialize)]
+struct MessageBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "threadId")]
+    thread_id: Option<String>,
+    // `Option<Vec<String>>` rather than `Vec<String>` so that **absent** stays distinct from **empty**: an
+    // absent `labelIds` means the provider did not return the field, while `[]` means the message carries no
+    // labels. A `Vec` with `#[serde(default)]` collapses both to empty, which would render "this message has no
+    // labels" for a response that never mentioned labels at all.
+    #[serde(default, rename = "labelIds")]
+    label_ids: Option<Vec<String>>,
 }
 
 /// The `events.list` response body.
@@ -775,30 +930,68 @@ pub fn parse_history_page(status: u16, body: &str) -> Result<HistoryPage, Reques
     })
 }
 
-/// Returns the JSON body's `id` field, for an operation whose output names one identifier.
+/// The message fields this connector's `gmail_messages_read` output promises.
+///
+/// **This is not Gmail's `Message` resource.** It carries exactly the top-level fields the tool's declared
+/// output names — the same rule [`IdPage`] and [`CalendarPage`] follow — so the declaration and the rendering
+/// cannot drift. A parser returning the provider's `Message` would make the tool's declared output a fiction
+/// (`ADR-0059`).
+///
+/// # Why there is no `snippet`, and why that is the finding rather than an omission
+///
+/// The `Message` resource has a `snippet` field, and an earlier version of the declared output promised it.
+/// But the **Format** page defines what each format returns: `minimal` is "only email message ID and labels"
+/// and `metadata` is "only email message ID, labels, and email headers" — neither returns `snippet`. So a tool
+/// offering those two formats **cannot deliver** a `snippet` field, and declaring one promises a value two of
+/// its three accepted formats never produce. The field is omitted rather than declared-optional, because
+/// "sometimes absent" for something two of three formats never return reads as an unreliable field rather than
+/// as an impossible one (`ADR-0083`).
+///
+/// # Why `thread_id` and `label_ids` are optional and `id` is not
+///
+/// `id` is returned by every format and is the one field every read can deliver. `thread_id` and `label_ids`
+/// are in the resource, but the connector does not claim the provider returns them for **every** format — the
+/// Format page names `labelIds` for `minimal` and `metadata` and says nothing about `threadId` — so they are
+/// modelled as possibly-absent and the renderer emits each only when it arrived. A `required` field a
+/// `minimal` read could not fill would make an honest response fail the tool's own validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailMessage {
+    /// The immutable message identifier, present in every format.
+    pub id: String,
+    /// The thread the message belongs to, when the provider returned it.
+    pub thread_id: Option<String>,
+    /// The labels applied to the message, when the provider returned them.
+    ///
+    /// `None` means **the field was not in the response**, which is different from `Some(vec![])` meaning the
+    /// message carries no labels. See [`MessageBody`] for why the two are kept apart.
+    pub label_ids: Option<Vec<String>>,
+}
+
+/// Parses a `messages.get` response into the fields this connector's output declares.
 ///
 /// # Errors
 ///
-/// Returns [`RequestError`] when the status is not 200 or the body has no usable `id`.
-pub fn parse_single_id(status: u16, body: &str) -> Result<String, RequestError> {
+/// Returns [`RequestError`] when the status is not 200 or the body is JSON with no usable `id`.
+pub fn parse_single_message(status: u16, body: &str) -> Result<GmailMessage, RequestError> {
     if status != 200 {
         return Err(RequestError::Argument {
             field: "status",
             reason: "a resource may only be read from a 200",
         });
     }
-    let value: Value = serde_json::from_str(body).map_err(|_| RequestError::Argument {
+    let parsed: MessageBody = serde_json::from_str(body).map_err(|_| RequestError::Argument {
         field: "body",
         reason: "a resource body must be JSON",
     })?;
-    value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(RequestError::Argument {
-            field: "body",
-            reason: "a resource body must carry a string `id`",
-        })
+    let id = parsed.id.ok_or(RequestError::Argument {
+        field: "body",
+        reason: "a resource body must carry a string `id`",
+    })?;
+    Ok(GmailMessage {
+        id,
+        thread_id: parsed.thread_id,
+        label_ids: parsed.label_ids,
+    })
 }
 
 /// The API base a request belongs to, for a diagnostic that must not print a query.

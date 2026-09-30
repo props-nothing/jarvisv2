@@ -490,6 +490,156 @@ fn assert_output_matches_declared_schema(tool: &str, output: &str) {
     );
 }
 
+/// Returns the declared top-level output property names of a tool, from its own schema.
+fn declared_output_properties(tool: &str) -> Vec<String> {
+    let manifest = must(
+        super::super::GoogleConnector::manifest(),
+        "the manifest must be built",
+    );
+    let definition = must(
+        crate::google::definitions::definitions(&manifest),
+        "the manifest must derive its definitions",
+    )
+    .into_iter()
+    .find(|candidate| candidate.id().to_string() == tool)
+    .unwrap_or_else(|| panic!("the manifest must declare {tool}"));
+    let mut names: Vec<String> = definition
+        .output_schema()
+        .document()
+        .pointer("/properties")
+        .and_then(serde_json::Value::as_object)
+        .map_or_else(
+            || panic!("{tool} must declare a `properties` object"),
+            |properties| properties.keys().cloned().collect(),
+        );
+    names.sort();
+    names
+}
+
+/// Returns the top-level keys a rendered output actually carries.
+fn rendered_keys(output: &str) -> Vec<String> {
+    let value: serde_json::Value = must(serde_json::from_str(output), "a rendering must be JSON");
+    let mut keys: Vec<String> = value.as_object().map_or_else(
+        || panic!("a rendering must be an object: {output}"),
+        |object| object.keys().cloned().collect(),
+    );
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_read_delivers_every_field_its_output_declares() {
+    // **The forward direction of `ADR-0083`'s finding.** `gmail_messages_read` declared four output fields and
+    // its renderer emitted one, so three quarters of the declared contract was unreachable — a consumer
+    // reading a field the schema promised would find nothing. This asserts the fields `full` returns are all
+    // rendered, so the declaration is not a promise the code declines to keep.
+    let message = must(
+        interpret(
+            "google.gmail_messages_read",
+            Ok(response(
+                200,
+                r#"{"id":"m1","threadId":"t1","labelIds":["INBOX","UNREAD"]}"#,
+            )),
+            now(),
+        ),
+        "a read must be a result",
+    );
+    let output = message
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_output_matches_declared_schema("google.gmail_messages_read", output);
+    let keys = rendered_keys(output);
+    assert!(keys.contains(&"message_id".to_owned()), "{output}");
+    assert!(keys.contains(&"thread_id".to_owned()), "{output}");
+    assert!(keys.contains(&"label_ids".to_owned()), "{output}");
+}
+
+#[test]
+fn no_declared_output_property_is_undeliverable() {
+    // **The reverse direction, and the one that finds the defect the forward test cannot.** The forward test
+    // proves the fields the renderer *emits* are declared; only this proves every field the schema *declares* is
+    // something the renderer can produce. A field added to the schema and forgotten in the renderer passes every
+    // other test — the schema validates, nothing references the field — and fails here, because a maximal
+    // response does not produce a matching key. That is exactly how `thread_id`, `label_ids` and `snippet` were
+    // declared and never rendered (`ADR-0083`).
+    //
+    // The comparison is between the declared property NAMES and the keys of the rendering, so it cannot be
+    // satisfied by a schema the renderer ignores. `snippet` is the case that made this necessary: it was
+    // declared and is genuinely undeliverable, which is why it was **removed from the schema** rather than left
+    // to be found missing here.
+    let maximal = must(
+        interpret(
+            "google.gmail_messages_read",
+            Ok(response(
+                200,
+                r#"{"id":"m1","threadId":"t1","labelIds":["INBOX"]}"#,
+            )),
+            now(),
+        ),
+        "a read must be a result",
+    );
+    let output = maximal
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert_eq!(
+        rendered_keys(output),
+        declared_output_properties("google.gmail_messages_read"),
+        "every declared output property must be producible from a maximal response, and nothing rendered \
+         may be undeclared: {output}"
+    );
+}
+
+#[test]
+fn a_response_without_thread_or_labels_omits_them_rather_than_inventing_an_empty_value() {
+    // The two optional fields are omitted when the provider did not return them — `minimal` and `metadata` may
+    // not include `threadId`, and the Format page says nothing about it for either. The distinction that
+    // matters is `label_ids`: absent means "the provider did not return labels", while `[]` means "the message
+    // carries no labels". Rendering `[]` for an absent field would turn the first into the second, so the keys
+    // are asserted **absent** rather than merely empty (`ADR-0083`).
+    let sparse = must(
+        interpret(
+            "google.gmail_messages_read",
+            Ok(response(200, r#"{"id":"m1"}"#)),
+            now(),
+        ),
+        "a read must be a result",
+    );
+    let output = sparse
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    // It still satisfies the schema, which is the point: an honest response with only the required field is
+    // valid, so a `minimal` read is not forced to fabricate fields it does not have.
+    assert_output_matches_declared_schema("google.gmail_messages_read", output);
+    let keys = rendered_keys(output);
+    assert_eq!(
+        keys,
+        vec!["message_id"],
+        "only the required field is present: {output}"
+    );
+
+    // The control: an explicit empty label list **is** rendered, so the omission above is driven by the
+    // field's absence and not by the renderer dropping every empty value.
+    let empty_labels = must(
+        interpret(
+            "google.gmail_messages_read",
+            Ok(response(200, r#"{"id":"m1","labelIds":[]}"#)),
+            now(),
+        ),
+        "a read must be a result",
+    );
+    let output = empty_labels
+        .output()
+        .unwrap_or_else(|| panic!("a confirmed read carries output"))
+        .content();
+    assert!(
+        output.contains(r#""label_ids":[]"#),
+        "an explicit empty label list must be rendered, not dropped: {output}"
+    );
+}
+
 #[test]
 fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
     // The claim `ADR-0059` makes is that the tool's declared output is what this module renders, and until now
@@ -586,6 +736,62 @@ fn every_rendered_output_satisfies_the_schema_the_definition_declares() {
         .content();
     assert_output_matches_declared_schema("google.gmail_messages_list", rendered);
     assert!(rendered.contains("\"message_ids\":[]"), "{rendered}");
+}
+
+#[test]
+fn a_sync_token_with_a_time_range_is_refused_by_the_operation_layer() {
+    // The operation layer is what a model's arguments pass through, so this is where the impossible pairing
+    // must be stopped — by `request_for`, **before** a transport call is built. The refusal is a
+    // `RefusedBeforeReaching` style fault, not a provider answer, because nothing was sent: the point of
+    // catching it here is that a `400` from Google would cost a request and still not tell the caller which
+    // argument to drop (`ADR-0084`).
+    let error = request_for(
+        "google.calendar_events_read",
+        &json!({ "calendar_id": "primary", "sync_token": "tok", "time_min": "2026-01-01T00:00:00Z" }),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("a time range with a sync token must be refused"));
+    assert!(
+        matches!(
+            error,
+            OperationError::Request(RequestError::DisallowedCombination { .. })
+        ),
+        "the refusal must survive the operation layer as a combination fault: {error:?}"
+    );
+
+    // The same call without the time bound builds, so the refusal is about the pairing and not the token.
+    assert!(
+        request_for(
+            "google.calendar_events_read",
+            &json!({ "calendar_id": "primary", "sync_token": "tok" }),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_calendar_page_token_is_accepted_and_sent_by_the_operation_layer() {
+    // The input the output's `next_page_token` needs. Before this the renderer emitted a page token the caller
+    // was told to use and **no argument existed to use it with**, so a large read could not be continued — and a
+    // large *incremental* sync is the normal case, since the provider returns a page token instead of a sync
+    // token mid-walk (`ADR-0085`).
+    let request = must(
+        request_for(
+            "google.calendar_events_read",
+            &json!({ "calendar_id": "primary", "sync_token": "sync-1", "page_token": "page-2" }),
+        ),
+        "a page token alongside a sync token is the documented walk",
+    );
+    let query: Vec<&str> = request
+        .query()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(query.contains(&"pageToken"), "{query:?}");
+    assert!(
+        query.contains(&"syncToken"),
+        "the sync token must survive alongside the page token: {query:?}"
+    );
 }
 
 #[test]

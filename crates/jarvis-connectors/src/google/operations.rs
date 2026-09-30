@@ -104,6 +104,10 @@ pub fn request_for(
             text(arguments, "time_min")?,
             text(arguments, "time_max")?,
             page_size(arguments)?,
+            // The page token is what continues a large incremental sync: the provider returns one instead of a
+            // sync token mid-walk, and the sync guide requires it to be re-sent with the same query. A read
+            // without it could not fetch page two (`ADR-0085`).
+            text(arguments, "page_token")?,
             text(arguments, "sync_token")?,
         )?),
         other => Err(OperationError::UnknownTool {
@@ -312,9 +316,34 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
                 }
                 value.to_string()
             }),
-        "gmail_messages_read" => request::parse_single_id(response.status, &response.body)
+        // **Every field the output schema declares is rendered, and every field rendered is declared.** The
+        // previous version emitted only `message_id` while the schema promised `thread_id`, `label_ids` and
+        // `snippet`, so three of four declared fields were unreachable — `ADR-0082`'s finding in the *output*
+        // direction. `snippet` is gone from both because **no offered format returns it**: the Format page says
+        // `minimal` is "only email message ID and labels" and `metadata` is "only email message ID, labels, and
+        // email headers", so a `snippet` field would be declared and undeliverable for two of the three
+        // formats (`ADR-0083`).
+        //
+        // `thread_id` and `label_ids` are emitted **only when the provider returned them**. An absent key is
+        // the honest rendering of a field that did not arrive; emitting `"label_ids": []` for an absent field
+        // would claim the message has no labels (ADR-0083).
+        "gmail_messages_read" => request::parse_single_message(response.status, &response.body)
             .ok()
-            .map(|id| serde_json::json!({ "message_id": id }).to_string()),
+            .map(|message| {
+                let mut value = serde_json::json!({ "message_id": message.id });
+                if let Some(thread_id) = message.thread_id {
+                    value["thread_id"] = serde_json::Value::String(thread_id);
+                }
+                if let Some(label_ids) = message.label_ids {
+                    value["label_ids"] = serde_json::Value::Array(
+                        label_ids
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
+                value.to_string()
+            }),
         "gmail_history_list" => request::parse_history_page(response.status, &response.body)
             .ok()
             .map(|page| {

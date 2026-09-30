@@ -56,6 +56,7 @@
 mod account;
 mod auth;
 mod authorization;
+mod base64;
 mod cursor;
 mod diagnostics;
 mod health;

@@ -136,7 +136,7 @@ fn the_request_carries_no_credential_in_its_url() {
             "a get request",
         ),
         must(
-            calendar_events_list("primary", None, None, None, None),
+            calendar_events_list("primary", None, None, None, None, None),
             "an events request",
         ),
     ];
@@ -245,14 +245,38 @@ fn a_body_of_the_wrong_shape_is_refused_rather_than_silently_empty() {
     // is correct for `{"resultSizeEstimate": 0}` and would be wrong to accept as a *different* document. What
     // is refused is a body that is not JSON at all, and a resource with no `id`.
     assert!(parse_id_page(200, "not json").is_err());
-    assert!(parse_single_id(200, "not json").is_err());
-    assert!(parse_single_id(200, r#"{"threadId": "t"}"#).is_err());
-    assert_eq!(
-        must(
-            parse_single_id(200, r#"{"id": "msg-1", "threadId": "t"}"#),
-            "a valid resource"
-        ),
-        "msg-1"
+    assert!(parse_single_message(200, "not json").is_err());
+    assert!(parse_single_message(200, r#"{"threadId": "t"}"#).is_err());
+    let message = must(
+        parse_single_message(200, r#"{"id": "msg-1", "threadId": "t"}"#),
+        "a valid resource",
+    );
+    assert_eq!(message.id, "msg-1");
+    assert_eq!(message.thread_id.as_deref(), Some("t"));
+}
+
+#[test]
+fn an_absent_label_list_is_not_an_empty_one() {
+    // The distinction that a `Vec` with `#[serde(default)]` would erase. `minimal` and `metadata` returns carry
+    // `labelIds`; a body without the field means the provider did not return it, which is a different fact from
+    // "the message has no labels". Only the second renders an empty array, and the renderer omits the key for
+    // the first — so `None` and `Some(vec![])` must stay distinguishable here or the output lies about one of
+    // them (`ADR-0083`).
+    let absent = must(
+        parse_single_message(200, r#"{"id": "m"}"#),
+        "a body with no labels field",
+    );
+    assert_eq!(absent.label_ids, None);
+
+    let empty = must(
+        parse_single_message(200, r#"{"id": "m", "labelIds": []}"#),
+        "a body with an empty labels array",
+    );
+    assert_eq!(empty.label_ids, Some(Vec::new()));
+
+    assert_ne!(
+        absent, empty,
+        "an absent label list must not equal an empty one"
     );
 }
 
@@ -265,7 +289,15 @@ fn max_results_is_bounded_per_api_and_zero_is_refused() {
     assert!(gmail_messages_list(None, Some(GMAIL_MAX_RESULTS_CAP + 1), None).is_err());
     assert!(gmail_messages_list(None, Some(GMAIL_MAX_RESULTS_CAP), None).is_ok());
     assert!(
-        calendar_events_list("primary", None, None, Some(GMAIL_MAX_RESULTS_CAP + 1), None).is_ok()
+        calendar_events_list(
+            "primary",
+            None,
+            None,
+            Some(GMAIL_MAX_RESULTS_CAP + 1),
+            None,
+            None
+        )
+        .is_ok()
     );
     assert!(
         calendar_events_list(
@@ -273,15 +305,189 @@ fn max_results_is_bounded_per_api_and_zero_is_refused() {
             None,
             None,
             Some(CALENDAR_MAX_RESULTS_CAP + 1),
+            None,
             None
         )
         .is_err()
     );
     let calendar = must(
-        calendar_events_list("primary", None, None, Some(1_000), None),
+        calendar_events_list("primary", None, None, Some(1_000), None, None),
         "a Calendar page of 1000 is within its own cap",
     );
     assert_eq!(calendar.query()[0].1, "1000");
+}
+
+#[test]
+fn a_time_range_cannot_be_sent_with_a_sync_token() {
+    // **A request the provider documents as impossible, refused before it is built.** `events.list` lists
+    // `timeMin` and `timeMax` among the parameters that "cannot be specified together with nextSyncToken to
+    // ensure consistency of the client state", so sending both is a `400` by construction. The pairing is
+    // refused locally because it can *never* succeed: a refusal from the provider would spend a request to
+    // learn something already documented and would still not tell the caller which argument to drop.
+    for (time_min, time_max) in [
+        (Some("2026-01-01T00:00:00Z"), None),
+        (None, Some("2026-12-31T00:00:00Z")),
+        (Some("2026-01-01T00:00:00Z"), Some("2026-12-31T00:00:00Z")),
+    ] {
+        let refused =
+            calendar_events_list("primary", time_min, time_max, None, None, Some("sync-1"))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a time range with a sync token must be refused: {time_min:?} {time_max:?}"
+                    )
+                });
+        assert!(
+            matches!(refused, RequestError::DisallowedCombination { .. }),
+            "the refusal must name the combination, not one value: {refused:?}"
+        );
+    }
+
+    // **Each argument alone is still accepted**, so the refusal is about the combination and not about either
+    // value. Without these two the test would pass for a builder that refused every `time_min` or every
+    // `sync_token`, which would break the full sync and the incremental sync respectively.
+    assert!(
+        calendar_events_list(
+            "primary",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+            None,
+            None
+        )
+        .is_ok()
+    );
+    assert!(calendar_events_list("primary", None, None, None, None, Some("sync-1")).is_ok());
+
+    // And a full sync with both bounds, which the sync guide's own sample uses ("we are only syncing events up
+    // to a year old`"), so the restriction is specifically the token and not the range.
+    assert!(
+        calendar_events_list(
+            "primary",
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-12-31T00:00:00Z"),
+            None,
+            None,
+            None
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_refusal_names_the_argument_the_caller_actually_sent() {
+    // **The defect: a shared validator hard-coded the field name it reported.** `search_query` said
+    // `field: "query"` while it also validated Calendar's `time_min` and `time_max`, so an oversized time bound
+    // was refused with *"the `query` argument is unusable"* — naming an argument the caller never supplied, and
+    // calling an RFC 3339 instant "a search query". A caller reading that would go looking for a `query`
+    // parameter that does not exist on `calendar_events_read` (`ADR-0086`).
+    for (label, refused) in [
+        (
+            "time_min",
+            calendar_events_list(
+                "primary",
+                Some(&"2".repeat(MAX_TIME_BOUND_CHARS + 1)),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+        (
+            "time_max",
+            calendar_events_list(
+                "primary",
+                None,
+                Some(&"2".repeat(MAX_TIME_BOUND_CHARS + 1)),
+                None,
+                None,
+                None,
+            ),
+        ),
+    ] {
+        let RequestError::Argument { field, reason } = refused.err().unwrap_or_else(|| {
+            panic!("an oversized {label} must be refused");
+        }) else {
+            panic!("an oversized {label} must be an argument fault");
+        };
+        assert_eq!(
+            field, label,
+            "the refusal must name the argument the caller sent, not `query`"
+        );
+        assert!(
+            !reason.contains("search query"),
+            "an RFC 3339 instant is not a search query: {reason}"
+        );
+    }
+
+    // The control: the Gmail list's own `query` argument still reports `query`, so threading the field through
+    // did not just rename every refusal. Without this a validator hard-coded to `time_min` would pass above.
+    let RequestError::Argument { field, .. } =
+        gmail_messages_list(Some(&"a".repeat(MAX_QUERY_CHARS + 1)), None, None)
+            .err()
+            .unwrap_or_else(|| panic!("an oversized query must be refused"))
+    else {
+        panic!("an oversized query must be an argument fault");
+    };
+    assert_eq!(field, "query");
+}
+
+#[test]
+fn a_time_bound_is_validated_as_a_bound_and_not_as_a_search_query() {
+    // The two bounds are different kinds of value, so the accepted length is not the query's 512. An instant is
+    // about 25 characters; the bound admits a generous one and refuses a string that is plainly not a
+    // timestamp, which is the check that stops a model-supplied string becoming an unbounded URL value.
+    //
+    // A `const` assertion because both sides are constants: a runtime assertion would be optimised to nothing,
+    // and clippy rejects `assert!` on a constant expression for exactly that reason.
+    const _: () = assert!(MAX_TIME_BOUND_CHARS < MAX_QUERY_CHARS);
+    assert!(
+        calendar_events_list(
+            "primary",
+            Some(&"2".repeat(MAX_TIME_BOUND_CHARS)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok(),
+        "a bound at the limit must be accepted, or the limit is unreachable"
+    );
+    // A real instant with an offset and fractional seconds is well inside it, so the bound does not refuse a
+    // value the provider would accept.
+    assert!(
+        calendar_events_list(
+            "primary",
+            Some("2026-09-27T00:00:00.123456+02:00"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok()
+    );
+    // A control character is refused for the same reason every value here refuses one: the bound becomes a URL
+    // query value and a log field, and a newline in a log field forges a record.
+    let control = calendar_events_list(
+        "primary",
+        Some("2026-01-01T00:00:00Z\nx"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .unwrap_or_else(|| panic!("a control character must be refused"));
+    assert!(
+        matches!(
+            control,
+            RequestError::Argument {
+                field: "time_min",
+                ..
+            }
+        ),
+        "the refusal must name `time_min`: {control:?}"
+    );
 }
 
 #[test]
@@ -396,7 +602,7 @@ fn the_urls_are_the_documented_api_bases_and_paths() {
     );
 
     let events = must(
-        calendar_events_list("primary", None, None, None, None),
+        calendar_events_list("primary", None, None, None, None, None),
         "a request",
     );
     assert_eq!(
@@ -490,6 +696,7 @@ fn a_time_bound_is_encoded_like_any_other_value() {
             Some("2026-09-28T00:00:00+02:00"),
             None,
             None,
+            None,
         ),
         "a valid range",
     );
@@ -498,5 +705,50 @@ fn a_time_bound_is_encoded_like_any_other_value() {
     assert!(
         url.contains("%2B02%3A00"),
         "a literal `+` must be escaped: {url}"
+    );
+}
+
+#[test]
+fn a_page_token_and_a_sync_token_are_sent_together_to_walk_an_incremental_sync() {
+    // **The shape the sync guide requires and this builder could not produce.** For a large incremental sync the
+    // provider returns a `pageToken` *instead of* a sync token, and the guide says to repeat "the exact same list
+    // query … with the exact same `syncToken`" and append the page token. So for the middle pages both are sent,
+    // which is the opposite of the `timeMin`/`timeMax` restriction — the two rules are different and only one of
+    // them is a conflict.
+    let walk = must(
+        calendar_events_list("primary", None, None, None, Some("page-2"), Some("sync-1")),
+        "a sync token with a page token is the documented incremental walk",
+    );
+    let url = walk.url_with_query();
+    assert!(url.contains("pageToken=page-2"), "{url}");
+    assert!(
+        url.contains("syncToken=sync-1"),
+        "a page token must not displace the sync token: {url}"
+    );
+
+    // A page token alone is also legal — it continues a *full* walk, where there is no sync token yet. Without
+    // this the test would pass for a builder that only sent the page token when a sync token was present.
+    let first_walk = must(
+        calendar_events_list("primary", None, None, None, Some("page-1"), None),
+        "a page token alone continues a full walk",
+    );
+    assert!(
+        first_walk.url_with_query().contains("pageToken=page-1"),
+        "a page token with no sync token must still be sent"
+    );
+
+    // And an oversized token is refused by the same bound every token is, so the new parameter is not a hole in
+    // the validation the other tokens go through.
+    assert!(
+        calendar_events_list(
+            "primary",
+            None,
+            None,
+            None,
+            Some(&"a".repeat(crate::google::client::MAX_PAGE_TOKEN_CHARS + 1)),
+            None
+        )
+        .is_err(),
+        "a page token must go through the same length bound as every other token"
     );
 }

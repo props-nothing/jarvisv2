@@ -4230,6 +4230,213 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     prefix, so a future operation not following that convention would silently get `Gmail`. Nothing outside
     `jarvis-connectors` consumes `RetryDecision` yet — the recurring pipeline-side gap also recorded for
     `provider_request_id`, `batch_plan` and `calendar_signal`.
+- [ ] `P5-005` **(continued — a declared output field is bounded by what the request can return)**:
+  `gmail_messages_read` now renders every field it declares, and its schema no longer declares a field the
+  request cannot return. **4 new tests (so 356 in the crate).** **`ADR-0083`.** Two guards falsified A-B-A with
+  compiling mutants. **Adds Finding 7 to the record.**
+  - **⭐⭐ THE FINDING: THE TOOL DECLARED FOUR OUTPUT FIELDS AND RENDERED ONE — AND ONE OF THE FOUR WAS
+    UNDELIVERABLE.** `GMAIL_READ_OUTPUT` promised `message_id`, `thread_id`, `label_ids` and `snippet`, while
+    the renderer emitted only `message_id` from `parse_single_id`, so **three of four declared fields were
+    unreachable**. The existing schema test did not catch it because **a validity check is one-directional**: it
+    proves the rendering is inside the schema (`{"message_id":"m1"}` satisfies `required: ["message_id"]`) and
+    never that the schema's fields are inside the rendering. This is `ADR-0082`'s defect in the *output*
+    direction — a declaration nothing produces.
+  - **⭐ AND `snippet` COULD NOT BE DELIVERED EVEN IN PRINCIPLE.** The `Format` enum page defines each value:
+    `minimal` is "only email message ID and labels" and `metadata` is "only email message ID, labels, and email
+    headers" — neither returns `snippet`. The tool offers all three formats, so a declared `snippet` would be
+    absent for two of them. **The fix for that is to stop declaring it, not to make it optional**: for a field
+    two of three formats never return, "optional" reads as unreliable rather than impossible, and a model cannot
+    tell which it is.
+  - **The reverse direction is now a test, and it is the one that finds this class of defect.**
+    `no_declared_output_property_is_undeliverable` compares the declared property **names** to the keys of a
+    maximal rendering, so a field added to the schema and forgotten in the renderer fails — and it needs no
+    maintenance when a field is added, because it fails until the renderer catches up. Written as name-set
+    equality rather than a required-field check, since the latter passes for an optional field never emitted,
+    which is exactly the `snippet` case.
+  - **`parse_single_id` becomes `parse_single_message` returning `GmailMessage`** — three fields, the ones the
+    output declares, **not** Gmail's nine-field `Message` resource. Same rule `IdPage` and `CalendarPage`
+    follow, so the declaration and the rendering cannot drift.
+  - **⭐ AN ABSENT LIST IS NOT AN EMPTY LIST.** `label_ids` is `Option<Vec<String>>` and the key is emitted
+    **only when the provider returned it**: `None` = "the field was not in the response", `Some([])` = "the
+    message has no labels". A `Vec` with `#[serde(default)]` collapses both to `[]` and renders "no labels" for
+    a response that never mentioned labels — the two-values-three-situations defect. `thread_id` and `label_ids`
+    are optional in the schema for the same reason: a `minimal` read may not carry them, so a `required` field
+    would make an honest response fail the tool's own validation.
+  - **NEW LIMITS:** no request has been sent, so what `minimal`/`metadata` return is taken from the Format page
+    and not observed; if `minimal` returns more than "ID and labels" the optionality is looser than reality,
+    which fails safe but is a gap the live smoke test would close. `GmailMessage` models three fields of the
+    resource's nine; a future read wanting `historyId` or `internalDate` must add them to the type and the
+    schema together. The reverse test is written for `gmail_messages_read` (where the defect was) and not yet
+    swept across every operation.
+- [ ] `P5-005` **(continued — an argument pair the provider forbids)**: `calendar_events_read` now refuses
+  `sync_token` with a time bound, in the builder and in the input schema. **3 new tests (so 359 in the crate).**
+  **`ADR-0084`.** Two guards falsified A-B-A with compiling mutants. **Adds Finding 8 to the record.**
+  - **⭐⭐ THE FINDING: THE INPUT SCHEMA ADVERTISED A COMBINATION THE PROVIDER DOCUMENTS AS A `400`.**
+    `calendar_events_read` offers `time_min`, `time_max` and `sync_token`, and the builder sent all three
+    together. The `events.list` reference says, under `syncToken`: *"There are several query parameters that
+    cannot be specified together with nextSyncToken … These are: `iCalUID` `orderBy` `privateExtendedProperty`
+    `q` `sharedExtendedProperty` **`timeMin`** **`timeMax`** `updatedMin`."* The sync guide gives the reason (a
+    time range belongs to the **initial full sync**, and each incremental sync repeats the initial filters) and
+    the consequence ("The response code for list queries containing disallowed restrictions is `400`").
+  - **⭐ THE LIST HAS EIGHT ENTRIES AND THE CONNECTOR OFFERS TWO — the count is the reason to record it.**
+    `timeMin`/`timeMax` are the two it can send; the other **six** (`iCalUID`, `orderBy`, `q`,
+    `privateExtendedProperty`, `sharedExtendedProperty`, `updatedMin`) are not offered by the operation at all,
+    so they need no check. A future slice adding `q` or `orderBy` joins the disallowed set and must be checked
+    against the note — which is why the whole list is written down rather than just the two that bite today.
+  - **A `DisallowedCombination` variant, not `Argument`.** Both values can be individually valid and the
+    *pair* is the fault; a caller told "`time_min` is unusable" would remove the legitimate part of a full sync.
+    The two checks are separate so the message names **which** bound conflicts, and it states both remedies
+    (drop the bounds to continue the sync, or drop the token for a filtered full read).
+  - **The schema carries it twice, on purpose.** The property descriptions state the restriction, because the
+    schema is what a **model** reads and a model that saw all three advertised could reasonably choose the
+    combination; an `allOf`/`not` constraint enforces it for a validator. Both are present because they serve
+    different readers, and the test asserts rejection by the **document** — so removing the constraint while
+    leaving the prose fails. A description a validator does not enforce is the "documented but not applied"
+    defect (`ADR-0077`).
+  - **The control is a filtered FULL sync**, which the sync guide's own sample performs ("we are only syncing
+    events up to a year old"). Without it a schema that rejected every `time_min` would pass.
+  - **Why refuse locally rather than let Google answer.** `ADR-0082` already classifies a `400` as
+    `Permanent`/`DoNotRetry`, so the outcome is identical — except the round trip, the quota unit, and the fact
+    that the `400` still does not tell the caller which argument to drop.
+  - **NEW LIMITS:** the restriction is taken from the reference and **not observed**, so if Google accepts the
+    pairing the connector refuses a call that would have worked (the safe direction — the guide's sample never
+    combines them). Nothing outside this module consumes `DisallowedCombination`; `request_for` is the only
+    caller and the tests hold the behaviour in place. The refusal lives in one builder, so a second
+    `events.list`-shaped operation would need its own check against the same note.
+- [ ] `P5-005` **(continued — a rendered token needs an input that can consume it)**: `calendar_events_read`
+  gains `page_token`, so the `next_page_token` it renders can actually be used. **3 new tests (so 362 in the
+  crate).** **`ADR-0085`.** Two guards falsified A-B-A with compiling mutants. **Adds Finding 9 to the record.**
+  - **⭐⭐ THE FINDING: THE TOOL EMITTED A PAGE TOKEN AND HAD NO ARGUMENT TO FETCH THE PAGE WITH.**
+    `calendar_events_read` declared `next_page_token` in its output, the renderer produced it, a test asserted
+    it — and the **input declared no `page_token`** and the builder never sent `pageToken`. So the caller was
+    told "there is a next page" with no way to fetch it. Both Gmail list operations pair `next_page_token` out
+    with `page_token` in; Calendar was asymmetric.
+  - **⭐ AND THE MISSING PAGE IS THE COMMON CASE.** The sync guide: *"you may find a `pageToken` **instead of** a
+    `syncToken` … you'll need to perform the exact same list query … (with the exact same `syncToken`), append
+    the `pageToken` to it and paginate through all the following requests until you find another `syncToken` on
+    the last page."* A sync of a busy calendar returns a page token instead of a cursor, so the walk could not
+    finish — **the cursor the whole sync mechanism exists to advance was unreachable exactly when it mattered.**
+  - **⭐⭐ THE SAME PROVIDER FACT POINTS THE OPPOSITE WAY FROM `ADR-0084`.** `pageToken` is **not** on the
+    disallowed-with-`syncToken` list; the guide **requires** it *with* a sync token (its example is
+    `…&syncToken=…&pageToken=…`). So the eight-parameter restriction must be applied **per parameter** and never
+    by shape: a conflict check added "for symmetry" with the time-range one would refuse the documented walk.
+  - **⭐ THE CHECK IS A PAIRING, NOT A PER-TOOL LITERAL.** Each schema was internally consistent, which is why
+    nothing caught this — only the **pairing** of one tool's input and output halves exposes a renderer that
+    emits a token no argument can consume. `every_output_that_can_return_a_page_token_accepts_one_as_input`
+    walks **every** definition, so a future paginated read cannot ship one-directional. `ADR-0083`'s method
+    (assert the reverse direction) applied across a single tool's two halves.
+  - **The description says why the two tokens ride together**, not just "continues a paginated read": the guide
+    requires the *exact same* query, so a model must repeat the sync token with the page token.
+  - **NEW LIMITS:** the walk is **possible but nothing performs it** — no code loops on `next_page_token`, so a
+    caller issues the follow-up call itself. The connector implements the *ability* to paginate rather than an
+    automatic walk, which is `P5-010`'s "pagination" item. No request has been sent, so the large-change-set
+    shape is from the guide and not observed.
+- [ ] `P5-005` **(continued — a refusal names the argument the caller sent)**: `search_query` takes the field
+  it validates, `time_min`/`time_max` get their own `time_bound` validator and a declared bound, and every
+  declared input bound is asserted equal to its constant. **3 new tests (so 365 in the crate).** **`ADR-0086`.**
+  Two guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: A SHARED VALIDATOR HARD-CODED THE FIELD NAME IT REPORTED.** `search_query` always said
+    `field: "query"`, but it had **three** callers — the Gmail list's `q`, and Calendar's `time_min` and
+    `time_max`. So an oversized `time_min` on `calendar_events_read` was refused with *"the `query` argument is
+    unusable: a search query may be at most 512 characters"*, **naming an argument the tool does not have** and
+    calling an RFC 3339 instant a search query. A caller acting on that message hunts for a `query` parameter
+    that does not exist. This is `ADR-0084`'s "remove the wrong argument" failure at a different layer: there a
+    *combination* was reported against one field, here one field was reported as *another*.
+  - **⭐ THE FIX IS A NEW VALIDATOR, NOT A RENAMED FIELD.** Passing the right field name through would still
+    leave the *reason* wrong ("a search query" for a timestamp). `time_bound(field, value)` names its own noun
+    and its own bound, because the fault's **kind** belongs in the message and not only the field it is about —
+    the same distinction `DisallowedCombination` makes against `Argument`.
+  - **⭐ `MAX_TIME_BOUND_CHARS = 64`, NOT THE QUERY'S 512.** An RFC 3339 instant is ~25 characters and at most
+    ~30 with fractional seconds and an offset, so 64 admits every valid instant and still refuses a string that
+    is plainly not a timestamp. The 512 was **the query's figure applied to a value of a different kind** —
+    `ADR-0079`'s "a figure read as the wrong thing". Google publishes no length limit for `timeMin`/`timeMax`,
+    so 64 is a **JARVIS** bound and the constant's doc says so.
+  - **⭐⭐ THE SECOND DEFECT: THE DECLARED BOUNDS AND THE ENFORCED BOUNDS AGREED ONLY BY HAND.** The input
+    schemas declare `maxLength`/`minimum`/`maximum`; `request.rs` enforces the same limits through constants;
+    **nothing tied them**, and `time_min`/`time_max` had no declared bound at all. Now
+    `every_declared_input_bound_matches_the_constant_that_enforces_it` reads each bound out of the schema by
+    JSON pointer and compares it to the constant — 13 bounds plus 3 `minLength`s. The comparison is against the
+    **constants**, so it cannot be satisfied by editing the schema alone, and it is the third instance this
+    phase of one shape: two statements that must agree with nothing between them (`ADR-0083` output fields,
+    `ADR-0085` token halves, this one numbers).
+  - **NEW LIMITS:** `MAX_TIME_BOUND_CHARS` is a JARVIS bound, not a provider figure (no published limit). The
+    drift test asserts **equality**, so it proves the two statements agree, not that either number is right — a
+    bound changed in **both** places would pass with no provider evidence, which is why each constant carries
+    its own justification rather than being asserted as "the value". The property table is explicit rather than
+    a walk over every `maxLength`, so a new schema needs its row added.
+- [ ] `P5-005` **(continued — a lease that lapses silently)**: new `google::watch` module — the watch lease's
+  `expiration`, whether it is alive, and when to renew. **9 new tests (so 374 in the crate).** **`ADR-0087`.**
+  Two guards falsified A-B-A with compiling mutants. **Adds Finding 10 to the record.**
+  - **⭐⭐ THE FINDING: THE MANIFEST LINKED THE SEVEN-DAY BOUND AND NOTHING COULD APPLY IT.** The Webhooks doc
+    link's purpose names "the seven-day renewal bound", but the crate had **no code that read a watch response
+    or could decide whether a watch was still alive** — the "documented but not applied" defect (`ADR-0077`) on
+    the one bound where it matters most, because **a Gmail watch fails silently**. The guide: *"You must call the
+    `watch` method at least once every 7 days or you'll stop receiving updates for the user."* Nothing is raised
+    and no notification announces that notifications stopped, so a lapsed watch is **indistinguishable from a
+    quiet mailbox**.
+  - **⭐⭐ `expiration` IS EPOCH MILLISECONDS IN A JSON STRING — two traps that raise nothing.** The reference:
+    `"expiration": string (int64 format)`, *"epoch millis"*. A parser reading a JSON number refuses a
+    **conforming** response; a parser scaling millis as seconds puts the watch's death **a thousand times too
+    far in the future** — which is a valid instant, so nothing fails and the watch is silently dead. The unit is
+    therefore pinned by a test against the reference's own value (`"1431990098200"` → 1,431,990,098 **seconds**
+    *and* a rendered May-2015 instant), not by inspection.
+  - **⭐ THE BOUND AND THE RECOMMENDATION ARE TWO FIGURES, ONE SENTENCE.** "At least once every 7 days" is when a
+    watch *dies*; "We recommend calling `watch` once per day" is when to *renew*. `RenewalAdvice` is
+    `Overdue | Recommended | NotYet` — ordered by **urgency**, which is why it is an enum and not a duration:
+    a caller wants "renew now / soon / leave it", and a number would make it re-derive both thresholds here.
+    Same split `ADR-0080` records for a rate limit and a recommendation.
+  - **⭐ THE BOUNDARY IS DECIDED IN NANOSECONDS.** A lease ends at an *instant*, so comparing truncated seconds
+    would call a watch with half a second left alive (keeping a dead watch) or lapsed (renewing early). The
+    whole-second field is the magnitude computed **after** the direction, so `Lapsed { 0 }` is the exact expiry
+    instant — **which counts as lapsed**, because the reference says the watch stops *at* that time and the safe
+    direction is to treat the boundary as dead.
+  - **`WatchLapse` is not a `bool`**: alive, just expired and long expired are three situations, and the elapsed
+    time is what tells a caller whether this is a fresh problem or a mailbox unwatched for days (`ADR-0035`).
+    **A renewal "in the future" is `NotYet`, not an error** — that is what a clock behind the renewal looks
+    like, and the negative elapsed is carried rather than clamped so a caller can see the clock is ahead.
+  - **FOUR unreadable shapes, four errors** (not JSON / absent-or-null / not a string / not an integer), because
+    the remedies point at different layers. And a missing `expiration` is **refused**, not read as "never
+    expires" — which would build a lease that never renews, the very failure being fixed.
+  - **NEW LIMITS:** the module is **pure decisions with no caller** — nothing sends a `watch` request, so there
+    is no response to parse and no scheduler to call `renewal_advice` (the same pipeline-side gap as
+    `provider_request_id`, `batch_plan`, `calendar_signal`, `RetryDecision`). Neither the millis unit nor the
+    inclusive boundary is **observed**; both are from the reference pages. `nanos_to_seconds` **truncates**, so a
+    1.9-second difference reads as 1 — deliberate, since the direction is decided in nanoseconds first.
+- [ ] `P5-005` **(continued — a field Google declares two encodings for)**: new `crate::base64` (extracted from
+  `auth.rs`, decoder added) and `google::pubsub` (the notification envelope). **6 new tests (so 380 in the
+  crate).** **`ADR-0088`.** Two guards falsified A-B-A with compiling mutants. **Adds Finding 11 to the
+  record** and writes its "Pub/Sub envelope fixture" plan item.
+  - **⭐⭐ THE FINDING: TWO OFFICIAL PAGES DECLARE `message.data`'s ENCODING DIFFERENTLY.** The Gmail push guide
+    says it is *"a **Base64URL**-encoded string"*; the Cloud Pub/Sub `PubsubMessage` reference it links to types
+    the field `string (bytes format)` and says *"A **base64**-encoded string"*. RFC 4648 §4/§5 differ in exactly
+    two characters (`+`/`/` vs `-`/`_`), so **the disagreement is invisible on any value containing neither**.
+  - **⭐⭐ AND ALMOST NO PAYLOAD CAN TELL THEM APART — which is why it is worth recording.** The guide's own
+    example (`eyJlbWFpbEFkZHJlc3MiOiAidXNlckBleGFtcGxlLmNvbSIsICJoaXN0b3J5SWQiOiAiMTIzNDU2Nzg5MCJ9`) uses only
+    `A-Za-z0-9` and decodes identically both ways — verified to yield exactly what the guide says. A sweep of all
+    **95 printable ASCII** characters at all **four** base64 alignments inside a Gmail-shaped payload found only
+    **three** (`>`, `?`, `~`, each after a one-character offset) that force the difference. So the readings agree
+    on nearly every payload and diverge on the one that matters — where choosing wrongly **refuses a delivery**,
+    which is a **missed change**.
+  - **The decoder accepts both, tries URL-safe first, and says which matched.** URL-safe first because the guide
+    is the more specific statement about *this* payload; both because the contradiction is the provider's and
+    neither reading is provably wrong. `PubsubData` is returned rather than discarded so a real delivery can
+    **settle the question from evidence** instead of the code resolving it silently in the provider's favour.
+  - **⭐ THE FORCING FIXTURE IS SPELLED OUT, NOT GENERATED.** A second encoder would be a second thing that can be
+    wrong, and the standard spelling is derived from the URL-safe one by RFC 4648 §5's substitution — with a test
+    asserting the substitution actually changed the text, since a no-op substitution would test the same
+    characters twice. Two earlier versions of the test failed here and each taught something: a hand-picked
+    payload that happened to contain no `+`/`/` (so the test proved nothing), and an assertion that an unpadded
+    value decoded (a fixture that did not contain the padding under test).
+  - **Padding refused, not stripped**; **empty `data` refused as a shape**, not read as "nothing changed" (the
+    silent direction); **four distinct errors** because the remedies point at different layers.
+  - **Base64 now has one home.** The encoder moved from `auth.rs` to `crate::base64` **unchanged**, so the RFC 7636
+    Appendix A test reaching it through `PkceVerifier` still guards the same lines. A `standard_padded` encoder
+    was written and then **removed as unused** — a dead second implementation checks nothing.
+  - **NEW LIMITS:** no delivery has been received, so which encoding a live subscription uses is **unknown** —
+    exactly what reporting `PubsubData` leaves open. The envelope is decoded **only** as far as `message.data`;
+    `messageId`, `publishTime`, `subscription` and the attributes map are not read, so there is no dedupe key and
+    no ordering yet. `crate::base64` has no padded standard decoder, so a caller needing one must add it with a
+    caller rather than as a spare function.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

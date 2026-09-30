@@ -393,35 +393,90 @@ const GMAIL_READ_INPUT: &str = r#"{
 }"#;
 
 /// The output schema of `gmail_messages_read`.
+///
+/// # Why only `message_id` is required, and why there is no `snippet`
+///
+/// The provider returns **different top-level fields for different formats**: the Format page says `minimal`
+/// returns "only email message ID and labels" and `metadata` returns "only email message ID, labels, and email
+/// headers", while `full` returns the whole parsed resource. So `thread_id` and `label_ids` may legitimately be
+/// absent and are declared optional — a `required` field a `minimal` read cannot fill would make an honest
+/// response fail this schema.
+///
+/// `snippet` is **absent from the resource fields this tool reads** because no offered format returns it:
+/// `minimal` and `metadata` do not, and the connector's default `full` would, but declaring a field two of the
+/// three accepted formats never produce promises a value the tool cannot reliably deliver. It is omitted rather
+/// than made optional, because "sometimes absent" for something genuinely unreachable reads as unreliable
+/// output (see `request::GmailMessage`, `ADR-0083`).
 const GMAIL_READ_OUTPUT: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
     "message_id": { "type": "string" },
-    "thread_id": { "type": "string" },
-    "label_ids": { "type": "array", "items": { "type": "string" } },
-    "snippet": { "type": ["string", "null"] }
+    "thread_id": {
+      "type": ["string", "null"],
+      "description": "The thread the message belongs to. Omitted when the provider did not return it, which `minimal` and `metadata` may not."
+    },
+    "label_ids": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Labels applied to the message. Omitted when the provider did not return them; an empty array means the message carries no labels."
+    }
   },
   "required": ["message_id"],
   "additionalProperties": false
 }"#;
 
 /// The input schema of `calendar_events_read`.
+///
+/// # Why the `time_min`/`time_max` descriptions carry the sync-token restriction
+///
+/// The `events.list` reference lists `timeMin` and `timeMax` among the parameters that "cannot be specified
+/// together with nextSyncToken", and the connector refuses the pairing in `request::calendar_events_list`
+/// (`ADR-0084`). The **schema is what a model reads**, so the restriction has to be visible here and not only
+/// as a refusal at call time: a model that saw both fields advertised with no note would have no way to know
+/// the combination it chose could never work. The `allOf`/`not` constraint below enforces the restriction for
+/// a validator that runs the document; the prose is what a model reading the properties sees, and both are
+/// present because they serve different readers.
 const CALENDAR_READ_INPUT: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
     "calendar_id": { "type": "string", "minLength": 1, "maxLength": 256 },
-    "time_min": { "type": "string", "description": "RFC 3339 lower bound." },
-    "time_max": { "type": "string", "description": "RFC 3339 upper bound." },
+    "time_min": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "RFC 3339 lower bound. Cannot be combined with `sync_token`: the provider refuses a time range together with a sync token, because an incremental sync must repeat the initial request's filters."
+    },
+    "time_max": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "RFC 3339 upper bound. Cannot be combined with `sync_token`, for the same reason as `time_min`."
+    },
     "max_results": { "type": "integer", "minimum": 1, "maximum": 2500 },
+    "page_token": {
+      "type": "string",
+      "maxLength": 4096,
+      "description": "Continues a paginated read. The provider returns `next_page_token` when a page is incomplete, and the same query must be repeated with it — including the same `sync_token`, which is how a large incremental sync is walked."
+    },
     "sync_token": {
       "type": "string",
       "maxLength": 4096,
-      "description": "Opaque. Invalidated tokens produce HTTP 410, which requires a full resync."
+      "description": "Opaque. Invalidated tokens produce HTTP 410, which requires a full resync. Cannot be combined with `time_min` or `time_max`."
     }
   },
   "required": ["calendar_id"],
+  "allOf": [
+    {
+      "not": {
+        "required": ["sync_token", "time_min"]
+      }
+    },
+    {
+      "not": {
+        "required": ["sync_token", "time_max"]
+      }
+    }
+  ],
   "additionalProperties": false
 }"#;
 

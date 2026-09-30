@@ -42,9 +42,12 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | OAuth consent and scope categories | https://developers.google.com/workspace/guides/configure-oauth-consent (last updated **2026-09-03**) | 2026-09-27 | which review each scope category requires |
 | Cloud Pub/Sub push authentication | https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions (last updated **2026-09-24**) | 2026-09-27 | **the JWT-bearer mechanism** — see Finding 1 |
 | Cloud Pub/Sub push subscriptions | https://cloud.google.com/pubsub/docs/push | 2026-09-27 | the envelope and the acknowledgement rule |
+| Cloud Pub/Sub `PubsubMessage` | https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage (last updated **2026-05-14**) | 2026-09-30 | the envelope's field **types** — including `data`'s, which **contradicts** the Gmail guide (`ADR-0088`) |
 | Google OIDC discovery document | https://accounts.google.com/.well-known/openid-configuration | 2026-09-27 | **machine-readable**: every endpoint, the PKCE methods, and whether the `iss` response parameter is supported |
 | Google OAuth 2.0 for native apps | https://developers.google.com/identity/protocols/oauth2/native-app (last updated **2026-09-14**) | 2026-09-27 | the installed-app flow: the loopback method, the token and refresh exchanges, the response fields, DPoP, revocation |
 | Gmail `users.history.list` method reference | https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list (page footer: last updated **2026-04-15**) | 2026-09-27 | the incremental-sync read: **the query parameters, the required `startHistoryId`, and the response body `{ history[], nextPageToken, historyId }`** — the shape the `gmail_history_list` fixtures reproduce |
+| Gmail `Format` enum + `Message` resource | https://developers.google.com/workspace/gmail/api/reference/rest/v1/Format (last updated **2026-03-24**) and https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages | 2026-09-30 | **which fields each `format` returns** — the fact that bounds what a `messages.get` output can declare (`ADR-0083`) |
+| Calendar `events.list` method reference | https://developers.google.com/workspace/calendar/api/v3/reference/events/list (last updated **2026-07-29**) | 2026-09-30 | the full parameter list and **the eight parameters that cannot be combined with `syncToken`** (`ADR-0084`), the `maxResults` default and ceiling, and the `nextPageToken`/`nextSyncToken` exclusivity |
 
 The shared OAuth protocol facts — PKCE, loopback redirects, rotation, revocation — are recorded once in
 [oauth2-pkce-native-apps.md](oauth2-pkce-native-apps.md) and are not restated here.
@@ -499,6 +502,141 @@ decision instead of a surprise. See `ADR-0082`.
 mental model flattens: the two APIs are separate products with separate error contracts that happen to share a
 host and an OAuth server.
 
+### Finding 7 — `format` decides which fields `messages.get` returns, so an output field is bounded by the request
+
+`users.messages.get` takes a `format` and returns **different top-level fields for each value**. From the
+**Format** enum page (last updated **2026-03-24**), verbatim:
+
+| Format | What it returns (the page's own words) |
+| --- | --- |
+| `minimal` | "Returns only email message ID and labels; does not return the email headers, body, or payload." |
+| `metadata` | "Returns only email message ID, labels, and email headers." |
+| `full` | "Returns the full email message data with body content parsed in the `payload` field; the `raw` field is not used." |
+| `raw` | "Returns the full email message data with body content in the `raw` field as a base64url encoded string." |
+
+The `Message` **resource** lists `id`, `threadId`, `labelIds`, `snippet`, `historyId`, `internalDate`,
+`payload`, `sizeEstimate`, `raw` and `classificationLabelValues`. The consequence a per-format reading makes
+visible: **`snippet` ("A short part of the message text") is not in the `minimal` or `metadata` definitions**,
+so a tool offering those two formats cannot reliably return it. `labelIds` is named for both; `threadId` is in
+the resource but the Format page says nothing about it for either format, so it is not guaranteed.
+
+**`full` and `raw` "cannot be used when accessing the api using the `gmail.metadata` scope."** The connector
+requests `gmail.readonly`, not `gmail.metadata`, so this is not a live constraint for it — but it is recorded
+because a future metadata-only connector would find its `full` reads refused by that rule.
+
+**This is the fact a declared-output contract must respect**, and it was found by reading the *Format* page and
+not the method page: the method page only says "the response body contains an instance of `Message`", which
+suggests every field is always returned. A declaration promising a field that two of three accepted formats do
+not produce is a promise the connector cannot keep — see `ADR-0083`.
+
+### Finding 8 — Eight query parameters cannot be combined with Calendar's `syncToken`, and two of them are inputs the connector offers
+
+The `events.list` reference states, under `syncToken`, verbatim:
+
+> "There are several query parameters that **cannot be specified together with nextSyncToken** to ensure
+> consistency of the client state. These are: `iCalUID` `orderBy` `privateExtendedProperty` `q`
+> `sharedExtendedProperty` **`timeMin`** **`timeMax`** `updatedMin`."
+
+The sync guide explains the reason and the consequence: a time range belongs to the **initial full sync** and
+"each incremental sync should use the same set of query parameters, including the initial request"; the guide's
+own sample sets `timeMin` only in the full-sync branch and `syncToken` only in the incremental one. "The
+response code for list queries containing disallowed restrictions is `400`."
+
+**The finding for this connector is narrower than the list.** `calendar_events_read` offers **two** of those
+eight — `time_min` and `time_max` — and its input schema advertised them alongside `sync_token` with no
+restriction, so `{calendar_id, sync_token, time_min}` was a request the schema called legal, the builder built,
+and the provider documents as a `400`. The other **six** (`iCalUID`, `orderBy`, `q`, `privateExtendedProperty`,
+`sharedExtendedProperty`, `updatedMin`) are simply **not offered by the operation**, so they need no check — a
+parameter the connector never sends cannot conflict. That distinction is why the list is recorded: a future
+slice adding `q` or `orderBy` to `events_read` joins the disallowed set and must be checked against this note
+rather than discovered as a `400`.
+
+The pairing is now refused in `request::calendar_events_list` and by an `allOf`/`not` constraint in the input
+schema — see `ADR-0084`.
+
+### Finding 9 — A large incremental sync returns a `pageToken` *instead of* a `syncToken`, so a page token must be sent alongside the sync token
+
+The sync guide, verbatim:
+
+> "In cases where a large number of resources have changed since the last incremental sync request, you may find
+> a `pageToken` instead of a `syncToken` in the list result. In these cases you'll need to perform the exact same
+> list query as was used for retrieval of the first page in the incremental sync (with the exact same
+> `syncToken`), append the `pageToken` to it and paginate through all the following requests until you find
+> another `syncToken` on the last page."
+
+The guide's own example is `GET /calendars/primary/events?maxResults=10&singleEvents=true&syncToken=…&pageToken=…`.
+
+**Two facts follow, and they point in opposite directions from Finding 8.** First, `pageToken` is **not** on the
+disallowed-with-`syncToken` list — `timeMin`, `timeMax`, `q`, `orderBy` and four others are, and a page token is
+required *with* a sync token. So the eight-parameter list must be read per parameter rather than applied by
+shape. Second, the connector's `calendar_events_read` rendered `next_page_token` while declaring **no**
+`page_token` input, so a sync of a busy calendar — where the provider returns a page token rather than a
+cursor — could not be walked to its end. The input is added and the two halves are now asserted in step
+(`ADR-0085`).
+
+**Why the pairing matters more than the two fields.** Each schema was internally consistent, so no per-tool
+check found this; only the pairing of the input and output halves of one tool exposes a renderer that emits a
+token no argument can consume. The check is therefore written over every definition, not for this tool alone.
+
+### Finding 10 — A Gmail watch lapses silently, and its `expiration` is epoch **milliseconds** in a JSON string
+
+The push guide's renewal sentence is two facts in one line:
+
+> "You must call the `watch` method at least once every 7 days or you'll stop receiving updates for the user. We
+> recommend calling `watch` once per day."
+
+- **The bound is seven days; the recommendation is one day.** They answer different questions — when a watch
+  *dies* versus when to *renew* — and reporting one as the other either renews six days late or hides the cadence
+  to use. The same limit/recommendation split as `ADR-0080`.
+- **The failure is silent.** Nothing is raised when the lease ends and no notification announces that
+  notifications have stopped, so a lapsed watch is indistinguishable from a quiet mailbox. That is why the
+  connector must be able to decide for itself.
+
+**And the value that says when the lease ends is doubly mistyped.** The `users.watch` reference publishes the
+response as `{ "historyId": string, "expiration": string (int64 format) }` and describes `expiration` as *"When
+Gmail will stop sending notifications for mailbox updates (epoch millis)"*:
+
+- **It is a string, not a number.** Reading a JSON number would refuse a *conforming* response; the string is
+  Google's convention for a 64-bit integer JSON cannot carry exactly.
+- **It is milliseconds, not seconds.** A seconds value read as millis puts the watch's death a thousand times too
+  far in the future — which raises nothing, and produces exactly the silent dead watch this fact is about. The
+  connector scales millis → the timestamp's nanoseconds (× 1,000,000) and asserts a real documented value
+  (`"1431990098200"`) both as seconds and as a rendered instant, so the unit is pinned by a test rather than by
+  inspection (`ADR-0087`).
+
+**A Calendar comparison worth noting for `P5-006`-style work.** Calendar's channel `expiration` is an RFC 3339
+date-time string rather than epoch millis — the same concept in a different unit and type across two APIs of the
+same provider. Neither is wrong; the lesson is that "expiration" is not a shared shape.
+
+### Finding 11 — Google declares `message.data`'s encoding two different ways, and almost no payload can tell them apart
+
+The Gmail push guide and the Cloud Pub/Sub reference — a page the same guide links to — **disagree** about the
+encoding of the notification payload:
+
+| Source | Statement |
+| --- | --- |
+| Gmail push guide | *"The `message.data` field is a **Base64URL**-encoded string that decodes to a JSON object containing the email address and the new mailbox history ID."* |
+| `PubsubMessage` reference | `data \| string (bytes format) \| … A **base64**-encoded string.` |
+
+RFC 4648 §4 (standard, `+`/`/`) and §5 (URL-safe, `-`/`_`) differ in **exactly two characters**, so:
+
+- **The guide's own example cannot tell them apart.** `eyJlbWFpbEFkZHJlc3MiOiAidXNlckBleGFtcGxlLmNvbSIsICJoaXN0b3J5SWQiOiAiMTIzNDU2Nzg5MCJ9` uses only
+  `A-Za-z0-9` and decodes identically under both — and it decodes to exactly what the guide says,
+  `{"emailAddress": "user@example.com", "historyId": "1234567890"}` (verified by decoding it).
+- **Neither can almost any real notification.** A sweep of all 95 printable ASCII characters at all four base64
+  alignments, inside a Gmail-shaped JSON payload, found only **three** — `>`, `?`, `~`, each after a
+  one-character offset — whose standard encoding contains `+` or `/`.
+
+**So the two readings agree on nearly every payload, and diverge on the one that matters** — where choosing
+wrongly means **refusing a delivery**, i.e. a missed change. The connector therefore decodes under **both**
+alphabets, tries URL-safe first (the guide is the more specific statement), and **reports which matched** so a
+real delivery can settle the question rather than leaving it resolved in the provider's favour silently. See
+`ADR-0088`.
+
+**A generalisation worth keeping:** two pages describing the same field's *type* is a disagreement about
+**values**, not prose, and the test that catches it is one whose input forces the difference — not the
+provider's convenient example, which is chosen to be readable rather than discriminating.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in
@@ -593,7 +731,12 @@ where every line looks equally done is a plan nobody can audit.
   which a status-code-only classifier cannot distinguish from `rateLimitExceeded`. **WRITTEN** — see below.
 - **A recording fixture for the Pub/Sub envelope** — a sanitized delivery with `message.data` Base64URL-decoded
   to `{"emailAddress":…,"historyId":…}` — so the envelope handling is tested without a Pub/Sub subscription.
-  **Not written.**
+  **WRITTEN**, and the decode found a **contradiction in the sources**: the guide says `message.data` is
+  Base64URL while the `PubsubMessage` reference it links to types the field `string (bytes format)`, "a
+  base64-encoded string". The guide's own example value is the fixture, asserted to decode to both documented
+  fields — and because it uses only `A-Za-z0-9` it cannot distinguish the two alphabets, so the test that
+  catches the difference uses one of the three printable-ASCII payloads that force it. See `ADR-0088` and
+  Finding 11.
 - **A Calendar sync-message fixture**, including that it can arrive *before* the `watch` response and that
   `X-Goog-Message-Number` is `1` for it. **Not written.**
 - **An unauthenticated-delivery test** for whichever push mechanism is chosen, asserting the refusal **fails
@@ -754,5 +897,11 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-27 | Cross-check against `jarvis-connectors` | `AuthFlow::new` requires a **`https://` authorization endpoint** and a redirect URI for an OAuth method, so the discovery document's values are what make the flow constructible. `AuthorizationTransaction::begin` requires the listener's redirect to **match the flow's registration on host and path, ignoring the port** — so the registered form and the listening form are both needed, and the unverified question is what a human types into the console (Unresolved Question 7). |
 | 2026-09-27 | Cross-check against `jarvis-connectors` (webhook and cursor) | `SignatureAlgorithm` has no OIDC/JWT variant and `SignatureScheme` requires a signed body, so **Finding 1 is a contract gap rather than a connector mistake**; `SyncCursorKind` has `MonotonicMarker` and `OpaqueToken`, so both cursor shapes are already representable and only the **staleness signal** (Finding 2) is new. |
 | 2026-09-30 | Gmail error page **re-read against the Calendar errors page**, to compare the two status sets | The two pages are separate with separate summaries and **do not agree**: Gmail's guide has **no `410` subsection** (its sections are 400, 401, 403, 404, 429 and 5xx), while Calendar's documents `410` in detail; and on `404` Calendar suggests "use exponential backoff" where Gmail states no action. The consequence in code was that a Calendar `410` reached a caller as `unknown`/"reconcile", so `classify` now takes the API and carries a `(Calendar, 410)` arm (`ADR-0082`). Also confirmed the shared arms are shared **because the pages agree**: the Calendar page calls `rateLimitExceeded` "functionally similar" across `403` and `429`. |
+| 2026-09-30 | Gmail **`Format` enum** page fetched (`reference/rest/v1/Format`, last updated **2026-03-24**) plus the `users.messages` resource and the `messages.get` method page | The per-format definitions verbatim: `minimal` = "only email message ID and labels"; `metadata` = "only email message ID, labels, and email headers"; `full` = the full parsed resource; `raw` = the base64url body. The resource lists nine top-level fields and the method page says only "the response body contains an instance of `Message`" — so **the format is what bounds the returned fields**, which the method page alone does not reveal. Consequence: `snippet` is not returned by `minimal` or `metadata`, so a tool offering those formats cannot declare it (`ADR-0083`). Also recorded that `full`/`raw` "cannot be used" with the `gmail.metadata` scope. |
+| 2026-09-30 | Calendar **`events.list` reference** fetched (last updated **2026-07-29**) for the `syncToken` restrictions, and the **sync guide** re-read (last updated **2026-09-11**) | The `syncToken` parameter lists **eight** query parameters that "cannot be specified together with nextSyncToken": `iCalUID`, `orderBy`, `privateExtendedProperty`, `q`, `sharedExtendedProperty`, **`timeMin`**, **`timeMax`**, `updatedMin`. The sync guide adds the reason — a time range belongs to the initial full sync and each incremental sync repeats the initial filters — and the consequence ("The response code for list queries containing disallowed restrictions is `400`"). The connector's `calendar_events_read` offers **two** of the eight (`time_min`, `time_max`), so the pairing is now refused locally and by an `allOf`/`not` constraint (`ADR-0084`). Also confirmed from the same page: `maxResults` default 250, ceiling 2500; `nextPageToken` and `nextSyncToken` are mutually exclusive. |
+| 2026-09-30 | Calendar **sync guide** re-read for the pagination rule (same fetch as the row above, this fact recorded separately because it points the **opposite way**) | A large incremental sync returns "a `pageToken` **instead of** a `syncToken`", and the guide instructs repeating "the exact same list query … (with the exact same `syncToken`)" and appending the page token, its own example being `…&syncToken=…&pageToken=…`. So `pageToken` is **not** disallowed with a sync token but **required with** it — the eight-parameter restriction must be applied per parameter and never by shape. The consequence for the connector was that `calendar_events_read` rendered `next_page_token` with **no `page_token` input**, so a large sync could not be walked to its cursor; the input is added and the input/output halves are asserted in step (`ADR-0085`). |
+| 2026-09-30 | Audit of this record's own **input** facts against the connector's schemas — no page fetched, a cross-check of what is already recorded | The record establishes `timeMin`/`timeMax` as "datetime … **Must be an RFC3339 timestamp with mandatory time zone offset**" (from the `events.list` reference), so a time bound is a bounded *instant* and **not** a search string. That distinction was missing from the code: `time_min`/`time_max` were validated by the Gmail **search-query** validator, which bounded them at 512 characters and reported the failing argument as **`query`** — an argument `calendar_events_read` does not have. Google publishes **no length limit** for `timeMin`/`timeMax`, so the 64-character bound the fix introduces is a **JARVIS** figure and is recorded as one (`ADR-0086`). No source change; the connector's declared input bounds are now asserted equal to the constants that enforce them. |
+| 2026-09-30 | Gmail **push guide** re-fetched (last updated **2026-09-15**) for the notification envelope and the renewal rule, and the **`users.watch` method reference** fetched (last updated **2026-04-15**) for the response type | The envelope verbatim: a `POST` whose body is `{ message: { data, messageId, publishTime }, subscription }` where **`message.data` is a Base64URL-encoded string** decoding to `{"emailAddress": …, "historyId": …}`. The renewal rule's two figures: **"at least once every 7 days"** (the bound) and **"We recommend calling `watch` once per day"** (the recommendation). And the response: `{ "historyId": string, "expiration": string (int64 format) }` where `expiration` is **"epoch millis"** — a **string** carrying **milliseconds**, both of which a naive parser gets wrong while still producing a valid-looking instant. Implemented as `google::watch`, with the unit pinned by a test against the reference's own example value (`ADR-0087`). Also confirmed from the same page: a successful `watch` **immediately sends a notification**, so the first delivery is not a change. |
+| 2026-09-30 | Cloud Pub/Sub **`PubsubMessage` reference** fetched (`docs.cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage`, last updated **2026-05-14**) to check the envelope's field types, since the Gmail guide links to it | **The contradiction**: `data` is typed `string (bytes format)` and described as **"A base64-encoded string"**, while the Gmail push guide (one page over) calls the same field **"Base64URL"**. The two alphabets differ in `+`/`/` versus `-`/`_`, so the disagreement is invisible on any value containing neither — **including the guide's own example**, which was decoded and confirmed to yield `{"emailAddress": "user@example.com", "historyId": "1234567890"}`. A sweep of all 95 printable ASCII characters at all four base64 alignments found only **three** (`>`, `?`, `~`, after a one-character offset) that force the difference, so the connector decodes under **both** alphabets, URL-safe first, and reports which matched (`ADR-0088`). Also recorded: `messageId`, `publishTime` (RFC 3339) and `attributes`, none of which this path reads yet. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

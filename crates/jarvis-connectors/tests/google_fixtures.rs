@@ -90,18 +90,38 @@ fn the_gmail_list_fixture_parses_to_identifiers_and_a_page_token() {
 }
 
 #[test]
-fn the_gmail_message_fixture_parses_to_one_identifier() {
+fn the_gmail_message_fixture_parses_to_the_fields_the_output_declares() {
     let text = fixture("gmail_messages_get.json");
     assert_declared_shape(&text);
-    let id = match request::parse_single_id(200, &text) {
-        Ok(id) => id,
+    let message = match request::parse_single_message(200, &text) {
+        Ok(message) => message,
         Err(error) => panic!("the documented Message shape must parse: {error}"),
     };
-    assert_eq!(id, "18f9c0d1e2a3b4c5");
+    // **Three fields, not one.** The output schema declares `message_id`, `thread_id` and `label_ids`, and the
+    // fixture carries all three top-level fields — so a parser that read only `id` left two thirds of the
+    // declared output unreachable, which is what `ADR-0083` fixes.
+    assert_eq!(message.id, "18f9c0d1e2a3b4c5");
+    assert_eq!(
+        message.thread_id.as_deref(),
+        Some("18f9c0d1e2a3b4c5"),
+        "the fixture carries `threadId`, so the parser must read it"
+    );
+    assert_eq!(
+        message.label_ids.as_deref(),
+        Some(
+            [
+                "UNREAD".to_owned(),
+                "CATEGORY_PERSONAL".to_owned(),
+                "INBOX".to_owned()
+            ]
+            .as_slice()
+        ),
+        "the fixture carries `labelIds`, so the parser must read them"
+    );
 
-    // The `Message` resource carries MIME parts, headers, and an `internalDate`, and this connector reads
-    // exactly one field from it. The rest is asserted **present in the fixture** so that a future slice which
-    // starts reading a header does so against a payload that already has one.
+    // The `Message` resource carries MIME parts, headers, an `internalDate`, and a `snippet`, and this connector
+    // reads exactly three top-level fields from it. The rest is asserted **present in the fixture** so that a
+    // future slice which starts reading a header does so against a payload that already has one.
     let value: Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(error) => panic!("{error}"),

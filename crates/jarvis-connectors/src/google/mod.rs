@@ -39,11 +39,13 @@ pub mod credential;
 pub mod definitions;
 pub mod http;
 pub mod operations;
+pub mod pubsub;
 pub mod request;
 pub mod revocation;
 pub mod scopes;
 pub mod token;
 pub mod transport;
+pub mod watch;
 
 use crate::auth::{AuthError, AuthFlow, AuthMethod, PkceMethod};
 use crate::authorization::{LoopbackHost, LoopbackRedirect, RedirectError};

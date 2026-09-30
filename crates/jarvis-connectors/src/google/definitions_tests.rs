@@ -294,6 +294,229 @@ fn the_schemas_are_the_2020_12_dialect_and_refuse_unknown_arguments() {
 }
 
 #[test]
+fn the_calendar_input_schema_refuses_a_time_range_with_a_sync_token() {
+    // **The declaration and the builder must agree about an impossible pairing.** `request::calendar_events_list`
+    // refuses `time_min`/`time_max` together with `sync_token`, because the `events.list` reference lists both
+    // bounds among the parameters that "cannot be specified together with nextSyncToken". A schema that
+    // advertised all three with no constraint would tell a model the combination is legal, and the model would
+    // learn otherwise only from a refusal — so the constraint is asserted here on the **document**, which is
+    // what a validator and a model both read (`ADR-0084`).
+    let definitions = definitions();
+    let Some(calendar) = definitions
+        .iter()
+        .find(|definition| definition.id().name() == "calendar_events_read")
+    else {
+        panic!("`calendar_events_read` must exist");
+    };
+    let schema = calendar.input_schema();
+
+    let valid = serde_json::json!({ "calendar_id": "primary", "sync_token": "tok" });
+    let report = must(schema.validate(&valid), "the schema must be usable");
+    assert!(report.is_valid(), "a sync token alone is a legal call");
+
+    // The two forbidden pairings, each asserted to be **rejected by the document** rather than merely absent
+    // from prose. If the `allOf`/`not` constraint were dropped, the descriptions would still mention the
+    // restriction and these two assertions would fail — which is the point: a description a validator does not
+    // enforce is exactly the "documented but not applied" defect `ADR-0077` records.
+    for document in [
+        serde_json::json!({ "calendar_id": "primary", "sync_token": "tok", "time_min": "2026-01-01T00:00:00Z" }),
+        serde_json::json!({ "calendar_id": "primary", "sync_token": "tok", "time_max": "2026-12-31T00:00:00Z" }),
+    ] {
+        let report = must(schema.validate(&document), "the schema must be usable");
+        assert!(
+            !report.is_valid(),
+            "the schema must reject a time range with a sync token: {document}"
+        );
+    }
+
+    // The control: a filtered **full** sync is legal, which the sync guide's own sample performs ("we are only
+    // syncing events up to a year old"). Without it a schema that rejected every `time_min` would pass.
+    let full = serde_json::json!({
+        "calendar_id": "primary",
+        "time_min": "2026-01-01T00:00:00Z",
+        "time_max": "2026-12-31T00:00:00Z",
+    });
+    let report = must(schema.validate(&full), "the schema must be usable");
+    assert!(report.is_valid(), "a filtered full sync is a legal call");
+}
+
+#[test]
+fn every_output_that_can_return_a_page_token_accepts_one_as_input() {
+    // **The symmetry check `ADR-0085` is about.** The `read_output` renderer emits `next_page_token` for every
+    // list operation, and the caller is expected to fetch the next page with it — but `calendar_events_read`
+    // declared no `page_token` input, so it emitted a token no argument could consume and a large read could not
+    // be continued. A per-tool test would have missed it because each schema is internally consistent; only the
+    // **pairing** of the two schemas exposes it.
+    //
+    // Generalised rather than asserted for the Calendar tool alone: any operation whose output declares
+    // `next_page_token` — now or later — must accept `page_token`, so a new paginated read cannot ship
+    // one-directional (`ADR-0083`'s method applied across the input and output halves of one tool).
+    for definition in definitions() {
+        let output_declares_a_page_token = definition
+            .output_schema()
+            .document()
+            .pointer("/properties/next_page_token")
+            .is_some();
+        if !output_declares_a_page_token {
+            continue;
+        }
+        let input_accepts_one = definition
+            .input_schema()
+            .document()
+            .pointer("/properties/page_token")
+            .is_some();
+        assert!(
+            input_accepts_one,
+            "`{}` renders `next_page_token` and must accept `page_token`, or it advertises a page the caller \
+             cannot fetch",
+            definition.id()
+        );
+    }
+}
+
+/// Reads one declared input bound out of a tool's schema by JSON pointer.
+///
+/// Shared by the two drift tests below. A pointer that resolves to nothing is a failure rather than a skip,
+/// because a schema that stopped declaring a bound would otherwise make the comparison vacuous.
+fn declared_bound(tool: &str, name: &str, keyword: &str) -> usize {
+    let definition = definitions()
+        .into_iter()
+        .find(|candidate| candidate.id().name() == tool)
+        .unwrap_or_else(|| panic!("`{tool}` must exist"));
+    let value = definition
+        .input_schema()
+        .document()
+        .pointer(&format!("/properties/{name}/{keyword}"))
+        .cloned()
+        .unwrap_or_else(|| panic!("`{tool}.{name}` must declare `{keyword}`"));
+    usize::try_from(
+        value.as_u64().unwrap_or_else(|| {
+            panic!("a declared bound must be a non-negative integer, not {value}")
+        }),
+    )
+    .unwrap_or_else(|_| panic!("a declared bound must fit a usize"))
+}
+
+#[test]
+fn every_declared_input_bound_matches_the_constant_that_enforces_it() {
+    // **Two places state each of these numbers, with nothing between them.** The input schema declares
+    // `maxLength` and `maximum` so a model is told the bounds *before* it chooses an argument, and `request.rs`
+    // enforces the same bounds through its constants. They agree today by hand, and a change to one would leave
+    // the other stating a bound the code does not keep: a model would be permitted something the builder
+    // refuses, or refused something it permits.
+    //
+    // This is the "two values that must agree, with nothing holding both" defect the repository keeps recording,
+    // applied to a declared number (`ADR-0086`). The comparison is against the **constants**, so it cannot be
+    // satisfied by editing the schema alone — a literal copied here would drift with the constant and pass.
+    use crate::google::client::{GMAIL_MAX_RESULTS_CAP, MAX_PAGE_TOKEN_CHARS};
+    use crate::google::request::{
+        CALENDAR_MAX_RESULTS_CAP, MAX_QUERY_CHARS, MAX_RESOURCE_ID_CHARS, MAX_TIME_BOUND_CHARS,
+    };
+
+    let cases = [
+        ("gmail_messages_list", "query", "maxLength", MAX_QUERY_CHARS),
+        (
+            "gmail_messages_list",
+            "max_results",
+            "maximum",
+            GMAIL_MAX_RESULTS_CAP as usize,
+        ),
+        (
+            "gmail_messages_list",
+            "page_token",
+            "maxLength",
+            MAX_PAGE_TOKEN_CHARS,
+        ),
+        (
+            "gmail_history_list",
+            "start_history_id",
+            "maxLength",
+            MAX_RESOURCE_ID_CHARS,
+        ),
+        (
+            "gmail_history_list",
+            "max_results",
+            "maximum",
+            GMAIL_MAX_RESULTS_CAP as usize,
+        ),
+        (
+            "gmail_history_list",
+            "page_token",
+            "maxLength",
+            MAX_PAGE_TOKEN_CHARS,
+        ),
+        (
+            "gmail_messages_read",
+            "message_id",
+            "maxLength",
+            MAX_RESOURCE_ID_CHARS,
+        ),
+        (
+            "calendar_events_read",
+            "calendar_id",
+            "maxLength",
+            MAX_RESOURCE_ID_CHARS,
+        ),
+        (
+            "calendar_events_read",
+            "time_min",
+            "maxLength",
+            MAX_TIME_BOUND_CHARS,
+        ),
+        (
+            "calendar_events_read",
+            "time_max",
+            "maxLength",
+            MAX_TIME_BOUND_CHARS,
+        ),
+        (
+            "calendar_events_read",
+            "max_results",
+            "maximum",
+            CALENDAR_MAX_RESULTS_CAP as usize,
+        ),
+        (
+            "calendar_events_read",
+            "page_token",
+            "maxLength",
+            MAX_PAGE_TOKEN_CHARS,
+        ),
+        (
+            "calendar_events_read",
+            "sync_token",
+            "maxLength",
+            MAX_PAGE_TOKEN_CHARS,
+        ),
+    ];
+    for (tool, property_name, keyword, expected) in cases {
+        assert_eq!(
+            declared_bound(tool, property_name, keyword),
+            expected,
+            "`{tool}.{property_name}.{keyword}` must equal the constant the builder enforces"
+        );
+    }
+}
+
+#[test]
+fn every_required_argument_declares_a_minimum_length_of_one() {
+    // The other half of the drift: `minLength` is the schema's statement that a value may not be empty, and the
+    // builder refuses an empty (or all-whitespace) identifier as well. Every declared `minLength` here is 1;
+    // asserted so a schema that dropped it — or wrote 0, permitting the empty identifier the builder refuses —
+    // fails rather than passing unnoticed.
+    for (tool, name) in [
+        ("gmail_history_list", "start_history_id"),
+        ("gmail_messages_read", "message_id"),
+        ("calendar_events_read", "calendar_id"),
+    ] {
+        assert_eq!(
+            declared_bound(tool, name, "minLength"),
+            1,
+            "`{tool}.{name}` must refuse an empty value in the schema as the builder does"
+        );
+    }
+}
+
+#[test]
 fn gmail_reads_do_not_offer_the_raw_format() {
     // `format=raw` returns the unparsed MIME message, which is the whole message including attachments. The
     // connector has no reason to expose it, and an enum that admitted it would let a model ask for bytes the

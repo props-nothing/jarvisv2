@@ -287,29 +287,10 @@ impl PkceChallenge {
 
 /// Base64url-encodes without padding, as RFC 7636 and RFC 4648 §5 require.
 ///
-/// Hand-written rather than a dependency, because this is the only base64 this crate needs and a
-/// base64 crate would arrive with an API surface larger than the twelve lines below. The alphabet is the
-/// **URL-safe** one (`-` and `_` rather than `+` and `/`), which is what makes the value safe in a query
-/// string — a `+` there decodes as a space, which is the defect that produces a challenge the provider
-/// rejects with no explanation.
-fn base64url_no_pad(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = u32::from(chunk[0]);
-        let second = chunk.get(1).copied().map_or(0, u32::from);
-        let third = chunk.get(2).copied().map_or(0, u32::from);
-        let block = (first << 16) | (second << 8) | third;
-        // Each output character takes six bits; a chunk of `n` bytes yields `n + 1` characters, which is
-        // exactly what dropping the padding means.
-        for position in 0..=chunk.len() {
-            let index = (block >> (18 - 6 * position)) & 0b11_1111;
-            let character = ALPHABET[usize::try_from(index).unwrap_or(0)];
-            output.push(char::from(character));
-        }
-    }
-    output
-}
+/// The implementation lives in [`crate::base64`] now that a second caller needs the same encoding — a decode of
+/// the Pub/Sub notification body — so there is one implementation rather than two chances to disagree about the
+/// alphabet.
+use crate::base64::url_safe_no_pad as base64url_no_pad;
 
 /// A one-time value compared for equality and never displayed.
 ///
