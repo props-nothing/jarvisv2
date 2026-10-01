@@ -130,3 +130,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0110](0110-a-first-sync-with-two-documented-branches.md) | A first sync with two documented branches and one expressible, and an anchor with a reader and no consumer | Accepted |
 | [0111](0111-a-bound-and-a-lease-are-different-inputs.md) | A bound and a lease are different inputs, so the exposure that took one could not report the state the other reaches | Accepted |
 | [0112](0112-a-prescribed-call-with-no-builder.md) | A prescribed call with no builder, and a body that made a request's own doc false | Accepted |
+| [0113](0113-the-value-that-survives-is-the-one-that-did-not-hold-it.md) | The value that survives the `watch` is the one the renewal needs, and it was the one that did not hold it | Accepted |

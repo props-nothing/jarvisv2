@@ -824,14 +824,22 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
         Ok(secret) => secret,
         Err(error) => panic!("a valid token: {error}"),
     };
+    // The fixture's channel and resource id, and an arbitrary representable expiry: routing and verification
+    // do not read the expiry, so only its presence is required by this test.
+    let expires_at = jarvis_core::UtcTimestamp::from_unix_nanos(1_426_325_213_i128 * 1_000_000_000)
+        .unwrap_or_else(|error| panic!("a representable instant: {error}"));
+    let register = |token: Option<SecretValue>| {
+        ChannelRegistration::new(
+            "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+            "ret08u3rv24htgh289g".to_owned(),
+            reference("acct-example"),
+            token,
+            expires_at,
+        )
+    };
 
     // The change fixture's channel and token, from the file itself.
-    let registrations = [ChannelRegistration::new(
-        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
-        "ret08u3rv24htgh289g".to_owned(),
-        reference("acct-example"),
-        Some(secret("target=myApp-myCalendarChannelDest")),
-    )];
+    let registrations = [register(Some(secret("target=myApp-myCalendarChannelDest")))];
 
     // A helper that ingests a fixture as a delivery.
     let ingest = |name: &str, registrations: &[ChannelRegistration]| {
@@ -870,24 +878,14 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
         ChannelIngest::Unroutable(jarvis_connectors::google::channel::ChannelRoute::Unknown)
     );
     // A registration whose token differs: the channel routes, and the token control fails.
-    let wrong_token = [ChannelRegistration::new(
-        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
-        "ret08u3rv24htgh289g".to_owned(),
-        reference("acct-example"),
-        Some(secret("a-different-token")),
-    )];
+    let wrong_token = [register(Some(secret("a-different-token")))];
     assert_eq!(
         ingest("calendar_channel_message.json", &wrong_token),
         ChannelIngest::Rejected(ChannelTokenCheck::Mismatch)
     );
     // A registration **without** a token: the channel verifies as `Absent` and the change still syncs, which is
     // the guide's optional-token case rather than a failure.
-    let untokened = [ChannelRegistration::new(
-        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
-        "ret08u3rv24htgh289g".to_owned(),
-        reference("acct-example"),
-        None,
-    )];
+    let untokened = [register(None)];
     assert_eq!(
         ingest("calendar_channel_message.json", &untokened),
         ChannelIngest::Changed {
@@ -904,8 +902,10 @@ fn the_watch_response_drives_a_renewal_decision_the_header_cannot() {
     // **human-readable date** (not comparable without a parser the crate does not have). So only the response
     // can drive a renewal decision, and this fixture is what makes that checkable.
     use jarvis_connectors::google::channel::{
-        ChannelLease, ChannelRenewal, channel_lease, parse_channel_watch_response, renewal_decision,
+        ChannelLease, ChannelRegistration, ChannelRenewal, channel_lease, parse_channel_watch_response,
+        renewal_decision,
     };
+    use jarvis_connectors::AccountReference;
     use jarvis_core::UtcTimestamp;
 
     let text = fixture("calendar_channel_watch_response.json");
@@ -951,6 +951,30 @@ fn the_watch_response_drives_a_renewal_decision_the_header_cannot() {
     assert_eq!(
         channel_lease(response.expires_at, after),
         ChannelLease::Lapsed { for_seconds: 120 }
+    );
+
+    // **And the decision is reachable from the value that SURVIVES the `watch`.** `renewal_decision` needs the
+    // expiry, and before this slice the registration — the only value between the `watch` and the teardown —
+    // had no field for it, so the decision was reachable only from the response in hand. Building a
+    // registration from the response and asking it the same question is what proves the value that survives
+    // carries the input the decision needs.
+    let account = match AccountReference::new("acct-example") {
+        Ok(reference) => reference,
+        Err(error) => panic!("a valid account reference: {error}"),
+    };
+    let registration = match ChannelRegistration::from_watch_response(&response, account, None) {
+        Ok(registration) => registration,
+        Err(error) => panic!("a conforming watch response must register: {error}"),
+    };
+    assert_eq!(
+        registration.renewal(after),
+        renewal_decision(response.expires_at, after),
+        "the registration's own answer must equal the free function's: the bridge is not a second opinion"
+    );
+    assert_eq!(
+        registration.expires_at(),
+        response.expires_at,
+        "the registration must hold the expiry the provider reported, not one recomputed from the request"
     );
 }
 

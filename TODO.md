@@ -5596,6 +5596,40 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     are unverifiable offline; the stop **permission** rule (`ADR-0107`) is still unenforceable locally; **no
     expiry parameter** is offered (the figure acted on is the response's), and **nothing renews on a schedule**
     yet, so `CHANNEL_REPLACE_LEAD_SECONDS` and this builder are not exercised together.
+- [ ] `P5-005` **(continued — the value that survives is the one that did not hold it)**: `google::channel`'s
+  `ChannelRegistration` gains `expires_at` (the provider's reported expiry), `from_watch_response`, `expires_at()`
+  and `renewal(now)`; the three test fixtures and the integration test gain the argument. **2 new tests (so 489
+  in the crate)**, plus the end-to-end fixture test extended. **`ADR-0113`.** Three guards falsified A-B-A.
+  - **⭐⭐ THE FINDING: THE RECORD THAT SURVIVES THE CALL DID NOT CARRY A VALUE A LATER DECISION NEEDS AS ITS SOLE
+    INPUT.** `parse_channel_watch_response` reads the response's `expiration` into `ChannelWatchResponse::expires_at`
+    — whose own doc says it *"can drive a renewal decision"* — and `renewal_decision` takes **that expiry as its
+    only input**. But `ChannelRegistration`, documented as *"the value that survives between the `watch` and the
+    teardown"*, had **no field for it**, so nothing in production held the input and the decision was reachable
+    only from a test. **⭐ The same "a value read and then dropped" shape `ADR-0107` found for `resourceId` one
+    round earlier, from the same call.**
+  - **⭐⭐ AND THE TYPE'S OWN DOC COUNTED ITS FACTS AND THE COUNT WAS WRONG.** It said *"two of the four facts are
+    the provider's and two are not"* — there were **five** (three from the response: `id`, `resourceId`,
+    `expiration`; two the connector's own: account, token), and the one the count had no room for was the
+    expiry. **⭐ A doc that enumerates its inputs is a claim about the set, and an omission inside the
+    enumeration is invisible because the arithmetic adds up.**
+  - **⭐ `from_watch_response` IS THE CONSTRUCTOR, BECAUSE IT MAKES THE SPLIT UNNECESSARY.** Three of the five
+    facts come from the one response; taking the response whole makes the expiry travel with the two identifiers
+    beside it rather than leaving a caller to remember a third — which is exactly how it was dropped. The plain
+    `new` stays for tests and a caller holding loose values.
+  - **⭐ A STORED FACT, NOT A STORED DECISION.** The field is the `UtcTimestamp` and **not** a `ChannelLease` or
+    `ChannelRenewal`: those are answers to a question asked at an instant, and storing one would pin it to the
+    second it was computed. `renewal(now)` is the bridge and **delegates** to `renewal_decision`, asserted equal
+    so the bridge is provably not a second opinion.
+  - **⭐ `from_watch_response` REFUSES A BLANK `resourceId`.** The parser checks presence and type but not
+    usability, so a blank second stop identifier would build a registration that cannot end its own channel.
+  - **⭐ THREE GUARDS FALSIFIED A-B-A:** (1) `renewal()` ignoring the registration's expiry → detected; (2) the
+    blank-`resourceId` refusal removed → detected (`left: Ok(… resource_id: "   " …)`, `right: Err(Missing {
+    field: "resourceId" })`); (3) `from_watch_response` not carrying the expiry → detected.
+  - **NEW LIMITS:** still no caller that renews on a schedule, so `CHANNEL_REPLACE_LEAD_SECONDS` and this bridge
+    are not exercised together; a registration is **not persisted**, so the new `UtcTimestamp` field has no
+    stored column yet; the expiry is read back from the response rather than recomputed from the request,
+    because the guide's *"more restrictive value is used"* means a recomputation would disagree exactly when
+    Google shortened it.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

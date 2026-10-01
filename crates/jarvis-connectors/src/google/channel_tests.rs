@@ -457,6 +457,9 @@ fn registration(channel_id: &str, account: &str) -> ChannelRegistration {
             "a valid account reference",
         ),
         None,
+        // An arbitrary but representable expiry: routing and verification do not read it, so its value is
+        // irrelevant to the tests that use this helper.
+        instant(1_426_325_213),
     )
 }
 
@@ -552,6 +555,7 @@ fn a_registration_redacts_its_token_and_the_route_uses_only_the_id() {
             "a valid account reference",
         ),
         Some(stored("target=myApp-myChannelDest")),
+        instant(1_426_325_213),
     );
     let rendered = format!("{with_token:?}");
     assert!(
@@ -614,6 +618,92 @@ fn a_registration_carries_both_identifiers_the_stop_call_needs_and_they_reach_it
     assert!(crate::google::request::calendar_channel_stop("channel-alpha", "  ").is_err());
 }
 
+#[test]
+fn a_registration_carries_the_channels_expiry_so_renewal_is_reachable_from_the_value_that_survives()
+{
+    // **The finding this field exists for.** `parse_channel_watch_response` read the response's `expiration`
+    // into `ChannelWatchResponse::expires_at`, whose own doc says it can *"drive a renewal decision"* — and the
+    // renewal decision `renewal_decision` takes that expiry as its **only** input. But the registration, the
+    // value that survives from the `watch` to the teardown, had **no field for it**, so nothing that survived
+    // held the input and the decision was reachable only from a test. This is `ADR-0107`'s dropped `resourceId`
+    // one round later, from the same omission shape: a value read and then dropped.
+    let response = must(
+        parse_channel_watch_response(
+            r#"{"kind":"api#channel","id":"01234567-89ab-cdef-0123456789ab","resourceId":"o3hgv1538sdjfh","resourceUri":"https://www.googleapis.com/calendar/v3/calendars/primary/events","expiration":1426325213000}"#,
+        ),
+        "the guide's own watch response must parse",
+    );
+    let registration = must(
+        ChannelRegistration::from_watch_response(
+            &response,
+            must(
+                crate::account::AccountReference::new("acct-alpha"),
+                "a valid account reference",
+            ),
+            None,
+        ),
+        "a conforming response must register",
+    );
+    // The expiry the response reported is the expiry the registration holds — the same instant from the
+    // provider, not a recomputation from the request (which could differ: the guide says the actual value is
+    // "the more restrictive" of the request and Google's own limits).
+    assert_eq!(registration.expires_at(), response.expires_at);
+    // And the decision is reachable **from the registration alone**, at three instants straddling the
+    // replacement lead (`CHANNEL_REPLACE_LEAD_SECONDS` = 86_400). Before the fix there was no way to ask a
+    // stored channel this question at all.
+    let expiry = instant(1_426_325_213);
+    assert!(matches!(
+        registration.renewal(instant(1_426_325_213 - 86_401)),
+        ChannelRenewal::NotYet { .. }
+    ));
+    assert!(matches!(
+        registration.renewal(instant(1_426_325_213 - 86_400)),
+        ChannelRenewal::ReplaceSoon { .. }
+    ));
+    assert!(matches!(
+        registration.renewal(expiry),
+        ChannelRenewal::ReplaceNow { .. }
+    ));
+    // The registration's answer and the free function agree, so `renewal` is a bridge and not a second
+    // opinion: two implementations of one decision would be the defect this repository records for every
+    // duplicated rule.
+    assert_eq!(
+        registration.renewal(expiry),
+        renewal_decision(expiry, expiry)
+    );
+}
+
+#[test]
+fn a_registration_surfaces_its_expiry_and_refuses_a_blank_resource_id_from_a_response() {
+    // The expiry is a stored **fact** and not a secret, so it is surfaced and shown in a diagnostic.
+    let built = registration("channel-alpha", "acct-alpha");
+    assert_eq!(built.expires_at(), instant(1_426_325_213));
+    assert!(
+        format!("{built:?}").contains("expires_at"),
+        "a diagnostic about a stale channel needs its expiry: {built:?}"
+    );
+    // And a response whose `resourceId` is **blank** is refused rather than registered: the parser reads a
+    // string as-is, so usability is the constructor's question, and an empty second stop identifier would build
+    // a registration that cannot end its own channel.
+    let response = must(
+        parse_channel_watch_response(r#"{"id":"c","resourceId":"   ","expiration":1426325213000}"#),
+        "a blank resource id still parses; parsing checks presence and type, not usability",
+    );
+    assert_eq!(
+        ChannelRegistration::from_watch_response(
+            &response,
+            must(
+                crate::account::AccountReference::new("acct-alpha"),
+                "a valid account reference",
+            ),
+            None,
+        ),
+        Err(ChannelWatchError::Missing {
+            field: "resourceId"
+        })
+    );
+}
+
 /// Full header set for a delivery naming a channel, in a given state, with an optional token.
 ///
 /// Dynamic values are leaked (test-only) so the header slice keeps its `&'static` element type rather than
@@ -665,6 +755,7 @@ fn registration_with_token(channel_id: &str, account: &str, token: &str) -> Chan
             "a valid account reference",
         ),
         Some(stored(token)),
+        instant(1_426_325_213),
     )
 }
 

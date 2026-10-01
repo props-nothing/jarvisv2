@@ -530,7 +530,23 @@ pub fn verify_channel_token(
 /// of the `watch` response, and this type had nowhere to put it, so the value the stop call needs was dropped
 /// one function after it was obtained (`ADR-0107`). A registration is therefore assembled from **two**
 /// sources — the provider's response (`channel_id`, `resource_id`) and the connector's own choices (`account`,
-/// `token`) — because two of the four facts are the provider's and two are not.
+/// `token`) — because some of the facts are the provider's and some are not.
+///
+/// # `expires_at` is the *second* value read and then dropped, and dropping it is what orphans the renewal
+///
+/// A channel's **expiry** is read by [`parse_channel_watch_response`] into
+/// [`ChannelWatchResponse::expires_at`], where its own doc says it is *"a hard boundary"* that *"can drive a
+/// renewal decision"* — and the renewal decision [`renewal_decision`] takes that expiry as its **only** input.
+/// This type is the value that survives between the `watch` and the teardown, so a registration without the
+/// expiry makes the decision **unreachable from production**: nothing holds a channel's `expires_at` and
+/// nothing computes a [`ChannelLease`] from one, which is the shape `ADR-0107` found for `resource_id` and
+/// `ADR-0092` found for the Gmail watch anchor. The field is the **provider's**, taken from the same response
+/// as the two identifiers rather than recomputed from the request.
+///
+/// It is deliberately **not** a [`ChannelLease`] or a [`ChannelRenewal`]: those are *answers* to a question
+/// asked at an instant, while a registration is a stored **fact**. Storing an answer would pin it to the
+/// instant it was computed, so the registration would be wrong one second later — the same reason
+/// `ChannelWatchResponse` holds an instant and the decision is a function of it and `now`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ChannelRegistration {
     /// The channel id the connector chose for this watch. The value a delivery echoes back.
@@ -544,6 +560,13 @@ pub struct ChannelRegistration {
     pub account: AccountReference,
     /// The token the connector set, when it set one. Redacted by the hand-written `Debug`.
     token: Option<SecretValue>,
+    /// When the channel stops delivering, as the `watch` response reported it.
+    ///
+    /// **A hard boundary, and possibly not the one requested**: the guide says the value is *"determined
+    /// either by your request or by any Google Calendar API internal limits or defaults (the more restrictive
+    /// value is used)"*, so a requested far-future expiry can come back shortened. This is the value
+    /// [`renewal_decision`] needs and the reason [`Self::renewal`] exists.
+    expires_at: UtcTimestamp,
 }
 
 impl ChannelRegistration {
@@ -551,20 +574,61 @@ impl ChannelRegistration {
     ///
     /// The argument order follows the stop call's body — `id`, then `resourceId` — so the two identifiers a
     /// caller passes sit in the same order as the fields they will be serialized into, which is what makes a
-    /// transposition visible rather than plausible (`ADR-0107`).
+    /// transposition visible rather than plausible (`ADR-0107`). `expires_at` comes last because it is the one
+    /// field with no counterpart in the stop body: the stop does not need to know when the channel would have
+    /// ended, and a caller reading the signature sees the four values that reach a request first.
     #[must_use]
     pub const fn new(
         channel_id: String,
         resource_id: String,
         account: AccountReference,
         token: Option<SecretValue>,
+        expires_at: UtcTimestamp,
     ) -> Self {
         Self {
             channel_id,
             resource_id,
             account,
             token,
+            expires_at,
         }
+    }
+
+    /// Reads a registration's four provider-and-connector facts out of a `watch` **response**.
+    ///
+    /// # Why this is the constructor a caller should reach for, and the plain one is not enough
+    ///
+    /// A channel's two identifiers **and** its expiry all come from the one `watch` response, and the
+    /// connector's own two facts (the account it authenticated as, the token it set) are the only values that
+    /// do not. Building a registration by hand therefore requires the caller to have already split those
+    /// sources correctly, and the defect this method prevents is **dropping the expiry** — the `resource_id`
+    /// omission (`ADR-0107`) one round later, from the same omission shape. Taking the response as a whole
+    /// makes the fact it carries travel with the two beside it, rather than leaving a caller to remember a
+    /// third.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelWatchError`] when the response's `resourceId` — echoed back as the stop call's second
+    /// identifier — is not usable as the identifier the request layer requires. The response's `id` and
+    /// `expiration` are already validated by [`parse_channel_watch_response`]; the resource id is not, and a
+    /// blank one would build a registration that cannot stop its channel.
+    pub fn from_watch_response(
+        response: &ChannelWatchResponse,
+        account: AccountReference,
+        token: Option<SecretValue>,
+    ) -> Result<Self, ChannelWatchError> {
+        if response.resource_id.trim().is_empty() {
+            return Err(ChannelWatchError::Missing {
+                field: "resourceId",
+            });
+        }
+        Ok(Self {
+            channel_id: response.channel_id.clone(),
+            resource_id: response.resource_id.clone(),
+            account,
+            token,
+            expires_at: response.expires_at,
+        })
     }
 
     /// Returns the provider's id for the watched resource, which `channels.stop` requires.
@@ -586,15 +650,38 @@ impl ChannelRegistration {
     pub const fn token(&self) -> Option<&SecretValue> {
         self.token.as_ref()
     }
+
+    /// Returns when the channel stops delivering, as the `watch` response reported it.
+    ///
+    /// The value [`renewal_decision`] needs, kept on the registration so a caller that holds one can decide
+    /// whether to replace the channel **without** the response it was built from — which is the whole point of
+    /// the registration being the value that survives.
+    #[must_use]
+    pub const fn expires_at(&self) -> UtcTimestamp {
+        self.expires_at
+    }
+
+    /// Returns whether this channel should be **replaced** as of `now`.
+    ///
+    /// The bridge between the stored fact and the decision, and the one place the two halves meet: it computes
+    /// the channel's [`ChannelLease`] from the registration's own expiry and answers
+    /// [`ChannelRenewal::ReplaceNow`] or [`ReplaceSoon`](ChannelRenewal::ReplaceSoon) when a replacement `watch`
+    /// should be issued. Without it a caller holding a registration had no way to reach [`renewal_decision`] —
+    /// the decision existed and nothing that survived from the `watch` could feed it.
+    #[must_use]
+    pub fn renewal(&self, now: UtcTimestamp) -> ChannelRenewal {
+        renewal_decision(self.expires_at, now)
+    }
 }
 
 impl fmt::Debug for ChannelRegistration {
     /// Redacts `token`, which is the channel's anti-spoofing control (`ADR-0091`).
     ///
-    /// The channel id, the resource id and the account are kept, because they name no secret and are what a
-    /// diagnostic about a stray delivery needs to show; a token would be a value an attacker could replay. A
-    /// `resource_id` is an opaque provider identifier for a **collection**, not for a person, so printing it
-    /// discloses nothing that printing the channel id does not.
+    /// The channel id, the resource id, the account and the expiry are kept, because they name no secret and
+    /// are what a diagnostic about a stray delivery or a stale channel needs to show; a token would be a value
+    /// an attacker could replay. A `resource_id` is an opaque provider identifier for a **collection**, not for
+    /// a person, so printing it discloses nothing that printing the channel id does not, and the expiry is an
+    /// instant rather than content.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ChannelRegistration")
@@ -608,6 +695,7 @@ impl fmt::Debug for ChannelRegistration {
                     .as_ref()
                     .map(|token| format!("[REDACTED], {} chars", token.expose().len())),
             )
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
