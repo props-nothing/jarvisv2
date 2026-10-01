@@ -83,14 +83,41 @@ http_port = 8765
 executor_model = "scripted"
 ```
 
-The only value this build implements is `scripted`, a **deterministic local model** that needs no
-network and no credential. It says in its own answer that no language model is configured, so a
-misconfigured daemon cannot look like a working one. A name the build does not implement stops the
-daemon at startup with an actionable error rather than being discovered when the first run is started.
+The two values this build implements are `scripted` and `openai-compatible`. `scripted` is a
+**deterministic local model** that needs no network and no credential. It says in its own answer that no
+language model is configured, so a misconfigured daemon cannot look like a working one. A name the build
+does not implement stops the daemon at startup with an actionable error rather than being discovered when
+the first run is started.
 
 With the executor enabled, `jarvis ask` completes in about a second: answer text on stdout, progress on
 stderr, and exit `0` for a completed run. The run's events are durable, so a client that reconnects
 replays from its position rather than re-reading the whole answer.
+
+**Answering with a real model.** `openai-compatible` reaches any server speaking
+`POST /v1/chat/completions` — OpenAI itself, or a local Ollama server:
+
+```toml
+[daemon]
+http_enabled = true
+http_port = 8765
+executor_model = "openai-compatible"                          # selects the transport
+executor_base_url = "http://localhost:11434/v1"               # the server
+executor_model_name = "qwen3:8b"                              # the model id sent to it
+executor_api_key_ref = "C:/jarvis/model.key"                  # a FILE holding the key
+```
+
+`executor_model` selects the **transport** and `executor_model_name` is the **model id** the provider
+receives; they are separate settings, so wanting a different model does not change how JARVIS talks to the
+server. **The key is a path to a file, never the key itself**, because the configuration document is
+printed and round-tripped by routine commands. Ollama ignores the key's value but requires one to be
+present, so a local server can use a placeholder in that file.
+
+A **partial** provider is refused rather than corrected: selecting `openai-compatible` while any
+coordinate is missing stops the daemon at startup naming the missing setting, because a half-configured
+provider would otherwise start cleanly and fail on the first run with an error from the *provider* instead
+of from JARVIS. Provider coordinates without `openai-compatible` are refused too — a settings block that
+has no effect is a worse outcome than an error, since it looks like it works. A relative key path is
+refused; it must be absolute. `ADR-0121` records the reasoning.
 
 The executor lives in `apps/jarvisd` rather than `jarvis-application`, because
 `docs/architecture/repository-layout.md` allows the application layer to depend only on `jarvis-core`

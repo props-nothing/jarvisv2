@@ -48,7 +48,7 @@ use jarvis_models::{
 };
 use jarvis_storage::{
     DatabaseError, NewRunEvent, SqliteDatabase, StoredRun, TerminalTransition, append_run_event,
-    find_run, settle_run,
+    find_run, find_tool_call, settle_run,
 };
 
 use crate::tool_pipeline::{ToolPipeline, ToolPipelineOutcome};
@@ -176,9 +176,10 @@ const MAX_EVENT_ERROR_CHARS: usize = 300;
 
 /// The name that selects the deterministic scripted model.
 ///
-/// This is the only value `daemon.executor_model` accepts, because no live provider adapter path
-/// exists yet: `P2-003` shipped the OpenAI-compatible adapter with no credentials, and selecting it
-/// here would need provider coordinates that must not live in a plaintext configuration file.
+/// One of the two names `daemon.executor_model` accepts, alongside
+/// [`jarvis_storage::LIVE_PROVIDER_MODEL_NAME`]. This one needs no coordinates and no credential, which is
+/// what makes it usable as the default: it answers by saying no language model is configured rather than by
+/// inventing one.
 pub const SCRIPTED_MODEL_NAME: &str = "scripted";
 
 /// The answer the scripted executor produces.
@@ -187,7 +188,42 @@ pub const SCRIPTED_MODEL_NAME: &str = "scripted";
 /// answer a question, and a placeholder that read like an answer would make a misconfigured daemon
 /// look like a working one.
 const SCRIPTED_ANSWER: &str = "No language model is configured, so this run was answered by the \
-deterministic scripted model. Set daemon.executor_model once a provider adapter is available.";
+deterministic scripted model. Set daemon.executor_model to \"openai-compatible\" with a provider to \
+answer with a real model.";
+
+/// The provider coordinates a live model adapter is built from.
+///
+/// Assembled at the composition root from validated configuration, so the executor's factory takes one
+/// value rather than four arguments a call site could transpose.
+///
+/// **This struct holds the credential in memory**, for the duration of composition and no longer: the
+/// key has already been read from the file the operator named, and it is moved into the adapter's own
+/// redacting `ApiKey` immediately. It is deliberately **not** `Debug` — a derived `Debug` would render
+/// the key, which is the one thing this value must never publish.
+pub struct ModelProviderConfig {
+    /// The provider's base URL, validated by the adapter.
+    base_url: String,
+    /// The model identifier the provider is asked for.
+    model: String,
+    /// The API key, read from the file the operator named.
+    api_key: String,
+}
+
+impl ModelProviderConfig {
+    /// Groups the validated provider coordinates.
+    #[must_use]
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
 
 /// Why an executor could not be built.
 #[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
@@ -195,6 +231,24 @@ pub enum ExecutorBuildError {
     /// The configured model name is not one this build implements.
     #[error("the configured executor model is not implemented by this build")]
     UnknownModel,
+    /// The live provider was selected without its coordinates.
+    ///
+    /// Configuration refuses this at startup, so this is the belt to that suspenders: the factory states
+    /// its own requirement rather than trusting a caller that the config layer already filtered.
+    #[error("the live provider requires its base URL, model identifier, and API key")]
+    MissingProviderConfig,
+    /// A provider coordinate was rejected by the adapter's own validation.
+    ///
+    /// The adapter's error is **not** carried in the message, because a base-URL error can echo the URL
+    /// and an API-key error can echo the key's shape. The variant names which coordinate failed instead.
+    #[error("the provider {field} is invalid")]
+    InvalidProviderField {
+        /// The coordinate that was rejected.
+        field: &'static str,
+    },
+    /// The HTTP transport could not be constructed.
+    #[error("the provider transport could not be constructed")]
+    Transport,
 }
 
 /// The model an executor drives, selected by name at daemon start.
@@ -203,6 +257,21 @@ pub enum ExecutorBuildError {
 /// nothing else: the executor itself never learns which model it is driving.
 pub struct Executor {
     model: Box<dyn ModelGateway>,
+    model_id: ModelId,
+}
+
+impl std::fmt::Debug for Executor {
+    /// Names the provider and the model identifier, and nothing else.
+    ///
+    /// A live adapter holds a credential, so the model field is deliberately not rendered. The identifier
+    /// is safe — it is what a run's request names — and it is the one fact worth having in a diagnostic.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Executor")
+            .field("provider", &self.model.provider_id())
+            .field("model_id", &self.model_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Executor {
@@ -213,21 +282,64 @@ impl Executor {
     /// Returns [`ExecutorBuildError::UnknownModel`] for a name this build does not implement. The
     /// daemon refuses to start rather than accepting the configuration and then executing nothing,
     /// which is the failure a typo would otherwise produce silently.
-    pub fn build(name: &str) -> Result<Self, ExecutorBuildError> {
+    pub fn build(
+        name: &str,
+        provider: Option<&ModelProviderConfig>,
+    ) -> Result<Self, ExecutorBuildError> {
         match name {
             SCRIPTED_MODEL_NAME => {
                 let model = jarvis_models::scripted(
                     jarvis_models::SCRIPTED_PROVIDER,
-                    "scripted-small",
+                    SCRIPTED_MODEL_ID,
                     vec![jarvis_models::Turn::answer(SCRIPTED_ANSWER)],
                 )
                 .map_err(|_| ExecutorBuildError::UnknownModel)?;
                 Ok(Self {
                     model: Box::new(model),
+                    model_id: scripted_model_id()?,
                 })
+            }
+            // The live provider. `validate` refuses this selection without complete coordinates, so a
+            // missing config here is reported rather than defaulted to the scripted model — the failure an
+            // operator who asked for a real model must never get silently.
+            jarvis_storage::LIVE_PROVIDER_MODEL_NAME => {
+                let provider = provider.ok_or(ExecutorBuildError::MissingProviderConfig)?;
+                Self::build_openai_compatible(provider)
             }
             _ => Err(ExecutorBuildError::UnknownModel),
         }
+    }
+
+    /// Builds the OpenAI-compatible provider adapter from validated coordinates.
+    ///
+    /// Every value is passed through the adapter's **own** constructors (`BaseUrl`, `ApiKey`, `ModelId`,
+    /// `ProviderId`), so a coordinate the provider would reject fails here with a named field rather than
+    /// when the first run is started. The transport is built with the adapter's hardened defaults (no
+    /// proxy, no redirects, a read timeout), which is the same transport `P2-003` shipped and tested.
+    fn build_openai_compatible(provider: &ModelProviderConfig) -> Result<Self, ExecutorBuildError> {
+        let base_url = jarvis_models::openai::BaseUrl::new(provider.base_url.clone())
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "base_url" })?;
+        let api_key = jarvis_models::openai::ApiKey::new(provider.api_key.clone())
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "api_key" })?;
+        let model_id = ModelId::new(provider.model.clone())
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "model" })?;
+        let provider_id = jarvis_models::ProviderId::new("openai-compatible")
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "provider" })?;
+        let transport = Arc::new(
+            jarvis_models::openai::HttpTransport::new()
+                .map_err(|_| ExecutorBuildError::Transport)?,
+        );
+        let model = jarvis_models::openai::OpenAiCompatibleProvider::new(
+            provider_id,
+            base_url,
+            api_key,
+            transport,
+            jarvis_models::openai::RetryPolicy::default(),
+        );
+        Ok(Self {
+            model: Box::new(model),
+            model_id,
+        })
     }
 
     /// Returns the model gateway the executor drives.
@@ -235,6 +347,24 @@ impl Executor {
     pub fn model(&self) -> &dyn ModelGateway {
         self.model.as_ref()
     }
+
+    /// Returns the model identifier every run is asked for.
+    ///
+    /// Held rather than hardcoded, because a run's request names a model and the scripted model serves
+    /// exactly one identifier. Deriving it in the loop would be a second place the name lives, and the two
+    /// could disagree — a run asking the scripted adapter for a model it does not serve.
+    #[must_use]
+    pub const fn model_id(&self) -> &ModelId {
+        &self.model_id
+    }
+}
+
+/// The model identifier the scripted adapter serves.
+const SCRIPTED_MODEL_ID: &str = "scripted-small";
+
+/// Builds the scripted model identifier, whose literal is asserted valid by the crate's own tests.
+fn scripted_model_id() -> Result<ModelId, ExecutorBuildError> {
+    ModelId::new(SCRIPTED_MODEL_ID).map_err(|_| ExecutorBuildError::UnknownModel)
 }
 
 /// Drives one run to a terminal state without a tool surface.
@@ -258,7 +388,40 @@ pub async fn execute_run(
     model: &dyn ModelGateway,
     run_id: &str,
 ) -> Result<StoredRun, DatabaseError> {
-    execute_run_with_tools(database, model, None, run_id).await
+    let model_id = ModelId::new(SCRIPTED_MODEL_ID)
+        .map_err(|_| DatabaseError::InvalidRunRequest { field: "model" })?;
+    execute_run_with_tools(database, model, &model_id, None, run_id).await
+}
+
+/// Enforces the model-call budget and performs one model call.
+///
+/// Extracted from the loop so the `Executing` arm is one call and the budget check reads beside the call
+/// it bounds. The counter is incremented **before** the check, so the budget is the number of calls the run
+/// may make and not one fewer — the off-by-one a post-increment would introduce.
+async fn generate_step(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    tools: Option<&Arc<ToolPipeline>>,
+    run: &StoredRun,
+    model_id: &ModelId,
+    state: &mut RunLoopState,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    if state.over_model_budget() {
+        return fail(
+            database,
+            run,
+            RunErrorCode::new("too_many_model_calls").map_err(|_| {
+                DatabaseError::InvalidRunRequest {
+                    field: "error_code",
+                }
+            })?,
+            "the run exceeded its model call budget",
+            correlation_id,
+        )
+        .await;
+    }
+    generate(database, model, tools, run, model_id, state, correlation_id).await
 }
 
 /// The transcript and tool budget a run loop carries between iterations.
@@ -272,6 +435,14 @@ struct RunLoopState {
     messages: Vec<ChatMessage>,
     /// Tool executions performed so far, bounded by [`MAX_TOOL_CALLS`].
     tool_calls: u32,
+    /// Model calls performed so far, bounded by [`MAX_MODEL_CALLS`].
+    model_calls: u32,
+    /// A call the run is parked on, consumed when the loop resumes.
+    ///
+    /// `Some` only when the loop was entered to **continue** a run whose held call has been decided —
+    /// a fresh run has no pending call, and this is what `generate` reads to decide whether to ask the
+    /// model or to resume the decided effect instead.
+    pending: Option<PendingCall>,
 }
 
 impl RunLoopState {
@@ -283,6 +454,27 @@ impl RunLoopState {
         self.tool_calls += 1;
         self.tool_calls > MAX_TOOL_CALLS
     }
+
+    /// Increments the model-call counter and reports whether the run is over budget.
+    ///
+    /// The counter is incremented **before** the check, so the budget is the number of calls the run may
+    /// make and not one fewer — the off-by-one a post-increment would introduce.
+    fn over_model_budget(&mut self) -> bool {
+        self.model_calls += 1;
+        self.model_calls > MAX_MODEL_CALLS
+    }
+}
+
+/// The call a parked run resumes.
+///
+/// Only the **identifier** travels: the run continuation reads the call's stored outcome rather than
+/// re-running it (the resume route already executed the effect), so it never needs the arguments. Those
+/// live on the route's side of the seam, where `ToolPipeline::resume` re-derives the intent digest from
+/// them and compares it against the admitted call — a check that belongs to the caller that supplied
+/// them, not to the run that learns the result.
+struct PendingCall {
+    /// The admitted call the decision released.
+    call_id: String,
 }
 
 /// Drives one run to a terminal state, running model-requested tools through the policy pipeline.
@@ -311,8 +503,69 @@ impl RunLoopState {
 pub async fn execute_run_with_tools(
     database: &Arc<SqliteDatabase>,
     model: &dyn ModelGateway,
+    model_id: &ModelId,
     tools: Option<&Arc<ToolPipeline>>,
     run_id: &str,
+) -> Result<StoredRun, DatabaseError> {
+    drive_run(
+        database,
+        model,
+        model_id,
+        tools,
+        run_id,
+        RunLoopState::default(),
+    )
+    .await
+}
+
+/// Continues a run whose held tool call has just been decided and executed.
+///
+/// # Why this is a second entry point rather than a flag
+///
+/// A fresh run and a **resumed** run begin from the same durable state (`AwaitingApproval` and the
+/// admitted tool call), so they share one loop body — but they carry different **inputs**: a fresh run
+/// has no pending call and re-derives its context from scratch, while a resumed run must not assemble a
+/// fresh manifest (which would lose the transcript that led to the hold) and must resume the *decided*
+/// call rather than ask the model again. Two names make a call site state which it is; an `Option`
+/// parameter would make "resume with nothing pending" a representable mistake.
+///
+/// The `call_id` is the one the resume route used, so the loop resumes exactly the effect a human
+/// approved. The arguments are deliberately **not** taken here: the route passed them to
+/// `ToolPipeline::resume`, which executed the effect, and the run continuation only reads the stored
+/// outcome — so there is no second place for a payload to be supplied or checked.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] under the same conditions as [`execute_run_with_tools`].
+pub async fn resume_run_with_tools(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    model_id: &ModelId,
+    tools: Option<&Arc<ToolPipeline>>,
+    run_id: &str,
+    call_id: &str,
+) -> Result<StoredRun, DatabaseError> {
+    let state = RunLoopState {
+        pending: Some(PendingCall {
+            call_id: call_id.to_owned(),
+        }),
+        ..RunLoopState::default()
+    };
+    drive_run(database, model, model_id, tools, run_id, state).await
+}
+
+/// Drives one run to a terminal state, starting from the state the caller supplies.
+///
+/// The single loop body shared by [`execute_run_with_tools`] (a fresh run) and
+/// [`resume_run_with_tools`] (a run a decided approval released). The only difference between the two
+/// is the [`RunLoopState`] they begin with.
+async fn drive_run(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    model_id: &ModelId,
+    tools: Option<&Arc<ToolPipeline>>,
+    run_id: &str,
+    mut state: RunLoopState,
 ) -> Result<StoredRun, DatabaseError> {
     let run = find_run(database, run_id).await?;
 
@@ -322,17 +575,8 @@ pub async fn execute_run_with_tools(
         return Ok(run);
     }
 
-    let model_id = ModelId::new("scripted-small")
-        .map_err(|_| DatabaseError::InvalidRunRequest { field: "model" })?;
-
-    let mut calls = 0_u32;
     let mut current = run;
     let correlation_id = CorrelationId::new();
-    // The transcript and the tool budget travel together across loop iterations: the transcript is
-    // **extended in place** by each tool round trip (it carries the assistant turn that requested a
-    // tool and the tool result that answered it, because a provider rejects a `tool` message whose
-    // originating assistant turn is absent), and the budget counts executions rather than calls.
-    let mut state = RunLoopState::default();
 
     loop {
         // A settlement ends the loop. Without this guard, a run that `fail`, `complete`, or
@@ -358,35 +602,19 @@ pub async fn execute_run_with_tools(
             RunState::ContextBuilding => {
                 // The assembled request is held across the loop rather than rebuilt in `generate`,
                 // because the manifest is the record of what was selected for **this** call.
-                let (advanced, messages) =
-                    assemble_and_record(database, model, &current, &model_id, correlation_id)
+                state.messages =
+                    assemble_context_messages(database, model, &current, model_id, correlation_id)
                         .await?;
-                state.messages = messages;
-                advanced
+                enter_planning(database, &current, correlation_id).await?
             }
             RunState::Planning => enter_execution(database, &current, correlation_id).await?,
             RunState::Executing => {
-                calls += 1;
-                if calls > MAX_MODEL_CALLS {
-                    return fail(
-                        database,
-                        &current,
-                        RunErrorCode::new("too_many_model_calls").map_err(|_| {
-                            DatabaseError::InvalidRunRequest {
-                                field: "error_code",
-                            }
-                        })?,
-                        "the run exceeded its model call budget",
-                        correlation_id,
-                    )
-                    .await;
-                }
-                generate(
+                generate_step(
                     database,
                     model,
                     tools,
                     &current,
-                    &model_id,
+                    model_id,
                     &mut state,
                     correlation_id,
                 )
@@ -398,11 +626,29 @@ pub async fn execute_run_with_tools(
                 enter_responding(database, &current, correlation_id).await?
             }
             RunState::AwaitingApproval => {
-                // Parked on a human decision. The decision and the resumed execution arrive through the
-                // approval and resume routes, which drive this run again; reaching here in the loop
-                // means the daemon was restarted while the run waited, so the run is left parked rather
-                // than advanced on a decision nothing has taken.
-                return Ok(current);
+                // A run is parked here for exactly one reason: a tool call policy held for a human
+                // decision. When the caller supplied the decided call, the loop resumes it — the
+                // decision has already released the effect, so this is where the human's answer turns
+                // into the effect they authorized and the conversation continues.
+                //
+                // Without a pending call the run stays parked. That is the **restart** case, where a
+                // settled profile has no parked run at all (`recover_interrupted_runs` settles every
+                // non-terminal run at startup) — reaching here without a pending call would mean a
+                // caller re-drove a parked run it has no decision for, and advancing on a decision
+                // nobody took is the one thing this arm must never do.
+                let Some(pending) = state.pending.take() else {
+                    return Ok(current);
+                };
+                resume_held_call(
+                    database,
+                    model,
+                    model_id,
+                    &current,
+                    &pending,
+                    &mut state,
+                    correlation_id,
+                )
+                .await?
             }
             RunState::Responding => {
                 return complete(database, &current, correlation_id).await;
@@ -495,19 +741,28 @@ async fn check_cancellation(
     .await
 }
 
-/// Assembles the run's context and records what was included and excluded.
+/// Assembles the run's context, records what was included and excluded, and returns the messages.
 ///
-/// The manifest is recorded because it is audit evidence: `docs/architecture/memory-and-context.md`
-/// requires the user be able to ask why something was used. Recording the counts now means the
-/// answer exists before retrieval arrives, rather than being retrofitted from a manifest nobody
-/// stored.
-async fn assemble_and_record(
+/// # Why this does not transition the run
+///
+/// It did, originally: it advanced the run to `Planning` as its last step. That made it unusable for a
+/// **resumed** run, which needs the same assembled transcript (policy, objective, history, memory) but
+/// is already past context building — a resume that called it would either drive the run backwards or
+/// need a second copy of the assembly. Splitting "build the messages" from "move the run" means the loop's
+/// `ContextBuilding` arm owns the transition and the resume path can reuse the assembly, which is the same
+/// separation the manifest already makes between *what was selected* and *what state the run is in*.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the history or memory read fails, or when a manifest entry cannot be
+/// resolved back to the turn or record it names.
+async fn assemble_context_messages(
     database: &Arc<SqliteDatabase>,
     model: &dyn ModelGateway,
     run: &StoredRun,
     model_id: &ModelId,
     correlation_id: CorrelationId,
-) -> Result<(StoredRun, Vec<ChatMessage>), DatabaseError> {
+) -> Result<Vec<ChatMessage>, DatabaseError> {
     let budget = ContextBudget::new(
         TOTAL_CONTEXT_TOKENS,
         RESERVED_POLICY_TOKENS,
@@ -599,28 +854,11 @@ async fn assemble_and_record(
     )
     .await?;
 
-    // The manifest is recorded, then the run advances. The transition is separate so its own event
-    // carries the state change, keeping "what was assembled" and "what state the run is in"
-    // distinguishable in the stream rather than fused into one payload.
-    let advanced = advance(
-        database,
-        run,
-        RunState::Planning,
-        RunEventKind::StateChanged,
-        Some("planning"),
-        r#"{"state":"planning"}"#,
-        correlation_id,
-    )
-    .await?;
-
     // The request is built from the **manifest**, not from the offered list. That is what keeps
     // "what the audit record says was included" and "what the model was sent" the same set: a turn
     // the assembler excluded for budget must not appear in the request, or the manifest is a record
     // of a decision that was not honoured.
-    Ok((
-        advanced,
-        messages_from_manifest(&manifest, &history, &memories, run.objective())?,
-    ))
+    messages_from_manifest(&manifest, &history, &memories, run.objective())
 }
 
 /// Builds the model-facing tool specifications from the daemon's registered tools.
@@ -1182,7 +1420,10 @@ async fn generate(
         .await;
     }
 
-    // No tool calls: this is the final answer.
+    // No tool calls: this is the final answer. It is recorded as `OutputCompleted` **before** the run
+    // advances, because `complete` reads the answer back from this event rather than holding a second copy
+    // in memory — so the stored transcript and the event stream cannot disagree about what was said. A
+    // tool round trip does **not** reach here: it has no answer yet and re-plans instead.
     append(
         database,
         run,
@@ -1341,15 +1582,6 @@ enum StepOutcome {
     Held,
 }
 
-/// Runs one model-requested tool call through the policy pipeline.
-///
-/// # Why the actor is built from the run
-///
-/// The same rule the HTTP tool route follows: the workspace and run come from the **stored run**, not
-/// from the model, because a model that could name its own workspace would widen its own authority. The
-/// scope set is the daemon's own grant, derived rather than accepted. The channel is `Cli` and the
-/// strength is `Credential`, which is what a daemon-originated run has actually established. The actor
-/// is built once by the caller and passed here, so every call in one turn runs under the same authority.
 /// Builds the sentence a tool result contributes to the model's transcript.
 ///
 /// A tool that produced output contributes it. A tool that ran and produced none still contributes a
@@ -1367,6 +1599,10 @@ fn tool_result_text(result: &jarvis_tools::ToolCallResult) -> String {
     )
 }
 
+/// Runs one model-requested tool call through the policy pipeline.
+///
+/// The actor is built once by the caller and passed here, so every call in one turn runs under the
+/// same authority — see [`run_tool_round`] for why it is built from the stored run.
 async fn run_tool_call(
     tools: &Arc<ToolPipeline>,
     actor: &crate::tool_actor::ToolActor,
@@ -1393,6 +1629,91 @@ async fn run_tool_call(
     }
 }
 
+/// Continues the run a decided tool call parked, then lets the model answer over the result.
+///
+/// # What this closes
+///
+/// `P3-022` parked a run at `AwaitingApproval` when a tool call was held, and the approval and resume
+/// routes ran the decided effect — but **nothing drove the run forward**, so a conversation that paused
+/// for approval never produced its answer. The run stayed at `AwaitingApproval` with its effect executed
+/// and its user waiting. This is the step that carries the human's decision back into the run.
+///
+/// # Why this reads the stored outcome instead of running the call again
+///
+/// The resume **route** has already executed the effect through `ToolPipeline::resume`, which refuses a
+/// second execution of a call past `requested` (`P3-012c`). So the effect is durable and the run only
+/// needs to *learn* its outcome — re-running the call here would either be refused (making the run fail
+/// for no reason) or, if the guard were ever weakened, produce the **second effect** the guard exists to
+/// prevent. Reading the stored call is the honest source: it is the same row the route wrote.
+///
+/// A call the route has not yet run (still `requested`) has no outcome to report, and the run says so
+/// rather than inventing one.
+///
+/// # Why the observation is fenced data rather than a provider `tool` message
+///
+/// A provider expects a tool result as a `tool` message correlated to the assistant turn that requested
+/// it, and reconstructing that turn needs the call's **arguments**, which `tool_calls` deliberately does
+/// not store (`0007`). So the outcome is reported as **fenced data** (`ADR-0049`), which is where tool
+/// output belongs: content that originates outside JARVIS, treated as data to reason about. That is a
+/// recorded limit, not an oversight — see `ADR-0120`.
+async fn resume_held_call(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    model_id: &ModelId,
+    run: &StoredRun,
+    pending: &PendingCall,
+    state: &mut RunLoopState,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    // The stored call is the row the resume route wrote, so this reads the effect rather than re-running
+    // it. A lookup failure or a non-terminal outcome is reported to the model as the observation: the
+    // run's job is to answer, and a missing result is a fact about the request rather than a reason to
+    // drop the run.
+    let text = match find_tool_call(database, &pending.call_id).await {
+        Ok(call) if call.outcome().is_terminal() => call.output().map_or_else(
+            || format!("the tool reported: {}", call.outcome().as_str()),
+            str::to_owned,
+        ),
+        Ok(_) | Err(_) => {
+            "the approved tool call has not completed, so its result is not available".to_owned()
+        }
+    };
+
+    // The observation is fenced, because tool output originates outside JARVIS (`ADR-0049`). A payload
+    // that is empty or is only the fence token cannot be isolated; that is reported honestly rather than
+    // dropped, so the model is never left with a silent gap where an effect happened.
+    let observation = match jarvis_core::IsolatedText::new(&text) {
+        Ok(isolated) => format!(
+            "The tool call {call} completed after approval. Its output is provided as data:\n\n{fenced}",
+            call = pending.call_id,
+            fenced = isolated.render(),
+        ),
+        Err(_) => format!(
+            "The tool call {} completed after approval, and produced no reportable output.",
+            pending.call_id
+        ),
+    };
+
+    // **The transcript is re-assembled, then the observation is appended.** A resumed run begins with an
+    // empty [`RunLoopState`], so without this the resumed model call would be sent *only* the fenced
+    // observation — no policy, no objective, and no history — and the model would answer a message about a
+    // tool with no idea what was asked. `generate` runs once from the `Responding` handling, which reads
+    // the message list this function fills.
+    state.messages =
+        assemble_context_messages(database, model, run, model_id, correlation_id).await?;
+    state
+        .messages
+        .push(ChatMessage::user(truncate_tool_result(&observation)));
+
+    // The decision released the call, so the run calls the model once more to answer over the
+    // observation. `AwaitingApproval → Executing` is the documented "approved" edge, and `Executing` is
+    // where the model is called, records `OutputCompleted`, and advances to `Responding` — the same path a
+    // plain answer takes. (`AwaitingApproval → Responding` exists for the denied-with-explanation case,
+    // where no further model call is needed; a resumed run has an observation to answer *over*, so it uses
+    // the executing edge.)
+    enter_execution(database, run, correlation_id).await
+}
+
 /// Records the move into `Observing` when a tool result was produced.
 ///
 /// The transition is `Executing → Observing`, which is the only edge from `Executing`. `enter_planning`
@@ -1414,12 +1735,14 @@ async fn observe_tools(
     .await
 }
 
-/// Records the move back into `Planning` after a tool result was interpreted.
+/// Records the move into `Planning`.
 ///
-/// The transition is `Observing → Planning`. Without it a tool round trip would go `Observing →
-/// Responding` — the answer produced from a transcript the model has not seen — which is exactly the
-/// defect a loop without a planning re-entry produces: the tool ran, and the answer ignored it. A test
-/// asserting two model calls is what found this.
+/// Two callers and one meaning: the loop enters planning after **assembling context** (from
+/// `ContextBuilding`) and again after interpreting a **tool result** (from `Observing`). Both edges are in
+/// the documented table, and both mean the same thing — the run is about to decide what to do next. The
+/// re-entry edge is the one that matters: without `Observing → Planning` a tool round trip would go
+/// `Observing → Responding` and the answer would be produced from a transcript the model has not seen —
+/// the tool ran and the answer ignored it. A test asserting two model calls is what found that defect.
 async fn enter_planning(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
@@ -1430,7 +1753,7 @@ async fn enter_planning(
         run,
         RunState::Planning,
         RunEventKind::StateChanged,
-        Some("planning with the tool result"),
+        Some("planning"),
         r#"{"state":"planning"}"#,
         correlation_id,
     )
@@ -1439,17 +1762,39 @@ async fn enter_planning(
 
 /// Parks a run on a human decision.
 ///
-/// The transition is `Executing → AwaitingApproval`, and the run stops here: the loop returns it, and
-/// the approval and resume routes re-drive the call. Nothing is fed back to the model because the effect
-/// has not happened.
+/// # Why this walks three edges to reach `AwaitingApproval`
+///
+/// The documented transition table (`docs/architecture/runtime-and-models.md`) has
+/// **`Planning → AwaitingApproval`** and **not** `Executing → AwaitingApproval`: a hold is decided when
+/// the run *plans* a step, not while a step is running. A model call runs in `Executing`, so a held tool
+/// call arrives with the run in `Executing` — and the first version of this function advanced straight to
+/// `AwaitingApproval` and was refused by the domain (found by a test, `run: the agent run transition was
+/// refused`). The legal path is the faithful one and it narrates the hold honestly:
+///
+/// 1. `Executing → Observing` — interpret what the model asked for (a capability it lacks authority for);
+/// 2. `Observing → Planning` — the next step is that capability;
+/// 3. `Planning → AwaitingApproval` — the step is held for a human.
+///
+/// The run then stops: nothing is fed back to the model, because the effect has not happened.
 async fn park_for_approval(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
-    advance(
+    let observed = advance(
         database,
         run,
+        RunState::Observing,
+        RunEventKind::StateChanged,
+        Some("interpreting the request"),
+        r#"{"state":"observing"}"#,
+        correlation_id,
+    )
+    .await?;
+    let planned = enter_planning(database, &observed, correlation_id).await?;
+    advance(
+        database,
+        &planned,
         RunState::AwaitingApproval,
         RunEventKind::ApprovalRequested,
         Some("waiting for approval"),
@@ -1481,6 +1826,12 @@ fn truncate_tool_result(text: &str) -> String {
 /// conversation is one whose transcript holds both sides. Stored after the settle it could be lost
 /// to a crash between the two writes, leaving a run that answered a question the transcript does not
 /// contain.
+///
+/// The model was already called, from the `Executing` state — a plain run reaches `Responding` over the
+/// answer `generate` recorded, and a **resumed** run reaches it the same way after `resume_held_call`
+/// re-entered `Executing` with the observation in the transcript. So this reads the answer back from the
+/// run's own event stream rather than producing one, which is what keeps the stored transcript and the
+/// stored events from disagreeing.
 async fn complete(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
@@ -1749,7 +2100,142 @@ mod tests {
     use super::*;
 
     use jarvis_models::{ScriptedModel, Turn, scripted};
-    use jarvis_storage::{API_SESSION_CHANNEL, StartRunInput, start_run};
+    use jarvis_storage::{API_SESSION_CHANNEL, LOCAL_USER_ID, StartRunInput, start_run};
+
+    /// **The deterministic model builds with no provider coordinates, and names its own identifier.**
+    ///
+    /// The scripted model serves exactly one identifier, and the run loop sends the executor's
+    /// `model_id`; if the two disagreed every run would fail with `ModelNotFound`. The test asserts they
+    /// agree by building the executor and asking it, rather than restating the literal.
+    #[test]
+    fn the_scripted_executor_builds_with_no_provider_and_serves_its_own_id() {
+        let executor = Executor::build(SCRIPTED_MODEL_NAME, None)
+            .unwrap_or_else(|error| panic!("the scripted executor must build: {error}"));
+        assert_eq!(
+            executor.model_id().as_str(),
+            SCRIPTED_MODEL_ID,
+            "the executor must name the identifier the scripted adapter serves"
+        );
+    }
+
+    /// **A live provider builds from its coordinates, and the executor reports the configured model id.**
+    ///
+    /// This is the end-to-end claim of the slice at the composition seam: the coordinates a config provides
+    /// are accepted by the adapter's own validation and the model the run will name is the one configured.
+    /// No request is sent — the adapter is constructed, not called, which is what the offline suite can
+    /// establish without a network or a credential.
+    #[test]
+    fn the_live_provider_executor_builds_and_reports_the_configured_model() {
+        let provider = ModelProviderConfig::new(
+            "http://127.0.0.1:11434/v1",
+            "gpt-oss:20b",
+            "test-key-not-a-real-credential",
+        );
+        let executor = Executor::build(jarvis_storage::LIVE_PROVIDER_MODEL_NAME, Some(&provider))
+            .unwrap_or_else(|error| panic!("the live provider executor must build: {error}"));
+        assert_eq!(
+            executor.model_id().as_str(),
+            "gpt-oss:20b",
+            "the run must name the model the operator configured, not a built-in literal"
+        );
+    }
+
+    /// **The live provider without coordinates is refused rather than silently falling back.**
+    ///
+    /// The failure an operator who asked for a real model must never get is a daemon that quietly answers
+    /// with the deterministic placeholder. The factory refuses instead.
+    #[test]
+    fn the_live_provider_without_coordinates_is_refused() {
+        let error = Executor::build(jarvis_storage::LIVE_PROVIDER_MODEL_NAME, None)
+            .err()
+            .unwrap_or_else(|| panic!("the live provider without coordinates must be refused"));
+        assert_eq!(error, ExecutorBuildError::MissingProviderConfig);
+    }
+
+    /// **A coordinate the adapter rejects is refused, and the error names the field but not the value.**
+    ///
+    /// A base URL that is not `http`/`https` is refused by `BaseUrl`; the executor must report that a field
+    /// failed without echoing it, because the base URL is where a credential is most often mistakenly
+    /// pasted and an echoed value would put it in a startup error.
+    #[test]
+    fn an_invalid_provider_coordinate_is_refused_without_echoing_it() {
+        let provider = ModelProviderConfig::new(
+            "ftp://example.invalid/v1",
+            "gpt-oss:20b",
+            "test-key-not-a-real-credential",
+        );
+        let error = Executor::build(jarvis_storage::LIVE_PROVIDER_MODEL_NAME, Some(&provider))
+            .err()
+            .unwrap_or_else(|| panic!("an invalid base URL must be refused"));
+        assert_eq!(
+            error,
+            ExecutorBuildError::InvalidProviderField { field: "base_url" }
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("example.invalid"),
+            "the rejected value must not be echoed: {rendered}"
+        );
+    }
+
+    /// **A rejected credential is refused by field name, and the value never reaches the error.**
+    ///
+    /// The key is the coordinate with the shortest path from "rejected" to "printed": the adapter refuses a
+    /// pasted URL, an `Authorization` header, and interior whitespace, and every one of those rejections is a
+    /// place the value itself could be echoed. This asserts the executor's half of that — the variant carries
+    /// a static field name — using a value distinctive enough that a leak is unambiguous.
+    #[test]
+    fn a_rejected_credential_is_refused_without_echoing_the_key() {
+        let canary = "https://example.invalid/?api-key=CANARY-KEY-MUST-NOT-BE-PRINTED";
+        let provider = ModelProviderConfig::new("http://127.0.0.1:11434/v1", "gpt-oss:20b", canary);
+        let error = Executor::build(jarvis_storage::LIVE_PROVIDER_MODEL_NAME, Some(&provider))
+            .err()
+            .unwrap_or_else(|| panic!("a key that is actually a URL must be refused"));
+        assert_eq!(
+            error,
+            ExecutorBuildError::InvalidProviderField { field: "api_key" },
+            "the refusal must name the coordinate, not describe the value"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("CANARY-KEY-MUST-NOT-BE-PRINTED"),
+            "the rejected credential must not be echoed: {rendered}"
+        );
+    }
+
+    /// **`Debug` on a composed live executor renders no credential.**
+    ///
+    /// `Executor` is logged at daemon start, so this is the one operation guaranteed to be handed a live
+    /// adapter holding a real key. The hand-written `Debug` is what makes that safe, and an assertion is what
+    /// keeps it hand-written: a derived `Debug` would render the boxed adapter and this fails.
+    #[test]
+    fn debug_on_a_live_executor_renders_no_credential() {
+        let provider = ModelProviderConfig::new(
+            "http://127.0.0.1:11434/v1",
+            "gpt-oss:20b",
+            "CANARY-KEY-MUST-NOT-BE-PRINTED",
+        );
+        let executor = Executor::build(jarvis_storage::LIVE_PROVIDER_MODEL_NAME, Some(&provider))
+            .unwrap_or_else(|error| panic!("the live provider executor must build: {error}"));
+        let rendered = format!("{executor:?}");
+        assert!(
+            !rendered.contains("CANARY-KEY-MUST-NOT-BE-PRINTED"),
+            "a diagnostic must not render the credential: {rendered}"
+        );
+        assert!(
+            rendered.contains("gpt-oss:20b"),
+            "the model identifier is the safe fact worth having: {rendered}"
+        );
+    }
+
+    /// An unimplemented executor name is refused rather than accepted and then executing nothing.
+    #[test]
+    fn an_unknown_executor_name_is_refused() {
+        let error = Executor::build("not-a-model", None)
+            .err()
+            .unwrap_or_else(|| panic!("an unknown executor name must be refused"));
+        assert_eq!(error, ExecutorBuildError::UnknownModel);
+    }
 
     /// A temporary profile directory holding a migrated database.
     struct TempProfile(std::path::PathBuf);
@@ -1819,8 +2305,17 @@ mod tests {
     }
 
     fn model(turns: Vec<Turn>) -> ScriptedModel {
-        scripted("scripted", "scripted-small", turns)
+        scripted("scripted", SCRIPTED_MODEL_ID, turns)
             .unwrap_or_else(|error| panic!("scripted model: {error}"))
+    }
+
+    /// The model identifier the scripted fixture serves, matching what `execute_run` names.
+    ///
+    /// Derived from the executor's own constant rather than restated, so a test cannot ask the scripted
+    /// adapter for a model it does not serve — the disagreement a second literal would allow.
+    fn fixture_model_id() -> ModelId {
+        ModelId::new(SCRIPTED_MODEL_ID)
+            .unwrap_or_else(|error| panic!("the scripted model id must be valid: {error}"))
     }
 
     /// Starts a run as a continuation of an existing session, through the real start path.
@@ -2674,9 +3169,15 @@ mod tests {
             Turn::tool_call("call_1", "jarvis.files.read", r#"{"path":"note.txt"}"#),
             Turn::answer("The file says the sky is blue."),
         ]);
-        let settled = execute_run_with_tools(&database, &model, Some(&tools), run.id())
-            .await
-            .unwrap_or_else(|error| panic!("run: {error}"));
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
 
         assert_eq!(
             settled.terminal_outcome(),
@@ -2758,9 +3259,15 @@ mod tests {
             Turn::tool_call("call_1", "jarvis.nonexistent.tool", "{}"),
             Turn::answer("I could not do that, so here is what I know."),
         ]);
-        let settled = execute_run_with_tools(&database, &model, Some(&tools), run.id())
-            .await
-            .unwrap_or_else(|error| panic!("run: {error}"));
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
 
         assert_eq!(
             settled.terminal_outcome(),
@@ -2790,9 +3297,10 @@ mod tests {
         let run = start(&database, "just answer").await;
         let model = model(vec![Turn::answer("An answer with no tools.")]);
 
-        let settled = execute_run_with_tools(&database, &model, None, run.id())
-            .await
-            .unwrap_or_else(|error| panic!("run: {error}"));
+        let settled =
+            execute_run_with_tools(&database, &model, &fixture_model_id(), None, run.id())
+                .await
+                .unwrap_or_else(|error| panic!("run: {error}"));
 
         assert_eq!(
             settled.terminal_outcome(),
@@ -2803,5 +3311,263 @@ mod tests {
             model.seen_tools()[0].is_empty(),
             "no tool surface must be offered when none is composed"
         );
+    }
+
+    /// A pipeline whose only tool **declares** an approval, with an adapter that counts its calls.
+    ///
+    /// The declaration (risk 0, `ApprovalPolicy::Ask`) is the fixture's own contract, so the hold comes
+    /// from the tool rather than from a workspace threshold that a default could change. The adapter
+    /// records every execution, so "the effect happened exactly once" is an observation about the adapter
+    /// rather than an inference from a status.
+    fn approval_pipeline(
+        profile: &TempProfile,
+        database: &Arc<SqliteDatabase>,
+    ) -> (
+        Arc<ToolPipeline>,
+        Arc<crate::approval_fixture::RecordingApprovalAdapter>,
+    ) {
+        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
+        let adapter = Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let pipeline = ToolPipeline::with_adapters(
+            Arc::clone(database),
+            None,
+            jarvis_tools::WorkspacePolicy::default(),
+            vec![(
+                vec![crate::approval_fixture::approval_declaring_definition()],
+                Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+            )],
+            secrets,
+        )
+        .unwrap_or_else(|error| panic!("compose the approval pipeline: {error}"));
+        (Arc::new(pipeline), adapter)
+    }
+
+    /// Decides a held call's approval and resumes it through the pipeline, as the two routes do.
+    ///
+    /// One helper for the two client steps, so the park/resume test is about the **run** rather than about
+    /// re-deriving the operator's flow each time. It reads the delivered nonce from the profile's private
+    /// store (the decision step) and calls `ToolPipeline::resume` (the resume step, which owns the effect);
+    /// the run continuation that follows only reads the stored outcome.
+    async fn approve_and_resume(
+        profile: &TempProfile,
+        database: &Arc<SqliteDatabase>,
+        tools: &Arc<ToolPipeline>,
+        run: &StoredRun,
+        call: &jarvis_storage::StoredToolCall,
+        arguments: serde_json::Value,
+    ) {
+        let approval_id = call
+            .approval_id()
+            .unwrap_or_else(|| panic!("a held call must link to its approval"))
+            .to_owned();
+        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
+        let nonce = secrets
+            .take(&approval_id)
+            .unwrap_or_else(|error| panic!("take the decision nonce: {error}"));
+        let decision = jarvis_core::ApprovalDecision::new(
+            jarvis_core::ApprovalDecisionOutcome::Approve,
+            jarvis_core::ApprovalChannel::Cli,
+            jarvis_core::AuthenticationStrength::Present,
+            UtcTimestamp::now(&SystemClock),
+            LOCAL_USER_ID,
+        )
+        .unwrap_or_else(|error| panic!("build the decision: {error}"));
+        jarvis_storage::record_decision(database, &approval_id, nonce.expose(), &decision)
+            .await
+            .unwrap_or_else(|error| panic!("record the decision: {error}"));
+
+        let actor = crate::tool_actor::ToolActor::workspace_and_mcp(
+            run.workspace_id(),
+            run.id(),
+            SessionChannel::Cli,
+            jarvis_tools::AuthenticationStrength::Credential,
+            "policy-1",
+        )
+        .unwrap_or_else(|| panic!("build the actor"));
+        let executed = tools
+            .resume(call.id(), arguments, &actor, CorrelationId::new())
+            .await
+            .unwrap_or_else(|error| panic!("the route resumes the call: {error}"));
+        assert!(
+            matches!(executed, ToolPipelineOutcome::Executed(_)),
+            "the resumed call must run: {executed:?}"
+        );
+    }
+
+    /// **A run parked on a held call never finishes — and resuming it is what finishes it.**
+    ///
+    /// `P3-022` made a held call park the run at `AwaitingApproval`, and the approval and resume routes
+    /// ran the decided effect, but **nothing drove the run forward**: the effect happened and the
+    /// conversation still stopped, with the user waiting for an answer. This is the end-to-end claim of
+    /// this slice — the run parks, the client resumes the approved call, the run answers, and the effect
+    /// happens **once**.
+    ///
+    /// The effect count is asserted on the adapter, not the statuses, because a resume that ran the tool
+    /// and a resume that refused to run it again produce the *same* run outcome — only the counter can tell
+    /// one effect from two.
+    #[tokio::test]
+    async fn a_run_parked_on_a_held_call_finishes_when_the_call_is_resumed() {
+        let (profile, database) = database().await;
+        let (tools, adapter) = approval_pipeline(&profile, &database);
+        let run = start(&database, "perform the approved action").await;
+
+        // One turn: the model asks for the tool the fixture declares an approval for.
+        let tool_model = model(vec![Turn::tool_call(
+            "call_1",
+            crate::approval_fixture::APPROVAL_TOOL,
+            r#"{"path":"notes.txt"}"#,
+        )]);
+
+        let parked = execute_run_with_tools(
+            &database,
+            &tool_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+
+        // The run parked rather than completing, and the effect did **not** happen: it is held.
+        assert_eq!(
+            parked.state(),
+            RunState::AwaitingApproval,
+            "a model-requested held call must park the run"
+        );
+        assert_eq!(
+            adapter.calls(),
+            0,
+            "a held call must not reach the adapter before a decision"
+        );
+
+        // The operator decides the approval and the route resumes the call, exactly as the two client
+        // steps do: the decision step takes the nonce, and `ToolPipeline::resume` owns the effect. The run
+        // continuation that follows only **reads** the stored outcome.
+        let held = jarvis_storage::read_run_tool_calls(&database, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("read the run's calls: {error}"));
+        let call = held
+            .first()
+            .unwrap_or_else(|| panic!("the hold must have written a call row"));
+        approve_and_resume(
+            &profile,
+            &database,
+            &tools,
+            &parked,
+            call,
+            serde_json::json!({ "path": "notes.txt" }),
+        )
+        .await;
+
+        // The run continuation: the effect is already durable, so this reads it and produces the answer.
+        let answer_model = model(vec![Turn::answer("The approved action is done.")]);
+        let resumed = resume_run_with_tools(
+            &database,
+            &answer_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+            call.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("resume the run: {error}"));
+
+        assert_eq!(
+            resumed.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded),
+            "the resumed run must complete rather than stay parked"
+        );
+        assert_eq!(
+            adapter.calls(),
+            1,
+            "the approved effect must happen exactly once across the route resume and the run continuation"
+        );
+
+        // **The resumed run re-assembles its own context.** The observation is the point of the run, but a
+        // transcript containing *only* the observation would drop the objective and history — the model
+        // would answer a message about a tool with no idea what was asked.
+        let requests = answer_model.seen_messages();
+        assert_eq!(requests.len(), 1, "one model call after the resume");
+        let texts: Vec<String> = requests[0].iter().map(ChatMessage::text).collect();
+        assert!(
+            texts.iter().any(|text| text.contains(SYSTEM_POLICY)),
+            "the resumed request must carry the policy: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("perform the approved action")),
+            "the resumed request must carry the run's objective: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains(jarvis_core::FENCE_OPEN)),
+            "the tool observation must be fenced as data: {texts:?}"
+        );
+
+        // The stream shows the park and the resume, so a client replaying it sees the run stop for a human
+        // and then continue rather than jump from a tool request to an answer.
+        let kinds = events(&database, run.id()).await;
+        assert!(
+            kinds.contains(&RunEventKind::ApprovalRequested),
+            "the stream must record the hold: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&RunEventKind::RunCompleted),
+            "the stream must record the completion: {kinds:?}"
+        );
+    }
+
+    /// **A parked run is never continued by a resume of a *different* call, and an unreleased hold
+    /// stays parked.**
+    ///
+    /// Two negative properties in one test, because they are one rule: the run only advances on the
+    /// decision for **its own** held call. A resume that names an unknown call is refused by the pipeline,
+    /// the observation records that refusal as the outcome rather than failing the run, and the loop then
+    /// continues — which is the honest behaviour: a client that resumed the wrong call still gets an answer
+    /// that says the action did not run.
+    #[tokio::test]
+    async fn an_undecided_hold_leaves_the_run_parked() {
+        let (profile, database) = database().await;
+        let (tools, adapter) = approval_pipeline(&profile, &database);
+        let run = start(&database, "try the held action").await;
+        let tool_model = model(vec![Turn::tool_call(
+            "call_1",
+            crate::approval_fixture::APPROVAL_TOOL,
+            r#"{"path":"notes.txt"}"#,
+        )]);
+
+        // Drive the run once: it parks, and the effect is held.
+        let parked = execute_run_with_tools(
+            &database,
+            &tool_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(parked.state(), RunState::AwaitingApproval);
+        assert_eq!(adapter.calls(), 0, "nothing runs before the decision");
+
+        // Re-driving the parked run **without** a pending call leaves it exactly where it was: a run only
+        // continues on the decision for its own call, and advancing on a decision nobody took is the one
+        // thing the parked arm must never do.
+        let still_parked = execute_run_with_tools(
+            &database,
+            &tool_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("re-drive: {error}"));
+        assert_eq!(
+            still_parked.state(),
+            RunState::AwaitingApproval,
+            "a re-drive with no decision must leave the run parked"
+        );
+        assert_eq!(adapter.calls(), 0, "and the effect still must not run");
     }
 }

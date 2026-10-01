@@ -255,6 +255,7 @@ async fn start_run(
                     if let Err(error) = crate::executor::execute_run_with_tools(
                         &database,
                         executor.model(),
+                        executor.model_id(),
                         tools.as_ref(),
                         &run_id,
                     )
@@ -483,16 +484,23 @@ async fn resume_call(
         );
     };
 
+    let arguments = body.arguments;
     match tools
         .resume(
             &call_id,
-            body.arguments,
+            arguments.clone(),
             &actor,
             jarvis_core::CorrelationId::new(),
         )
         .await
     {
         Ok(crate::tool_pipeline::ToolPipelineOutcome::Executed(result)) => {
+            // The effect ran. A run that parked on this call must now **answer**, or the conversation
+            // stops with an executed effect and a user still waiting. The continuation is spawned rather
+            // than awaited for the same reason `start_run` spawns: the outcome is already durable and the
+            // run identifier is known, so a continuation that fails leaves a run visibly unfinished
+            // rather than a response that claims a completion it did not make.
+            continue_parked_run(&state, stored.run_id(), &call_id).await;
             (StatusCode::OK, Json(tool_call_reply(&result))).into_response()
         }
         // A resumed call cannot be held again: the approval is what released it. Reaching `AwaitingApproval`
@@ -534,6 +542,65 @@ async fn resume_call(
             )
         }
     }
+}
+
+/// Continues a run that parked on a tool call the resume route has just executed.
+///
+/// # Why the run needs this and the call does not
+///
+/// The resume route executes the effect through `ToolPipeline::resume`, which settles the **call**. The
+/// **run** is a separate lifecycle: a run parked at `AwaitingApproval` on a held call stays there until
+/// something drives it forward, and without this the effect happens and the conversation never produces
+/// its answer. This is that step, and it is the reason `P3-022` recorded "a held call parks the run" as a
+/// limit rather than a completion.
+///
+/// # Why it is spawned rather than awaited, and why a non-parked run is a no-op
+///
+/// The effect is already durable and the run identifier is the call's own, so the client's `200` does not
+/// need to wait for a model call — the same reasoning `start_run` gives. A run that is **not** parked is
+/// left alone: a client may resume a call from a run that was since cancelled or failed, and driving a
+/// settled run is refused by the domain, so this is entered only for a live `AwaitingApproval` run and
+/// otherwise does nothing. With no executor composed there is nothing to drive, which is a profile
+/// property rather than an error.
+async fn continue_parked_run(state: &GatewayState, run_id: &str, call_id: &str) {
+    let Some(executor) = &state.executor else {
+        return;
+    };
+
+    // Only a parked run is continued. Read first so a settled or non-parked run never reaches the
+    // spawn, which keeps "resume always answers" from turning into "resume re-drives a run it should
+    // not" — the domain would refuse the second drive, but reaching for it at all is the mistake.
+    let parked = match state.runs.read(run_id).await {
+        Ok(reply) => reply.state == jarvis_core::RunState::AwaitingApproval,
+        Err(_) => false,
+    };
+    if !parked {
+        return;
+    }
+
+    let database = Arc::clone(&state.database);
+    let executor = Arc::clone(executor);
+    let tools = state.tools.clone();
+    let run_id = run_id.to_owned();
+    let call_id = call_id.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = crate::executor::resume_run_with_tools(
+            &database,
+            executor.model(),
+            executor.model_id(),
+            tools.as_ref(),
+            &run_id,
+            &call_id,
+        )
+        .await
+        {
+            tracing::error!(
+                run_id,
+                error = %error,
+                "the resumed run could not be driven to a terminal state"
+            );
+        }
+    });
 }
 
 /// `POST /api/v1/approvals/{id}/decision`

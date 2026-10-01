@@ -2097,6 +2097,96 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       with no selection rule (fine at the current tool count, named in `ADR-0119` as the condition for a
       selection or pagination rule); and no live provider has been called, so the loop is proven against the
       scripted adapter and the offline wire fixtures, not a real streaming provider.
+- [x] `P3-023` Continue the run a decided approval released: a paused conversation must produce its answer.
+      **THE LIMIT `P3-022` RECORDED, CLOSED.** `P3-022` parked a run at `AwaitingApproval` when a tool call
+      was held; the approval and resume routes executed the decided effect, but **nothing advanced the run**
+      — it stayed at `AwaitingApproval` with its effect already made and its user still waiting. A
+      conversation that paused for approval never finished.
+      **Delivered:** `apps/jarvisd` gains `resume_run_with_tools` (a second entry point sharing one loop
+      body) and `resume_held_call` (reads the decided call's outcome, feds it back as a **fenced**
+      observation, and re-enters the model call); `gateway.rs`'s `resume_call` now spawns
+      `continue_parked_run` so the run answers after the route executes the effect. Context assembly was
+      split into `assemble_context_messages` (returns the messages) from the transition that moved the run,
+      so the resume reuses it.
+      **⭐⭐ A STATE-MACHINE VIOLATION, FOUND BY A TEST.** The first `park_for_approval` advanced
+      `Executing → AwaitingApproval` and was refused by the domain (`run: the agent run transition was
+      refused`). **The documented table has `Planning → AwaitingApproval` and NOT `Executing →
+      AwaitingApproval`** — a hold is decided when the run *plans* a step, not while one is *running*, and a
+      model call runs in `Executing`. Fixed by walking the legal path and narrating the hold honestly:
+      `Executing → Observing → Planning → AwaitingApproval`. **A shortcut to a legal state by an illegal
+      path is not a state-machine fix; the table encoded the semantics.**
+      **⭐⭐ THE RUN CONTINUATION MUST NOT RE-RUN THE CALL.** The resume **route** owns the effect
+      (`ToolPipeline::resume` refuses any call past `requested`, `P3-012c`). The first version resumed the
+      call from inside the executor too — a test caught it as *"the approved effect must happen exactly
+      once — left: 0"*, because the route had not run yet in the test. The fix separates the two: the route
+      executes, the run continuation **reads** the stored outcome. Two execution paths is how a single
+      effect becomes two; the test asserts the adapter's own call count, not a status.
+      **⭐ A RESUMED RUN RE-ASSEMBLES ITS CONTEXT.** A resumed run begins with an empty loop state, so
+      without re-assembly the model call would be sent *only* the observation — no policy, no objective, no
+      history — and it would answer a message about a tool with no idea what was asked. The test asserts all
+      three are present.
+      **⭐ THE OBSERVATION IS FENCED, NOT A PROVIDER `tool` MESSAGE.** `tool_calls` stores no arguments
+      (`0007`), so the assistant turn that requested a call is not reconstructible and a `tool` result
+      cannot be correlated. The outcome is reported through `IsolatedText` (`ADR-0049`) — the vocabulary
+      for content originating outside JARVIS. **A recorded limit, not an oversight.**
+      **⭐ A RUN PARKED WITH NO PENDING CALL STAYS PARKED.** `recover_interrupted_runs` settles every
+      non-terminal run at startup, so a parked run does not survive a restart; reaching the arm without a
+      pending call means a caller re-drove a run it has no decision for. Advancing there would act on a
+      decision never made. And the route's continuation spawns only when the run **is** parked, so a
+      resume of a settled run is a no-op. **`ADR-0120`.** Gates: fmt, clippy `-D warnings`, `cargo test
+      --workspace --all-features --locked` (adds 2 daemon park/resume tests, 112 daemon tests total), `cargo
+      deny check` ok.
+      **Limits, recorded rather than glossed:** the continuation is **in-memory**, so an approval decided
+      *after a daemon restart* finds no parked run — persisted approval across a restart is the `P6`
+      workflow slice; a resumed run **answers** over the observation rather than re-planning (so it cannot
+      chain a second tool call within the same resume); and the observation is fenced data, not a provider
+      `tool` message, per the `0007` decision.
+- [x] `P3-024` Compose the live model provider from configuration: a configured profile must answer a run
+      with a real model instead of the scripted one.
+      **THE `P3-022`/`P3-023` LIMIT, CLOSED.** Both slices recorded the same limit — *"no live provider has
+      been called"*. The `openai-compatible` adapter existed and passed offline wire fixtures, but **nothing
+      in a running daemon could select it**: `executor_model` was compared against one scripted constant, so
+      a user could install JARVIS, hold a conversation, and receive a deterministic scripted answer with no
+      configuration key that changed that.
+      **Delivered:** `jarvis-storage`'s `DaemonConfig` gains `executor_base_url`, `executor_model_name`, and
+      `executor_api_key_ref` with matching environment variables and three validation rules;
+      `LIVE_PROVIDER_MODEL_NAME` (`"openai-compatible"`) is the single spelling that selects the adapter,
+      exported so configuration validation and the composition root cannot disagree. `jarvisd` gains
+      `compose_executor` and `compose_model_provider`; `Executor::build(name, provider)` dispatches on the
+      name and validates each coordinate through the adapter's own constructors. The configured `model_id`
+      is threaded through every executor entry point rather than hardcoded.
+      **⭐⭐ THE KEY IS A FILE PATH, NEVER A VALUE.** `to_toml` round-trips a profile and `Debug` is derived,
+      so a key **field** would be republished by the very operations that exist to *inspect* configuration
+      — and a committed config would contain a live credential. `executor_api_key_ref` is a `PathBuf` read
+      **once** at composition; the file's contents never become a `DaemonConfig` field, so they cannot reach
+      `to_toml`, the derived `Debug`, or the SQLite profile row. **`ADR-0121`.**
+      **⭐ A PARTIAL PROVIDER IS REFUSED, NOT COMPLETED FROM DEFAULTS.** Each field is independently optional,
+      which is what makes a half-configured provider *start cleanly and fail on the first run with a vendor
+      error instead of a local one*. `IncompleteModelProvider` refuses the live implementation without all
+      three coordinates; `ModelProviderWithoutImplementation` refuses coordinates with no implementation —
+      the opposite error, a settings block with no effect that makes an operator believe their setting is
+      used. The default is "refuse to start", because a daemon whose provider is half-configured is a daemon
+      whose answers cannot be trusted.
+      **⭐ THE RELATIVE PATH IS REFUSED AT LOAD.** Resolved against a service's working directory, "which
+      file?" would depend on the process; `RelativeModelApiKeyRef` answers it once, where the operator can
+      see the error.
+      **⭐ AN ERROR ABOUT A CREDENTIAL IS A PLACE A CREDENTIAL GETS PRINTED.** `InvalidProviderField` names
+      the **field** and not the value, and `Executor`'s `Debug` is hand-written to redact it, so `{:?}` on
+      the composed executor is safe by construction rather than by discipline. **Two tests pin this with
+      distinct canaries**: a key that is actually a URL is refused while the error renders no part of it,
+      and `format!("{executor:?}")` on a composed live executor contains the model id and no credential —
+      the latter fails if the hand-written `Debug` is ever replaced by a derive.
+      Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` (adds 7 executor
+      composition tests and 4 configuration tests; 119 daemon tests), `cargo deny check` ok.
+      **Limits, recorded rather than glossed:** **no live provider was called by any test** — composition is
+      proven against the scripted adapter and the adapter's own constructor validation, so a live smoke
+      against Ollama or OpenAI remains opt-in and credential-gated; the key file is read **once at startup**
+      and a rotation on disk needs a restart; there is **no keyring integration** (the path is a plain file
+      path); there is **no per-model or per-session routing** (one composed executor, one credential); and
+      `executor_model` selects the transport while `executor_model_name` is the id sent to the provider, so
+      an operator must set both. Two stale statements were corrected alongside: the scripted model's answer
+      text and the `SCRIPTED_MODEL_NAME` doc comment both told the reader to set `executor_model` "once a
+      provider adapter is available", which this slice makes false.
 
 ## P4: Memory And Context
 

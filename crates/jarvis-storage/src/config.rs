@@ -19,6 +19,14 @@ use crate::{
 /// The configuration schema understood by this build.
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
+/// The `executor_model` value that selects the live OpenAI-compatible provider.
+///
+/// Exposed so the daemon's composition site and this validation agree on one spelling rather than two
+/// copies of a literal that must match — the defect class this repository keeps finding, where two values
+/// that have to agree have nothing holding both. The deterministic `scripted` implementation is the other
+/// value `executor_model` accepts, and it is named where it is built.
+pub const LIVE_PROVIDER_MODEL_NAME: &str = "openai-compatible";
+
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_SHUTDOWN_TIMEOUT_SECONDS: u16 = 300;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -103,6 +111,35 @@ pub struct DaemonConfig {
     /// typo cannot silently leave every run unexecuted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executor_model: Option<String>,
+    /// The model identifier a **live** provider is asked for.
+    ///
+    /// Distinct from [`Self::executor_model`], which selects a built-in **implementation**. This is the
+    /// name the provider knows the model by (`gpt-oss:20b`, `llama3.2`, `qwen2.5`), and a self-hosted
+    /// server serves whatever its operator pulled. Required when the selected implementation is a live
+    /// provider, refused when it is not — a setting with no consumer is the shape this repository removes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_model_name: Option<String>,
+    /// The base URL a **live** provider is called at, including its version path (`https://host/v1`).
+    ///
+    /// # Why no credential may appear here
+    ///
+    /// A key placed in a URL is a substring of every log line, access log, and referrer it passes
+    /// through — the mistake `jarvis-models`'s `BaseUrl` is built to reject. So the URL carries only the
+    /// endpoint and the key is read from [`Self::executor_api_key_ref`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_base_url: Option<String>,
+    /// A **file** whose contents are the provider API key, read once at daemon startup.
+    ///
+    /// # Why a path and not the key
+    ///
+    /// The key is deliberately **not** in this document. A configuration file is plaintext, is routinely
+    /// read by tooling and pasted into support bundles, and a credential in it is a credential in every
+    /// copy of it. A path names a file the operator controls with its own permissions, and the key never
+    /// enters the configuration, a log line, or an error message — the daemon reads it into the adapter's
+    /// own redacting [`jarvis_models::openai::ApiKey`] and nowhere else. The path must be absolute, so it
+    /// resolves the same wherever the daemon is started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_api_key_ref: Option<PathBuf>,
     /// The absolute directories the read-only filesystem tool is confined to.
     ///
     /// # Why this is configuration and not derived
@@ -165,9 +202,42 @@ impl DaemonConfig {
     }
 
     /// Returns the configured executor model name, when one is set.
+    ///
+    /// This selects the built-in **implementation** (`scripted`, `openai-compatible`), not the provider's
+    /// model identifier — see [`Self::executor_model_name`].
     #[must_use]
     pub fn executor_model(&self) -> Option<&str> {
         self.executor_model.as_deref()
+    }
+
+    /// Returns the provider model identifier a live provider is asked for, when set.
+    #[must_use]
+    pub fn executor_model_name(&self) -> Option<&str> {
+        self.executor_model_name.as_deref()
+    }
+
+    /// Returns the base URL a live provider is called at, when set.
+    #[must_use]
+    pub fn executor_base_url(&self) -> Option<&str> {
+        self.executor_base_url.as_deref()
+    }
+
+    /// Returns the file whose contents are the provider API key, when set.
+    #[must_use]
+    pub fn executor_api_key_ref(&self) -> Option<&Path> {
+        self.executor_api_key_ref.as_deref()
+    }
+
+    /// Returns whether every live-provider setting is present.
+    ///
+    /// All three are required together: a live implementation needs a model identifier, an endpoint, and a
+    /// credential. Partial configuration is refused by [`Config::validate`] rather than discovered when the
+    /// first run is started.
+    #[must_use]
+    pub fn has_complete_provider(&self) -> bool {
+        self.executor_model_name.is_some()
+            && self.executor_base_url.is_some()
+            && self.executor_api_key_ref.is_some()
     }
 
     /// Returns the absolute directories the read-only filesystem tool is confined to.
@@ -192,6 +262,9 @@ impl Default for DaemonConfig {
             // Off by default: a daemon that executes runs without being asked to would spend a
             // model budget nobody enabled.
             executor_model: None,
+            executor_model_name: None,
+            executor_base_url: None,
+            executor_api_key_ref: None,
             // Empty: no filesystem tool is registered until an operator grants roots.
             tool_workspace_roots: Vec::new(),
             // Not served: an inbound MCP endpoint is opt-in, deliberately.
@@ -358,6 +431,33 @@ impl Config {
         // with a port that cannot answer anything.
         if self.daemon.mcp_serve_port.is_some() && self.daemon.tool_workspace_roots.is_empty() {
             return Err(ConfigError::McpServeWithoutTools);
+        }
+        // The live-provider settings are grouped: they are meaningful together and each is meaningless
+        // alone. Three cases are refused rather than tolerated, because each would otherwise be a daemon
+        // that started and then failed — or worse, quietly drove nothing:
+        //
+        // - **a live implementation with no provider coordinates** cannot call anything;
+        // - **provider coordinates with no live implementation** are settings with no consumer (the shape
+        //   that reads as configured while doing nothing), which is why they are refused rather than
+        //   ignored;
+        // - **a base URL with no key file**, or the reverse, is half a credential — the provider would
+        //   reject every call at runtime rather than at startup.
+        let live = self.daemon.executor_model.as_deref() == Some(LIVE_PROVIDER_MODEL_NAME);
+        let has_coordinates = self.daemon.executor_model_name.is_some()
+            || self.daemon.executor_base_url.is_some()
+            || self.daemon.executor_api_key_ref.is_some();
+        if live && !self.daemon.has_complete_provider() {
+            return Err(ConfigError::IncompleteModelProvider);
+        }
+        if !live && has_coordinates {
+            return Err(ConfigError::ModelProviderWithoutImplementation);
+        }
+        // The path must be absolute so it resolves the same wherever the daemon is started, the same rule
+        // the configuration path itself follows.
+        if let Some(path) = &self.daemon.executor_api_key_ref
+            && !path.is_absolute()
+        {
+            return Err(ConfigError::RelativeModelApiKeyRef);
         }
         Ok(())
     }
@@ -570,6 +670,33 @@ pub enum ConfigError {
          an MCP server"
     )]
     McpServeWithoutTools,
+    /// A live provider implementation was selected without its coordinates.
+    ///
+    /// Refused at startup rather than left to fail on the first run: an operator who selected the live
+    /// provider but supplied no endpoint, model, or key would otherwise get a daemon that reports itself
+    /// ready and then fails every run.
+    #[error(
+        "daemon.executor_model = openai-compatible requires daemon.executor_model_name, \
+         daemon.executor_base_url, and daemon.executor_api_key_ref"
+    )]
+    IncompleteModelProvider,
+    /// Provider coordinates were supplied without a live implementation to consume them.
+    ///
+    /// Refused because a setting with no consumer reads as configured while doing nothing — the shape this
+    /// repository removes wherever it finds it. It also catches the common mistake of setting the provider
+    /// fields and leaving `executor_model` unset, which would otherwise leave every run unexecuted.
+    #[error(
+        "daemon.executor_model_name, daemon.executor_base_url, and daemon.executor_api_key_ref require \
+         daemon.executor_model = openai-compatible"
+    )]
+    ModelProviderWithoutImplementation,
+    /// The API key file path was not absolute.
+    ///
+    /// Refused for the same reason the configuration path is: a relative path resolves against the
+    /// process's working directory, so the daemon would read a different file depending on where it was
+    /// started — or none at all.
+    #[error("daemon.executor_api_key_ref must be an absolute path")]
+    RelativeModelApiKeyRef,
     /// A prefixed environment key is not part of the explicit override contract.
     #[error("unknown configuration environment variable: {key}")]
     UnknownEnvironmentKey {
@@ -666,6 +793,9 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "http_enabled",
                 "http_port",
                 "executor_model",
+                "executor_model_name",
+                "executor_base_url",
+                "executor_api_key_ref",
                 "tool_workspace_roots",
                 "mcp_serve_port",
             ],
@@ -787,9 +917,14 @@ where
                     );
             }
             _ => {
-                return Err(ConfigError::UnknownEnvironmentKey {
-                    key: bounded_identifier(key),
-                });
+                // The live-provider variables are handled by a helper, so this function stays about the
+                // handful of core lifecycle settings rather than growing a match arm per provider field.
+                // A `false` return means the key is not one this build recognizes, which fails closed.
+                if !apply_provider_environment(&mut config.daemon, key, &value)? {
+                    return Err(ConfigError::UnknownEnvironmentKey {
+                        key: bounded_identifier(key),
+                    });
+                }
             }
         }
     }
@@ -800,6 +935,53 @@ fn environment_text<'a>(value: &'a OsString, key: &'static str) -> Result<&'a st
     value
         .to_str()
         .ok_or(ConfigError::InvalidEnvironmentValue { key })
+}
+
+/// Applies the live-provider environment variables, returning whether the key was one of them.
+///
+/// Extracted so [`apply_environment`] does not grow an arm per provider field: the three variables are a
+/// group (they configure one thing) and handling them together keeps that grouping visible. Each is refused
+/// when empty rather than treated as unset, for the reason stated on `JARVIS_EXECUTOR_MODEL`: an empty value
+/// reads as "set this" and would otherwise silently leave the provider half-configured.
+fn apply_provider_environment(
+    daemon: &mut DaemonConfig,
+    key: &str,
+    value: &OsString,
+) -> Result<bool, ConfigError> {
+    match key {
+        "JARVIS_EXECUTOR_MODEL_NAME" => {
+            let name = environment_text(value, "JARVIS_EXECUTOR_MODEL_NAME")?;
+            if name.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvironmentValue {
+                    key: "JARVIS_EXECUTOR_MODEL_NAME",
+                });
+            }
+            daemon.executor_model_name = Some(name.to_owned());
+        }
+        "JARVIS_EXECUTOR_BASE_URL" => {
+            let url = environment_text(value, "JARVIS_EXECUTOR_BASE_URL")?;
+            if url.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvironmentValue {
+                    key: "JARVIS_EXECUTOR_BASE_URL",
+                });
+            }
+            // The raw text is stored rather than a trimmed copy: a URL with surrounding whitespace would be
+            // a different endpoint, and `BaseUrl::new` trims and validates it at construction, so storing
+            // the raw value keeps the configuration and the adapter from disagreeing about what was set.
+            daemon.executor_base_url = Some(url.to_owned());
+        }
+        "JARVIS_EXECUTOR_API_KEY_REF" => {
+            let path = environment_text(value, "JARVIS_EXECUTOR_API_KEY_REF")?;
+            if path.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvironmentValue {
+                    key: "JARVIS_EXECUTOR_API_KEY_REF",
+                });
+            }
+            daemon.executor_api_key_ref = Some(PathBuf::from(path));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn is_valid_profile_name(value: &str) -> bool {
@@ -947,6 +1129,149 @@ shutdown_timeout_seconds = 30
         assert_eq!(loaded.config().profile().name(), "work");
         assert_eq!(loaded.config().logging().level(), LogLevel::Debug);
         assert_eq!(loaded.config().daemon().shutdown_timeout_seconds(), 45);
+    }
+
+    /// A config that selects the live provider reads all four settings, from the document and the
+    /// environment, with the environment winning.
+    #[test]
+    fn the_live_provider_model_is_configurable_from_document_and_environment() {
+        // The key path must be absolute **on the platform running the test**, because validation refuses a
+        // relative one and a Unix path is relative on Windows — the platform-fixture trap this workspace
+        // has recorded before. Forward slashes are used on both, because a Windows path with backslashes
+        // inside a TOML **basic** string is an escape sequence and would make the document invalid rather
+        // than test the path rule; `C:/...` is still an absolute Windows path.
+        let key_path = if cfg!(windows) {
+            "C:/jarvis/model.key"
+        } else {
+            "/etc/jarvis/model.key"
+        };
+        let document = format!(
+            r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+executor_model = "openai-compatible"
+executor_model_name = "gpt-oss:20b"
+executor_base_url = "http://127.0.0.1:11434/v1"
+executor_api_key_ref = "{key_path}"
+"#
+        );
+        let loaded =
+            Config::parse_with_environment(&document, [("JARVIS_EXECUTOR_MODEL_NAME", "llama3.2")])
+                .unwrap_or_else(|error| {
+                    panic!("a complete live-provider config must load: {error}")
+                });
+
+        let daemon = loaded.config().daemon();
+        assert_eq!(
+            daemon.executor_model(),
+            Some(LIVE_PROVIDER_MODEL_NAME),
+            "the implementation selector must be read"
+        );
+        assert_eq!(
+            daemon.executor_model_name(),
+            Some("llama3.2"),
+            "the environment must override the document's provider model"
+        );
+        assert_eq!(
+            daemon.executor_base_url(),
+            Some("http://127.0.0.1:11434/v1"),
+            "the base URL must round-trip"
+        );
+        assert_eq!(
+            daemon.executor_api_key_ref(),
+            Some(Path::new(key_path)),
+            "the API key **file** path must round-trip, and it must be a path not the key"
+        );
+        assert!(
+            daemon.has_complete_provider(),
+            "all three provider coordinates must be present"
+        );
+    }
+
+    /// **The live implementation without its coordinates is refused at startup.**
+    #[test]
+    fn a_live_provider_without_coordinates_is_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+executor_model = "openai-compatible"
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a live provider with no endpoint, model, or key must be refused")
+            });
+        assert_eq!(error, ConfigError::IncompleteModelProvider);
+    }
+
+    /// **Provider coordinates with no live implementation are refused rather than ignored.**
+    ///
+    /// A setting with no consumer reads as configured while doing nothing, which is exactly the mistake an
+    /// operator makes when they set the provider fields and forget `executor_model`.
+    #[test]
+    fn provider_coordinates_without_the_implementation_are_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+executor_model_name = "gpt-oss:20b"
+executor_base_url = "http://127.0.0.1:11434/v1"
+executor_api_key_ref = "/etc/jarvis/model.key"
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| {
+                panic!("provider coordinates with no implementation must be refused")
+            });
+        assert_eq!(error, ConfigError::ModelProviderWithoutImplementation);
+    }
+
+    /// The API key file path must be absolute, for the same reason the configuration path must be.
+    #[test]
+    fn a_relative_api_key_path_is_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+executor_model = "openai-compatible"
+executor_model_name = "gpt-oss:20b"
+executor_base_url = "http://127.0.0.1:11434/v1"
+executor_api_key_ref = "model.key"
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| panic!("a relative key path must be refused"));
+        assert_eq!(error, ConfigError::RelativeModelApiKeyRef);
     }
 
     #[test]

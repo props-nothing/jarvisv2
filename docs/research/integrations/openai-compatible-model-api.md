@@ -201,3 +201,59 @@ Ollama streaming fixture: if the adapter cannot decode a real local-server strea
   "no credential required" versus "credential required" is not yet decided.
 - Streaming cancellation semantics (whether aborting the HTTP request stops provider
   billing) are not documented in the sources consulted.
+
+## Live Composition Configuration (added 2026-10-01)
+
+This section records the **configuration contract** for reaching the adapter from a
+running daemon. It adds no provider capability; it decides where a key comes from,
+which is the part of an external integration that a codebase's own rules govern.
+
+### Configuration keys
+
+Flat on the `daemon` document, all `Option` so a profile without a live provider is
+simply absent rather than defaulted:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `executor_model` | string | selects the implementation; `openai-compatible` is the live one |
+| `executor_base_url` | string | provider base URL, e.g. `http://localhost:11434/v1` |
+| `executor_model_name` | string | the model **id** sent to the provider |
+| `executor_api_key_ref` | path | path to a **file** holding the key, absolute |
+
+Environment equivalents, handled by `apply_provider_environment`:
+`JARVIS_EXECUTOR_MODEL_NAME`, `JARVIS_EXECUTOR_BASE_URL`,
+`JARVIS_EXECUTOR_API_KEY_REF`. An **environment variable holding the key itself is
+deliberately not supported** — the environment can name a file, but the key is read
+from disk. The same reasoning as the repo's provider-env convention: a key in an
+environment variable leaks into process listings and crash dumps, and only the path
+needs to be a supported input.
+
+### Validation rules (each is a refusal, not a default)
+
+- `openai-compatible` selected without all three coordinates → `IncompleteModelProvider`.
+  A **partial** provider is the dangerous shape: each field optional independently
+  looks configured, starts cleanly, and fails on the first run with a vendor error
+  instead of a local one.
+- Any provider coordinate present without `openai-compatible` → `ModelProviderWithoutImplementation`.
+  A settings block with no effect is the "accepted and silently ignored" defect.
+- A relative `executor_api_key_ref` → `RelativeModelApiKeyRef`. Resolved against a
+  service's working directory, "which file?" would depend on the process.
+
+### Why a path and not a value
+
+`Config::to_toml` round-trips a profile and `Debug` is derived, so a key **field** would
+be republished by the routine operations that exist to *inspect* configuration. A path
+the operator chose is safe in both. The adapter's own `ApiKey` still validates the
+*value* it is handed (empty, whitespace, or a pasted URL is refused, naming the field
+and never the value), and `Executor`'s `Debug` is hand-written to redact it.
+
+### Verification
+
+The live adapter is **not** called by any default test. Composition is covered by
+executor tests that assert the scripted executor serves its own id with no provider,
+that the live name with valid coordinates reports the configured model, and that a
+missing config, an invalid coordinate, and an unknown name each refuse — with the
+invalid-coordinate test asserting the malformed value does not appear in the error.
+A live smoke against Ollama or OpenAI remains opt-in and credential-gated, per the
+plan above.
+

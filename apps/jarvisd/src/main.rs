@@ -18,7 +18,7 @@ mod tool_pipeline;
 #[cfg(test)]
 mod approval_fixture;
 
-use std::{env, future::Future, io, path::Path, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{env, fs, future::Future, io, path::Path, path::PathBuf, process::ExitCode, sync::Arc};
 
 use jarvis_core::{
     DAEMON_LOCK_FILE_NAME, DaemonRunId, LocalEndpoint, LocalListener, SystemClock, UtcTimestamp,
@@ -84,6 +84,23 @@ enum DaemonError {
         #[source]
         source: executor::ExecutorBuildError,
     },
+    /// The file named by `daemon.executor_api_key_ref` could not be read.
+    ///
+    /// The path is **not** echoed in the message and the source is kept for a log, because a file error's
+    /// text names the path and a startup error reaches an operator's console. The operator knows which path
+    /// they configured.
+    #[error("the model provider API key file could not be read")]
+    ModelApiKeyFile {
+        /// Why the file could not be read.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The file named by `daemon.executor_api_key_ref` was empty or whitespace only.
+    ///
+    /// Refused rather than passed to the adapter, which would reject it with a message about the key's shape
+    /// rather than about the file the operator supplied.
+    #[error("the model provider API key file is empty")]
+    ModelApiKeyEmpty,
     #[error("a tool workspace root could not be granted")]
     ToolWorkspaceRoots {
         /// Why the grant was refused, which names the root and the reason.
@@ -359,18 +376,12 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         .http_enabled()
         .then(|| loaded_config.config().daemon().http_port());
 
-    // The executor model is resolved HERE, so an unimplemented name stops the daemon at startup
-    // with an actionable error rather than being discovered when the first run is started and
-    // leaving a run that is accepted but never driven.
-    let executor = match loaded_config.config().daemon().executor_model() {
-        Some(name) => Some(Arc::new(executor::Executor::build(name).map_err(
-            |error| DaemonError::ExecutorModel {
-                name: name.to_owned(),
-                source: error,
-            },
-        )?)),
-        None => None,
-    };
+    // The executor is composed HERE, so an unimplemented name — or a live provider with unusable
+    // coordinates — stops the daemon at startup with an actionable error rather than being discovered when
+    // the first run is started and leaving a run that is accepted but never driven. Extracted as its own
+    // function because the live provider adds a file read and a credential, and `start` was already at the
+    // length where clippy's `too_many_lines` signals a function carrying a second responsibility.
+    let executor = compose_executor(loaded_config.config().daemon())?;
 
     // The tool pipeline and MCP host are composed HERE, for the same reason the executor is: an unusable
     // workspace grant must stop the daemon at startup rather than be discovered by the first tool call.
@@ -407,6 +418,86 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
+}
+
+/// Reads the live provider coordinates from configuration, loading the API key from its file.
+///
+/// # Why the key is read here and nowhere else
+///
+/// The key lives in a file the operator controls, never in `config.toml`. This is the one place it is read
+/// into memory, and it is placed straight into the adapter's own redacting [`jarvis_models::openai::ApiKey`]
+/// by `Executor::build` — so it does not enter the configuration, a log line, an error message, or any value
+/// this function returns for display. The read is bounded: the file is refused if it is empty, and the
+/// adapter refuses an oversized one.
+///
+/// # When there is nothing to compose
+///
+/// Returns `None` for a profile whose executor is the deterministic scripted model — it has no provider
+/// coordinates, and configuration already refuses provider settings without `openai-compatible` selected.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::ModelApiKeyFile`] when the file cannot be read and [`DaemonError::ModelApiKeyEmpty`]
+/// when it is blank. Both stop the daemon at startup rather than at the first run.
+fn compose_model_provider(
+    daemon: &jarvis_storage::DaemonConfig,
+) -> Result<Option<executor::ModelProviderConfig>, DaemonError> {
+    // Only the live implementation has coordinates. `validate` guarantees they are complete together, so a
+    // missing one here would mean this ran against an unvalidated config, which is not a state the daemon
+    // reaches — the `.ok_or` is stated rather than unwrapped so a future caller cannot turn it into a panic.
+    let Some(key_ref) = daemon.executor_api_key_ref() else {
+        return Ok(None);
+    };
+    let (Some(base_url), Some(model)) = (daemon.executor_base_url(), daemon.executor_model_name())
+    else {
+        return Ok(None);
+    };
+
+    let key =
+        fs::read_to_string(key_ref).map_err(|source| DaemonError::ModelApiKeyFile { source })?;
+    // Trailing newlines are stripped, because a key file written by an editor almost always ends with one and
+    // a newline inside an `Authorization` header would split it. Interior whitespace is left for the adapter's
+    // `ApiKey` to refuse, so a genuinely malformed value is rejected rather than silently trimmed into a
+    // different one.
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(DaemonError::ModelApiKeyEmpty);
+    }
+    Ok(Some(executor::ModelProviderConfig::new(
+        base_url, model, key,
+    )))
+}
+
+/// Builds the run executor from the daemon configuration.
+///
+/// The live provider's coordinates are read into a carrier here and passed to the factory, which validates
+/// each one through the adapter's own constructors. **The API key is read from the file the operator named
+/// and never enters the configuration, a log line, or the error this returns** — [`executor::Executor`]'s
+/// hand-written `Debug` redacts the credential so a failure cannot print it either.
+///
+/// # When there is nothing to compose
+///
+/// Returns `None` for a profile with no executor model, which is the deterministic scripted default.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::ExecutorModel`] when the name is not one this build implements, and the
+/// [`compose_model_provider`] errors when a configured provider cannot be assembled. Both stop the daemon at
+/// startup rather than at the first run.
+fn compose_executor(
+    daemon: &jarvis_storage::DaemonConfig,
+) -> Result<Option<Arc<executor::Executor>>, DaemonError> {
+    let Some(name) = daemon.executor_model() else {
+        return Ok(None);
+    };
+    let provider = compose_model_provider(daemon)?;
+    let executor = executor::Executor::build(name, provider.as_ref()).map_err(|source| {
+        DaemonError::ExecutorModel {
+            name: name.to_owned(),
+            source,
+        }
+    })?;
+    Ok(Some(Arc::new(executor)))
 }
 
 /// Composes the MCP host and then the tool pipeline, in that order.

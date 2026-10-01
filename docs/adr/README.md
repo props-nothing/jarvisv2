@@ -137,3 +137,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0117](0117-a-skill-is-a-procedure-not-a-permission.md) | A skill is a procedure, not a permission | Accepted |
 | [0118](0118-a-diagnostic-that-contradicts-the-predicate.md) | A diagnostic that contradicts the predicate the platform gates on | Accepted |
 | [0119](0119-the-model-may-request-a-tool-and-rust-decides.md) | The model may request a tool; deterministic policy still decides whether it runs | Accepted |
+| [0120](0120-a-decided-approval-continues-the-run.md) | A decided approval continues the run that parked on it | Accepted |
+| [0121](0121-a-providers-credential-is-a-file-path-not-a-value.md) | A provider's credential is a file path, and a partial provider is refused rather than guessed | Accepted |

@@ -24,7 +24,7 @@ pub use approval_repository::{
 };
 pub use config::{
     CURRENT_CONFIG_VERSION, Config, ConfigError, ConfigMigration, ConfigStore, DaemonConfig,
-    LoadedConfig, LoggingConfig, ProfileConfig,
+    LIVE_PROVIDER_MODEL_NAME, LoadedConfig, LoggingConfig, ProfileConfig,
 };
 pub use credential::{CREDENTIAL_FILE_NAME, CredentialStore, CredentialStoreError};
 pub use database::{
