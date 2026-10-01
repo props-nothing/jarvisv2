@@ -214,3 +214,211 @@ fn routing_names_an_account_to_read_and_never_a_credential() {
     // reference is what travels, which is why the reference is opaque and case-constrained.
     assert!(!named.as_str().contains('@'));
 }
+
+/// Builds a Pub/Sub push body whose `message.data` decodes to a Gmail notification.
+///
+/// Uses the crate's own base64url encoder rather than a literal, so the fixture is the documented shape without
+/// a hand-encoded blob that could drift from it.
+fn delivery_body(address: &str, history_id: &str, message_id: Option<&str>) -> String {
+    let payload = format!(r#"{{"emailAddress":"{address}","historyId":"{history_id}"}}"#);
+    let data = crate::base64::url_safe_no_pad(payload.as_bytes());
+    match message_id {
+        Some(id) => format!(
+            r#"{{"message":{{"data":"{data}","messageId":"{id}"}},"subscription":"projects/p/subscriptions/s"}}"#
+        ),
+        None => format!(
+            r#"{{"message":{{"data":"{data}"}},"subscription":"projects/p/subscriptions/s"}}"#
+        ),
+    }
+}
+
+#[test]
+fn a_routable_delivery_is_the_one_gmail_outcome_that_syncs() {
+    // The happy path: the body parses, the address matches exactly, and the outcome carries the account, the
+    // stated position, and the dedupe key.
+    let accounts = [account("acct-1", "person@example.invalid")];
+    let body = delivery_body(
+        "person@example.invalid",
+        "9876543210",
+        Some("2070443601311540"),
+    );
+    let outcome = ingest_gmail_delivery(&body, &accounts);
+    assert_eq!(
+        outcome,
+        GmailIngest::Changed {
+            account: reference("acct-1"),
+            history_id: "9876543210".to_owned(),
+            message_id: Some("2070443601311540".to_owned()),
+        }
+    );
+    assert_eq!(
+        outcome.account_to_sync().map(AccountReference::as_str),
+        Some("acct-1")
+    );
+    // A routed delivery is **accepted**, so the subscription stops redelivering it.
+    assert_eq!(outcome.acknowledgement(), DeliveryAck::Accept);
+}
+
+#[test]
+fn an_unroutable_delivery_carries_its_reason_and_is_acknowledged() {
+    // The three unroutable routes. All acknowledge because the account set is a **local** fact — another attempt
+    // changes nothing — and a negative ack is subscription-global (`ADR-0094`). But the route is carried, because
+    // `CaseDiffers` and `Ambiguous` are actionable signals that must not be silently dropped.
+    let accounts = [account("acct-1", "person@example.invalid")];
+    // No account holds this address at all.
+    let unknown = ingest_gmail_delivery(
+        &delivery_body("other@example.invalid", "1", None),
+        &accounts,
+    );
+    assert_eq!(unknown, GmailIngest::Unroutable(DeliveryRoute::Unknown));
+    assert_eq!(
+        unknown.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    assert_eq!(unknown.account_to_sync(), None);
+    // A case-only near-match: reported, never applied automatically.
+    let case_differs = ingest_gmail_delivery(
+        &delivery_body("Person@Example.Invalid", "1", None),
+        &accounts,
+    );
+    assert_eq!(
+        case_differs,
+        GmailIngest::Unroutable(DeliveryRoute::CaseDiffers { accounts: 1 })
+    );
+    assert_eq!(
+        case_differs.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    // Two accounts for one address: a registration defect, undecidable without a person.
+    let ambiguous = ingest_gmail_delivery(
+        &delivery_body("person@example.invalid", "1", None),
+        &[
+            account("acct-1", "person@example.invalid"),
+            account("acct-2", "person@example.invalid"),
+        ],
+    );
+    assert_eq!(
+        ambiguous,
+        GmailIngest::Unroutable(DeliveryRoute::Ambiguous { accounts: 2 })
+    );
+    assert_eq!(
+        ambiguous.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+}
+
+#[test]
+fn an_unreadable_body_is_distinct_by_layer_and_acknowledged() {
+    // A body that cannot be read stops at the first step, and the **layer** that failed is preserved: a broken
+    // Pub/Sub envelope points at the wire, while a broken Gmail payload inside a good envelope points at the
+    // payload. A single "bad body" would send a caller to the wrong one.
+    let accounts = [account("acct-1", "person@example.invalid")];
+    // Not JSON at all — the envelope.
+    let not_json = ingest_gmail_delivery("not json", &accounts);
+    assert!(matches!(
+        not_json,
+        GmailIngest::Unreadable(GmailBodyError::Envelope(
+            PubsubDeliveryError::NotJson { .. }
+        ))
+    ));
+    // JSON, but not the wrapped shape — the envelope.
+    let no_payload = ingest_gmail_delivery("{}", &accounts);
+    assert_eq!(
+        no_payload,
+        GmailIngest::Unreadable(GmailBodyError::Envelope(
+            PubsubDeliveryError::NoWrappedPayload
+        ))
+    );
+    // A wrapped body whose `data` decodes to something that is not the Gmail payload — the payload layer.
+    let bad_payload = format!(
+        r#"{{"message":{{"data":"{}"}}}}"#,
+        crate::base64::url_safe_no_pad(b"not the documented shape")
+    );
+    let payload = ingest_gmail_delivery(&bad_payload, &accounts);
+    assert_eq!(
+        payload,
+        GmailIngest::Unreadable(GmailBodyError::Payload(
+            PubsubNotificationError::NotTheDocumentedShape
+        )),
+        "a good envelope with a bad payload must report the payload layer, not the envelope"
+    );
+    // Both acknowledge, so a body this connector cannot read is not redelivered forever.
+    for outcome in [not_json, no_payload, payload] {
+        assert_eq!(
+            outcome.acknowledgement(),
+            DeliveryAck::AbandonAndAcknowledge
+        );
+    }
+}
+
+#[test]
+fn the_message_id_is_carried_because_pubsub_delivers_at_least_once() {
+    // `messageId` is the only field that tells a redelivery from a new change, so it is carried for
+    // deduplication. A delivery that omits it is `None` rather than a fabricated id — and `None` means "this may
+    // be a repeat I cannot detect", which a caller must handle differently from a real id.
+    let accounts = [account("acct-1", "person@example.invalid")];
+    let with_id = ingest_gmail_delivery(
+        &delivery_body("person@example.invalid", "5", Some("2070443601311540")),
+        &accounts,
+    );
+    let without_id = ingest_gmail_delivery(
+        &delivery_body("person@example.invalid", "5", None),
+        &accounts,
+    );
+    let id_of = |outcome: &GmailIngest| match outcome {
+        GmailIngest::Changed { message_id, .. } => message_id.clone(),
+        other => panic!("expected a routed change, got {other:?}"),
+    };
+    assert_eq!(
+        id_of(&with_id),
+        Some("2070443601311540".to_owned()),
+        "the provider's message id is carried verbatim"
+    );
+    assert_eq!(
+        id_of(&without_id),
+        None,
+        "an absent id is absent, not invented"
+    );
+}
+
+#[test]
+fn gmail_has_no_handshake_outcome_because_its_opening_notification_is_unmarked() {
+    // **The divergence from `ChannelIngest`, asserted rather than assumed.** The Calendar ingest has a
+    // `Handshake` outcome because `X-Goog-Resource-State: sync` marks its opening message (`ADR-0100`). Gmail's
+    // guide says a successful `watch` *"also immediately sends a notification"* — but that notification is an
+    // **ordinary** one, the same `{emailAddress, historyId}` payload a real change produces, with no marker. So
+    // Gmail's start-of-notifications message is **indistinguishable from a change**: it ingests as `Changed`, and
+    // a `Handshake` variant would claim a distinction the wire does not carry.
+    let accounts = [account("acct-1", "person@example.invalid")];
+    let opening = ingest_gmail_delivery(
+        &delivery_body("person@example.invalid", "1234567890", Some("1")),
+        &accounts,
+    );
+    assert!(
+        matches!(opening, GmailIngest::Changed { .. }),
+        "with no marker on the wire, the opening notification IS a change to the connector"
+    );
+    // The outcome space is exactly the three that exist — read failure, routing failure, routed change — so a
+    // reader cannot find a handshake state here to branch on.
+    let outcomes = [
+        GmailIngest::Unreadable(GmailBodyError::Envelope(
+            PubsubDeliveryError::NoWrappedPayload,
+        )),
+        GmailIngest::Unroutable(DeliveryRoute::Unknown),
+        GmailIngest::Changed {
+            account: reference("acct-1"),
+            history_id: "1".to_owned(),
+            message_id: None,
+        },
+    ];
+    let syncing = outcomes
+        .iter()
+        .filter(|outcome| outcome.account_to_sync().is_some())
+        .count();
+    assert_eq!(syncing, 1, "exactly one of the three outcomes syncs");
+    // And none is a `Retry`: this function decides what the delivery IS, not whether acting on it succeeded, so
+    // the transient-failure answer belongs to the caller that acts.
+    for outcome in &outcomes {
+        assert_ne!(outcome.acknowledgement(), DeliveryAck::Retry);
+    }
+}

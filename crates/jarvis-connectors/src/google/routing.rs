@@ -62,7 +62,9 @@
 //! of a provider fact, which is why each one is argued rather than cited.
 
 use crate::account::{AccountReference, VerifiedAccount};
-use crate::google::pubsub::{DeliveryAck, PubsubNotification};
+use crate::google::pubsub::{
+    DeliveryAck, PubsubDeliveryError, PubsubNotification, PubsubNotificationError, parse_delivery,
+};
 
 /// Which of the connector's known accounts a push delivery names.
 ///
@@ -234,6 +236,164 @@ pub fn route_delivery(
             accounts: case_matches,
         },
         (_, _) => DeliveryRoute::Unknown,
+    }
+}
+
+/// The two ways a push body could not be read, kept apart because they name different layers.
+///
+/// [`crate::google::pubsub::parse_delivery`] already separates the Pub/Sub **envelope** from the Gmail
+/// **payload** inside it, and this type preserves that split rather than flattening it into one string: a
+/// caller debugging a refusal needs to know whether the delivery's wrapper or the payload it carried was
+/// wrong, and a single "bad body" message would send it to the wrong one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GmailBodyError {
+    /// The Pub/Sub envelope was not the documented wrapped shape.
+    Envelope(PubsubDeliveryError),
+    /// The envelope was fine and the Gmail payload inside it was not.
+    Payload(PubsubNotificationError),
+}
+
+/// What ingesting one Gmail notification concluded.
+///
+/// # Why there is no `Handshake` here, and why that is the finding
+///
+/// The Calendar mechanism has a `Handshake` outcome (`ADR-0103`) because its opening message is **marked**: the
+/// guide defines a `sync` state a caller may *"safely ignore"* (`ADR-0100`). **Gmail has no such marker.** Its
+/// guide says a successful `watch` *"immediately sends a notification"*, and that notification is an ordinary
+/// one — the same `{emailAddress, historyId}` payload a real change produces. So **Gmail's start-of-notifications
+/// notification is indistinguishable from a change**, and a type with a `Handshake` variant would claim a
+/// distinction the wire does not carry. This is the deliberate divergence from [`ChannelIngest`]: a value shaped
+/// to have a handshake would invite a caller to detect one.
+///
+/// # Why this is not a `bool`
+///
+/// A `bool` ("acknowledged or not") erases the difference between **a delivery that failed to parse** and **a
+/// delivery routed to a mailbox this connector does not hold**, which need different diagnostics and different
+/// operator action — a broken envelope is a wire fault, while an unknown address is a stray or forged delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GmailIngest {
+    /// The body could not be read into a Pub/Sub delivery carrying a Gmail payload.
+    ///
+    /// Carries the layer that failed. A delivery this connector cannot read is **acknowledged and recorded**, so
+    /// it is not redelivered forever.
+    Unreadable(GmailBodyError),
+    /// The payload named an address none of the connector's accounts hold, or several do.
+    ///
+    /// The route is carried because [`DeliveryRoute::CaseDiffers`] and [`DeliveryRoute::Ambiguous`] are
+    /// **actionable signals** a caller must surface — two accounts for one address is a registration defect, and
+    /// a case-only near-match may be one mailbox, so **neither may be applied automatically**.
+    Unroutable(DeliveryRoute),
+    /// The payload named exactly one account, so a sync is warranted.
+    ///
+    /// Carries the `historyId` the delivery stated (which a sync uses as an **upper bound**, never as a
+    /// position it trusts) and the **message id** because Pub/Sub is **at-least-once**: the same message can
+    /// arrive twice, and `messageId` — the only field that distinguishes a redelivery from a new change — is
+    /// what a caller deduplicates on (`ADR-0094`).
+    Changed {
+        /// The account whose stored credential syncs the mailbox.
+        account: AccountReference,
+        /// The mailbox position the delivery stated, as an upper bound for the sync.
+        history_id: String,
+        /// The Pub/Sub message id: the **deduplication key** for an at-least-once delivery.
+        ///
+        /// `None` when the delivery carried no `messageId`. **Absent is not the same as absent** — a caller that
+        /// needs a dedupe key must treat a missing one as *"this delivery may be a repeat I cannot detect"*,
+        /// which is why the field is an `Option` rather than a defaulted string.
+        message_id: Option<String>,
+    },
+}
+
+impl GmailIngest {
+    /// The answer to send the subscription, so the delivery is acknowledged or redelivered.
+    ///
+    /// # Why `Unreadable` and `Unroutable` acknowledge, and the one case that does not
+    ///
+    /// A malformed body and an address this connector does not hold are **never repaired by another attempt** —
+    /// the payload is what it is and the account set is a **local** fact — so both are acknowledged and recorded,
+    /// because a negative acknowledgement triggers a **subscription-global** backoff for up to 60 seconds
+    /// (`ADR-0094`) and would slow **every other mailbox** for a message that can never become routable. This is
+    /// the same conclusion [`DeliveryRoute::unroutable_acknowledgement`] reaches.
+    ///
+    /// **`Changed` acknowledges too**, and for a different and stronger reason: the delivery routed, so the
+    /// work is *accepted* — acknowledging is exactly what tells Pub/Sub to stop redelivering it. A routable
+    /// delivery is therefore `Accept`, not the `Retry` reserved for a *transient* failure to act on a
+    /// **verified** delivery (a held store, a token refresh in flight), which this function cannot see because
+    /// it decides *what* the delivery is, not whether acting on it succeeded.
+    #[must_use]
+    pub const fn acknowledgement(&self) -> DeliveryAck {
+        match self {
+            Self::Unreadable(_) | Self::Unroutable(_) => DeliveryAck::AbandonAndAcknowledge,
+            Self::Changed { .. } => DeliveryAck::Accept,
+        }
+    }
+
+    /// Returns the account whose credential should sync, when a sync is warranted.
+    ///
+    /// `Some` for [`Self::Changed`] **alone** — the question a caller asks before doing work, named so a missed
+    /// arm reads as "nothing to sync" rather than as a silent default.
+    #[must_use]
+    pub const fn account_to_sync(&self) -> Option<&AccountReference> {
+        match self {
+            Self::Changed { account, .. } => Some(account),
+            Self::Unreadable(_) | Self::Unroutable(_) => None,
+        }
+    }
+}
+
+/// Ingests one Gmail push notification: reads the body, routes it, and decides what to do.
+///
+/// # The composition, and the finding that shaped it
+///
+/// This joins [`parse_delivery`] ([`crate::google::pubsub`]) with [`route_delivery`], the Gmail counterpart of
+/// `ingest_channel_delivery` (`ADR-0103`). Composing them is where the **mechanism difference** becomes explicit
+/// rather than assumed: the Calendar ingest has five outcomes including a **`Handshake`**, and this one has
+/// **three with none**, because Gmail's opening notification is not marked and so cannot be told from a change.
+/// A caller that reused `ChannelIngest`'s shape here would be looking for a marker that does not exist.
+///
+/// # The order: read, then route
+///
+/// A body that does not parse into a notification has no address to route, so reading is first. Unlike the
+/// Calendar path there is **no verification step between** them: Gmail's delivery is authenticated by an OIDC
+/// bearer JWT (`ADR-0099`), and **that verifier is not built** — there is no JWKS reader — so this function
+/// decides attribution and *records* that the authentication is outstanding rather than pretending to perform
+/// it. That is the same limit `docs/research/integrations/google.md` records as Unresolved Question 9, and it is
+/// why `GmailIngest` has no `Rejected` variant: nothing can reject on a control that does not exist.
+///
+/// # What it does not do
+///
+/// It does not receive the delivery, verify the JWT, sync anything, or record the drop. It decides, and hands
+/// back the account whose credential the sync must use.
+#[must_use]
+pub fn ingest_gmail_delivery(body: &str, accounts: &[VerifiedAccount]) -> GmailIngest {
+    // 1. Read. `parse_delivery` splits the envelope from the payload, and this preserves which layer failed.
+    let (delivery, notification, _encoding) = match parse_delivery(body) {
+        Ok(parsed) => parsed,
+        Err(error) => return GmailIngest::Unreadable(read_error(error)),
+    };
+    // 2. Route by the address the payload named.
+    let route = route_delivery(&notification, accounts);
+    let Some(account) = route.account() else {
+        // `Unknown`, `Ambiguous` or `CaseDiffers` — all carried, because the last two are actionable signals a
+        // caller must surface rather than silently dropping.
+        return GmailIngest::Unroutable(route);
+    };
+    GmailIngest::Changed {
+        account: account.clone(),
+        history_id: notification.history_id,
+        message_id: delivery.message_id().map(str::to_owned),
+    }
+}
+
+/// Classifies a `parse_delivery` failure into the layer it came from.
+///
+/// `parse_delivery` returns `PubsubDeliveryError`, whose `Payload` variant **wraps** a
+/// [`PubsubNotificationError`]. `#[from]` makes that wrap a one-way conversion, so this destructures it back
+/// into [`GmailBodyError`] to keep the two layers distinguishable to the caller — the same reason
+/// `parse_delivery`'s own error type nests rather than flattens.
+fn read_error(error: PubsubDeliveryError) -> GmailBodyError {
+    match error {
+        PubsubDeliveryError::Payload(payload) => GmailBodyError::Payload(payload),
+        envelope => GmailBodyError::Envelope(envelope),
     }
 }
 

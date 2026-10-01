@@ -34,11 +34,23 @@
 //!
 //! **`sync` is not a change.** The guide says the API *"sends a `sync` message to indicate that notifications
 //! are starting"* and that *"It's safe to ignore the `sync` notification"*. So the **first** message on a
-//! channel is a handshake, not a resource update — the Calendar counterpart of the Gmail rule that a successful
-//! `watch` *"immediately sends a notification, so the first delivery is not a change"* (`ADR-0092`). A caller
-//! that acted on every delivery would therefore do one spurious read the moment it started watching, and
-//! [`ChannelMessage::is_sync`] is the predicate that prevents it. The `sync` message can also arrive **before**
-//! the `watch` response, so a caller must not assume it holds the channel metadata when the first message lands.
+//! channel is a handshake, not a resource update, and [`ChannelMessage::is_sync`] is the predicate that keeps a
+//! caller from doing one spurious read the moment it starts watching. The `sync` message can also arrive
+//! **before** the `watch` response, so a caller must not assume it holds the channel metadata when the first
+//! message lands.
+//!
+//! # ⚠ The two mechanisms are NOT symmetric here, and an earlier version of this doc claimed they were
+//!
+//! Gmail's guide says a successful `watch` *"also immediately sends a notification"* — so **both** mechanisms
+//! produce an opening message. But **only Calendar marks it**: a Calendar delivery carries
+//! `X-Goog-Resource-State: sync`, a value the guide says may be ignored, while **a Gmail notification carries no
+//! such field at all** — it is the ordinary `{emailAddress, historyId}` payload, byte-for-byte like a change.
+//! So **Gmail's opening notification is indistinguishable from a change**, and a caller cannot skip it the way a
+//! Calendar `sync` message is skipped. A sentence here previously said the Gmail rule was "the first delivery
+//! is not a change", which quoted a source but **overstated what is detectable**: the *cause* (the opening
+//! notification) is real, the *marker* is not, and the two are not the same thing. `google::routing`'s
+//! `GmailIngest` therefore has **no `Handshake` outcome** (`ADR-0104`), and a type shared between the two
+//! mechanisms would invite exactly the mistake this note corrects.
 //!
 //! # Two fields that look interchangeable and are not
 //!

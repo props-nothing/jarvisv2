@@ -53,6 +53,7 @@ pub mod definitions;
 pub mod http;
 pub mod operations;
 pub mod pubsub;
+pub mod recovery;
 pub mod request;
 pub mod revocation;
 pub mod routing;

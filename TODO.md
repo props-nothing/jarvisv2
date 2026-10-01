@@ -5098,6 +5098,97 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     tests, not a running handler. It does not record the drop, sync anything, or deduplicate a redelivery
     (`X-Goog-Message-Number` is read but unused, per `ADR-0100`). The Gmail `OidcIdToken` verifier is still
     unbuilt (Unresolved Question 9), so the Gmail path has no equivalent composition.
+- [ ] `P5-005` **(continued — a cause is not a marker, and the two pushes do not share a state machine)**:
+  `google::routing` gains `GmailIngest { Unreadable(GmailBodyError), Unroutable(DeliveryRoute),
+  Changed{account, history_id, message_id} }`, `GmailBodyError { Envelope, Payload }`, `ingest_gmail_delivery`,
+  and `acknowledgement()`. **5 new tests (so 458 in the crate).** **`ADR-0104`.** Composes the Gmail push path
+  (`ADR-0103`'s counterpart) **and corrects a shipped claim** in `channel.rs`. Two guards falsified A-B-A.
+  - **⭐⭐ THE FINDING: A *CAUSE* IS NOT A *MARKER*.** `ADR-0092`/`ADR-0100` recorded Gmail's rule as *"a
+    successful `watch` immediately sends a notification, **so the first delivery is not a change**"*. Re-fetching
+    the guide (footer **2026-09-15**) to build on it shows only the **first** clause is stated: the notification
+    `watch` sends is an **ordinary** one — the same `{emailAddress, historyId}` payload a change produces, with
+    **no state field**. Google **causes** an opening Gmail notification but **marks** the opening Calendar one
+    (`X-Goog-Resource-State: sync`, *"safe to ignore"*). So *"X is not a Y"* was true of **what happens** and
+    false of **what a consumer can detect**, and a state drawn from that confusion would be one the wire cannot
+    produce. **⭐ Ask of any "X is not a Y" rule: a fact about what happens, or about what the message says
+    happened?**
+  - **⭐⭐ AND THE FALSE CLAIM HAD ALREADY SHIPPED — composition is what surfaced it.** `channel.rs`'s module doc
+    said the Calendar `sync` rule was *"the Calendar counterpart of the Gmail rule"* — attributing to Gmail a
+    detectable handshake it does not have (the `ADR-0074`/`ADR-0096` class, reached from a new direction: the
+    wrong thing was a **comparison between two mechanisms**). Building the Gmail ingest forced the question
+    *"which of `ChannelIngest`'s five variants apply here?"* — and the answer was *four do not, and one of the
+    four is missing for a reason the doc got backwards*. Corrected in place and labelled as a correction.
+  - **⭐ `GmailIngest` HAS THREE VARIANTS AND NO `Handshake`.** Copying `ChannelIngest` would have **invented a
+    state**: with no marker, a `Handshake` variant is unreachable by any input (the "a variant nothing
+    constructs" defect this phase keeps finding) *and* reachable-looking, so a caller would branch on it and
+    believe it was skipping the opening notification. The outcome space is exactly read-failure,
+    routing-failure, routed-change.
+  - **⭐ `Unreadable` KEEPS THE LAYER.** `GmailBodyError::Envelope` (a broken Pub/Sub wrapper) vs `Payload` (a
+    broken Gmail payload inside a good wrapper) — the two point at different layers, and a single "bad body"
+    would send a caller to the wrong one. The failure is destructured back out of `PubsubDeliveryError::Payload`
+    rather than flattened.
+  - **⭐ `message_id` IS CARRIED AS AN `Option`, BECAUSE PUB/SUB IS AT-LEAST-ONCE.** It is the **only** field that
+    tells a redelivery from a new change (`ADR-0094`); `None` means *"this may be a repeat I cannot detect"*,
+    which is why it is not a defaulted string.
+  - **⭐ `acknowledgement()`: `Accept` for a routed change, `AbandonAndAcknowledge` for both failures.** Neither
+    failure is repaired by retrying (the payload is what it is; the account set is local) and a negative ack is
+    subscription-global (`ADR-0094`). **No `Retry`** — this decides *what the delivery IS*, not whether acting on
+    it succeeded, so the transient-failure answer belongs to the caller that acts.
+  - **⭐ NO `Rejected` OUTCOME, AND THE REASON IS A NAMED GAP.** Gmail's delivery is authenticated by an OIDC
+    bearer JWT (`ADR-0099`) and **that verifier is not built** (no JWKS reader, no `aud`/`iss`/`exp`), so there
+    is no control to reject on — inventing the variant would claim a check that does not happen. Unresolved
+    Question 9, still open.
+  - **NEW LIMITS:** **nothing receives the delivery** (no endpoint), so this is a decision with tests; the JWT
+    verification gap stands (the same trust limitation `ADR-0097` records — a forged delivery can select a
+    mailbox to *read*, never a credential, and cannot cause a *missed* change); and the opening Gmail
+    notification still costs **one** spurious sync per `watch`, which is the honest, documented cost of the
+    absent marker rather than something this code can remove.
+- [ ] `P5-005` / `P5-010` **(continued — the documented remedy is two steps, and only the second was a type)**:
+  new `google::recovery` — `CallRecovery { Refresh, Reauth{reason}, NotCredential }`,
+  `RefreshRecovery { RetryCall, RetryCallAndStore, RetryRefresh, Reauth{reason} }`, `TokenState
+  { PossiblyStale, JustRefreshed }`, `recover_from_call`, `recover_from_refresh`. **8 new tests (so 466 in the
+  crate).** **`ADR-0105`.** The first piece of the reauth lifecycle `P5-010` owns. Two guards falsified A-B-A.
+  - **⭐⭐ THE FINDING: THE PROVIDER'S REMEDY IS TWO STEPS AND OUR VOCABULARY NAMED ONLY THE SECOND.** The errors
+    guide, verbatim: *"To fix this error, **refresh the access token** … **If this fails, direct the user through
+    the OAuth flow**."* The connector's `RetryGuidance::Reauthenticate` renders the **second** half as the whole
+    of it — so read literally it sends a user through a consent screen as the **first** response to an **expired
+    token**, exactly the failure a silent refresh repairs. The first step **had no type anywhere**, so the
+    documented sequence was not expressible. **⭐ Generalisation: a remedy enum that names the *last* step of a
+    documented sequence makes the earlier steps unrepresentable.** Ask of any remedy vocabulary: *does it cover
+    the sequence the provider documents, or only its end?*
+  - **⭐⭐ AND ONE ERROR CODE MEANS TWO CAUSES, WHICH ONLY THE PRESCRIBED *FIRST ACTION* SPLITS.** The same page:
+    *"the access token … is either expired or invalid. **Missing authorization for the requested scopes can also
+    cause this error.**"* So `authError` is an expired token (refresh fixes it) **or** a scope the grant never
+    had (only re-consent does) — and the refusal cannot tell them apart. **A refresh can**, because it cannot
+    grant a scope: a call refused with a *fresh* token is not a token problem at all. That is the guide's own
+    *"if this fails"* branch from the other direction, and it is why the decision **takes `TokenState` as an
+    input** rather than deciding from the refusal alone (the inference/decision split the cursor and pub/sub
+    decisions already use).
+  - **⭐ `TokenState` IS A TYPE, NOT A `bool`.** `PossiblyStale` (a refresh may help) vs `JustRefreshed` (a
+    refresh was already tried **in response to this same failure** and the call was refused again). The
+    distinction is a fact about the **attempt**, not about the token, and a `bool` named `refreshed` would read
+    as the latter — which is how the second step gets taken first.
+  - **⭐ `Rotated` CARRIES A STORE OBLIGATION `Refreshed` DOES NOT (`RetryCallAndStore` vs `RetryCall`).** A
+    caller that treats a rotation as an ordinary refresh keeps using a refresh token the provider has already
+    invalidated, and the **next** attempt then reads as a broken account rather than as a missed store.
+    `RefreshOutcome::Rotated` was already its own variant; this is where it reaches a caller as an **action**.
+  - **⭐ `Transient` RETRIES THE *REFRESH*, NOT THE CALL (`RetryRefresh`).** The one non-obvious direction:
+    retrying the *call* with a token that was never obtained fails identically, while retrying the *refresh* is
+    what a rate-limited token endpoint eventually honours.
+  - **⭐ `JustRefreshed` NAMES `ScopeLoss`, NOT `ProviderRefused`.** With the token excluded by freshness, the
+    guide's documented remaining cause is a missing scope; a persistent client-level problem is a
+    *possibility* the refusal does not establish, so the reason named is the documented one rather than the
+    graver-sounding one (`P3-008i`: do not assert a cause you cannot know). The code says the two are **not
+    distinguishable here**.
+  - **⭐ ONLY AN `Authentication` REFUSAL REACHES A REFRESH.** A `429`, a `403` and a `5xx` are `NotCredential`
+    for **both** token states — refreshing a token that is not the cause spends the token endpoint's budget and
+    changes nothing. `NotCredential` says *this module has an opinion and it is that the credential is not the
+    problem*, which is different from "not considered".
+  - **NEW LIMITS:** **nothing calls these functions and nothing performs a refresh** — no credential store and no
+    refresh loop exist, so both are decisions with tests rather than enforced behaviour, and the
+    `Rotated`→`RetryCallAndStore` obligation is only **expressed** (a store that could discharge it does not
+    exist). `ProviderRefused` is **unreachable from `recover_from_call`** by design — only a caller that knows
+    the client itself was refused can produce it, and this function cannot see that.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

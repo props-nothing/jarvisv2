@@ -121,3 +121,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0101](0101-a-missing-control-and-a-failed-one-are-not-the-same-answer.md) | A missing control and a failed one are not the same answer | Accepted |
 | [0102](0102-two-pushes-routed-on-keys-of-opposite-provenance.md) | Two pushes routed on keys of opposite provenance | Accepted |
 | [0103](0103-composing-the-push-path-is-what-decides.md) | Composing the push path is what decides, and the seam changed a type | Accepted |
+| [0104](0104-a-cause-is-not-a-marker.md) | A cause is not a marker, and the two pushes do not share a state machine | Accepted |
+| [0105](0105-the-documented-remedy-is-two-steps.md) | The documented remedy is two steps, and only the second was a type | Accepted |
