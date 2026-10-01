@@ -596,6 +596,100 @@ fn a_resource_identifier_is_validated_and_encoded_as_a_path_segment() {
 }
 
 #[test]
+fn a_calendar_id_is_encoded_as_a_path_segment_because_a_real_one_carries_a_hash() {
+    // **The asymmetry this fixes.** `gmail_messages_get` percent-encodes its path identifier and both Calendar
+    // builders (`calendar_events_list`, `calendar_channel_watch`) interpolated `calendar_id` **raw**. A Calendar
+    // id is not an opaque hex string like a Gmail message id: it is routinely a mailbox address
+    // (`user@example.com`), and a holiday calendar's id contains a literal `#`
+    // (`en.usa#holiday@group.v.calendar.google.com`). Interpolated raw, that `#` starts a URL **fragment** and
+    // truncates the path to `/calendars/en.usa` — a calendar that does not exist. For the **watch** builder the
+    // consequence is worse than a failed read: the channel would be registered against the wrong resource and
+    // its deliveries would route to a channel nobody meant to create.
+    let holiday = "en.usa#holiday@group.v.calendar.google.com";
+
+    let events = must(
+        calendar_events_list(holiday, None, None, None, None, None),
+        "a calendar id with a hash builds a request",
+    );
+    assert!(
+        !events.url().contains('#'),
+        "a hash in a calendar id must not survive into the path: {}",
+        events.url()
+    );
+    assert!(
+        events.url().contains("en.usa%23holiday"),
+        "the hash must be escaped as %23: {}",
+        events.url()
+    );
+
+    // The same control on the watch builder, where a wrong path registers a channel for the wrong calendar.
+    let watch = must(
+        calendar_channel_watch(
+            holiday,
+            "channel-alpha",
+            "https://mydomain.example/notifications",
+            None,
+        ),
+        "a calendar id with a hash builds a watch",
+    );
+    assert!(
+        !watch.url().contains('#') && watch.url().contains("en.usa%23holiday"),
+        "the watch path must escape the calendar id too: {}",
+        watch.url()
+    );
+
+    // Every structural character that would change the request, not just the hash. A `?` would turn the rest of
+    // the id into a query string, a `/` would change which path segment is addressed, and a `%` would start an
+    // escape sequence of the caller's choosing. Each is asserted as its exact encoding on both halves of the
+    // id, so a partial fix (escaping only the `#`) is not mistaken for the whole one.
+    for (raw, encoded) in [('#', "%23"), ('?', "%3F"), ('/', "%2F"), ('%', "%25")] {
+        let request = must(
+            calendar_events_list(&format!("cal{raw}x"), None, None, None, None, None),
+            "a request",
+        );
+        assert!(
+            request.url().contains(&format!("cal{encoded}x")),
+            "`{raw}` must be encoded as `{encoded}`: {}",
+            request.url()
+        );
+        assert!(
+            !request.url().contains(&format!("cal{raw}x")),
+            "`{raw}` must not survive raw into the path: {}",
+            request.url()
+        );
+    }
+
+    // And `primary`, the connector's own alias, is unchanged: the encoding must not touch an already-safe id,
+    // or every ordinary Calendar read would address a percent-escaped calendar. The control is what separates
+    // "encode structural characters" from "encode everything".
+    let primary = must(
+        calendar_events_list("primary", None, None, None, None, None),
+        "a request",
+    );
+    assert!(
+        primary.url().ends_with("/calendars/primary/events"),
+        "an already-safe id must be left alone: {}",
+        primary.url()
+    );
+    let primary_watch = must(
+        calendar_channel_watch(
+            "primary",
+            "channel-alpha",
+            "https://mydomain.example/notifications",
+            None,
+        ),
+        "a watch",
+    );
+    assert!(
+        primary_watch
+            .url()
+            .ends_with("/calendars/primary/events/watch"),
+        "an already-safe id must be left alone: {}",
+        primary_watch.url()
+    );
+}
+
+#[test]
 fn the_message_format_cannot_express_raw() {
     // The type is the control rather than a check: `format=raw` returns the unparsed MIME message, nothing in
     // this connector parses it, and a caller cannot ask for it because no variant names it.

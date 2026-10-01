@@ -5630,6 +5630,39 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     stored column yet; the expiry is read back from the response rather than recomputed from the request,
     because the guide's *"more restrictive value is used"* means a recomputation would disagree exactly when
     Google shortened it.
+- [ ] `P5-005` **(continued — a path identifier validated but not encoded)**: `calendar_events_list` and
+  `calendar_channel_watch` now apply `percent_encode` to the calendar id; `resource_id`'s doc is corrected to
+  separate log forging from request structure. **1 new test (so 490 in the crate).** **`ADR-0114`.** Two guards
+  falsified A-B-A.
+  - **⭐⭐ THE FINDING: BOTH CALENDAR PATH BUILDERS INTERPOLATED `calendar_id` RAW, WHILE THE GMAIL ONE ENCODED.**
+    `gmail_messages_get` percent-encodes its path identifier, with a comment and a test asserting a `/` becomes
+    `%2F` — while `calendar_events_list` and `calendar_channel_watch` put a `calendar_id` in the path **raw**. A
+    Gmail message id is an opaque hex string so the omission was invisible; **a Calendar id is routinely a
+    mailbox address (`user@example.com`) and a holiday calendar's id contains a literal `#`
+    (`en.usa#holiday@group.v.calendar.google.com`)**, which starts a URL **fragment** and truncates the path to
+    `/calendars/en.usa` — a calendar that does not exist.
+  - **⭐⭐ AND THE ASYMMETRY IS WHAT HID IT.** A reader asking "does this module encode path identifiers?" finds a
+    `yes` in the sibling that was written with a message id in hand — the same shape `ADR-0107` records for two
+    teardown steps that should have matched. **⭐ Two builders that should behave alike and do not are invisible
+    until they are compared side by side.**
+  - **⭐ A VALIDATOR THAT BOUNDS LENGTH AND REFUSES CONTROL CHARACTERS DOES NOT MAKE AN IDENTIFIER URL-SAFE**, and
+    that is the second half: `resource_id` **accepts** `@`, `#`, `%` and `/` because a real calendar id contains
+    them, so it addresses **log forging** and not **request structure**. Its doc implied the check covered URL
+    safety; it now states what it does and names `percent_encode` as the control for the other. **⭐ A doc that
+    implies coverage is what makes the next builder omit the control.**
+  - **⭐ THE WATCH HALF MATTERS MORE.** A wrong path on a read addresses the wrong calendar and fails; a wrong
+    path on a `watch` **registers a channel against the wrong resource**, and the channel id is the join key a
+    delivery routes on — so the mistake propagates past the call.
+  - **⭐ THE SAME `percent_encode`, NOT A PATH VARIANT.** The unreserved set is identical for a query value and a
+    path segment, so one function is correct in both positions and a second would be two implementations of one
+    rule that could drift.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A:** (1) removing the encoding from `calendar_events_list` → detected
+    (`…/calendars/en.usa#holiday@…/events`); (2) removing it from `calendar_channel_watch` → detected. The test
+    asserts each structural character's **exact** encoding (`#`→`%23`, `?`→`%3F`, `/`→`%2F`, `%`→`%25`) on both
+    builders, plus the control that `primary` is left alone, so a partial fix (escaping only the `#`, or only one
+    builder) fails rather than passing.
+  - **NEW LIMITS:** no request is sent, so the encoding is proved against the builder's own output rather than a
+    provider's response; a fourth builder would justify extracting the encoding into a shared URL helper.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

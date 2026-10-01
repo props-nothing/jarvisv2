@@ -291,11 +291,23 @@ pub fn percent_encode(value: &str) -> String {
 
 /// Validates a resource identifier.
 ///
+/// # What this refuses, and the two controls it deliberately does **not** fold in
+///
+/// It refuses empty, oversized, and control-bearing values. The control-character refusal matters beyond a
+/// malformed URL: an identifier reaches a log line, and a newline in one forges a record.
+///
+/// **It deliberately accepts the URL-structural characters a real identifier contains** — a Calendar id is
+/// routinely a mailbox address (`user@example.com`) and a holiday calendar's id contains a literal `#`
+/// (`en.usa#holiday@group.v.calendar.google.com`) — so a validator that refused `#`, `?`, `/` or `%` would
+/// make a conforming identifier unusable. The consequence is that this function does **not** make an
+/// identifier safe to interpolate into a URL; that is [`percent_encode`]'s job, applied by whichever builder
+/// puts the value in a path or a query. An earlier version of this doc implied the control-character check
+/// covered URL safety, which is false for exactly the characters a real calendar id is made of: the check
+/// addresses **log forging**, and the encoding addresses **request structure** (`ADR-0114`).
+///
 /// # Errors
 ///
-/// Returns [`RequestError::Argument`] when the value is empty, oversized, or holds a control character. The
-/// control-character refusal matters beyond a malformed URL: an identifier reaches a log line, and a newline
-/// in one forges a record.
+/// Returns [`RequestError::Argument`] when the value is empty, oversized, or holds a control character.
 fn resource_id<'a>(field: &'static str, value: &'a str) -> Result<&'a str, RequestError> {
     let trimmed: &str = value.trim();
     if trimmed.is_empty() {
@@ -685,7 +697,18 @@ pub fn calendar_events_list(
     );
     Ok(HttpRequest {
         method: "GET",
-        url: format!("{CALENDAR_API_BASE}/calendars/{calendar}/events"),
+        // The calendar id goes in the **path**, so it is percent-encoded as a path segment — the same control
+        // `gmail_messages_get` applies to its message id, and here it matters more: a calendar id is routinely
+        // a **mailbox address** (`primary`, or `user@example.com`), and a holiday calendar's id contains a
+        // literal `#` (`en.usa#holiday@group.v.calendar.google.com`). Interpolated raw, that `#` starts a
+        // fragment and truncates the path to `/calendars/en.usa`, addressing a calendar that does not exist;
+        // a `?` would turn the rest into a query, and a `/` would change which resource is addressed. The
+        // validator bounds length and control characters but deliberately permits the URL-structural characters
+        // a real calendar id contains, so the encoding is what makes them safe rather than the validator.
+        url: format!(
+            "{CALENDAR_API_BASE}/calendars/{}/events",
+            percent_encode(calendar)
+        ),
         query: parameters,
         accept: JSON_ACCEPT,
     })
@@ -1179,7 +1202,16 @@ pub fn calendar_channel_watch(
         // The calendar the events collection belongs to. `primary` is the connector's own alias, passed by the
         // caller because a watch is per-calendar (the guide: *"you need to separately subscribe to the
         // events/ACL collections for A and for B"*), unlike the profile read which knows its own constant.
-        format!("{CALENDAR_API_BASE}/calendars/{calendar}/events/watch"),
+        //
+        // **Percent-encoded for the reason `calendar_events_list` records**: a calendar id may be a mailbox
+        // address or carry a `#`, and interpolated raw it would truncate at the fragment and watch a calendar
+        // that does not exist — which for a *watch* is worse than a failed read, because the channel would be
+        // registered against the wrong resource and its deliveries would route to a channel nobody meant to
+        // create.
+        format!(
+            "{CALENDAR_API_BASE}/calendars/{}/events/watch",
+            percent_encode(calendar)
+        ),
         serde_json::Value::Object(body).to_string(),
     ))
 }

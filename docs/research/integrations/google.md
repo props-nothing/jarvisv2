@@ -1081,6 +1081,40 @@ as the provider's own `400`-class refusal rather than pretending to check it.
 what lets a created channel be bound to a registration: the two identifiers a `channels.stop` needs are the one
 the connector sent and the one the provider returned, so creation and teardown are two halves of one record.
 
+### Finding 24 — a Calendar id is a mailbox address or carries a `#`, so a path-encoded identifier is not the same as a validated one
+
+The `events.list` and `events.watch` paths take **`calendarId`** as a path parameter, documented as *"Calendar
+identifier. To retrieve calendar IDs call the `calendarList.list` method. If you want to access the primary
+calendar of the currently logged in user, use the `primary` keyword."* Unlike a Gmail message id — an opaque
+hex string — a Calendar id is routinely **a mailbox address** (`user@example.com`) and a **holiday calendar's id
+contains a literal `#`** (`en.usa#holiday@group.v.calendar.google.com`). Both are ordinary, documented
+identifiers, and each carries a character that is **URL-structural**:
+
+| character | what it does in a URL |
+| --- | --- |
+| `#` | starts a **fragment**, truncating everything after it |
+| `?` | starts the **query string** |
+| `/` | changes which **path segment** is addressed |
+| `%` | begins an **escape sequence** the caller chose |
+
+So a builder that interpolates `calendarId` into `…/calendars/{id}/events` **raw** sends a different request than
+the one intended: a holiday calendar's `#` truncates the path to `/calendars/en.usa`, a calendar that does not
+exist. The consequence differs by method and is worse for the **watch**: a wrong path on a read addresses the
+wrong calendar and fails, while a wrong path on a `watch` **registers a notification channel against the wrong
+resource** — and the channel's id is the join key a delivery routes on, so the mistake propagates past the call.
+
+**A validator that bounds length and refuses control characters does not make an identifier URL-safe**, and this
+is the distinction that hid the defect: the connector's `resource_id` validator deliberately **accepts** `@`,
+`#`, `%` and `/` because a real calendar id contains them, so it addresses **log forging** and not **request
+structure**. The two are separate controls — the validator refuses a value that would forge a log line, and
+`percent_encode` makes a value safe to place in a URL — and only the first was applied to the Calendar path.
+
+**And the asymmetry is what hid it**: `gmail_messages_get` already percent-encoded its path identifier, with a
+comment saying so, so a reader asking "does this module encode path identifiers?" finds a `yes` in the sibling
+that was written with a message id in hand. Implemented by applying `percent_encode` to the calendar id in both
+`calendar_events_list` and `calendar_channel_watch`, and by correcting `resource_id`'s doc so the next builder
+does not infer coverage the check does not provide (`ADR-0114`).
+
 
 ## Rejected Alternatives
 
@@ -1290,6 +1324,15 @@ where every line looks equally done is a plan nobody can audit.
   expiry, the blank-`resourceId` refusal removed, and `from_watch_response` not carrying the expiry. What is
   **not** built: no scheduler renews, so the margin and the bridge are not exercised together, and a registration
   is not persisted, so the new `UtcTimestamp` field has no stored column yet.
+- **A test that a Calendar `calendarId` is encoded as a path segment**, added once `ADR-0112` made the second
+  Calendar path builder exist and the two were compared side by side against the Gmail one. **WRITTEN** by
+  `ADR-0114`: both `calendar_events_list` and `calendar_channel_watch` now apply `percent_encode` to the
+  calendar id, because a real one is a mailbox address or carries a `#` (**Finding 24**), and `gmail_messages_get`
+  already did this for a message id. Each structural character is asserted as its **exact** encoding
+  (`#`→`%23`, `?`→`%3F`, `/`→`%2F`, `%`→`%25`) on both builders, plus the control that `primary` is left alone.
+  **Two guards falsified A-B-A**: the encoding removed from each builder in turn. What is **not** built: no
+  request is sent, so the encoding is proved against the builder's own output rather than against a provider's
+  response.
 - **Opt-in live smoke test** behind credentials and a cost gate, as `tools-and-connectors.md` requires.
   **Not written.**
 
@@ -1513,5 +1556,6 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-10-01 | **Cross-check of `ADR-0107`'s recorded wiring gap against this crate's own types** — no page fetched, an audit of what the record already establishes about a watch's expiry | The gap `ADR-0107` named is closed by a **second Gmail function, not a parameter**: `parse_watch_response` already reads the `watch` response's `expiration` into a `UtcTimestamp` and `watch_lapse` turns it into a `WatchLapse`, so a caller **does** hold the instant `gmail_exposure` lacked, and `AlreadyEnded` becomes reachable for Gmail from the same `WatchLapse` a channel reaches it from. A **bound** ("at least once every 7 days") and a **lease** (this watch's `expiration`) are different inputs, so the bound-only figure is kept for the scheduler that holds no watch rather than replaced. Two guards falsified A-B-A: the `stop_succeeded` guard inverted, and the live arm's `for_seconds` replaced by `WATCH_RENEWAL_BOUND_SECONDS`. Also found and removed in the same slice: a **dangling intra-doc link to the `PushMechanism` enum `ADR-0107` removed**, and a **gap in this record's own Finding numbering** (findings ran `…20, 22, 23` because `ADR-0108` renamed the then-existing Finding 21 to 23, leaving no 21). Implemented as `gmail_watch_exposure`, `ADR-0111`. |
 | 2026-10-01 | Calendar **`events.watch` reference** (`…/calendar/v3/reference/events/watch`, footer **2026-05-12**, unchanged) and **push guide** (*Make watch requests*, footer **2026-09-11**) read for the **request body** — the fields a channel *creation* carries, since the record had only the **response** shape | The reference gives the body as `{ id, token, type, address, params }` with `params.ttl` *"The time-to-live in seconds for the notification channel. **Default is 604800 seconds.**"*, and the guide states the **required** trio verbatim: `id` *"A UUID or similar unique string that identifies this channel… **Maximum length: 64 characters**"* (echoed as `X-Goog-Channel-Id`), `type` *"set to the value `web_hook`"*, and `address` *"the URL that listens and responds to notifications… **must use HTTPS**"* — *"If a channel has an expiration time, it's included as the value of the `X-Goog-Channel-Expiration` HTTP header (in human-readable format)"*. The **optional** pair: `token` *"an arbitrary string value to use as a channel token… **Maximum length: 256 characters**"* (*"use the token to verify that each incoming message is for a channel that your application created—to ensure that the notification is not being spoofed"*), and the guide warns *"Don't include sensitive data such as OAuth tokens."* So the **create** body carries a credential-adjacent `token` and a webhook `address`, which `JsonRequest::rendered_body`'s own doc (*"there is no credential here"*) had asserted could not happen — corrected by making the type's redaction body-dependent. The guide's **certificate** rule (*"only if there's a valid SSL certificate installed on your web server"*, invalid cases listed) is a **limit**: a chain is not observable at request-construction time. Implemented as `calendar_channel_watch` + `webhook_address`, `ADR-0112`. |
 | 2026-10-01 | **Cross-check of the channel path against this crate's own types** — no page fetched, an audit of what the record already establishes about a channel's expiry and which value carries it | `parse_channel_watch_response` reads the response's `expiration` into `ChannelWatchResponse::expires_at`, whose doc says it *"can drive a renewal decision"*, and `renewal_decision` takes **the expiry as its only input** — but `ChannelRegistration`, the value that survives between the `watch` and the teardown, had **no field for it**, so the decision was reachable only from a test: the same "a value read and then dropped" shape `ADR-0107` found for `resourceId`, from the same call. The type's own doc counted *"four facts"* while **five** were in play, and the omitted one was the expiry. Closed by `expires_at` + `from_watch_response` (so the third provider fact travels with the two identifiers) + `renewal(now)` (which delegates, asserted equal so the bridge is not a second opinion). Three guards falsified A-B-A. Implemented as `ChannelRegistration::{expires_at, from_watch_response, renewal}`, `ADR-0113`. |
+| 2026-10-01 | **Calendar `events.list` and `events.watch` reference pages** read for the **`calendarId` path parameter** — the value both paths carry, after the two Calendar path builders were compared side by side against the Gmail one | `calendarId` is *"Calendar identifier. To retrieve calendar IDs call the `calendarList.list` method. If you want to access the primary calendar of the currently logged in user, use the `primary` keyword."* So the value is **not** an opaque hex id like a Gmail message id: a calendar list returns ids that are mailbox addresses, and a holiday calendar's id is `en.usa#holiday@group.v.calendar.google.com` — carrying a literal `#`, which starts a URL **fragment** and truncates the path. `?` starts a query, `/` changes the path segment, `%` starts an escape — the structure-changing characters the module's encoding rule exists for. The connector's `resource_id` validator **accepts** these (a real id contains them), so it addresses log forging and not request structure; `gmail_messages_get` already percent-encoded its path identifier while **both** Calendar builders interpolated the calendar id raw — the asymmetry that hid it. Implemented as `percent_encode` applied in `calendar_events_list` and `calendar_channel_watch` (Finding 24), `ADR-0114`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**
