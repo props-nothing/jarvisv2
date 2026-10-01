@@ -23,6 +23,13 @@ use jarvis_connectors::google::client::{self, GoogleApi, GoogleErrorBody, Google
 use jarvis_connectors::google::request;
 use serde_json::Value;
 
+/// A page that carried no continuation token at all.
+///
+/// Named because the signal tests are about **which** continuation a response established, and spelling
+/// `NothingFurther` at seven call sites to say "this test is not about the tokens" obscures that. It is a
+/// `const` rather than a helper function so a call site reads as a value.
+const NOTHING_FURTHER: client::CalendarContinuation = client::CalendarContinuation::NothingFurther;
+
 /// Reads a fixture from `tests/fixtures/google/`.
 ///
 /// Fails loudly rather than skipping: a missing fixture is a broken test, not an absent capability. A skip
@@ -173,10 +180,18 @@ fn a_calendar_mid_walk_page_yields_a_page_token_and_no_sync_token() {
         Err(error) => panic!("the documented events shape must parse: {error}"),
     };
     assert_eq!(page.ids, ["0a1b2c3d4e5f6071", "0a1b2c3d4e5f6072"]);
-    assert_eq!(page.next_page_token.as_deref(), Some("CpEBGh0KA2NhbA"));
     assert_eq!(
-        page.next_sync_token, None,
-        "a page with further results cannot carry a sync token -- the two are mutually exclusive"
+        page.continuation,
+        client::CalendarContinuation::MorePages {
+            page_token: "CpEBGh0KA2NhbA".to_owned()
+        },
+        "a page with further results carries a page token and, since the two are mutually exclusive, no sync \
+         token -- expressed as ONE state rather than as two absent fields"
+    );
+    assert_eq!(
+        page.continuation.storable(),
+        None,
+        "a mid-walk page yields nothing a caller may store as a sync position"
     );
 }
 
@@ -190,13 +205,20 @@ fn a_calendar_last_page_yields_a_sync_token_and_no_page_token() {
     };
     assert_eq!(page.ids, ["0a1b2c3d4e5f6073"]);
     assert_eq!(
-        page.next_page_token, None,
-        "the last page cannot carry a page token"
+        page.continuation,
+        client::CalendarContinuation::WalkComplete {
+            sync_token: "CMf8oPz2sPICEMf8oPz2sPICGAU=".to_owned()
+        },
+        "only the last page carries the durable cursor, and carrying it means carrying no page token"
     );
     assert_eq!(
-        page.next_sync_token.as_deref(),
-        Some("CMf8oPz2sPICEMf8oPz2sPICGAU="),
-        "only the last page carries the durable cursor"
+        page.continuation.storable(),
+        Some("CMf8oPz2sPICEMf8oPz2sPICGAU=")
+    );
+    assert_eq!(
+        page.continuation.page_token(),
+        None,
+        "a completed walk has no next page to fetch"
     );
 }
 
@@ -215,11 +237,12 @@ fn the_two_calendar_pages_together_are_the_only_way_to_get_a_cursor() {
             Ok(page) => page,
             Err(error) => panic!("{error}"),
         };
-    assert!(first.next_sync_token.is_none() && last.next_sync_token.is_some());
-    assert!(first.next_page_token.is_some() && last.next_page_token.is_none());
+    assert!(!first.continuation.is_nonconforming() && !last.continuation.is_nonconforming());
+    assert!(first.continuation.storable().is_none() && last.continuation.storable().is_some());
+    assert!(first.continuation.page_token().is_some() && last.continuation.page_token().is_none());
     assert_ne!(
-        first.next_page_token, last.next_sync_token,
-        "the two continuation tokens are different values for different purposes"
+        first.continuation, last.continuation,
+        "the two continuation tokens are different values for different purposes, and the states are distinct"
     );
 }
 
@@ -516,11 +539,16 @@ fn two_410s_with_one_status_and_opposite_remedies_are_told_apart_by_the_reason()
         None,
     );
     assert_eq!(
-        client::calendar_signal(410, None, Some(&full_sync), refusal.clone()),
+        client::calendar_signal(410, &NOTHING_FURTHER, Some(&full_sync), refusal.clone()),
         client::SyncSignal::CursorUnusable
     );
     assert_eq!(
-        client::calendar_signal(410, None, Some(&deleted_reason), refusal.clone()),
+        client::calendar_signal(
+            410,
+            &NOTHING_FURTHER,
+            Some(&deleted_reason),
+            refusal.clone()
+        ),
         client::SyncSignal::Refused(refusal),
         "a deleted resource is a refusal for the call, not a dead cursor"
     );
@@ -561,7 +589,7 @@ fn a_400_on_an_incremental_sync_is_a_callers_mistake_and_never_a_stale_cursor() 
         "the page says plainly: 'this is a permanent error, do not retry'"
     );
     assert_eq!(
-        client::calendar_signal(400, None, None, decision.clone()),
+        client::calendar_signal(400, &NOTHING_FURTHER, None, decision.clone()),
         client::SyncSignal::Refused(decision),
         "a 400 is carried as a refusal, never as staleness"
     );
@@ -592,7 +620,7 @@ fn a_410_whose_reason_cannot_be_read_still_resyncs_because_the_alternative_is_a_
             None,
         );
         assert_eq!(
-            client::calendar_signal(410, None, reason, refusal),
+            client::calendar_signal(410, &NOTHING_FURTHER, reason, refusal),
             client::SyncSignal::CursorUnusable,
             "{reason:?}"
         );
@@ -614,14 +642,50 @@ fn a_successful_calendar_read_advances_the_cursor_from_the_sync_token() {
         None,
     );
     assert_eq!(
-        client::calendar_signal(200, Some("CPDAlvWDx70C="), None, refusal.clone()),
+        client::calendar_signal(
+            200,
+            &client::CalendarContinuation::WalkComplete {
+                sync_token: "CPDAlvWDx70C=".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
         client::SyncSignal::Advanced {
             history_id: Some("CPDAlvWDx70C=".to_owned())
         }
     );
+    // **The mid-walk case, and the one the type exists for.** A page token is not a position, so a 200 whose
+    // page continues advances NOTHING -- a caller that read the page token as a cursor would hold one that
+    // expires with the walk.
+    assert_eq!(
+        client::calendar_signal(
+            200,
+            &client::CalendarContinuation::MorePages {
+                page_token: "CPDAlvWDx70C=".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
+        client::SyncSignal::Advanced { history_id: None },
+        "a page token must never become a sync position, however plausible it looks as one"
+    );
     // A 200 with no token is an unchanged calendar -- ordinary, and distinguishable from an absent response.
     assert_eq!(
-        client::calendar_signal(200, None, None, refusal.clone()),
+        client::calendar_signal(200, &NOTHING_FURTHER, None, refusal.clone()),
+        client::SyncSignal::Advanced { history_id: None }
+    );
+    // And the nonconforming pair yields nothing either, so a response nobody can interpret cannot become a
+    // stored position.
+    assert_eq!(
+        client::calendar_signal(
+            200,
+            &client::CalendarContinuation::Rejected {
+                page_token: "p".to_owned(),
+                sync_token: "s".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
         client::SyncSignal::Advanced { history_id: None }
     );
     // And a retryable status is carried rather than read as staleness, which is the mistake that discards a
@@ -635,7 +699,7 @@ fn a_successful_calendar_read_advances_the_cursor_from_the_sync_token() {
             None,
         );
         assert_eq!(
-            client::calendar_signal(status, None, None, decision.clone()),
+            client::calendar_signal(status, &NOTHING_FURTHER, None, decision.clone()),
             client::SyncSignal::Refused(decision),
             "{status}"
         );

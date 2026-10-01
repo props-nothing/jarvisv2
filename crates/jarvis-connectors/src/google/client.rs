@@ -716,9 +716,142 @@ impl HistoryPosition {
     }
 
     /// Returns whether this page's id may be stored as the next sync's position.
+    ///
+    /// **The caller that stores a cursor does not exist yet** — there is no sync loop — so this is currently
+    /// reached only by tests. It is the question in the form a caller asks it *before* acting, where
+    /// [`Self::storable`] is the form a caller uses *to act*, and the pair is deliberate: a caller that only
+    /// wants to route on the state should not have to hold an `Option` to do it.
     #[must_use]
     pub const fn is_storable(&self) -> bool {
         matches!(self, Self::Storable { .. })
+    }
+}
+
+/// Which continuation token an `events.list` page carried, given that the provider allows **one**.
+///
+/// # The rule, stated in both fields
+///
+/// The `events.list` reference documents the two tokens as mutually exclusive, in **each** field's own
+/// description rather than in prose elsewhere:
+///
+/// - `nextPageToken`: *"Token used to access the next page of this result. **Omitted if no further results are
+///   available, in which case `nextSyncToken` is provided.**"*
+/// - `nextSyncToken`: *"Token used at a later point in time to retrieve only the entries that have changed
+///   since this result was returned. **Omitted if further results are available, in which case `nextPageToken`
+///   is provided.**"*
+///
+/// So a page carries **at most one** token, and the two mean opposite things about the walk: a page token says
+/// *there is more of this walk*, a sync token says *the walk is over and this is the position*. A body with
+/// both is one the provider cannot produce.
+///
+/// # Why this is a type, and why it is not [`HistoryPosition`]
+///
+/// This repository already corrected this exact confusion — in a fixture's prose, in the research record, and
+/// in the renderer's own test helper — while the **parser's** test went on asserting a body carrying both, and
+/// `calendar_signal` went on taking a bare `Option<&str>` that made the pair representable. Three layers knew
+/// the rule and one enforced nothing: the same "no type asked the question" shape `ADR-0108` records for
+/// `HistoryPosition`.
+///
+/// It is **not** `HistoryPosition` because the two rules have different shapes. Gmail's rule is *"storable only
+/// when the page token is absent"* — a condition on **one** value, which leaves an id present and unstorable.
+/// Calendar's is *"exactly one token"*, a relation between **two** values, which leaves no such state. Sharing
+/// one type would make Calendar carry a variant its provider cannot produce, which is the defect being fixed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CalendarContinuation {
+    /// A `nextPageToken`: this walk continues and the token in hand expires when it ends.
+    ///
+    /// Store it only to fetch the **next page**; it is not a sync position.
+    MorePages {
+        /// The token to send as `page_token`.
+        page_token: String,
+    },
+    /// A `nextSyncToken` and no page token: the walk is complete and this is the position to keep.
+    ///
+    /// The one state a caller may take a durable cursor from, and reaching it requires the absence of the page
+    /// token — which is the half of the rule a caller cannot be expected to remember.
+    WalkComplete {
+        /// The token to store and later send as `sync_token`.
+        sync_token: String,
+    },
+    /// Neither token. The walk ended with nothing further to fetch or store.
+    NothingFurther,
+    /// **Both** tokens, which the provider documents as impossible.
+    ///
+    /// Reachable only from a provider that changed its response shape or from a hand-built fixture that
+    /// contradicted its own notes. Kept as a value rather than a panic because this is external input, and kept
+    /// distinct from the three conforming states rather than resolved into one of them because there is no way
+    /// to tell which token the provider meant.
+    Rejected {
+        /// The token that says the walk continues.
+        page_token: String,
+        /// The token that says the walk is over.
+        sync_token: String,
+    },
+}
+
+impl CalendarContinuation {
+    /// Reads both tokens into the one continuation the provider permits.
+    ///
+    /// # The `Rejected` arm is unreachable against a conforming provider
+    ///
+    /// A body carrying both tokens is documented as impossible, so this state exists to **name a provider
+    /// change or a fixture error rather than to be exercised**. It is a variant and not a panic because a
+    /// provider response is external input: a nonconforming one should reach the caller as a value it can
+    /// report, not as an abort inside a parser. The alternative — silently preferring one token — is the
+    /// defect this type exists to prevent, since a caller that was handed the sync token from such a page
+    /// would store a position for a walk that has not finished.
+    #[must_use]
+    pub fn of_page(next_page_token: Option<String>, next_sync_token: Option<String>) -> Self {
+        match (next_page_token, next_sync_token) {
+            (Some(page_token), None) => Self::MorePages { page_token },
+            (None, Some(sync_token)) => Self::WalkComplete { sync_token },
+            (None, None) => Self::NothingFurther,
+            // Both. The provider documents the pair as impossible, so this is a change in the provider or a
+            // mistake in a hand-built fixture — and it is reported rather than resolved.
+            (Some(page_token), Some(sync_token)) => Self::Rejected {
+                page_token,
+                sync_token,
+            },
+        }
+    }
+
+    /// Returns the sync token to store, which exists only on a completed walk.
+    ///
+    /// Named for the **question** rather than the value, as [`HistoryPosition::storable`] is: an accessor
+    /// called `sync_token` would be reached for by a caller that never asked whether the walk had finished.
+    #[must_use]
+    pub fn storable(&self) -> Option<&str> {
+        match self {
+            Self::WalkComplete { sync_token } => Some(sync_token),
+            Self::MorePages { .. } | Self::NothingFurther | Self::Rejected { .. } => None,
+        }
+    }
+
+    /// Returns the page token to fetch the next page with, when the walk continues.
+    ///
+    /// **The caller that walks pages does not exist yet** — there is no sync loop — so this is currently
+    /// reached only by tests, in the same sense `WatchLapse::seconds_from_edge` is (*"what a dashboard shows"*).
+    /// It is here because the walk needs it and because leaving it out would make the page token unreadable
+    /// while the sync token is not: a caller could store a position **or** be told nothing, and only one of
+    /// those is a choice this type should make for them.
+    #[must_use]
+    pub fn page_token(&self) -> Option<&str> {
+        match self {
+            Self::MorePages { page_token } => Some(page_token),
+            Self::WalkComplete { .. } | Self::NothingFurther | Self::Rejected { .. } => None,
+        }
+    }
+
+    /// Returns whether the response carried tokens the provider documents as mutually exclusive.
+    ///
+    /// A caller reports this; nothing in the connector can repair it, because there is no way to tell which
+    /// token the provider meant. **The caller that would report it is the sync loop, which does not exist yet**,
+    /// so today this is reached only by tests — and it is the accessor that makes the state **actionable**
+    /// rather than merely representable, which is why it is not left for that caller to derive by matching on
+    /// the enum's fields itself.
+    #[must_use]
+    pub const fn is_nonconforming(&self) -> bool {
+        matches!(self, Self::Rejected { .. })
     }
 }
 
@@ -1096,7 +1229,7 @@ pub fn gmail_history_signal(
 #[must_use]
 pub fn calendar_signal(
     status: u16,
-    next_sync_token: Option<&str>,
+    continuation: &CalendarContinuation,
     gone_reason: Option<&str>,
     refusal: RetryDecision,
 ) -> SyncSignal {
@@ -1111,7 +1244,10 @@ pub fn calendar_signal(
     }
     if status == 200 {
         return SyncSignal::Advanced {
-            history_id: next_sync_token.map(str::to_owned),
+            // Only a **completed** walk yields a position. The name of that variant is what makes this line
+            // correct rather than lucky: a page-token continuation means the walk has not finished, so there is
+            // no position yet, and `storable` is the only way to reach one.
+            history_id: continuation.storable().map(str::to_owned),
         };
     }
     SyncSignal::Refused(refusal)

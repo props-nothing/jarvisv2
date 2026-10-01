@@ -190,30 +190,110 @@ fn next_page_is_refused(token: Option<&str>) -> bool {
 }
 
 #[test]
-fn a_page_token_and_a_sync_token_are_not_interchangeable() {
-    // Google's sync guide says `nextSyncToken` "is present only on the very last page", while `nextPageToken`
-    // continues the current walk. A caller that stored the page token as a cursor would store something that
-    // expires with the walk, so the two are separate fields and a fixture carries both.
+fn a_page_token_and_a_sync_token_cannot_arrive_together_and_the_pair_is_reported_rather_than_resolved()
+ {
+    // **This test used to assert the opposite, and that was the defect `ADR-0109` records.** It fed a body
+    // carrying BOTH tokens and asserted the parser yielded both — a body Google documents as impossible, since
+    // `nextPageToken` is *"Omitted if no further results are available, in which case `nextSyncToken` is
+    // provided"* and `nextSyncToken` is *"Omitted if further results are available, in which case `nextPageToken`
+    // is provided"*. The constraint had already been recorded in the fixture's own notes and in the renderer's
+    // test helper; the parser's test was the layer that never heard about it.
+    //
+    // So the body is still exercised — deliberately, as the **nonconforming** case — and the assertion is now
+    // that it is *reported* rather than silently resolved into a token. A parser that preferred one would hand a
+    // caller a sync position for a walk that has not finished.
     let body = r#"{
         "items": [{"id": "event-1"}, {"id": "event-2"}],
         "nextPageToken": "page-token-1",
         "nextSyncToken": "sync-token-1"
     }"#;
-    let page = must(parse_calendar_page(200, body), "a valid events page");
+    let page = must(
+        parse_calendar_page(200, body),
+        "a body with both tokens must still parse into a reportable state",
+    );
     assert_eq!(page.ids, ["event-1", "event-2"]);
-    assert_eq!(page.next_page_token.as_deref(), Some("page-token-1"));
-    assert_eq!(page.next_sync_token.as_deref(), Some("sync-token-1"));
-    assert_ne!(page.next_page_token, page.next_sync_token);
+    assert_eq!(
+        page.continuation,
+        client::CalendarContinuation::Rejected {
+            page_token: "page-token-1".to_owned(),
+            sync_token: "sync-token-1".to_owned(),
+        },
+        "a pair the provider documents as impossible must be named, not resolved"
+    );
+    assert!(page.continuation.is_nonconforming());
+    // And neither half is offered as usable, which is the property that matters: a caller cannot store a sync
+    // position, and cannot fetch a next page, from a response nobody can interpret.
+    assert_eq!(page.continuation.storable(), None);
+    assert_eq!(page.continuation.page_token(), None);
+
+    // The two conforming shapes, asserted apart — which is the pair the fixtures carry.
+    let mid_walk = must(
+        parse_calendar_page(
+            200,
+            r#"{"items":[{"id":"e1"}],"nextPageToken":"page-token-1"}"#,
+        ),
+        "a mid-walk page",
+    );
+    assert_eq!(
+        mid_walk.continuation,
+        client::CalendarContinuation::MorePages {
+            page_token: "page-token-1".to_owned()
+        }
+    );
+    assert_eq!(
+        mid_walk.continuation.storable(),
+        None,
+        "a page token is not a position, so a mid-walk page yields nothing to store"
+    );
+    assert_eq!(mid_walk.continuation.page_token(), Some("page-token-1"));
+
+    let last = must(
+        parse_calendar_page(
+            200,
+            r#"{"items":[{"id":"e3"}],"nextSyncToken":"sync-token-1"}"#,
+        ),
+        "a last page",
+    );
+    assert_eq!(
+        last.continuation,
+        client::CalendarContinuation::WalkComplete {
+            sync_token: "sync-token-1".to_owned()
+        }
+    );
+    assert_eq!(last.continuation.storable(), Some("sync-token-1"));
+    assert_eq!(
+        last.continuation.page_token(),
+        None,
+        "a completed walk has no next page to fetch"
+    );
+
+    // And neither token at all is its own state rather than an empty token or a page token.
+    let empty = must(
+        parse_calendar_page(200, r#"{"items":[]}"#),
+        "a page with no continuation",
+    );
+    assert_eq!(
+        empty.continuation,
+        client::CalendarContinuation::NothingFurther
+    );
+    assert_eq!(empty.continuation.storable(), None);
 }
 
 #[test]
-fn a_sync_token_absent_from_a_page_is_not_an_empty_one() {
-    // The middle pages of a paginated incremental sync carry no sync token at all. Reading the absence as an
+fn a_sync_token_absent_from_a_middle_page_is_not_an_empty_one() {
+    // The middle pages of a paginated incremental sync carry no sync token at all — and, because the two tokens
+    // are mutually exclusive, that absence is exactly what the page token beside it means. Reading it as an
     // empty token would store a cursor that addresses nothing.
     let body = r#"{"items": [{"id": "event-1"}], "nextPageToken": "more"}"#;
     let page = must(parse_calendar_page(200, body), "a valid events page");
-    assert_eq!(page.next_sync_token, None);
-    assert_eq!(page.next_page_token.as_deref(), Some("more"));
+    assert_eq!(
+        page.continuation,
+        client::CalendarContinuation::MorePages {
+            page_token: "more".to_owned()
+        },
+        "a page token implies no sync token, and one value says both"
+    );
+    assert_eq!(page.continuation.storable(), None);
 }
 
 #[test]

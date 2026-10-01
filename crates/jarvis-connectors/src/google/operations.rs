@@ -378,13 +378,24 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
                 .ok()
                 .map(|page| {
                     let mut value = serde_json::json!({ "event_ids": page.ids });
-                    if let Some(token) = page.next_page_token {
-                        value["next_page_token"] = serde_json::Value::String(token);
-                    }
-                    // The sync token is a **different** token from the page token and only the last page
-                    // carries one, so it is rendered separately rather than merged into one field.
-                    if let Some(token) = page.next_sync_token {
-                        value["next_sync_token"] = serde_json::Value::String(token);
+                    // **At most one token is rendered, because at most one can arrive.** The page token and the
+                    // sync token are documented as mutually exclusive, so rendering both would require the page
+                    // to have carried an impossible pair — and `Rejected` renders **neither**, so a nonconforming
+                    // response does not become a cursor a model would store. The two are separate fields rather
+                    // than one, because they mean opposite things about the walk: a page token continues *this*
+                    // walk and expires with it, while a sync token positions a *future* one.
+                    match &page.continuation {
+                        client::CalendarContinuation::MorePages { page_token } => {
+                            value["next_page_token"] =
+                                serde_json::Value::String(page_token.clone());
+                        }
+                        client::CalendarContinuation::WalkComplete { sync_token } => {
+                            value["next_sync_token"] =
+                                serde_json::Value::String(sync_token.clone());
+                        }
+                        // Nothing further to fetch or store, and a nonconforming pair, both render no token.
+                        client::CalendarContinuation::NothingFurther
+                        | client::CalendarContinuation::Rejected { .. } => {}
                     }
                     value.to_string()
                 })

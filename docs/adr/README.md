@@ -126,3 +126,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0106](0106-the-same-expiry-in-two-encodings.md) | The same expiry in two encodings, and renewal is a replacement | Accepted |
 | [0107](0107-a-teardown-whose-arity-the-provider-decides.md) | A teardown step whose arity the provider decides, and a value read for a consumer that did not exist | Accepted |
 | [0108](0108-a-rule-stated-in-another-fields-description.md) | A rule stated in another field's description, and a cursor the schema told a model to store | Accepted |
+| [0109](0109-a-constraint-three-layers-knew-and-the-test-contradicted.md) | A constraint three layers knew and the test contradicted, and a guard whose only detector was in another binary | Accepted |

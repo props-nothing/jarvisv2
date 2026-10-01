@@ -5392,6 +5392,62 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     fixtures. A `200` whose page states **no** id advances nothing and is `Unstated`, explicitly *not* "the
     mailbox is unchanged"; the reference does not mark `historyId` optional, so that shape is not one the provider
     documents — which is why the inference is refused rather than guessed.
+- [ ] `P5-005` **(continued — a constraint three layers knew and the test contradicted)**: `google::client`
+  gains `CalendarContinuation { MorePages, WalkComplete, NothingFurther, Rejected }` + `of_page`;
+  `CalendarPage.next_page_token`/`next_sync_token` become `continuation`; `calendar_signal` takes the type; the
+  renderer emits **at most one** token; the `calendar_events_read` output schema's two tokens gain descriptions.
+  **1 new test (so 478 in the crate; 1751 in the workspace)**, plus a shipped test **corrected**. **`ADR-0109`.**
+  Two guards falsified A-B-A — and one of them **survived `--lib`**, which is the second finding.
+  - **⭐⭐ THE FINDING: A CONSTRAINT THREE LAYERS KNEW AND NONE ENFORCED.** The `events.list` reference documents
+    the two continuation tokens as mutually exclusive **in each field's own description** (`nextPageToken`
+    *"Omitted if no further results are available, in which case `nextSyncToken` is provided"*; `nextSyncToken`
+    *"Omitted if further results are available, in which case `nextPageToken` is provided"*). **Three layers of
+    this repository already stated it** — the research record, the fixture's own
+    `_the_point_of_this_fixture` prose, and the renderer's test helper — while `CalendarPage` carried both as
+    independent `Option<String>` fields, `calendar_signal` took a bare `Option<&str>`, and the **output schema**
+    declared both with **no description at all**. **⭐ Writing a rule down three times is not enforcing it once;
+    and the layers that repeat it read as corroboration, so nobody looks for the layer that is missing.**
+  - **⭐⭐ AND THE ONE TEST STILL ASSERTING THE IMPOSSIBLE THING WAS THE PARSER'S — which the fixture's own notes
+    had already flagged.** The fixture says: *"An earlier test of mine asserted a body carrying both, which
+    Google cannot produce."* **The correction reached the fixture, the record and the renderer's helper, and
+    missed the parser's test.** So the slice is not "add a type": it is "**the same defect was fixed four times
+    in three places that do not run, and left in the one that does**". **⭐ Generalisation: when a correction is
+    applied to several copies of a claim, enumerate the copies and check the ones that EXECUTE first.**
+  - **⭐⭐ THE SECOND FINDING IS ABOUT THE TEST SUITE, NOT THE CODE: A GUARD WHOSE ONLY DETECTOR LIVED IN ANOTHER
+    TEST BINARY.** The mutation routing a **page token through as the sync position** **survived the entire
+    `cargo test --lib` run** (477 passed), because `calendar_signal`'s 200 arm had **no unit test** while the
+    **Gmail** producer's arm did — the asymmetry was invisible and nobody had a reason to look for it. Only
+    `tests/google_fixtures.rs` caught it. **`cargo test --lib` is what a developer runs while iterating, so a
+    guard checked only by an integration test is one refactor from being unguarded.** The missing unit test was
+    written, and re-running the *same* mutant then fails in `--lib` — **confirmed by mutation, not assumed**.
+  - **⭐ FOUR VARIANTS, AND `Rejected` IS A VALUE RATHER THAN A PANIC OR A PRECEDENCE.** The pair is impossible
+    against a conforming provider, so the state names a provider change or a hand-built fixture error. A panic
+    would turn reportable provider input into a crash; **silently preferring one token is the defect the type
+    exists for** — a caller handed the sync token from such a page would store a position for a walk that has not
+    finished. Both accessors return `None` for it, so an uninterpretable response yields neither a position nor a
+    next page, and `is_nonconforming()` makes the state actionable.
+  - **⭐ IT IS NOT `HistoryPosition`, BECAUSE THE RULES HAVE DIFFERENT SHAPES.** Gmail's is a condition on **one**
+    value (*"storable only when the page token is absent"*), which leaves an id present and unstorable;
+    Calendar's is a relation between **two** (*"exactly one token"*), which leaves no such state. Sharing a type
+    would give Calendar a variant its provider cannot produce — the defect being fixed. **⭐ `ADR-0108`'s lesson
+    was "no type asked the question"; the answer is not therefore the same type.**
+  - **⭐ THE OUTPUT SCHEMA WAS THE LAYER WITH THE LEAST INFORMATION AND THE MOST AUTHORITY.** `ADR-0108` taught
+    the **Gmail** output schema to state its condition, and left this one — in the same tool family, in the
+    **same slice** — with bare `["string", "null"]`. A model reading it saw two optional tokens and could
+    persist the one that expires. **⭐ A lesson applied to one tool and not its neighbour is indistinguishable
+    from a lesson not learned.**
+  - **⭐ TWO GUARDS FALSIFIED A-B-A, both compiling.** (1) `of_page` **preferring the sync token** when both
+    arrive → **detected** by the parser's test. (2) routing a page token through as the sync position →
+    **detected only by the integration test** (which is the finding above); after the missing unit test was
+    written, the same mutant is **detected by `--lib`**.
+  - **⭐ A DUPLICATED VERIFICATION-LOG ROW WAS FOUND AND REMOVED** while appending the new one — the previous
+    slice's edit inserted its row twice, and the record had been carrying both. Found by inspection while adding
+    to the table, which is the only moment a duplicate of that shape is visible.
+  - **NEW LIMITS:** no request sent, no live walk run (two hand-built fixtures); **nothing stores a sync token**,
+    so `storable`/`page_token` have no production consumer and each doc says so explicitly (the
+    `seconds_from_edge` convention, rather than deleting accessors whose absence would leave a page token
+    unreadable while the sync token is not); `Rejected` is unreachable against a conforming provider by design,
+    so it is exercised only by the test that deliberately keeps the impossible body.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

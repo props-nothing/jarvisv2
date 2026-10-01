@@ -1224,20 +1224,24 @@ pub struct HistoryPage {
     pub position: client::HistoryPosition,
 }
 
-/// A parsed Calendar page, which carries **two** continuation tokens and they are not interchangeable.
+/// A parsed Calendar page, which carries **at most one** continuation token.
+///
+/// The two tokens the provider can send are documented as mutually exclusive, and each field's own description
+/// states the rule: `nextPageToken` is *"Omitted if no further results are available, in which case
+/// `nextSyncToken` is provided"*, and `nextSyncToken` is *"Omitted if further results are available, in which
+/// case `nextPageToken` is provided"*. So they are not two optional fields that happen to differ — they are
+/// **one** fact with two possible values, plus the possibility of neither.
+///
+/// **This type used to carry both as separate `Option<String>` fields, and that made a body the provider cannot
+/// produce representable** — which is exactly what a shipped test then asserted, two years after the fixture's
+/// own notes recorded the constraint (`ADR-0109`). The continuation is now one value, so the impossible pair
+/// has a name ([`CalendarContinuation::Rejected`]) instead of a silent precedence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CalendarPage {
     /// The event identifiers on this page.
     pub ids: Vec<String>,
-    /// The next **page**, valid only until the walk finishes.
-    pub next_page_token: Option<String>,
-    /// The next **sync token**, present only on the last page.
-    ///
-    /// A different thing from `next_page_token`: the page token continues *this* query, while the sync token
-    /// positions a *future* incremental sync. Google's sync guide says the sync token "is present only on the
-    /// very last page", so a caller that stored the page token as a cursor would store a token that expires
-    /// with the walk.
-    pub next_sync_token: Option<String>,
+    /// Which token the page carried, if any.
+    pub continuation: client::CalendarContinuation,
 }
 
 /// Parses a list response into identifiers.
@@ -1292,12 +1296,15 @@ pub fn parse_calendar_page(status: u16, body: &str) -> Result<CalendarPage, Requ
             field: "body",
             reason: "an events response body must be JSON with an `items` array",
         })?;
+    // Both tokens are bounded on the way out as well as on the way in, because a token from a *response*
+    // becomes the next request's parameter. `client::next_page` is the one bound, applied in both directions.
     let next_page_token = client::next_page(parsed.next_page_token.as_deref())?;
     let next_sync_token = client::next_page(parsed.next_sync_token.as_deref())?;
     Ok(CalendarPage {
         ids: parsed.items.into_iter().map(|entry| entry.id).collect(),
-        next_page_token,
-        next_sync_token,
+        // The mutual exclusion is decided here, where both fields are in hand, and by a function whose input is
+        // the pair — so no later layer can be handed a body shape the provider documents as impossible.
+        continuation: client::CalendarContinuation::of_page(next_page_token, next_sync_token),
     })
 }
 

@@ -553,13 +553,35 @@ const CALENDAR_READ_INPUT: &str = r#"{
 }"#;
 
 /// The output schema of `calendar_events_read`.
+///
+/// # Why each token now carries a description, and what they say
+///
+/// Both fields were declared with **no description at all** — bare `["string", "null"]` — while `ADR-0108` had
+/// just taught the Gmail output schema to state its storing condition. The omission was worse here than in the
+/// Gmail case, because the Calendar pair is documented as **mutually exclusive** and the constraint lives in
+/// each field's own description on the reference:
+///
+/// - `nextPageToken`: *"Omitted if no further results are available, in which case `nextSyncToken` is
+///   provided."*
+/// - `nextSyncToken`: *"Omitted if further results are available, in which case `nextPageToken` is provided."*
+///
+/// A model reading an undescribed pair sees two optional tokens and may persist whichever it saw — including the
+/// page token, which **expires when the walk ends**. So each description now carries its half of the rule, and
+/// each says which one may be stored. The connector renders **at most one** of them (`ADR-0109`), so the
+/// descriptions describe what can actually arrive rather than a schema permissive enough to promise both.
 const CALENDAR_READ_OUTPUT: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
     "event_ids": { "type": "array", "items": { "type": "string" } },
-    "next_sync_token": { "type": ["string", "null"] },
-    "next_page_token": { "type": ["string", "null"] }
+    "next_page_token": {
+      "type": ["string", "null"],
+      "description": "Continues THIS walk; send it back as page_token. It expires when the walk ends, so do NOT store it as a sync position. Mutually exclusive with next_sync_token: a page carries at most one of the two."
+    },
+    "next_sync_token": {
+      "type": ["string", "null"],
+      "description": "The position to store, sent later as sync_token to fetch only what has changed since. Present only on the LAST page of a walk, because it is omitted whenever further results are available. Mutually exclusive with next_page_token."
+    }
   },
   "required": ["event_ids"],
   "additionalProperties": false

@@ -729,6 +729,94 @@ fn a_pages_history_id_is_storable_exactly_when_no_page_token_accompanied_it() {
 }
 
 #[test]
+fn a_calendar_pages_continuation_decides_the_signal_and_only_a_completed_walk_advances_it() {
+    // **The Calendar counterpart of the Gmail 200-path test, and it was missing — which a surviving mutant
+    // found.** The mutation that fed a *page token* through as the sync position passed the entire crate
+    // library suite, because nothing in `--lib` exercised `calendar_signal`'s 200 arm; only the integration
+    // test in `tests/google_fixtures.rs` caught it. A guard whose only detector lives in a different test
+    // binary is one refactor away from being unguarded, so the case is asserted here as well.
+    let refusal = classify(
+        GoogleApi::Calendar,
+        403,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    // A completed walk advances, carrying the sync token.
+    assert_eq!(
+        calendar_signal(
+            200,
+            &CalendarContinuation::WalkComplete {
+                sync_token: "CPDAlvWDx70C=".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
+        SyncSignal::Advanced {
+            history_id: Some("CPDAlvWDx70C=".to_owned())
+        }
+    );
+    // A continuing walk advances **nothing**, however much its token looks like a position — this is the
+    // assertion the surviving mutant falsifies.
+    assert_eq!(
+        calendar_signal(
+            200,
+            &CalendarContinuation::MorePages {
+                page_token: "CPDAlvWDx70C=".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
+        SyncSignal::Advanced { history_id: None },
+        "a page token continues the walk; storing it as a sync position is the defect the type exists for"
+    );
+    // Neither token, and the nonconforming pair, also advance nothing.
+    assert_eq!(
+        calendar_signal(
+            200,
+            &CalendarContinuation::NothingFurther,
+            None,
+            refusal.clone()
+        ),
+        SyncSignal::Advanced { history_id: None }
+    );
+    assert_eq!(
+        calendar_signal(
+            200,
+            &CalendarContinuation::Rejected {
+                page_token: "p".to_owned(),
+                sync_token: "CPDAlvWDx70C=".to_owned()
+            },
+            None,
+            refusal.clone()
+        ),
+        SyncSignal::Advanced { history_id: None },
+        "a response nobody can interpret must not yield a position"
+    );
+    // And the 410 path is unaffected by which continuation arrived, which is the control: a dead token is dead
+    // whether or not a page token came with it.
+    for continuation in [
+        CalendarContinuation::MorePages {
+            page_token: "p".to_owned(),
+        },
+        CalendarContinuation::WalkComplete {
+            sync_token: "s".to_owned(),
+        },
+        CalendarContinuation::NothingFurther,
+    ] {
+        assert_eq!(
+            calendar_signal(
+                410,
+                &continuation,
+                Some("fullSyncRequired"),
+                refusal.clone()
+            ),
+            SyncSignal::CursorUnusable
+        );
+    }
+}
+
+#[test]
 fn a_calendar_410_requires_a_resync_and_a_400_does_not() {
     // Google's sync guide: a 410 "should trigger a full wipe of the client's store and a new full sync", while
     // 400 is a disallowed query restriction — the caller's mistake. Conflating them would discard a whole
