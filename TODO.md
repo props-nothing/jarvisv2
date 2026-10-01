@@ -2039,6 +2039,14 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         the adapter's own call **count**, which both the route test and the pipeline test now assert.
         Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero skips**,
         all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
+- [ ] `P3-020` Add a restricted-execution sandbox backend behind the `P3-011` contracts (a container or an
+      equivalent isolated worker), naming the guarantees the backend can actually enforce per `ADR-0041`.
+      No new capability surface: the existing code-execution tool gains a backend, and a guarantee the
+      backend cannot enforce is refused rather than declared. The `P3-011` backend stays available so a
+      deployment without a container runtime degrades to it rather than to nothing.
+- [ ] `P3-021` Add a remote or disposable sandbox backend (a hosted or short-lived worker) behind the same
+      contracts, and prove resource limits, crash isolation, output bounding, and cleanup on the adapter
+      boundary. The `P3-011` port is unchanged, so this is an adapter slice and not a protocol change.
 
 ## P4: Memory And Context
 
@@ -2713,6 +2721,26 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, all four phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, and
       `cargo deny check` ok (advisories, bans, licenses, sources — eight `duplicate` warnings, all pre-existing
       and none an error).
+- [ ] `P4-011` Define the skill format and its lifecycle. **Record `ADR-0117` first** (accepted): a skill is a
+      procedure naming already-granted tools, loading authorizes nothing, a self-authored skill is `Derived`
+      context fenced by `ADR-0049`, and promotion is a durable approval that names its approver (`ADR-0043`).
+      Delivers the record shape (source, version, and the tools it names at that version), the `Proposed`
+      state for an agent-authored skill, the promotion decision, and replacement by declared supersession
+      (`ADR-0045`). Refuses any authority-bearing field, a preset approver, or a pre-approval. An external
+      skill format is readable only under `ADR-0117` §7, and **every dropped field is recorded** rather than
+      silently ignored (the `ADR-0022` rule for an accepted-then-ignored field).
+- [ ] `P4-012` Retrieve and use a skill: selection by relevance to the task, inclusion in the context envelope
+      as derived content, and an execution path in which **every step is an ordinary tool request** through
+      the full gateway. There is deliberately **no "skill execution" path**, so a step whose grant was revoked
+      between load and run must refuse at execution — the check can only be an execution-time one.
+- [ ] `P4-013` Add skill inspection and control: list, inspect (what it is, what it names, its source), correct,
+      forget, export, and disable — the `FR-MEM-005` lifecycle surface, applied to a stored procedure.
+- [ ] `P4-014` Add agent-proposed memory admission: the model may submit memory candidates, a candidate that
+      deterministic code supports becomes a `Proposed` record, and admission is a decision that names its
+      approver. The inference boundary is unchanged (`P4-001`, `ADR-0049` §6): a model inference is never
+      admitted above `Unverified`.
+- [ ] `P4-015` Add session summarization as derived memory: a compressed summary of a session is stored as a
+      `Derived` claim with provenance and a retention rule, and is never presented as user-authored fact.
 
 ## P5: Connectors
 
@@ -5727,43 +5755,43 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **NEW LIMITS:** nothing renders the report yet, so the union's contents are asserted rather than shown; a
     shortfall without a reauth still has no `ConnectorHealth` variant, so the caller's argument is not yet
     redundant.
-- [ ] `P5-005` **(continued â€” a diagnostic that contradicts the predicate the platform gates on)**:
+- [ ] `P5-005` **(continued — a diagnostic that contradicts the predicate the platform gates on)**:
   `DiagnosticField::HealthStale` added; `diagnostics_for` takes `now` and `freshness_seconds` and derives the
   health severity from `permits_calls_at`. **2 new tests (so 496 in the crate).** **`ADR-0118`.** Three guards
   falsified A-B-A.
-  - **â­â­ THE FINDING: THE REPORT RANKED A STATE BY THE WRONG PREDICATE, AND THE TWO FACTS NEEDED TO SEE THE
+  - **⭐⭐ THE FINDING: THE REPORT RANKED A STATE BY THE WRONG PREDICATE, AND THE TWO FACTS NEEDED TO SEE THE
     CONTRADICTION WERE NOT IN THE REPORT.** `security.md`'s "missing or stale evidence fails closed" is enforced
-    by `ConnectorHealth::permits_calls_at(now, bound)` â€” whose module doc calls it *"the method a caller should
-    use"* and says calling `permits_calls` on an unfresh state *"is the defect this exists to prevent"* â€” and
+    by `ConnectorHealth::permits_calls_at(now, bound)` — whose module doc calls it *"the method a caller should
+    use"* and says calling `permits_calls` on an unfresh state *"is the defect this exists to prevent"* — and
     `diagnostics_for` derived `HealthState`'s severity from **`permits_calls()`** alone. So a `Connected`
     observation from yesterday was reported as `connected` at **`Info`** (the severity that means *nothing to
     do here*) about a state that permits **no call**.
-  - **â­â­ THE REPORT CARRIED `HealthObservedAt` AND NEITHER THE BOUND NOR *NOW*.** So an operator could not even
+  - **⭐⭐ THE REPORT CARRIED `HealthObservedAt` AND NEITHER THE BOUND NOR *NOW*.** So an operator could not even
     *see* the contradiction: the rule turns on `elapsed` versus a bound, and one of the two operands was in the
-    report and the other two were not. **â­ `ADR-0092`'s "a value with a producer and no reader" â€” the instant
-    was there and nothing about it.** **â­ A diagnostic that contradicts the predicate the rest of the platform
+    report and the other two were not. **⭐ `ADR-0092`'s "a value with a producer and no reader" — the instant
+    was there and nothing about it.** **⭐ A diagnostic that contradicts the predicate the rest of the platform
     gates on is worse than a missing one: it is read *instead of* the truth.**
-  - **â­ `DiagnosticField` IS DOCUMENTED AS A CLOSED SET OF FACTS A DIAGNOSTIC MAY REPORT, CHOSEN SO
+  - **⭐ `DiagnosticField` IS DOCUMENTED AS A CLOSED SET OF FACTS A DIAGNOSTIC MAY REPORT, CHOSEN SO
     `is_loggable()` IS TRUE FOR ALL OF IT.** "This state is too old to act on" is such a fact, and the set had
-    no variant â€” so the platform's central rule was the one thing the report could not say. The count assertion
-    (20 â†’ 21) was updated in the same change, so the new field is covered by the loggability, model-exposure,
+    no variant — so the platform's central rule was the one thing the report could not say. The count assertion
+    (20 → 21) was updated in the same change, so the new field is covered by the loggability, model-exposure,
     renderability and distinctness assertions.
-  - **â­ `now` IS A PARAMETER, NOT A CLOCK READ** â€” the reason the health module's own `is_fresh_at` records:
+  - **⭐ `now` IS A PARAMETER, NOT A CLOCK READ** — the reason the health module's own `is_fresh_at` records:
     a value that asked the system clock about its own age could not be checked against a supplied instant, and
     `jarvis_core::Clock` exists so time is injectable. The daemon owns the clock; this function owns the policy.
-  - **â­â­ A MUTANT SURVIVED THE FIRST VERSION OF THIS CHANGE, AND THAT IS THE SECOND FINDING.** With
+  - **⭐⭐ A MUTANT SURVIVED THE FIRST VERSION OF THIS CHANGE, AND THAT IS THE SECOND FINDING.** With
     `stale = !health.permits_calls_at(now, bound)` in place of `!is_fresh_at(now, bound)` **the entire suite
-    passed** â€” every state the staleness test used was `Connected`, where the two predicates **agree**. They are
+    passed** — every state the staleness test used was `Connected`, where the two predicates **agree**. They are
     different facts: a `NeedsReauth` observed a moment ago **permits no call** and **is fresh**, and the mutant
     would have told an operator "nobody has checked since" about a state that was just checked. The missing
     detector is a state that **refuses and is fresh**; `staleness_and_unusability_are_two_dimensions_and_a_
     mutant_is_why_this_exists` is it, and it was confirmed to fail under that mutant **after** being written.
-    **â­ A predicate with two conjuncts is exercised by a value where they DIFFER, and a fixture where they
+    **⭐ A predicate with two conjuncts is exercised by a value where they DIFFER, and a fixture where they
     agree cannot see the difference.**
-  - **â­ THREE GUARDS FALSIFIED A-B-A:** (1) the freshness inputs ignored entirely â†’ detected by **both** tests;
-    (2) staleness conflated with unusability â†’ detected by the **second** test only, after the gap was closed;
-    (3) the supplied bound ignored (`u64::MAX`) â†’ detected by both.
-  - **â­ THE SEVERITY IS DERIVED, NOT STORED, AND THE TWO FINDINGS NEITHER SUPPRESS NOR IMPLY EACH OTHER** â€” a
+  - **⭐ THREE GUARDS FALSIFIED A-B-A:** (1) the freshness inputs ignored entirely → detected by **both** tests;
+    (2) staleness conflated with unusability → detected by the **second** test only, after the gap was closed;
+    (3) the supplied bound ignored (`u64::MAX`) → detected by both.
+  - **⭐ THE SEVERITY IS DERIVED, NOT STORED, AND THE TWO FINDINGS NEITHER SUPPRESS NOR IMPLY EACH OTHER** — a
     stale healthy state is an error **and** stale; a fresh refusal is an error and **not** stale; a stale
     refusal reports both. `HealthStale` is emitted **only when true** (the `MissingScopes` rule), because a
     negative finding that is always present is one a reader stops seeing.
@@ -5786,6 +5814,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P6-006` Require idempotency or an explicit non-retryable classification for every effectful workflow step.
 - [ ] `P6-007` Implement notifications and proactive suggestion budgets, quiet hours, dedupe, and user controls.
 - [ ] `P6-008` Add crash-at-every-transition and duplicate-event tests; pass the Phase 6 gate.
+- [ ] `P6-009` Define the skill-candidate and memory-nudge events in the envelope **before `P6-001` freezes
+      it**: a complex task that completed, a repeated procedure worth proposing, and a nudge to persist
+      knowledge. Each is an ordinary event with causation, correlation, and a dedupe key, and **none carries
+      authority** — a candidate is a proposal (`ADR-0117` §4), decided by a person and not by the event.
+- [ ] `P6-010` Implement delegation as a durable workflow step: a step whose effect is starting a child run,
+      with the parent/child link recorded, the child's tool calls re-entering the same policy gateway
+      (`P7-003`), and parallel workstreams tested for single-effect on duplicate delivery and for
+      cancellation. The effect class "starts a run" is named explicitly rather than folded into an existing
+      one.
 
 ## P7: External Runtimes
 
@@ -5797,6 +5834,16 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P7-006` Implement a generic ACP adapter and conformance fixture.
 - [ ] `P7-007` Add LangGraph only for a named use case that benefits from its checkpoint/interrupt model.
 - [ ] `P7-008` Test crash isolation, cancellation, protocol skew, unavailable runtime fallback, and canonical audit ownership.
+- [ ] `P7-009` Add delegate/subagent semantics to runtime protocol v1 **before it is frozen**: a start request
+      that names a parent run, the child run's lifecycle and settlement, cancellation that propagates, and a
+      bounded depth. Whether `agent_runs` gains a `parent_run_id` is decided here and recorded before the
+      protocol ships, because the run table already exists and a child run's parentage cannot be added
+      cheaply afterwards.
+- [ ] `P7-010` Add a subagent delegation tool: an ordinary tool whose effect is "starts a run", classified
+      with its own risk level and approval policy, so a delegated run is authorized like any other capability
+      and a model cannot spawn work the actor was not granted.
+- [ ] `P7-011` Test delegation: depth limiting, crash isolation between parent and child, cancellation
+      propagation, single-effect on duplicate delivery, and canonical audit ownership of a child run's steps.
 
 ## P8: Voice And Calls
 
@@ -5840,6 +5887,14 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `README.md`, `AGENTS.md`, `.gitignore`, and the ~11 files linking into `example/` are updated in
       the same change. `docs/research/evaluated-prototypes.md` records the required sequence: findings
       become dated records first, then the prototype is deleted.
+- [ ] `P9-010` Add messaging surfaces as authenticated gateway clients, one slice per platform, each binding an
+      inbound sender to an actor, user, and workspace **without trusting caller-supplied identity**
+      (`FR-ID-001`, `ADR-0038`: a network request is never a local caller). A platform that is not configured
+      is an absent capability rather than a degraded one, so a delivery for an unconfigured surface is refused
+      and named.
+- [ ] `P9-011` Add an answer-quality evaluation harness: labeled prompts with expected properties, run against
+      a configured provider, asserting answer quality and regression over time. Distinct from the acceptance
+      gates, which assert correctness of behavior rather than the quality of an answer.
 
 ## P10: Server And Multi-Device
 

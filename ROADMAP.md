@@ -65,6 +65,9 @@ Deliver:
 - embedding provider abstraction and pgvector implementation for server mode
 - context selection explanations and token budgets
 - memory search, inspect, correct, forget, export, and retention APIs
+- procedural memory: a skill format in which a procedure names already-granted tools and never grants
+  authority ([ADR-0117](docs/adr/0117-a-skill-is-a-procedure-not-a-permission.md)), its promotion approval,
+  and agent-proposed memory admission
 
 **Exit gate:** a remembered preference survives restart, is retrieved with provenance, can be corrected and forgotten, and never crosses workspace boundaries.
 
@@ -91,6 +94,7 @@ Deliver:
 - durable event inbox/outbox and deduplication
 - scheduler with timezone and daylight-saving behavior
 - native workflow state machine with leases, retries, waits, parallel steps, cancellation, and compensation metadata
+- skill-candidate and memory-nudge events, and delegation as a step whose effect is starting a child run
 - event-triggered skills and notification routing
 - approval and timer restart recovery
 
@@ -104,6 +108,7 @@ Deliver:
 
 - versioned JARVIS runtime protocol and supervisor
 - capability negotiation, event normalization, cancellation, health, and crash isolation
+- delegate/subagent semantics in the runtime protocol, with a parent run recorded and a delegation tool whose effect is starting a run
 - OpenClaw adapter
 - OpenAI Agents adapter
 - ACP adapter
@@ -135,6 +140,7 @@ Deliver:
 Deliver:
 
 - Tauri desktop client with chat, activity, approvals, connections, memory, tasks, models, runtimes, voice, and settings
+- messaging surfaces as authenticated gateway clients, one per platform
 - onboarding and recovery UX
 - signed installers, checksums, update channels, rollback, and uninstall
 - Linux systemd user unit, macOS LaunchAgent, Windows per-user scheduled task; optional elevated system service modes
