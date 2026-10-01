@@ -1179,3 +1179,216 @@ fn both_channel_identifiers_go_through_the_same_identifier_validator() {
     // bound rather than about the bound being unreachable.
     assert!(calendar_channel_stop("channel-alpha", &"b".repeat(MAX_RESOURCE_ID_CHARS)).is_ok());
 }
+
+#[test]
+fn a_channel_creation_names_the_three_required_fields_and_echoes_the_id() {
+    // **The operation `renewal_decision` prescribes and nothing could issue.** `channels.stop` could end a
+    // channel while no builder could make one, so the whole lease/renewal chain was reachable only from a
+    // fixture. The reference's required trio is `id`, `type: web_hook` and `address`, with the optional `token`.
+    let request = must(
+        calendar_channel_watch(
+            "primary",
+            "01234567-89ab-cdef-0123456789ab",
+            "https://mydomain.example/notifications",
+            None,
+        ),
+        "a channel creation with the required fields must build",
+    );
+    assert_eq!(
+        request.url(),
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events/watch"
+    );
+    let body: serde_json::Value = must(
+        serde_json::from_str(request.rendered_body()),
+        "the body is JSON",
+    );
+    assert_eq!(body["id"], "01234567-89ab-cdef-0123456789ab");
+    // The `type` is a constant, and this is the assertion that keeps it spelled as the guide's example does.
+    assert_eq!(body["type"], "web_hook");
+    assert_eq!(body["address"], "https://mydomain.example/notifications");
+    // Exactly the three required fields when no token is supplied: an absent token is omitted rather than sent
+    // as `""`, which would be a token the provider echoes back and `verify_channel_token` then compares against.
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(3),
+        "the creation body must carry the required trio and nothing else: {body}"
+    );
+    assert_eq!(body.get("token"), None);
+    // No expiry parameter is offered: the channel's life is read back from the response, so the request cannot
+    // become a second place that life is decided.
+    assert_eq!(body.get("expiration"), None);
+    assert_eq!(body.get("params"), None);
+}
+
+#[test]
+fn a_channel_creation_carries_the_token_it_is_given_and_its_body_is_redacted() {
+    // The optional token is the anti-spoofing control `verify_channel_token` compares against, so it is a secret
+    // in a request body -- the case that made `JsonRequest`'s redaction body-dependent, because its derived
+    // `Debug` had printed both of its first two bodies (a topic name with label ids; a channel id with a
+    // resource id) and would print this one.
+    let token = must(
+        SecretValue::new("target=myApp-myCalendarChannelDest"),
+        "a token within the 256-character bound must build",
+    );
+    let request = must(
+        calendar_channel_watch(
+            "primary",
+            "channel-alpha",
+            "https://mydomain.example/notifications",
+            Some(&token),
+        ),
+        "a channel creation with a token must build",
+    );
+    let body: serde_json::Value = must(
+        serde_json::from_str(request.rendered_body()),
+        "the body is JSON",
+    );
+    // The accessor returns the real body -- the transport needs the bytes -- so the token IS present here.
+    assert_eq!(body["token"], "target=myApp-myCalendarChannelDest");
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(4),
+        "the four fields, token included: {body}"
+    );
+    // **And the secret does not reach a `Debug`.** This is the falsifiable half: before the change a derived
+    // `Debug` printed the body, token and all. The marker and the length are asserted rather than merely the
+    // absence of the token, so a `Debug` that printed nothing at all would fail too.
+    let rendered = format!("{request:?}");
+    assert!(
+        !rendered.contains("target=myApp-myCalendarChannelDest"),
+        "the token must not appear in a Debug rendering: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "a sensitive body must render as a redaction marker: {rendered}"
+    );
+    // The length is kept because it is not the value and it distinguishes two requests in a diagnostic.
+    assert!(
+        rendered.contains("chars"),
+        "the redaction keeps the body's length: {rendered}"
+    );
+}
+
+#[test]
+fn a_body_with_no_secret_still_prints_in_full() {
+    // **The control for the redaction.** A hand-written `Debug` that redacted *every* body would satisfy the
+    // test above while destroying the diagnostic value of the two bodies that hold no secret -- and the reason
+    // `rendered_body`'s doc could once say "there is no credential here" is precisely that those two bodies are
+    // printable. So the non-sensitive constructor's output is asserted to contain its fields.
+    let stop = must(
+        calendar_channel_stop("channel-alpha", "o3hgv1538sdjfh"),
+        "a stop must build",
+    );
+    let rendered = format!("{stop:?}");
+    assert!(
+        rendered.contains("channel-alpha") && rendered.contains("o3hgv1538sdjfh"),
+        "a non-sensitive body must print its fields: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[REDACTED]"),
+        "a non-sensitive body has nothing to redact: {rendered}"
+    );
+}
+
+#[test]
+fn a_webhook_address_must_be_absolute_https_with_a_host() {
+    // The guide: the address *"must use HTTPS"*. What this validator **can** check is a property of the string,
+    // and what it cannot -- a valid certificate chain, reachability -- is recorded as a limit rather than
+    // pretended. Each refusal names the `address` field so a caller learns which argument is unusable.
+    for address in [
+        "",                           // empty
+        "   ",                        // whitespace-only
+        "/notifications",             // a path, not an absolute URL
+        "http://mydomain.example/n",  // not HTTPS
+        "ftp://mydomain.example/n",   // not HTTPS
+        "https://",                   // HTTPS but no host
+        "https:///notifications",     // an empty authority with a path
+        "https://mydomain.example\n", // a control character, on the raw value
+    ] {
+        assert!(
+            matches!(
+                calendar_channel_watch("primary", "channel-alpha", address, None),
+                Err(RequestError::Argument {
+                    field: "address",
+                    ..
+                })
+            ),
+            "`{address}` must be refused naming `address`"
+        );
+    }
+    // The scheme comparison is case-insensitive because a URI scheme is, so `HTTPS://` is accepted -- asserted
+    // so a later reader does not "fix" it into a case-sensitive compare and refuse a conforming address.
+    assert!(
+        calendar_channel_watch(
+            "primary",
+            "channel-alpha",
+            "HTTPS://mydomain.example/notifications",
+            None
+        )
+        .is_ok()
+    );
+    // The control: a plain conforming address is accepted, so the refusals are about the rules and not about the
+    // validator refusing everything.
+    assert!(
+        calendar_channel_watch(
+            "primary",
+            "channel-alpha",
+            "https://mydomain.example/notifications",
+            None
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_channel_id_is_bounded_by_googles_64_and_not_the_generic_identifier_bound() {
+    // **Google's own figure, not the module's generic 256.** The push guide gives *"Maximum length: 64
+    // characters"* for the `id`. A channel id of 65 characters passes the generic `resource_id` bound and would
+    // be refused by the provider, so the builder checks Google's 64 -- and the boundary is exercised at 64 (ok)
+    // and 65 (refused), so neither side is unreachable.
+    let at_limit = "a".repeat(MAX_CHANNEL_ID_CHARS);
+    assert!(
+        calendar_channel_watch(
+            "primary",
+            &at_limit,
+            "https://mydomain.example/notifications",
+            None
+        )
+        .is_ok(),
+        "a 64-character channel id is Google's own maximum and must be accepted"
+    );
+    let over = "a".repeat(MAX_CHANNEL_ID_CHARS + 1);
+    assert!(
+        matches!(
+            calendar_channel_watch(
+                "primary",
+                &over,
+                "https://mydomain.example/notifications",
+                None
+            ),
+            Err(RequestError::Argument {
+                field: "channel_id",
+                ..
+            })
+        ),
+        "a 65-character channel id must be refused, because Google's limit is 64"
+    );
+    // And the generic identifier rules still apply underneath: an empty or control-bearing id is refused.
+    for channel in ["", "   ", "chan\nnel"] {
+        assert!(
+            matches!(
+                calendar_channel_watch(
+                    "primary",
+                    channel,
+                    "https://mydomain.example/notifications",
+                    None
+                ),
+                Err(RequestError::Argument {
+                    field: "channel_id",
+                    ..
+                })
+            ),
+            "`{channel}` must be refused naming `channel_id`"
+        );
+    }
+}

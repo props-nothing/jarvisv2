@@ -48,6 +48,7 @@ Meet, Chat, the admin SDK, and every Google Cloud product other than Pub/Sub. `P
 | Gmail `Format` enum + `Message` resource | https://developers.google.com/workspace/gmail/api/reference/rest/v1/Format (last updated **2026-03-24**) and https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages | 2026-09-30 | **which fields each `format` returns** — the fact that bounds what a `messages.get` output can declare (`ADR-0083`) |
 | Calendar `events.list` method reference | https://developers.google.com/workspace/calendar/api/v3/reference/events/list (last updated **2026-07-29**) | 2026-09-30 | the full parameter list and **the eight parameters that cannot be combined with `syncToken`** (`ADR-0084`), the `maxResults` default and ceiling, and the `nextPageToken`/`nextSyncToken` exclusivity |
 | Calendar `events.watch` method reference | https://developers.google.com/workspace/calendar/api/v3/reference/events/watch (last updated **2026-05-12**) | 2026-10-01 | the **response** `expiration` typed **`long`** — *"a Unix timestamp, in milliseconds"* — which **contradicts the guide's "property string"** for the same field; `params.ttl` *"Default is 604800 seconds"*; the channel fields and the `resourceId`/`resourceUri` distinction (`ADR-0106`, Finding 20) |
+| Calendar `events.watch` **request body** (method reference + push guide, *Make watch requests*) | https://developers.google.com/workspace/calendar/api/v3/reference/events/watch (last updated **2026-05-12**) and https://developers.google.com/workspace/calendar/api/guides/push (last updated **2026-09-11**) | 2026-10-01 | **the fields a channel *creation* carries** — the fact that made channel creation constructible at all (`ADR-0112`, Finding 23): the **required** trio (`id` ≤ 64 chars, *"echoed back in the `X-Goog-Channel-Id`"*; `type` = `web_hook`; `address`, **https-only with a valid certificate**), the **optional** pair (`token` ≤ 256 chars for anti-spoofing, `expiration` as a **Unix timestamp in milliseconds**), and that `address` and `token` are **credential-adjacent** fields a rendered body would disclose |
 | Calendar `channels.stop` method reference | https://developers.google.com/workspace/calendar/api/v3/reference/channels/stop (last updated **2025-04-01**) | 2026-10-01 | the stop body is exactly `{ id, resourceId, token? }` with **no `expiration`**, so the `resourceId` a `watch` response returns is what makes teardown constructible (`ADR-0106`) |
 
 The shared OAuth protocol facts — PKCE, loopback redirects, rotation, revocation — are recorded once in
@@ -1037,6 +1038,50 @@ property of the token, not of the channel**: the same channel id and `resourceId
 from another client cannot stop it, which means a stop is only ever attempted with the credential the `watch`
 used.
 
+### Finding 23 — the connector could **stop** a Calendar channel and could not **create** one, and the create body carries two credential-adjacent fields
+
+`channels.stop` was built (`ADR-0106`/`ADR-0107`) and `renewal_decision` prescribes the remedy for a lapsed
+channel — *"you must replace it with a new one by calling the `watch` method"* — while **no `events.watch`
+request builder existed**. So the connector could end a channel and had no way to make one, which is the
+"a remedy with no operation" shape from a new direction: not a decision without a caller, but a **prescribed
+call with no builder**. The response parser (`parse_channel_watch_response`) and the lease types were built
+around a `watch` that nothing could issue.
+
+**The request body is four fields, and two of them are credential-adjacent.** The `events.watch` reference gives
+the body as `{ id, token, type, address, params }`, and the push guide states which are required:
+
+| field | required? | documented value |
+| --- | --- | --- |
+| `id` | **yes** | *"A UUID or similar unique string that identifies this channel… **Maximum length: 64 characters**"*, **echoed** as `X-Goog-Channel-ID` |
+| `type` | **yes** | `"web_hook"` (*"or `webhook`"*) |
+| `address` | **yes** | *"the URL that listens and responds to notifications… **must use HTTPS**"* |
+| `token` | no | *"an arbitrary string value… **Maximum length: 256 characters**"*, echoed as `X-Goog-Channel-Token` |
+| `params.ttl` | no | *"The time-to-live in seconds… **Default is 604800 seconds**"* |
+
+So the body carries **the webhook address** (an endpoint, potentially internal) **and the channel token** (the
+anti-spoofing secret `verify_channel_token` compares against). That matters because
+[`JsonRequest::rendered_body`](crate::google::request::JsonRequest::rendered_body) is documented as *"not
+redacted… there is no credential here"* and derives `Debug` — a claim that was true of the two bodies it had
+(topic name + label ids; channel id + resourceId) and **false of the third**. A derived `Debug` on the third
+body would print the token, the same defect `ADR-0091` records for four types that held a sensitive field and
+printed it. So the type's redaction has to become **body-dependent**, which is a change a derived `Debug`
+cannot make.
+
+**The `address` is validated for shape only, and that is a boundary rather than an omission.** The guide
+requires HTTPS *and* a valid (non-self-signed, non-revoked, subject-matching) certificate at the receiving host,
+but **a certificate is not observable at request-construction time**: whether the host presents a valid chain is
+a fact about a TLS handshake this crate's request value (which has no socket) cannot perform, and whether the
+address is even *reachable* is untestable offline. So the builder enforces what is knowable — a non-empty
+`https://` absolute URL with a host, no control characters, a bounded length — and records the certificate rule
+as the provider's own `400`-class refusal rather than pretending to check it.
+
+**The `id` echo is what makes the create response the registration's other half.** The `watch` response returns
+`id`, `resourceId`, `resourceUri`, `token` and `epoch-millis expiration`; the connector already parses `id`,
+`resourceId` and `expiration` (`ADR-0106`/`ADR-0107`). The `id` the connector **chose** comes back, which is
+what lets a created channel be bound to a registration: the two identifiers a `channels.stop` needs are the one
+the connector sent and the one the provider returned, so creation and teardown are two halves of one record.
+
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in
@@ -1221,6 +1266,20 @@ where every line looks equally done is a plan nobody can audit.
   reordering the arms — changes nothing, since `Lapsed` and `Alive` are disjoint variants (`ADR-0107`'s lesson,
   applied rather than re-learned). What is **not** built: the teardown executor, so nothing computes the
   `WatchLapse` and passes it.
+- **A test that a channel creation carries the required trio and redacts a token-bearing body**, added once the
+  remedy `renewal_decision` prescribes was found to have **no builder**. **WRITTEN** by `ADR-0112`:
+  `calendar_channel_watch(calendar_id, channel_id, address, token)` builds `{id, type, address}` or, with a
+  token, `{id, type, address, token}`; `type` is the constant `web_hook` because Google describes no other
+  mechanism (**Findings 1 and 20** name the two delivery shapes); **no expiry parameter** is offered, because the
+  figure acted on is the **response's** (`ADR-0106`). The **token** made `JsonRequest`'s "there is no credential
+  here" doc false, so the type's redaction became **body-dependent**: `Debug` is hand-written and the two
+  constructors are private and named (`renderable`/`sensitive`), so a new builder must say which kind of body it
+  produces. Four guards falsified A-B-A: the sensitive constructor un-redacted (**the token appeared in a
+  `Debug`**), `strip_https_scheme` weakened (**`http://` accepted**), the channel-id bound relented to the generic
+  256 (**a 65-character id accepted**), and the **non**-sensitive constructor redacting (**the control**: a
+  printable body rendered `[REDACTED]`). The `address` **certificate** rule is a **recorded limit** — a valid
+  chain is not observable at request-construction time (Finding 23). What is **not** built: no request is sent,
+  no channel is registered, and the stop **permission** rule (`ADR-0107`) is still unenforceable locally.
 - **Opt-in live smoke test** behind credentials and a cost gate, as `tools-and-connectors.md` requires.
   **Not written.**
 
@@ -1442,5 +1501,6 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-10-01 | Calendar **`events.list` reference** re-fetched (`.../calendar/v3/reference/events/list`, footer **2026-07-29**, unchanged) for the two continuation tokens the output schema declared with **no descriptions** | The mutual exclusion is stated in **each field's own description**, not in prose elsewhere: `nextPageToken` is *"Token used to access the next page of this result. **Omitted if no further results are available, in which case `nextSyncToken` is provided.**"* and `nextSyncToken` is *"Token used at a later point in time to retrieve only the entries that have changed since this result was returned. **Omitted if further results are available, in which case `nextPageToken` is provided.**"* So a page carries **at most one**. Also re-confirmed from the same page: `maxResults` *"By default the value is 250 events. The page size can never be larger than 2500 events."*; *"Incomplete pages can be detected by a non-empty nextPageToken field"*; and the `syncToken` description's list of parameters that cannot accompany it (`iCalUID orderBy privateExtendedProperty q sharedExtendedProperty timeMin timeMax updatedMin`), which is `ADR-0084`'s list. Implemented as `CalendarContinuation` + `of_page` + schema descriptions, `ADR-0109`. |
 | 2026-10-01 | Gmail **push guide** re-fetched (`.../gmail/api/guides/push`, footer **2026-09-15**, unchanged) for the **two branches** a first sync has, and the `users.history.list` reference for what a `startHistoryId` of the anchor yields | The *Watch response* section names the anchor and then **forks**, verbatim: *"The response contains the current mailbox `historyId` for the user. **Your client receives notifications for all changes after that `historyId`.** If you need to process changes **before** this `historyId`, refer to Synchronize clients with Gmail."* So there are **two** documented first-sync branches � `history.list` from the anchor, or the mailbox's existing contents � and the connector could express only the second, because `resume_from` answered `FullSync` for every `Start` cursor while `WatchResponse::anchor` and `GmailProfile::history_id` both had readers and no consumer. Also re-confirmed: the worked example's two numbers (*"Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist `9876543210` as the last known `historyId`"*) and *"Additionally, a successful `watch` call immediately sends a notification to your Cloud Pub/Sub topic"* (the opening notification `ADR-0104` records as unmarked). The profile's `historyId` is the second anchor source and costs 1 quota unit rather than a message read. Implemented as `ResumePoint::FromAnchor` + `SyncOrigin` + `resume_anchored`/`resume_ignoring_anchor` + `AnchoredAccount`, `ADR-0110`. |
 | 2026-10-01 | **Cross-check of `ADR-0107`'s recorded wiring gap against this crate's own types** — no page fetched, an audit of what the record already establishes about a watch's expiry | The gap `ADR-0107` named is closed by a **second Gmail function, not a parameter**: `parse_watch_response` already reads the `watch` response's `expiration` into a `UtcTimestamp` and `watch_lapse` turns it into a `WatchLapse`, so a caller **does** hold the instant `gmail_exposure` lacked, and `AlreadyEnded` becomes reachable for Gmail from the same `WatchLapse` a channel reaches it from. A **bound** ("at least once every 7 days") and a **lease** (this watch's `expiration`) are different inputs, so the bound-only figure is kept for the scheduler that holds no watch rather than replaced. Two guards falsified A-B-A: the `stop_succeeded` guard inverted, and the live arm's `for_seconds` replaced by `WATCH_RENEWAL_BOUND_SECONDS`. Also found and removed in the same slice: a **dangling intra-doc link to the `PushMechanism` enum `ADR-0107` removed**, and a **gap in this record's own Finding numbering** (findings ran `…20, 22, 23` because `ADR-0108` renamed the then-existing Finding 21 to 23, leaving no 21). Implemented as `gmail_watch_exposure`, `ADR-0111`. |
+| 2026-10-01 | Calendar **`events.watch` reference** (`…/calendar/v3/reference/events/watch`, footer **2026-05-12**, unchanged) and **push guide** (*Make watch requests*, footer **2026-09-11**) read for the **request body** — the fields a channel *creation* carries, since the record had only the **response** shape | The reference gives the body as `{ id, token, type, address, params }` with `params.ttl` *"The time-to-live in seconds for the notification channel. **Default is 604800 seconds.**"*, and the guide states the **required** trio verbatim: `id` *"A UUID or similar unique string that identifies this channel… **Maximum length: 64 characters**"* (echoed as `X-Goog-Channel-Id`), `type` *"set to the value `web_hook`"*, and `address` *"the URL that listens and responds to notifications… **must use HTTPS**"* — *"If a channel has an expiration time, it's included as the value of the `X-Goog-Channel-Expiration` HTTP header (in human-readable format)"*. The **optional** pair: `token` *"an arbitrary string value to use as a channel token… **Maximum length: 256 characters**"* (*"use the token to verify that each incoming message is for a channel that your application created—to ensure that the notification is not being spoofed"*), and the guide warns *"Don't include sensitive data such as OAuth tokens."* So the **create** body carries a credential-adjacent `token` and a webhook `address`, which `JsonRequest::rendered_body`'s own doc (*"there is no credential here"*) had asserted could not happen — corrected by making the type's redaction body-dependent. The guide's **certificate** rule (*"only if there's a valid SSL certificate installed on your web server"*, invalid cases listed) is a **limit**: a chain is not observable at request-construction time. Implemented as `calendar_channel_watch` + `webhook_address`, `ADR-0112`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

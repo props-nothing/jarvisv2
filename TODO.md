@@ -5553,6 +5553,49 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     locally** (the client id lives inside the credential). A convenience that reads a `WatchResponse`'s
     `expiration` into a `WatchLapse` is **not** built, because it would be a second reader of a value with one
     caller — the consumerless-value defect the same slice's own argument invokes.
+- [ ] `P5-005` **(continued — a prescribed call with no builder)**: `google::request` gains
+  `calendar_channel_watch(calendar_id, channel_id, address, token)`; `JsonRequest`'s redaction becomes
+  body-dependent (hand-written `Debug`, two private named constructors `renderable`/`sensitive`); `webhook_address`
+  and the channel-id bound are new. **5 new tests (so 487 in the crate).** **`ADR-0112`.** Four guards falsified
+  A-B-A. Closes the **create** half of the channel path.
+  - **⭐⭐ THE FINDING: A PRESCRIBED CALL WITH NO BUILDER.** `channels.stop` was built and `renewal_decision`
+    prescribes the remedy — *"you must **replace it with a new one by calling the `watch` method`"* — while **no
+    `events.watch` builder existed**. So the connector could **end** a channel and had no way to **make** one,
+    and `parse_channel_watch_response` plus the whole `ChannelLease`/`ChannelRenewal` chain were reachable only
+    from a hand-built fixture. **⭐ `ADR-0092`'s "a value with no reader" from a new direction: not a decision
+    without a caller, but a call the documentation names and the connector's own decision function prescribes,
+    with no operation behind it.**
+  - **⭐⭐ THE THIRD BODY MADE A TYPE'S OWN DOC FALSE.** `JsonRequest`'s `rendered_body` said *"there is no
+    credential here"* and the type **derived `Debug`** — true of its two bodies (a topic name with label ids; a
+    channel id with a resource id) and false of a **creation** body carrying the webhook `address` and the
+    channel **`token`** (the anti-spoofing control `verify_channel_token` compares against). **⭐ A derived
+    `Debug` is a claim that every field is printable, and the claim expires when a new field arrives.** The
+    redaction is now body-dependent, and the choice is **forced** rather than defaulted: no public constructor,
+    two named private ones, so a fourth builder must say which kind of body it produces — the
+    "unrepresentable rather than checked" shape this module already uses for a credential in a URL.
+  - **⭐ THE `address` IS VALIDATED FOR WHAT A STRING CAN PROVE, AND THE CERTIFICATE RULE IS A RECORDED LIMIT.**
+    The guide requires HTTPS *and* a valid (non-self-signed, non-revoked, subject-matching) certificate —
+    but a chain is a fact about a TLS handshake a request value with no socket cannot perform. So a callback
+    with a bad certificate passes the builder and fails at **delivery** time; pretending to check it would be an
+    unverifiable claim. `http://` is refused rather than downgraded, and the scheme compare is case-insensitive
+    because a URI scheme is.
+  - **⭐ GOOGLE'S 64, NOT THE MODULE'S GENERIC 256.** The channel `id` is capped at *"64 characters"* by the
+    push guide, while every other identifier here uses a JARVIS bound of 256. A 65-character id passes the
+    generic `resource_id` and is refused by the provider, so the builder checks Google's figure **on top of**
+    the shared validator, and the boundary is exercised at 64 (ok) and 65 (refused).
+  - **⭐ THE REDUNDANT-GUARD RULE APPLIED.** The token's 256 bound is already enforced by `SecretValue::new`, so
+    the builder does **not** re-check it — a second check of the same bound is the guard `ADR-0066` records as
+    one that can never decide anything the first did not.
+  - **⭐ FOUR GUARDS FALSIFIED A-B-A**, all compiling: (1) `sensitive` setting `false` → the token appeared in a
+    `Debug` rendering → **detected**; (2) `strip_https_scheme` accepting any non-empty scheme → `http://`
+    accepted → **detected**; (3) the channel-id bound relented to `MAX_RESOURCE_ID_CHARS` → a 65-character id
+    accepted → **detected**; (4) **the control** — `renderable` setting `true` → a printable body rendered
+    `[REDACTED]` → **detected**, which is what stops a redact-everything `Debug` from satisfying the redaction
+    test while destroying the diagnostic value of the two bodies that hold no secret.
+  - **NEW LIMITS:** no request is sent and no channel is registered — the **certificate** rule and reachability
+    are unverifiable offline; the stop **permission** rule (`ADR-0107`) is still unenforceable locally; **no
+    expiry parameter** is offered (the figure acted on is the response's), and **nothing renews on a schedule**
+    yet, so `CHANNEL_REPLACE_LEAD_SECONDS` and this builder are not exercised together.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

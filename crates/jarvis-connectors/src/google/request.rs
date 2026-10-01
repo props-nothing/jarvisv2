@@ -33,6 +33,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::auth::SecretValue;
 use crate::google::CONNECTOR_ID;
 use crate::google::client::{self, CALENDAR_API_BASE, GMAIL_API_BASE, GMAIL_MAX_RESULTS_CAP};
 
@@ -79,6 +80,29 @@ pub const MAX_TOPIC_NAME_CHARS: usize = 512;
 /// the purpose is to refuse a list whose size is really an attempt at an unbounded body rather than to model
 /// a provider figure.
 pub const MAX_WATCH_LABEL_IDS: usize = 64;
+
+/// The longest channel id Google accepts, in characters.
+///
+/// **Google's own figure**, not a JARVIS bound: the push guide gives *"Maximum length: 64 characters"* for the
+/// `id` a `watch` request carries. Stated exactly so the refusal and the provider agree, the same way
+/// [`MAX_CHANNEL_TOKEN_BYTES`](crate::google::channel::MAX_CHANNEL_TOKEN_BYTES) is Google's 256.
+pub const MAX_CHANNEL_ID_CHARS: usize = 64;
+
+/// The longest a webhook address may be, in characters.
+///
+/// **A JARVIS bound**: the push guide states no maximum length for `address`, only that it must be HTTPS. A URL
+/// a model could supply is bounded here so it cannot become an unbounded request body or log line; 2048 admits
+/// every realistic callback URL with room to spare.
+pub const MAX_WEBHOOK_ADDRESS_CHARS: usize = 2_048;
+
+/// The channel `type` value every Google `watch` requires, spelled once.
+///
+/// The reference: `type` is *"The type of delivery mechanism used for this channel. Valid values are
+/// `web_hook` (or `webhook`)"*. The guide's own example uses `web_hook`, so that spelling is the one this crate
+/// sends. It is a **constant** rather than a parameter because it is the only delivery mechanism Google's
+/// `watch` methods describe: a caller has no valid alternative to choose, so offering one would be a field with
+/// one usable value — the "a value nothing is decided by" shape this crate removes.
+pub const WEBHOOK_CHANNEL_TYPE: &str = "web_hook";
 
 /// The `Accept` header value both APIs expect for a JSON body.
 pub const JSON_ACCEPT: &str = "application/json";
@@ -294,6 +318,83 @@ fn resource_id<'a>(field: &'static str, value: &'a str) -> Result<&'a str, Reque
         });
     }
     Ok(trimmed)
+}
+
+/// Validates a webhook callback address for a Calendar notification channel.
+///
+/// # What this can check, and the one rule it cannot
+///
+/// The push guide requires the `address` to *"use HTTPS"* **and** states that Google *"is able to send
+/// notifications to this HTTPS address only if there's a valid SSL certificate installed on your web
+/// server"*, listing the invalid cases (self-signed, signed by an untrusted source, revoked, or a subject that
+/// does not match the hostname). This function enforces the part that is a property of the **string** — an
+/// absolute `https://` URL with a host and no control character — and deliberately does **not** attempt the
+/// certificate rule.
+///
+/// **The certificate is not observable here, and pretending to check it would be worse than recording it.** A
+/// valid chain is a fact about a TLS handshake to a host this crate's request value (which has no socket)
+/// cannot perform; a reachability problem is likewise untestable offline. So a callback whose certificate is
+/// self-signed passes this validator and fails at **delivery** time — the notifications are accepted at channel
+/// creation and then silently dropped, which is the guide's own *"Notifications are not 100% reliable"* caveat
+/// reached from a configuration mistake rather than a provider fault. The builder records this as a limit rather
+/// than a check, the same way `channels.stop`'s permission rule is recorded (`ADR-0107`).
+///
+/// **`http://` is refused rather than downgraded**, because the guide says the address *"must use HTTPS"*: a
+/// plain-HTTP callback would be accepted by nothing, and sending it would spend a request to learn what the page
+/// already states. The scheme comparison is **case-insensitive** (`HTTPS://` is a valid URI scheme spelling) and
+/// the host check is on the remainder after the scheme and its `//`, so `https://` with no host is refused
+/// rather than sent as a request to an empty authority.
+///
+/// # Errors
+///
+/// Returns [`RequestError::Argument`] for an empty, oversized, or control-bearing address; an address that is
+/// not an absolute `https://` URL; or one with no host.
+fn webhook_address(value: &str) -> Result<&str, RequestError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_WEBHOOK_ADDRESS_CHARS {
+        return Err(RequestError::Argument {
+            field: "address",
+            reason: "a webhook address is 1 to 2048 characters and not only whitespace, because it becomes a \
+                     request body field and a log line",
+        });
+    }
+    // Against the raw value, not the trimmed one, for the reason `watch_json_body` records: trimming first
+    // removes the very control character the check exists to catch.
+    if value.chars().any(char::is_control) {
+        return Err(RequestError::Argument {
+            field: "address",
+            reason: "a webhook address may not hold a control character, because it becomes a request body \
+                     field and a log line where a newline forges a record",
+        });
+    }
+    let Some(rest) = strip_https_scheme(trimmed) else {
+        return Err(RequestError::Argument {
+            field: "address",
+            reason: "the provider requires the notification address to be an absolute URL that uses HTTPS, \
+                     so a callback over any other scheme would never receive a delivery",
+        });
+    };
+    // A host is everything up to the path, query or fragment. An empty authority (`https://`) or an address
+    // that is only a path is not a callback URL Google can reach, and sending it would be a request that fails
+    // at delivery time with nothing local to have caught it.
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(RequestError::Argument {
+            field: "address",
+            reason: "a webhook address must name a host, because an address with an empty authority is not \
+                     one the provider can deliver to",
+        });
+    }
+    Ok(trimmed)
+}
+
+/// Returns the part after an `https://` scheme, or `None` if the value does not begin with one.
+///
+/// Case-insensitive because a URI scheme is, and split out rather than inlined so the one comparison the HTTPS
+/// rule rests on is stated once.
+fn strip_https_scheme(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once("://")?;
+    scheme.eq_ignore_ascii_case("https").then_some(rest)
 }
 
 /// Validates a Gmail search query.
@@ -673,10 +774,13 @@ pub fn gmail_profile() -> HttpRequest {
 /// # Why this is the shape for every body-bearing call here, and what it is not
 ///
 /// [`HttpRequest`] has **no body** on purpose — every operation it builds is a `GET`, and it documents that a
-/// body field "would be a shape nothing uses". Two operations disprove the general claim: `users.watch`
+/// body field "would be a shape nothing uses". **Three** operations disprove the general claim: `users.watch`
 /// (`POST …/users/me/watch` with a JSON body carrying `topicName` and optionally `labelIds` and
-/// `labelFilterBehavior`) and `channels.stop` (`POST …/calendar/v3/channels/stop` with a JSON body carrying
-/// `id` and `resourceId`). So this crate needed a second request shape, and it is **not** [`FormRequest`] —
+/// `labelFilterBehavior`), `channels.stop` (`POST …/calendar/v3/channels/stop` with a JSON body carrying
+/// `id` and `resourceId`), and — the one that made this type's redaction a requirement rather than a
+/// decision — `events.watch` (`POST …/calendars/{calendarId}/events/watch`, whose body carries the webhook
+/// `address` and the channel `token`). So this crate needed a second request shape, and it is **not**
+/// [`FormRequest`] —
 /// that type exists for the token endpoint, whose body carries the `code` and the `refresh_token`, is
 /// `application/x-www-form-urlencoded`, and authenticates by its body's `client_id`. Neither body here carries
 /// a credential, and both authenticate by the caller's **bearer header**, so reusing `FormRequest` would have
@@ -699,19 +803,60 @@ pub fn gmail_profile() -> HttpRequest {
 /// that is `Content-Type: application/json`, which is a constant returned by [`Self::content_type`] rather than
 /// a field — a fact about the call rather than an argument to it.
 ///
-/// # The body is already rendered
+/// # The body is already rendered, and whether it may be rendered *back* is a property of the body
 ///
-/// `body` holds JSON text produced by [`watch_json_body`] from values whose shape was checked first, so the
-/// body is rendered **once** and by the function that also owns the field names. There is no `Serialize` here:
-/// the body is a string, so the set of fields sent is visible in one place rather than spread across attributes
-/// on a struct — which is what makes the deprecated-field rule below checkable.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `body` holds JSON text produced by the builder that owns the field names, so the body is rendered **once**
+/// and in one place. There is no `Serialize` here: the body is a string, so the set of fields sent is visible
+/// in one place rather than spread across attributes on a struct — which is what makes the deprecated-field
+/// rule below checkable.
+///
+/// **It was *always* safe to print, and that stopped being true when this type gained a third caller.** The
+/// first two bodies (a topic name with label ids; a channel id with a resource id) hold no secret, and a
+/// derived `Debug` printed them — which is why [`Self::rendered_body`]'s doc could once say *"there is no
+/// credential here"*. A channel **creation** body carries a webhook `address` and the channel `token` (the
+/// anti-spoofing control `verify_channel_token` compares against), so a derived `Debug` on that body would
+/// print the token — the defect `ADR-0091` records for four types that held a sensitive field and printed it.
+/// The redaction is therefore **body-dependent**, which a derived `Debug` cannot express, so the `Debug` is now
+/// hand-written.
+///
+/// **The choice is forced rather than defaulted.** There is no `pub` constructor: the two bodies are built
+/// through [`Self::renderable`] or [`Self::sensitive`], so a new builder must name which kind of body it
+/// produces and cannot add a fourth that silently prints a secret — the "unrepresentable rather than checked"
+/// shape this module records for the credential in a URL.
+#[derive(Clone, Eq, PartialEq)]
 pub struct JsonRequest {
     url: String,
     body: String,
+    /// Set by the constructor and never by a caller: the only two constructors are private and in this module.
+    body_is_sensitive: bool,
 }
 
 impl JsonRequest {
+    /// Builds a `POST` whose body holds **no secret**, so it may be printed in a diagnostic.
+    ///
+    /// Private so the set is closed. The doc of each caller is the evidence that a body belongs here: every
+    /// field is a provider or connector identifier, a label name, or a URL — none is a credential.
+    fn renderable(url: String, body: String) -> Self {
+        Self {
+            url,
+            body,
+            body_is_sensitive: false,
+        }
+    }
+
+    /// Builds a `POST` whose body holds a value a diagnostic must **not** print.
+    ///
+    /// Used by the channel **creation** body, which carries the webhook `address` and the channel `token`. The
+    /// whole body is redacted rather than one field, because redacting a field would leave the decision to
+    /// print the rest of it to the `Debug` — and the body is short enough that the trade costs nothing.
+    fn sensitive(url: String, body: String) -> Self {
+        Self {
+            url,
+            body,
+            body_is_sensitive: true,
+        }
+    }
+
     /// Returns the absolute URL. It carries no query parameters: the watch takes its arguments in the body.
     #[must_use]
     pub fn url(&self) -> &str {
@@ -720,14 +865,12 @@ impl JsonRequest {
 
     /// Returns the rendered JSON body.
     ///
-    /// **Not redacted, and that is a decision rather than an oversight.** A watch body holds a topic name and
-    /// label ids: the topic name is a resource in the caller's own Cloud project, and the label ids are Gmail's
-    /// own vocabulary (`INBOX`, `UNREAD`) rather than message content. A stop body holds a channel id the
-    /// connector generated and a `resourceId` the provider returned — neither is a secret, and neither names a
-    /// person. There is no credential here — unlike [`FormRequest::rendered_body`], whose type exists to hide
-    /// one — so rendering it in a diagnostic shows what was sent without disclosing anything the caller did not
-    /// already know. The body is bounded by the validators below, so it also cannot become an unbounded log
-    /// line.
+    /// **This returns the real body whatever it holds**, exactly like [`FormRequest::rendered_body`] — the
+    /// transport that will send it needs the bytes, so the accessor cannot redact. It is named for what it is
+    /// rather than `body` alone so a call site that renders it is visible, and [`Self`]'s `Debug` is what keeps
+    /// a sensitive body out of a log. A body that is **not** sensitive prints in full, which is the property
+    /// the first two bodies rely on; a sensitive body prints as `[REDACTED]` plus its length. The body is
+    /// bounded by the validators below, so it also cannot become an unbounded log line.
     #[must_use]
     pub fn rendered_body(&self) -> &str {
         &self.body
@@ -737,6 +880,26 @@ impl JsonRequest {
     #[must_use]
     pub const fn content_type(&self) -> &'static str {
         JSON_ACCEPT
+    }
+}
+
+impl fmt::Debug for JsonRequest {
+    /// Prints the body **only when it holds no secret**, and its shape otherwise.
+    ///
+    /// Hand-written rather than derived for the reason on [`JsonRequest`]: the third caller's body carries the
+    /// channel token, and a derived `Debug` would print it. A sensitive body is replaced by `[REDACTED]` plus
+    /// its character count, which is what distinguishes two requests in a diagnostic without disclosing the
+    /// value — the same trade [`FormRequest`]'s `Debug` makes.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("JsonRequest");
+        debug.field("url", &self.url);
+        if self.body_is_sensitive {
+            debug.field("body", &"[REDACTED]");
+            debug.field("chars", &self.body.chars().count());
+        } else {
+            debug.field("body", &self.body);
+        }
+        debug.finish()
     }
 }
 
@@ -871,13 +1034,13 @@ pub fn gmail_watch(
     filter: Option<client::LabelFilterBehavior>,
 ) -> Result<JsonRequest, RequestError> {
     let body = watch_json_body(topic_name, label_ids, filter)?;
-    Ok(JsonRequest {
+    Ok(JsonRequest::renderable(
         // Gmail's own base, and `me` because the connector authenticates as the account it watches. The
         // identifier is a constant here rather than an argument, because a caller that could name another
         // mailbox would be building a request the token does not authorise — a `403` rather than a watch.
-        url: format!("{GMAIL_API_BASE}/users/me/watch"),
+        format!("{GMAIL_API_BASE}/users/me/watch"),
         body,
-    })
+    ))
 }
 
 /// Builds the `channels.stop` request that ends **one** Calendar notification channel.
@@ -929,10 +1092,96 @@ pub fn calendar_channel_stop(
         "resourceId".to_owned(),
         serde_json::Value::String(watched.to_owned()),
     );
-    Ok(JsonRequest {
-        url: format!("{CALENDAR_API_BASE}/channels/stop"),
-        body: serde_json::Value::Object(body).to_string(),
-    })
+    Ok(JsonRequest::renderable(
+        format!("{CALENDAR_API_BASE}/channels/stop"),
+        serde_json::Value::Object(body).to_string(),
+    ))
+}
+
+/// Builds the `events.watch` request that **creates** a Calendar notification channel.
+///
+/// # The operation that was missing, and the shape of the gap
+///
+/// `channels.stop` ends a channel and `renewal_decision` prescribes the remedy for one that has lapsed —
+/// *"you must replace it with a new one by calling the `watch` method"* — while **nothing could issue that
+/// call**. So the connector could end a channel and had no way to make one, which made
+/// [`parse_channel_watch_response`](crate::google::channel::parse_channel_watch_response) and the whole
+/// `ChannelLease`/`ChannelRenewal` decision chain reachable only from a hand-built fixture. This is the
+/// "prescribed call with no builder" direction of `ADR-0092`, and the two halves — create and stop — are what a
+/// [`ChannelRegistration`](crate::google::channel::ChannelRegistration) is assembled from.
+///
+/// # The fields, and why each is validated the way it is
+///
+/// - **`id`** — required, *"Maximum length: 64 characters"* ([`MAX_CHANNEL_ID_CHARS`]), and **echoed** back as
+///   `X-Goog-Channel-ID` on every delivery, which is why the value the connector chose is the join key. Checked
+///   through the same [`resource_id`] validator every identifier here uses, with the length checked **against
+///   Google's 64** rather than the generic 256, so the refusal matches the provider's rule.
+/// - **`type`** — always [`WEBHOOK_CHANNEL_TYPE`]. A constant, not a parameter: Google describes no other
+///   delivery mechanism, so a caller has no valid alternative to choose.
+/// - **`address`** — checked by [`webhook_address`], which enforces HTTPS and a host and records the
+///   certificate rule as unenforceable offline.
+/// - **`token`** — optional, Google's 256-character bound
+///   ([`MAX_CHANNEL_TOKEN_BYTES`](crate::google::channel::MAX_CHANNEL_TOKEN_BYTES)). **Redacted in `Debug`**
+///   because it is the anti-spoofing control `verify_channel_token` compares against: this body is the *first*
+///   [`JsonRequest`] whose `Debug` matters, so it is built through [`JsonRequest::sensitive`].
+/// - **expiration** — the guide lets a request set one, but the reference's own `expiration` field is on the
+///   **response**; the request's expiry is governed by `params.ttl` on some surfaces and by internal limits on
+///   others (*"determined either by your request or by any Google Calendar API internal limits or defaults"*).
+///   **No expiry parameter is offered**: JARVIS does not need to shorten a channel it will replace on its own
+///   lease, and offering one would be a second place the channel's life is decided — the figure is read back
+///   from the response (`ADR-0106`).
+///
+/// # Errors
+///
+/// Returns [`RequestError::Argument`] for an unusable calendar id, channel id, address, or token.
+pub fn calendar_channel_watch(
+    calendar_id: &str,
+    channel_id: &str,
+    address: &str,
+    token: Option<&SecretValue>,
+) -> Result<JsonRequest, RequestError> {
+    let calendar = resource_id("calendar_id", calendar_id)?;
+    // The channel id is Google's 64, not the generic identifier bound: a refusal must agree with the provider's
+    // own rule, or a 64-character id would pass here and be refused there.
+    let id = resource_id("channel_id", channel_id)?;
+    if id.chars().count() > MAX_CHANNEL_ID_CHARS {
+        return Err(RequestError::Argument {
+            field: "channel_id",
+            reason: "a channel id may be at most 64 characters, which is Google's own limit for the `id` a \
+                     watch request carries",
+        });
+    }
+    let address = webhook_address(address)?;
+    // Built as a map rather than through a struct so the field names are spelled once each, beside the values
+    // they carry — the same reasoning `calendar_channel_stop` records, and here it is stronger: a transposed
+    // `address`/`token` would put the webhook URL where the secret belongs.
+    let mut body = serde_json::Map::new();
+    body.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+    body.insert(
+        "type".to_owned(),
+        serde_json::Value::String(WEBHOOK_CHANNEL_TYPE.to_owned()),
+    );
+    body.insert(
+        "address".to_owned(),
+        serde_json::Value::String(address.to_owned()),
+    );
+    if let Some(token) = token {
+        // The guide bounds the token at 256 characters. `SecretValue::new` already enforces exactly that bound
+        // (its own `MAX_STATE_CHARS` is 256), so a value that reaches here has been checked once — and this
+        // re-states the fact in the comment rather than re-checking it, because a second check of the same bound
+        // is the redundant guard `ADR-0066` records.
+        body.insert(
+            "token".to_owned(),
+            serde_json::Value::String(token.expose().to_owned()),
+        );
+    }
+    Ok(JsonRequest::sensitive(
+        // The calendar the events collection belongs to. `primary` is the connector's own alias, passed by the
+        // caller because a watch is per-calendar (the guide: *"you need to separately subscribe to the
+        // events/ACL collections for A and for B"*), unlike the profile read which knows its own constant.
+        format!("{CALENDAR_API_BASE}/calendars/{calendar}/events/watch"),
+        serde_json::Value::Object(body).to_string(),
+    ))
 }
 
 /// A `POST` whose body is a form, which is what the token endpoint requires.
