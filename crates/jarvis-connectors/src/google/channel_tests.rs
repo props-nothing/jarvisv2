@@ -430,3 +430,145 @@ fn a_candidate_of_a_different_length_is_refused_without_a_bound_check() {
     );
     assert_eq!(MAX_CHANNEL_TOKEN_BYTES, 256, "the guide's stated maximum");
 }
+
+/// A message whose delivery names the given channel id.
+fn message_for_channel(channel_id: &str) -> ChannelMessage {
+    // The header list is typed `&'static [u8]`, so the dynamic id is leaked — a test-only leak, and the
+    // clearest way to keep the fixture's slice types rather than parameterising them.
+    let leaked: &'static [u8] = Box::leak(channel_id.to_owned().into_boxed_str()).as_bytes();
+    let mut headers = change_headers();
+    headers[0] = (CHANNEL_ID_HEADER, leaked);
+    must(
+        parse_channel_message(&delivery(&headers, &[])),
+        "a message for the given channel parses",
+    )
+}
+
+/// A registration for a channel id and an account.
+fn registration(channel_id: &str, account: &str) -> ChannelRegistration {
+    ChannelRegistration::new(
+        channel_id.to_owned(),
+        must(
+            crate::account::AccountReference::new(account),
+            "a valid account reference",
+        ),
+        None,
+    )
+}
+
+#[test]
+fn a_delivery_routes_to_the_account_whose_registration_names_its_channel() {
+    // The join the push path needs: a Calendar delivery names the **channel** and never the account, so the
+    // sync it triggers learns whose credential to use only from what the connector registered. Two
+    // registrations, and the delivery's channel selects exactly one.
+    let registrations = [
+        registration("channel-alpha", "acct-alpha"),
+        registration("channel-beta", "acct-beta"),
+    ];
+    let route = route_channel(&message_for_channel("channel-beta"), &registrations);
+    assert_eq!(
+        route
+            .account()
+            .map(crate::account::AccountReference::as_str),
+        Some("acct-beta"),
+        "the delivery must route to the account that registered that exact channel"
+    );
+    assert!(route.may_be_applied_automatically());
+    // A channel nobody registered routes nowhere -- and this is not an error, because a delivery for an
+    // unknown channel is answered by acknowledging and recording.
+    assert_eq!(
+        route_channel(&message_for_channel("channel-gamma"), &registrations),
+        ChannelRoute::Unknown
+    );
+    // And a connector with no registrations routes nothing, which is the same answer as a non-matching channel.
+    assert_eq!(
+        route_channel(&message_for_channel("channel-beta"), &[]),
+        ChannelRoute::Unknown
+    );
+}
+
+#[test]
+fn a_channel_id_is_matched_exactly_and_a_case_variant_is_not_the_same_channel() {
+    // The channel id is the connector's **own** value, compared against the value it stored, so the comparison
+    // is byte-exact. Unlike the `emailAddress` near-match `ADR-0097` reports, a channel id has no case
+    // ambiguity to report: it is an identifier, and a case variant is a different id. None of these is the
+    // stored id, so each routes `Unknown` rather than to the wrong account.
+    let registrations = [registration("channel-alpha", "acct-alpha")];
+    for near_miss in [
+        "Channel-Alpha",  // case differs
+        "channel-alph",   // prefix
+        "channel-alphaa", // superstring
+        "channel-alpha ", // trailing space
+        " channel-alpha", // leading space
+    ] {
+        assert_eq!(
+            route_channel(&message_for_channel(near_miss), &registrations),
+            ChannelRoute::Unknown,
+            "`{near_miss}` is not a registered channel id"
+        );
+    }
+    // The control: the exact id DOES route, so the refusals above are about the comparison and not a route
+    // function that matches nothing.
+    assert!(
+        route_channel(&message_for_channel("channel-alpha"), &registrations)
+            .may_be_applied_automatically()
+    );
+}
+
+#[test]
+fn two_registrations_for_one_channel_id_are_ambiguous_and_never_a_pick() {
+    // Reachable when a channel id is reused -- which the guide's UUID recommendation exists to prevent, but a
+    // recommendation is not an enforcement. Two registrations for one id make the route **undecidable**, so it
+    // reports a **count** and carries no reference: picking the first, oldest, or most recent would sync one
+    // account under another's identity.
+    let registrations = [
+        registration("channel-alpha", "acct-one"),
+        registration("channel-alpha", "acct-two"),
+    ];
+    let route = route_channel(&message_for_channel("channel-alpha"), &registrations);
+    assert_eq!(route, ChannelRoute::Ambiguous { accounts: 2 });
+    assert_eq!(
+        route.account(),
+        None,
+        "an ambiguous route must not expose an arbitrarily chosen account"
+    );
+    assert!(!route.may_be_applied_automatically());
+}
+
+#[test]
+fn a_registration_redacts_its_token_and_the_route_uses_only_the_id() {
+    // The registration holds the channel's anti-spoofing token, so a `{:?}` must not print it (`ADR-0091`). And
+    // the route is decided by the **id** alone -- the token is a separate control -- so a registration whose
+    // token differs still routes, because routing and verification answer different questions.
+    let with_token = ChannelRegistration::new(
+        "channel-alpha".to_owned(),
+        must(
+            crate::account::AccountReference::new("acct-alpha"),
+            "a valid account reference",
+        ),
+        Some(stored("target=myApp-myChannelDest")),
+    );
+    let rendered = format!("{with_token:?}");
+    assert!(
+        !rendered.contains("target=myApp-myChannelDest"),
+        "the registration must not print its token: {rendered}"
+    );
+    assert!(
+        rendered.contains("REDACTED"),
+        "the redaction must be visible: {rendered}"
+    );
+    assert_eq!(
+        with_token.token().map(crate::auth::SecretValue::expose),
+        Some("target=myApp-myChannelDest"),
+        "the token is reachable for verification"
+    );
+    // Routing ignores the token entirely: a registration with a token still routes by id.
+    assert_eq!(
+        route_channel(&message_for_channel("channel-alpha"), &[with_token])
+            .account()
+            .map(crate::account::AccountReference::as_str),
+        Some("acct-alpha")
+    );
+    // And a registration with NO token is a recorded choice, surfaced as `None` rather than a sentinel.
+    assert_eq!(registration("channel-beta", "acct-beta").token(), None);
+}

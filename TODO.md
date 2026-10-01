@@ -5014,6 +5014,50 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     constant-time comparison) and half open (the JWT). `WebhookSupport` still declares `Polling` (cardinality).
     And the verifier checks **only the token** — that a delivery names a resource this channel watches is a
     separate control it does not perform.
+- [ ] `P5-005` **(continued — two pushes routed on keys of opposite provenance)**: `google::channel` gains the
+  routing join — `ChannelRegistration` (channel id + account + optional token), `ChannelRoute`
+  (`Exact`/`Ambiguous`/`Unknown`), and `route_channel`. **4 new tests (so 444 in the crate).** **`ADR-0102`.**
+  Completes the attribution join `ADR-0100`/`ADR-0101` left open, the Calendar counterpart of `ADR-0097`. Two
+  guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE TWO GOOGLE PUSHES JOIN ON KEYS OF OPPOSITE PROVENANCE.** A Calendar delivery names the
+    **channel** (`X-Goog-Channel-ID`) — a value the **connector chose** — while a Gmail delivery names the
+    **`emailAddress`** — a value the **provider sent**. So the same "which of mine is this" question is a
+    **lookup in the connector's own records** for Calendar and a **comparison against untrusted text** for
+    Gmail. Both want **byte-exact** matching, for **opposite** reasons: an untrusted provider string may only be
+    compared as sent, and a connector-generated id is compared against the bytes it stored. **⭐ A key's origin
+    decides how strictly it may be compared — and a reader who generalised one mechanism's rule to the other
+    would add either a spurious case-differs state or a dangerous case-fold.**
+  - **⭐ ROUTING AND VERIFICATION ANSWER DIFFERENT QUESTIONS, AND BOTH MUST RUN.** A delivery can route `Exact`
+    and still **fail** verification (a mismatched/absent token); a delivery for an **unregistered** channel is
+    `Unknown` and cannot be verified **at all**, because there is no stored value to compare against. So the
+    sequence is route → `verify_channel_token(registration.token(), message)`, and a test asserts routing
+    **ignores** the token entirely, so the two controls are provably independent — fusing them would make an
+    unroutable delivery unverifiable by construction and hide which control failed.
+  - **⭐ THE BINDING IS ONE TYPE, SO A ROUTE CANNOT MISPAIR.** `route_channel` takes `&[ChannelRegistration]`
+    (id + account + token bound together) rather than an `(id, account)` list, for the reason `route_delivery`
+    takes `&[VerifiedAccount]`: separate lists let a caller pair one account's reference with another's channel
+    and route to the wrong mailbox with nothing able to notice. `token()` reaches the stored value without the
+    field being public, and the hand-written `Debug` redacts it (`ADR-0091`).
+  - **⭐ `token: None` IS A RECORDED CHOICE, NOT A MISSING VALUE.** The guide makes the token optional, so a
+    registration with no token is one the connector **chose** not to protect — read as `ChannelTokenCheck::Absent`
+    (not a refusal), and an `Option<SecretValue>` with a sentinel would have made "I forgot the token" the same
+    as "there is none".
+  - **⭐ A REGISTRATION COLLISION IS `Ambiguous`, AND A COUNT IS NOT A PICK.** Reachable only if a channel id is
+    reused — the guide *recommends* a UUID "so it is unique", a recommendation not an enforcement — and
+    undecidable without a person. `ADR-0098`'s "one address, one account" argument applied to a channel: a
+    duplicate makes the route unactionable and looks exactly like two legitimate channels.
+  - **⚠ A COMPILE ERROR CAUGHT A DERIVE/IMPL CLASH BEFORE ANY TEST RAN** (`E0119`): `ChannelRegistration` derived
+    `Debug` **and** hand-wrote it to redact the token. The **intent was the redaction**, so the fix was to drop
+    the derive, not the hand-written impl — the compiler refused a type that would have printed the channel
+    token. And a **test-helper defect** was fixed before it could pass for the wrong reason: the first
+    `message_for_channel` built headers from a non-`'static` slice, so the helper leaks the id (test-only)
+    rather than widening the fixture types. **The fixture layer is where a test stops testing the code.**
+  - **NEW LIMITS:** **nothing calls `route_channel` and nothing registers a channel** — no `watch` executor, no
+    channel store — so the route is a decision with tests rather than enforced behaviour, and a collision is only
+    reachable if a caller hands in a duplicate slice (a store could enforce uniqueness, the revisit condition
+    `ADR-0098` names). The Calendar push path is now end-to-end **on paper** (name → read → verify → route); what
+    is missing is a handler that receives a delivery, and the Gmail `OidcIdToken` verifier (Unresolved Question
+    9, still open).
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

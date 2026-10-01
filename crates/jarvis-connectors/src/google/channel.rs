@@ -60,11 +60,14 @@
 //! The `X-Goog-Channel-Token` is **verified as well as surfaced** ([`verify_channel_token`], `ADR-0101`): the
 //! connector stores the value it registered, [`verify_channel_token`] compares it in constant time, and the
 //! four situations an absent or mismatched token can produce are **named** rather than collapsed into a
-//! `bool`. What stays unverified is anything *live* — no channel has been registered and no notification
-//! received — so the comparison is proved against values this crate builds.
+//! `bool`. And a verified delivery is **routed to the account** whose channel it names
+//! ([`route_channel`], `ADR-0102`), so the sync it triggers knows whose credential to use. What stays
+//! unverified is anything *live* — no channel has been registered and no notification received — so the
+//! comparison and the route are proved against values this crate builds.
 
 use std::fmt;
 
+use crate::account::AccountReference;
 use crate::auth::SecretValue;
 use crate::webhook::WebhookDelivery;
 
@@ -478,6 +481,192 @@ pub fn verify_channel_token(
             Some(presented) if expected.matches(presented) => ChannelTokenCheck::Verified,
             Some(_) => ChannelTokenCheck::Mismatch,
         },
+    }
+}
+
+/// A notification channel a connector **registered for one account**, and the token it set.
+///
+/// # Why the account and the channel are one value and not two
+///
+/// A Calendar notification names the **channel** (`X-Goog-Channel-ID`) and never the account — the account is
+/// whatever the `watch` call was authenticated as. So attributing a delivery to an account is a **join**
+/// against what the connector registered, and that join must not be reconstructable from parts: a caller
+/// holding a channel id and an account reference *separately* could pair one account with another's channel
+/// and route a delivery to the wrong mailbox with nothing able to notice. This type is the pair, so a route
+/// cannot pair them wrongly — the same argument `ADR-0097` makes for taking `&[VerifiedAccount]` rather than a
+/// list of `(reference, address)` tuples.
+///
+/// # The token is optional, and its absence is a *recorded choice*
+///
+/// The guide makes the channel token optional, so `token: None` means the connector registered this channel
+/// **without** one — a deliberate configuration, not a missing value. That is why the field is an `Option`
+/// rather than a [`SecretValue`] with a sentinel: [`verify_channel_token`] reads `None` as
+/// [`ChannelTokenCheck::Absent`] (not a refusal), and a caller cannot express "I forgot the token" as distinct
+/// from "there is none".
+#[derive(Clone)]
+pub struct ChannelRegistration {
+    /// The channel id the connector chose for this watch. The value a delivery echoes back.
+    pub channel_id: String,
+    /// The account whose credential created the channel.
+    pub account: AccountReference,
+    /// The token the connector set, when it set one. Redacted by the hand-written `Debug`.
+    token: Option<SecretValue>,
+}
+
+impl ChannelRegistration {
+    /// Records a registered channel.
+    #[must_use]
+    pub const fn new(
+        channel_id: String,
+        account: AccountReference,
+        token: Option<SecretValue>,
+    ) -> Self {
+        Self {
+            channel_id,
+            account,
+            token,
+        }
+    }
+
+    /// Returns the token the connector set, when it set one.
+    ///
+    /// `None` means the channel was registered **without** a token — the guide's optional case — so this is
+    /// the value [`verify_channel_token`] reads to decide between a control to check and none. Reached through
+    /// an accessor rather than a public field so the token never sits in a caller's `{:?}` of the registration.
+    #[must_use]
+    pub const fn token(&self) -> Option<&SecretValue> {
+        self.token.as_ref()
+    }
+}
+
+impl fmt::Debug for ChannelRegistration {
+    /// Redacts `token`, which is the channel's anti-spoofing control (`ADR-0091`).
+    ///
+    /// The channel id and the account are kept, because they name no secret and are what a diagnostic about a
+    /// stray delivery needs to show; a token would be a value an attacker could replay.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelRegistration")
+            .field("channel_id", &self.channel_id)
+            .field("account", &self.account)
+            .field(
+                "token",
+                &self
+                    .token
+                    .as_ref()
+                    .map(|token| format!("[REDACTED], {} chars", token.expose().len())),
+            )
+            .finish()
+    }
+}
+
+/// Which account a Calendar notification's channel belongs to.
+///
+/// # Why this is an enum and not `Option<AccountReference>`
+///
+/// `Option` has two states and this decision has **three**, and the two non-matches call for different
+/// operator action — the same reason [`crate::google::routing::DeliveryRoute`] is an enum rather than an
+/// `Option` (`ADR-0097`). Collapsing [`Self::Unknown`] and [`Self::Ambiguous`] into `None` would make a
+/// channel the connector **never registered** indistinguishable from a **registration collision**, and only
+/// one of those is a defect in this connector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChannelRoute {
+    /// Exactly one registration names this channel.
+    ///
+    /// The only route that may be applied without a person, and the reference is carried so the caller does not
+    /// have to search again — a second lookup would be a second place the comparison is decided.
+    Exact(AccountReference),
+    /// More than one registration carries this channel id.
+    ///
+    /// Reachable when a channel id is reused — the guide *recommends* a UUID precisely so it is unique — and
+    /// **undecidable** without a person: picking one registration would sync one account under another's
+    /// identity. A count rather than a selection, for the reason [`crate::google::routing::DeliveryRoute`]
+    /// carries counts.
+    Ambiguous {
+        /// How many registrations carry this channel id.
+        accounts: usize,
+    },
+    /// No registration names this channel.
+    ///
+    /// **Not an error.** A delivery for a channel this connector never registered — a watch established by a
+    /// previous profile, or one forged by anyone who knows the endpoint — is answered by acknowledging and
+    /// recording, not by a fault, and the token cannot even be checked because there is no stored value to
+    /// check it against.
+    Unknown,
+}
+
+impl ChannelRoute {
+    /// Returns the account this route names, when it names exactly one.
+    ///
+    /// `Some` for [`Self::Exact`] alone, so no accessor returns an arbitrarily chosen account from an ambiguous
+    /// route.
+    #[must_use]
+    pub const fn account(&self) -> Option<&AccountReference> {
+        match self {
+            Self::Exact(reference) => Some(reference),
+            Self::Ambiguous { .. } | Self::Unknown => None,
+        }
+    }
+
+    /// Returns whether this route may be applied **without a person's decision**.
+    ///
+    /// True only for [`Self::Exact`], named for the authority it grants rather than for a match quality.
+    #[must_use]
+    pub const fn may_be_applied_automatically(&self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+}
+
+/// Routes a Calendar notification to the account whose registration names its channel.
+///
+/// # The binding is by channel **id**, which is the connector's own value
+///
+/// A Calendar delivery carries no account — the account is whatever the `watch` call was authenticated as — so
+/// the only stable link from a delivery back to an account is the **channel id**, which the connector
+/// *chose*. That is the opposite of [`crate::google::routing::route_delivery`], which matches a
+/// **provider-supplied** `emailAddress`, and the difference is worth stating: an id the connector generated is
+/// its own value, so a match is a lookup in its own records rather than a comparison against untrusted text.
+/// (The id is still *echoed* through an unauthenticated channel and so remains untrusted input — it selects,
+/// and never authorises: the credential it selects is the account's own, and the token check is separate.)
+///
+/// # Why `registrations` is a slice of [`ChannelRegistration`] and not a `(id, account)` list
+///
+/// For the reason [`ChannelRegistration`] itself exists: the id and the account must belong to the same
+/// registration, and separate lists would let a caller pair them wrongly. The type that already binds them is
+/// the argument.
+///
+/// # Why the empty case is `Unknown`
+///
+/// A connector with no registered channels has nothing to route to, which is the same answer as a channel
+/// matching none — and the caller's action is the same for both: acknowledge and record. A separate "not
+/// configured" variant would be a state the caller cannot act on differently, the same restraint
+/// `route_delivery` records.
+#[must_use]
+pub fn route_channel(
+    message: &ChannelMessage,
+    registrations: &[ChannelRegistration],
+) -> ChannelRoute {
+    let named = message.channel_id.as_str();
+    let mut matched: Option<&AccountReference> = None;
+    let mut count: usize = 0;
+    for registration in registrations {
+        // **Byte-exact**, because the channel id is the connector's own value and it is compared against the
+        // value it stored. There is no case-folding: a channel id is an identifier, not an address with an
+        // ambiguous case rule, so a case variant is a different id — the opposite of the `emailAddress`
+        // near-match `ADR-0097` reports, and both are "compare the field as the provider sent it".
+        if registration.channel_id == named {
+            count += 1;
+            // Kept only for the single-match case; a second match makes the route `Ambiguous`, so retaining a
+            // second reference would be a selection nothing uses.
+            if matched.is_none() {
+                matched = Some(&registration.account);
+            }
+        }
+    }
+    match (count, matched) {
+        (1, Some(reference)) => ChannelRoute::Exact(reference.clone()),
+        (n, _) if n > 1 => ChannelRoute::Ambiguous { accounts: n },
+        (_, _) => ChannelRoute::Unknown,
     }
 }
 

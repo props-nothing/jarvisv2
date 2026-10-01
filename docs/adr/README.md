@@ -119,3 +119,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0099](0099-a-delivery-can-be-authenticated-without-covering-the-body.md) | A delivery can be authenticated without covering the body | Accepted |
 | [0100](0100-a-delivery-is-not-always-a-change.md) | A delivery is not always a change | Accepted |
 | [0101](0101-a-missing-control-and-a-failed-one-are-not-the-same-answer.md) | A missing control and a failed one are not the same answer | Accepted |
+| [0102](0102-two-pushes-routed-on-keys-of-opposite-provenance.md) | Two pushes routed on keys of opposite provenance | Accepted |
