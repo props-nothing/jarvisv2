@@ -21,6 +21,7 @@ mod transport;
 mod approval;
 mod approval_policy;
 mod candidate;
+mod escalation;
 mod isolation;
 mod memory;
 mod retrieval;
@@ -52,6 +53,7 @@ pub use endpoint::{
     UNIX_SOCKET_FILE_NAME, WINDOWS_PIPE_PREFIX, is_valid_profile,
 };
 pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessageReason};
+pub use escalation::{EscalationSignal, InvalidEscalationSignal};
 pub use id::{
     ApprovalId, ClientId, CorrelationId, DaemonRunId, EntityId, IdGenerator, InvalidId,
     InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SystemIdGenerator,

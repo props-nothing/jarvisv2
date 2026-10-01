@@ -339,6 +339,45 @@ that will not start.
 Omitting `[policy]` entirely gives the workspace defaults, which permit the full risk range and ask for
 approval from `moderate` up.
 
+### Seeing the policy in force
+
+A configuration file is the **input**; what the daemon enforces is derived from it (an override is applied as
+a maximum, a denial short-circuits several checks, and the actor's scopes are derived rather than
+configured). So `jarvis tools` reads the posture back from the running daemon:
+
+```powershell
+jarvis tools list
+jarvis tools list --json
+jarvis tools preview jarvis.files.read
+jarvis tools preview jarvis.mail.send --escalation bulk --channel voice
+```
+
+`list` shows each tool's effective approval policy, marking an override as `auto -> ask (overridden)` rather
+than printing the configured value as if it were in force. `preview` reports the decision a call **would**
+produce — `allow`, `require_approval`, or `deny` — with the stable reason code, the effective risk beside the
+declared one, and the context signals that raised it.
+
+It is a decision and not a prediction: the daemon computes it with the same pure `evaluate` the tool-call
+path uses, so it is exact for the context supplied. It records no call and consumes no idempotency key, so
+inspecting a policy cannot fill the ledger or make a later real call a duplicate.
+
+```powershell
+jarvis tools preview jarvis.mail.send --escalation bulk
+# jarvis.mail.send: require_approval
+#   reason            approval_required
+#   risk              high (declared moderate)
+#   escalated by      bulk
+#   approval needs    present
+```
+
+The flags a preview accepts are only the parts of the call the caller knows: `--channel`, `--strength`, and
+one `--escalation` per signal. Scopes and the workspace policy come from the daemon, so a preview cannot be
+used to ask what a different set of permissions would decide.
+
+**Two empty-looking answers are different problems.** `jarvis tools list` exits `4` and prints the remedy
+when the daemon has **no tool surface at all** (no roots granted and no MCP servers configured), rather than
+printing an empty list — "nothing is configured" and "this daemon cannot serve tools" need different fixes.
+
 ## Prototype
 
 The [example](../../example/readme.md) can be run separately to study behavior, subject to its dependencies, terms, and local credential handling. Do not run it automatically during production setup or tests. Do not read or commit its `config/api_keys.json` or `memory/long_term.json`.

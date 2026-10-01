@@ -14,6 +14,7 @@ mod chat;
 mod connector;
 mod memory;
 mod output;
+mod tools;
 
 use std::{io, path::PathBuf, process::ExitCode};
 
@@ -48,6 +49,7 @@ async fn main() -> ExitCode {
         Some("chat") => chat(&arguments).await,
         Some("logs") => logs(&arguments),
         Some("memory") => memory_command(&arguments).await,
+        Some("tools") => tools_command(&arguments).await,
         Some("connector") => connector::run(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
@@ -65,7 +67,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|tools|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis connector <new|check|items> [...]"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
@@ -84,6 +86,25 @@ async fn memory_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     memory::run(&client, arguments).await
+}
+
+/// Runs one `jarvis tools` verb over the daemon's HTTP API.
+///
+/// Shares `run_client` with `memory_command`, `ask`, and `chat`, for the reason that function's own comment
+/// gives: the tool surface lives on the same API and needs the same four facts, and a second client builder
+/// would be a second place a configured port is read — which is how two commands come to target different
+/// ports.
+async fn tools_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    tools::run(&client, arguments).await
 }
 
 fn json_requested(arguments: &[String]) -> bool {
@@ -573,5 +594,80 @@ mod tests {
             ExitStatus::from_code(ErrorCode::Internal),
             ExitStatus::from_code(ErrorCode::Conflict)
         );
+    }
+
+    /// **The preview flags become the request body the daemon expects.**
+    ///
+    /// Asserted on the request rather than on rendered output, because the flag parsing is what can be wrong:
+    /// a preview that ignored `--escalation` would render a decision for a call *without* that signal and
+    /// look entirely plausible, which is the failure mode a signal exists to prevent.
+    #[test]
+    fn preview_flags_parse_into_a_request() {
+        let arguments = [
+            "tools".to_owned(),
+            "preview".to_owned(),
+            "jarvis.files.read".to_owned(),
+            "--escalation".to_owned(),
+            "bulk".to_owned(),
+            "--channel".to_owned(),
+            "voice".to_owned(),
+            "--strength".to_owned(),
+            "channel_evidence".to_owned(),
+        ];
+        let request = tools::preview_request_for_test(&arguments)
+            .unwrap_or_else(|_| panic!("the flags must parse"));
+        assert_eq!(
+            request.escalation,
+            vec![jarvis_core::EscalationSignal::Bulk]
+        );
+        assert_eq!(request.channel, Some(jarvis_core::SessionChannel::Voice));
+        assert_eq!(
+            request.claimed_strength.as_deref(),
+            Some("channel_evidence")
+        );
+    }
+
+    /// **An unknown closed-set value is a usage error rather than an ignored flag.**
+    ///
+    /// The direction that matters, asserted for all three sets. Silently dropping `--escalation loud` would
+    /// compute the preview for a call without that signal, and a defaulted channel or strength would compute
+    /// one for a different trust boundary — every wrong answer in that direction reads as more permissive
+    /// than the user asked about.
+    #[test]
+    fn unknown_preview_flags_are_refused() {
+        for (flag, value) in [
+            ("--escalation", "loud"),
+            ("--channel", "telepathy"),
+            ("--strength", "strong"),
+        ] {
+            let arguments = [
+                "tools".to_owned(),
+                "preview".to_owned(),
+                "jarvis.files.read".to_owned(),
+                flag.to_owned(),
+                value.to_owned(),
+            ];
+            assert!(
+                tools::preview_request_for_test(&arguments).is_err(),
+                "{flag} {value} must be refused rather than ignored"
+            );
+        }
+    }
+
+    /// **`--json` is accepted by the preview parser and contributes nothing to the body.**
+    ///
+    /// The control for the test above: a parser that refused every flag would satisfy it, and `--json` is a
+    /// flag this command must tolerate because `json_requested` reads it separately.
+    #[test]
+    fn the_json_flag_is_tolerated_by_the_preview_parser() {
+        let arguments = [
+            "tools".to_owned(),
+            "preview".to_owned(),
+            "jarvis.files.read".to_owned(),
+            "--json".to_owned(),
+        ];
+        let request = tools::preview_request_for_test(&arguments)
+            .unwrap_or_else(|_| panic!("--json must be tolerated"));
+        assert_eq!(request, jarvis_protocol::ToolPreviewRequest::default());
     }
 }

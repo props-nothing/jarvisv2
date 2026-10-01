@@ -567,65 +567,11 @@ pub enum Decision {
 
 /// A context signal that raised a call's risk.
 ///
-/// A typed closed set rather than a string, for the same reason [`DenyReason`] is one: this value is
-/// stored in a decision record and read back, so a free-form name would be a place for content to
-/// enter an audit record, and a rename would silently change what an existing row means.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EscalationSignal {
-    /// The target is outside the workspace's own domains or organisation.
-    External,
-    /// The operation affects many targets at once.
-    Bulk,
-    /// The payload or target carries content above the ordinary classification.
-    Sensitive,
-    /// The target is a production system.
-    Production,
-}
-
-impl EscalationSignal {
-    /// Returns the stable snake-case code.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::External => "external",
-            Self::Bulk => "bulk",
-            Self::Sensitive => "sensitive",
-            Self::Production => "production",
-        }
-    }
-
-    /// Returns every signal, so a test can sweep them.
-    #[must_use]
-    pub const fn all() -> [Self; 4] {
-        [
-            Self::External,
-            Self::Bulk,
-            Self::Sensitive,
-            Self::Production,
-        ]
-    }
-
-    /// Returns the risk this signal alone raises a call to.
-    ///
-    /// `Bulk` and `Sensitive` reach `High` because of what they change about a call rather than how
-    /// large it is: `docs/architecture/tools-and-connectors.md` lists "mass-send" under the risk-3
-    /// posture, and a sensitive payload changes the consequence of the same action. `External` and
-    /// `Production` reach `Moderate`.
-    #[must_use]
-    pub const fn escalation(self) -> Risk {
-        match self {
-            Self::Bulk | Self::Sensitive => Risk::High,
-            Self::External | Self::Production => Risk::Moderate,
-        }
-    }
-}
-
-impl fmt::Display for EscalationSignal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.code())
-    }
-}
+/// The type itself lives in `jarvis-core` (see the re-export below) because the wire contract that
+/// reports *why* a decision was taken at a raised risk — `jarvis-protocol` — cannot depend on this
+/// adapter crate. This module documents what the set means for evaluation and re-exports it, so every
+/// `crate::EscalationSignal` path keeps resolving while there is one definition.
+pub use jarvis_core::EscalationSignal;
 
 /// The result of evaluating a request.
 ///

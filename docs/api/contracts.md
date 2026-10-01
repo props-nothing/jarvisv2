@@ -215,6 +215,44 @@ pub trait ToolExecutor: Send + Sync {
 
 Only the application tool gateway can create `AuthorizationReceipt` and `ValidatedToolIntent`. Adapter implementations should be unable to bypass construction invariants accidentally.
 
+### Tool Control Plane (`P3-025`, `P3-026` — implemented)
+
+Two routes let a CLI or a control-plane UI read the authorization posture in force and preview a decision
+without making a call. They exist because `P3-025` made the policy configurable per tool: a configuration
+file is the **input**, while the workspace policy is what the engine enforces, so a document cannot answer
+*"did my configuration take effect"*.
+
+```text
+GET  /api/v1/tools                          -> ToolListReply
+POST /api/v1/tools/{tool}/preview           -> ToolPreviewReply
+```
+
+The list reports, per tool, the **declared** approval policy and the **effective** one, plus `overridden`
+(whether an override is raising the declaration) and `denied` (whether the workspace refuses it outright).
+Both policies are reported because they differ for a reason the operator needs to see: a tool held by the
+workspace threshold looks identical to one held by its own declaration unless both are visible. The reply
+also carries the workspace's `max_risk` and `approval_threshold`, so a single tool's posture is readable
+against the ceiling it sits under.
+
+The preview reports the `decision`, its stable `reason` code, the `effective_risk` **beside** the
+`declared_risk`, the `escalated_by` signals, and the `required_strength` an approval would need. It is a
+**decision and not a prediction**: the daemon computes it with the same pure `evaluate` the tool-call path
+uses, so it is exact for the context supplied. It writes no `tool_calls` row and consumes no idempotency
+key, so an operator cannot fill the ledger by looking at it.
+
+**What a caller may supply, and what it may not.** A preview request carries only the `channel`, the
+`claimed_strength`, and the `escalation` signals — the properties of the call that only the caller knows.
+Scopes, the workspace policy, and the tool definition come from the daemon, and `deny_unknown_fields` makes
+an attempt to name them a `422` rather than an ignored value. A preview must not be a way to ask *"what if I
+had different permissions"*.
+
+**Three distinctions the statuses keep.** An unknown tool is `404` rather than a refusal, because a typo and
+a policy denial have opposite remedies. A daemon with **no tool surface at all** answers `404` rather than an
+empty list, because "nothing is configured" and "this daemon cannot serve tools" are different deployment
+facts. And a **denied** tool is still reported as `callable: true` — the denial is a policy fact, not an
+availability one, and conflating them would send an operator to fix a grant when the remedy is a
+configuration line.
+
 ## Policy And Approval
 
 ```rust

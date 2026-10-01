@@ -66,7 +66,8 @@ use jarvis_tools::ToolOutcome;
 use jarvis_tools::ToolRegistry;
 use jarvis_tools::{AdapterError, ToolExecutionRequest, ToolExecutionRequestParts};
 use jarvis_tools::{
-    AuthenticationStrength, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
+    ApprovalPolicy, AuthenticationStrength, PolicyDecision, PolicyRequest, Risk, TargetAssessment,
+    ToolSource, WorkspacePolicy, evaluate,
 };
 use jarvis_tools::{
     AuthorizationReceipt, AuthorizationReceiptParts, IdempotencyKey, ToolCallResult,
@@ -80,6 +81,57 @@ use jarvis_tools::{SchemaError, SchemaViolation};
 use jarvis_tools::ToolExecutor;
 
 use crate::dispatch::{Dispatch, DispatchError};
+
+/// The policy-version label a **preview** carries.
+///
+/// A stored receipt's label is a claim about the policy in force when a call was admitted, and a preview
+/// admits nothing — so it must not borrow a recorded label or invent one that looks recorded. This
+/// constant exists so the preview path names what it is doing rather than passing an empty string that
+/// reads as a missing value.
+pub const PREVIEW_POLICY_VERSION: &str = "preview";
+
+/// One tool in the operator-facing policy inventory.
+///
+/// # Why this type exists beside `jarvis_tools::ToolInventoryEntry`
+///
+/// The registry's entry answers "what is registered and what is wrong with it". This one answers the
+/// question an operator configuring policy has: **what will this workspace do with it**. It therefore
+/// carries the declared policy, the effective policy, and the two facts that explain a difference
+/// between them — an override and a denial — as well as the scopes and effects a person needs to judge
+/// whether the posture is right.
+///
+/// It is a **domain** value rather than a wire type: the REST shape is `jarvis_protocol::ToolReply`, and
+/// the gateway maps between them. Keeping the two apart is the rule `rest.rs` states, so a change here
+/// does not silently change a client-visible contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyInventoryEntry {
+    /// The canonical identifier, which is also the name a policy override addresses.
+    pub id: String,
+    /// The operator- and model-facing title.
+    pub title: String,
+    /// The declared behaviour/schema version.
+    pub version: String,
+    /// Which class of source the tool came from.
+    pub source: ToolSource,
+    /// The declared baseline risk.
+    pub risk: Risk,
+    /// The effects the tool may have, as stable names, in the adapter's own order.
+    pub effects: Vec<String>,
+    /// The capability scopes the tool requires.
+    pub required_scopes: Vec<String>,
+    /// The approval policy the tool's own definition declares.
+    pub declared_approval: ApprovalPolicy,
+    /// The approval policy in force after any workspace override.
+    pub effective_approval: ApprovalPolicy,
+    /// Whether an override is currently raising the declared policy.
+    pub overridden: bool,
+    /// Whether the workspace refuses this tool outright.
+    pub denied: bool,
+    /// Whether the tool can currently run.
+    pub callable: bool,
+    /// Why it cannot, when it cannot.
+    pub unavailable_reason: Option<String>,
+}
 
 /// What one pipeline call produced.
 ///
@@ -1076,6 +1128,112 @@ impl ToolPipeline {
                     .map_err(ToolPipelineError::Registry)
             })
             .collect()
+    }
+
+    /// Returns every registered tool with the policy that is **in force** for it.
+    ///
+    /// # Why this is not just `registry.inventory()`
+    ///
+    /// The registry reports what each tool *declares*. An operator configuring policy needs to see what
+    /// the workspace will actually do with it, and those differ in three ways this method resolves:
+    /// a per-tool approval override, an outright denial, and the effective approval after both. Reading
+    /// the registry directly would show the declaration and leave an operator unable to tell whether
+    /// their configuration took effect — the exact question `P3-025` exists to make answerable.
+    ///
+    /// # Why it lives here rather than in a route
+    ///
+    /// It needs the workspace policy, and the pipeline is the value that holds it. A route that rebuilt
+    /// the policy from configuration would be a second composition of the same grant, and the two could
+    /// disagree — so the surface a client reads is the surface `call_tool` decides with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError`] when an identifier from the registry cannot be parsed back. That is
+    /// unreachable for a key the registry itself produced, so it is reported rather than skipped: a
+    /// skipped tool would be a hole in the list an operator is reviewing.
+    pub fn policy_inventory(&self) -> Result<Vec<PolicyInventoryEntry>, ToolPipelineError> {
+        let mut entries = Vec::new();
+        for entry in self.registry.inventory() {
+            let id = ToolId::new(&entry.id)?;
+            let definition = self.registry.get(&id).cloned()?;
+            let declared = definition.approval();
+            let effective = self.workspace.effective_approval(&id, declared);
+            entries.push(PolicyInventoryEntry {
+                id: entry.id,
+                title: definition.title().to_owned(),
+                version: entry.version,
+                source: entry.source,
+                risk: entry.risk,
+                effects: entry
+                    .effects
+                    .iter()
+                    .map(|effect| effect.as_str().to_owned())
+                    .collect(),
+                required_scopes: definition
+                    .required_scopes()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                declared_approval: declared,
+                effective_approval: effective,
+                // Derived rather than stored, so the flag cannot disagree with the two policies it
+                // describes — a stored flag would be a third value to keep in step.
+                overridden: effective != declared,
+                denied: self.workspace.denies(&id),
+                callable: entry.callable,
+                unavailable_reason: entry.unavailable_reason,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Evaluates what a call to a tool **would** decide, without recording or running anything.
+    ///
+    /// # Why this is a decision and not a prediction
+    ///
+    /// [`evaluate`] is a pure function of declared facts and the supplied context, so this computes the
+    /// answer rather than estimating it. The distinction matters for how the result may be described: a
+    /// prediction would be a claim about a future state, while this is the same function `call_tool`
+    /// calls, given the same facts. It is exact **for the context supplied** — a caller that omits an
+    /// escalation signal gets the decision for a call without that signal.
+    ///
+    /// # Why this writes nothing
+    ///
+    /// A preview that recorded a call would let an operator fill the ledger by looking at it, and one
+    /// that consumed an idempotency key would make the real call a duplicate. It therefore takes no
+    /// `run_id` and touches no table: the whole value is the decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolPipelineError::UnknownTool`] for an identifier the registry does not hold, so a
+    /// caller learns it named a tool that does not exist rather than that a decision was denied.
+    pub fn preview_call(
+        &self,
+        tool: &str,
+        actor: &ToolActor,
+        target: &TargetAssessment,
+    ) -> Result<PolicyDecision, ToolPipelineError> {
+        let definition = self.definition_for(tool)?;
+        Ok(evaluate(&PolicyRequest {
+            definition: &definition,
+            actor: actor.authority(),
+            workspace: &self.workspace,
+            channel: actor.channel(),
+            claimed_strength: actor.claimed_strength(),
+            available: definition.availability().is_available(),
+            target: target.clone(),
+        }))
+    }
+
+    /// Returns the workspace policy this pipeline decides with.
+    ///
+    /// Offered so a caller can render the configured ceiling and threshold beside the per-tool entries
+    /// from [`Self::policy_inventory`], reading the same value `call_tool` consults rather than
+    /// recomposing it from configuration — the two would otherwise be able to disagree, and the one a
+    /// client displayed would be the one nothing enforced.
+    #[must_use]
+    pub const fn workspace_policy(&self) -> &WorkspacePolicy {
+        &self.workspace
     }
 
     /// Runs one tool call for a **remote MCP caller**, applying every gate a local call gets and recording no

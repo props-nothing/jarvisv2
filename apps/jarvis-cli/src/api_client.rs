@@ -45,7 +45,8 @@ use jarvis_protocol::{
     CorrectMemoryRequest, DeletionReceipt, ForgetMemoryRequest, JSON_BODY_CONTENT_TYPE,
     MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply,
     MemorySearchRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
-    SSE_ACCEPT, StartRunRequest, WireError, path_segment, run_path, run_stream_path, runs_path,
+    SSE_ACCEPT, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError,
+    path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -53,6 +54,21 @@ use jarvis_protocol::{
 /// A constant rather than a function because it takes no parameter, unlike a run path: there is one memory
 /// collection per profile, and its scope comes from the credential rather than from the URL.
 const MEMORIES_PATH: &str = "/api/v1/memories";
+
+/// The base path of the tool control-plane surface.
+const TOOLS_PATH: &str = "/api/v1/tools";
+
+/// Builds the preview path for one tool, validating the identifier first.
+///
+/// The identifier is a **tool identifier** (`jarvis.files.read`), which is dotted but contains no `/`, and
+/// it is passed through the same [`jarvis_protocol::path_segment`] rule the run and memory paths use. A
+/// tool identifier is validated by `ToolId` in the daemon, so this is not a second opinion about the
+/// name's shape — it is the check that stops a name containing a path separator from addressing a
+/// different route, which is a property of the *URL* rather than of the tool.
+fn tool_preview_path(tool: &str) -> Result<String, ApiError> {
+    let segment = path_segment(tool).map_err(ApiError::Identifier)?;
+    Ok(format!("{TOOLS_PATH}/{segment}/preview"))
+}
 
 /// Builds the path for one memory, validating the identifier first.
 ///
@@ -281,6 +297,45 @@ impl ApiClient {
             None => MEMORIES_PATH.to_owned(),
         };
         self.get_json(&path).await
+    }
+
+    /// Lists every registered tool with the authorization posture in force for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the daemon has no tool surface at all, which answers `404` rather than an
+    /// empty list — the two have different remedies, so they are different replies.
+    pub async fn list_tools(&self) -> Result<ToolListReply, ApiError> {
+        self.get_json(TOOLS_PATH).await
+    }
+
+    /// Asks what a call to one tool **would** decide, without making one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Identifier`] when the tool name is unusable in a path, and [`ApiError::Refused`]
+    /// when the tool is unknown — which is a `404` rather than a refusal, because a typo and a policy
+    /// denial have opposite remedies.
+    pub async fn preview_tool(
+        &self,
+        tool: &str,
+        request: &ToolPreviewRequest,
+    ) -> Result<ToolPreviewReply, ApiError> {
+        let path = tool_preview_path(tool)?;
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<ToolPreviewReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
     }
 
     /// Reads one claim, with its content.

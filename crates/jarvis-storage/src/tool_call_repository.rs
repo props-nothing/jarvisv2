@@ -577,6 +577,28 @@ pub async fn read_run_tool_calls(
     rows.iter().map(decode_tool_call).collect()
 }
 
+/// Counts every stored tool call, without reading any of them.
+///
+/// # Why a count of the whole table rather than of one run
+///
+/// The caller is a test asserting that a **preview** recorded nothing, and the property is about durable
+/// state rather than about a run: a preview has no run to attribute a row to, so a count filtered by run
+/// would report zero whether or not the preview wrote something. Counting everything is what makes the
+/// property observable at all.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the read fails.
+pub async fn count_tool_calls(database: &SqliteDatabase) -> Result<i64, DatabaseError> {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_calls")
+        .fetch_one(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "count stored tool calls",
+            source,
+        })
+}
+
 /// Reads the calls a re-drive must not repeat.
 ///
 /// # Errors

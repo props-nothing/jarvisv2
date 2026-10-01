@@ -148,7 +148,9 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
+        .route("/tools", get(list_tools))
         .route("/tools/{tool}/calls", post(call_tool))
+        .route("/tools/{tool}/preview", post(preview_tool))
         .route("/calls/{id}/resume", post(resume_call))
         .route("/approvals/{id}/decision", post(decide_approval))
         .route("/memories", get(list_memories).post(remember))
@@ -654,6 +656,236 @@ async fn read_run(State(state): State<GatewayState>, Path(id): Path<String>) -> 
     match state.runs.read(&id).await {
         Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /api/v1/tools`
+///
+/// Lists every registered tool with the authorization posture **in force** for it: the policy the tool
+/// declares, the policy after any workspace override, whether it is overridden or denied, and why it
+/// cannot run when it cannot. This is the surface a CLI or a control-plane UI enumerates, and it exists
+/// because `P3-025` made that posture configurable — without a way to read it back, an operator cannot
+/// tell whether a configuration line took effect.
+///
+/// # Why this is separate from the model-facing discovery list
+///
+/// `ToolRegistry::discover()` omits the approval policy, the required scopes, and the schemas on
+/// purpose: a model selects on what a tool does and must not act on authorization. This reply carries
+/// exactly those omissions, because that is the operator's question.
+///
+/// # An absent pipeline is `404`, not an empty list
+///
+/// A daemon with no roots and no MCP servers registered **no tool at all**, which is deliberately
+/// different from a registered tool that cannot run (`ADR-0020`). An empty `200` would read as "this
+/// daemon has no tools configured" when the truth is "this daemon cannot serve tools", and the two have
+/// different remedies.
+async fn list_tools(State(state): State<GatewayState>) -> Response {
+    let Some(tools) = state.tools() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no tool is registered: grant `daemon.tool_workspace_roots` or configure MCP servers in \
+             `mcp-servers.toml` to enable tools",
+        );
+    };
+    match tools.policy_inventory() {
+        Ok(entries) => {
+            // The ceiling and threshold come from the policy the pipeline actually decides with, not from
+            // configuration — recomposing them would let the displayed policy differ from the enforced one.
+            let policy = tools.workspace_policy();
+            let reply = jarvis_protocol::ToolListReply {
+                total: entries.len(),
+                tools: entries.iter().map(tool_reply).collect(),
+                max_risk: policy.max_risk(),
+                approval_threshold: policy.approval_threshold(),
+            };
+            (StatusCode::OK, Json(reply)).into_response()
+        }
+        // An identifier the registry itself produced cannot fail to parse, so this is a fault rather
+        // than a client error — reported as such rather than as an empty list that would hide a hole.
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &error.to_string(),
+        ),
+    }
+}
+
+/// Projects one inventory entry onto its wire shape.
+///
+/// A named function rather than a closure so the field mapping is readable in one place, and so a
+/// field added to either side is a compile error here rather than a field that silently stops being
+/// reported.
+fn tool_reply(entry: &crate::tool_pipeline::PolicyInventoryEntry) -> jarvis_protocol::ToolReply {
+    jarvis_protocol::ToolReply {
+        id: entry.id.clone(),
+        title: entry.title.clone(),
+        version: entry.version.clone(),
+        source: entry.source.as_str().to_owned(),
+        risk: entry.risk,
+        effects: entry.effects.clone(),
+        required_scopes: entry.required_scopes.clone(),
+        declared_approval: entry.declared_approval,
+        effective_approval: entry.effective_approval,
+        overridden: entry.overridden,
+        denied: entry.denied,
+        callable: entry.callable,
+        unavailable_reason: entry.unavailable_reason.clone(),
+    }
+}
+
+/// `POST /api/v1/tools/{tool}/preview`
+///
+/// Reports the decision a call to this tool **would** produce, without recording or running anything.
+/// The context a caller may supply is the channel, the claimed authentication strength, and the risk
+/// escalation signals, because those describe the call only the caller knows about. The actor's
+/// scopes and the workspace policy are **not** accepted — a preview must not be a way to ask "what if I
+/// had different permissions".
+///
+/// # The identity is the local profile, and that is the honest reading
+///
+/// A preview is an operator's own question about their own daemon, asked over the credential-guarded
+/// loopback transport. There is no run to attribute it to, so the actor is built from the profile's
+/// seeded local identity with the scopes the served tools require — the same derivation
+/// `call_remote_tool` uses, and for the same reason: the grant is what the registered tools need, not
+/// what the caller asks for.
+///
+/// # An unknown tool is `404`, not `deny`
+///
+/// Returning a refusal for a name that does not exist would make a typo indistinguishable from a
+/// policy denial, and the two have opposite remedies.
+async fn preview_tool(
+    State(state): State<GatewayState>,
+    Path(tool): Path<String>,
+    Json(request): Json<jarvis_protocol::ToolPreviewRequest>,
+) -> Response {
+    let Some(tools) = state.tools() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no tool is registered: grant `daemon.tool_workspace_roots` or configure MCP servers in \
+             `mcp-servers.toml` to enable tools",
+        );
+    };
+    let identity = match jarvis_storage::load_local_identity(&state.database).await {
+        Ok(identity) => identity,
+        // `Validation` rather than a not-found code, because `ErrorCode` has no `NotFound` member: its
+        // vocabulary is what a caller should *do*, and a missing local identity is a daemon that cannot
+        // act rather than a resource a client asked for and did not get.
+        Err(error) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                ErrorCode::Validation,
+                &error.to_string(),
+            );
+        }
+    };
+
+    // The channel defaults to the desktop view: the caller is a person inspecting their own daemon over
+    // the API, and `desktop` carries the strongest channel ceiling outside presence, so a default cannot
+    // understate what an authenticated operator could do. The strength defaults to the strongest the
+    // channel permits, which answers the question an operator is usually asking.
+    let channel = request
+        .channel
+        .unwrap_or(jarvis_core::SessionChannel::Desktop);
+    let claimed = match request.claimed_strength.as_deref() {
+        Some(name) => match parse_strength(name) {
+            Some(strength) => strength,
+            None => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    ErrorCode::Validation,
+                    "claimed_strength must be one of absent, channel_evidence, credential, present",
+                );
+            }
+        },
+        None => jarvis_tools::channel_ceiling(channel),
+    };
+
+    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+        identity.workspace_id(),
+        // No run: a preview is not attributed to one, and inventing an identifier would attribute a
+        // call that never happened to a run the caller named. The actor's run field is used for the
+        // call-attribution check in the real path, which this does not reach.
+        String::new(),
+        channel,
+        claimed,
+        // The policy version label a receipt would carry. A preview builds no receipt, so this is the
+        // current label rather than a recorded one — stated because a stored receipt's label is a claim
+        // about the policy in force when a call was admitted, and this is not that.
+        crate::tool_pipeline::PREVIEW_POLICY_VERSION,
+    ) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "the daemon's own scope literals were rejected",
+        );
+    };
+
+    let target = jarvis_tools::TargetAssessment::new(request.escalation.iter().copied());
+    match tools.preview_call(&tool, &actor, &target) {
+        Ok(decision) => {
+            // The declared risk comes from the inventory so the two figures beside each other are the
+            // same computation the listing reports — reading it from a second source would be a second
+            // statement of the tool's risk.
+            let declared = tools
+                .policy_inventory()
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|entry| entry.id == tool))
+                .map_or(decision.effective_risk(), |entry| entry.risk);
+            let reply = jarvis_protocol::ToolPreviewReply {
+                tool: tool.clone(),
+                decision: decision_name(decision.decision()),
+                reason: decision.reason_code().to_owned(),
+                effective_risk: decision.effective_risk(),
+                declared_risk: declared,
+                escalated_by: decision.escalated_by().to_vec(),
+                required_strength: decision.required_strength().map(|s| s.as_str().to_owned()),
+            };
+            (StatusCode::OK, Json(reply)).into_response()
+        }
+        Err(crate::tool_pipeline::ToolPipelineError::UnknownTool { tool }) => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            &format!("no tool is registered with the identifier {tool}"),
+        ),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &error.to_string(),
+        ),
+    }
+}
+
+/// Renders a decision as its stable snake-case wire name.
+///
+/// A hand-written match rather than `Debug`, for the reason every stored vocabulary here is: the name
+/// is a contract with clients, and a reordered or renamed variant must not silently change what a
+/// client reads.
+fn decision_name(decision: jarvis_tools::Decision) -> String {
+    match decision {
+        jarvis_tools::Decision::Allow => "allow",
+        jarvis_tools::Decision::RequireApproval => "require_approval",
+        jarvis_tools::Decision::Deny => "deny",
+    }
+    .to_owned()
+}
+
+/// Parses an authentication strength by its stable name.
+///
+/// Hand-written rather than a `FromStr` implementation because `jarvis_tools::AuthenticationStrength`
+/// deliberately has none: it is a **channel ceiling** rather than a recorded observation, and the type
+/// that a client's string becomes is chosen here, at the boundary, so a caller cannot parse its way to
+/// a value the daemon never intended to accept. An unknown name is `None` rather than a default — a
+/// defaulted strength would compute a preview for a weaker caller than the one asked about, and every
+/// wrong answer in that direction is a preview that looks more permissive than reality.
+fn parse_strength(name: &str) -> Option<jarvis_tools::AuthenticationStrength> {
+    match name {
+        "absent" => Some(jarvis_tools::AuthenticationStrength::Absent),
+        "channel_evidence" => Some(jarvis_tools::AuthenticationStrength::ChannelEvidence),
+        "credential" => Some(jarvis_tools::AuthenticationStrength::Credential),
+        "present" => Some(jarvis_tools::AuthenticationStrength::Present),
+        _ => None,
     }
 }
 
@@ -1641,6 +1873,75 @@ mod tests {
             presented,
             &serde_json::json!({ "run_id": run_id, "arguments": arguments }).to_string(),
         )
+    }
+
+    /// Builds a router over one granted root **and the approval fixture tool**, with a policy the test
+    /// supplies.
+    ///
+    /// The policy arrives as a function rather than a value so each test states only the change it cares
+    /// about and the default is applied here once — a test that built a `WorkspacePolicy` field by field
+    /// would restate the defaults it does not intend to vary.
+    ///
+    /// The approval fixture is registered because it is the only definition in this binary that declares
+    /// `ApprovalPolicy::Ask` at a risk the default workspace would otherwise allow, which is what makes the
+    /// direction rule observable at the wire surface: a looser override written against it must do nothing.
+    async fn tool_router_with_policy(
+        configure: impl FnOnce(jarvis_tools::WorkspacePolicy) -> jarvis_tools::WorkspacePolicy,
+    ) -> (Router, String, TempProfile) {
+        let profile = TempProfile::new();
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create workspace: {error}"));
+        std::fs::write(root.join("secret.txt"), "workspace contents")
+            .unwrap_or_else(|error| panic!("write fixture file: {error}"));
+
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate()
+            .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
+        let presented = credential.expose().to_owned();
+
+        let roots = jarvis_tools::WorkspaceRoots::new([root.as_path()])
+            .unwrap_or_else(|error| panic!("grant the workspace root: {error}"));
+        let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
+            Arc::clone(&database),
+            Some(roots),
+            configure(jarvis_tools::WorkspacePolicy::default()),
+            vec![(
+                vec![crate::approval_fixture::approval_declaring_definition()],
+                crate::approval_fixture::approval_adapter(),
+            )],
+            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
+        )
+        .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
+
+        let app = router(
+            GatewayState::new(
+                database,
+                credential,
+                jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
+            )
+            .with_tools(Arc::new(pipeline)),
+        );
+
+        (app, presented, profile)
+    }
+
+    /// Counts the `tool_calls` rows in a profile's database, so "a preview records nothing" is observed.
+    ///
+    /// A read of the table itself rather than a pipeline accessor, because the property under test is about
+    /// what reaches **durable state** — an accessor could report zero while a row existed.
+    async fn count_tool_calls(profile: &TempProfile) -> i64 {
+        let database = jarvis_storage::SqliteDatabase::open(&profile.database_path())
+            .await
+            .unwrap_or_else(|error| panic!("open fixture database: {error}"));
+        let stored = jarvis_storage::count_tool_calls(&database)
+            .await
+            .unwrap_or_else(|error| panic!("count tool calls: {error}"));
+        database.close().await;
+        stored
     }
 
     /// **The falsification test for the tool route's authority derivation.**
@@ -2672,5 +2973,346 @@ mod tests {
              the query string is well formed and it is the *value* that is unacceptable: {}",
             body_text(oversized).await
         );
+    }
+
+    /// **The tool list reports the policy in force, including an override that raised the declaration.**
+    ///
+    /// The claim `P3-025` makes reachable: an operator can configure a per-tool approval policy and then
+    /// **see that it took effect**. The two assertions that carry it are that the effective policy differs
+    /// from the declared one and that `overridden` is set — a route that returned the registry's own
+    /// inventory would report `declared_approval` for both and pass a "lists the tool" assertion.
+    #[tokio::test]
+    async fn the_tool_list_reports_the_effective_policy_and_its_override() {
+        let (app, presented, _profile) = tool_router_with_policy(
+            // Override the read tool to always ask, which the default workspace would otherwise allow.
+            |policy| policy.requiring(reader_id(), jarvis_tools::ApprovalPolicy::Ask),
+        )
+        .await;
+
+        let response = app
+            .oneshot(get_request("/api/v1/tools", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let reply: jarvis_protocol::ToolListReply =
+            serde_json::from_str(&body_text(response).await)
+                .unwrap_or_else(|error| panic!("decode tool list: {error}"));
+
+        assert_eq!(reply.total, reply.tools.len());
+        let entry = reply
+            .tools
+            .iter()
+            .find(|tool| tool.id == reader_id().to_string())
+            .unwrap_or_else(|| panic!("the read tool must be listed: {:?}", reply.tools));
+        assert_eq!(
+            entry.declared_approval,
+            jarvis_tools::ApprovalPolicy::Auto,
+            "the tool's own declaration must be reported unchanged"
+        );
+        assert_eq!(
+            entry.effective_approval,
+            jarvis_tools::ApprovalPolicy::Ask,
+            "the configured override must be reported as the policy in force"
+        );
+        assert!(
+            entry.overridden,
+            "an operator must be able to see that their override is why this asks"
+        );
+        assert!(!entry.denied, "no denial was configured");
+        assert!(entry.callable, "a read over a granted root is callable");
+        // The workspace settings are reported beside the per-tool entries, so a single tool's posture is
+        // readable against the ceiling it sits under.
+        assert_eq!(reply.max_risk, jarvis_tools::Risk::High);
+        assert_eq!(reply.approval_threshold, jarvis_tools::Risk::Moderate);
+    }
+
+    /// **An override that is looser than the declaration is reported as having done nothing.**
+    ///
+    /// The direction rule at the wire surface. The tool declares `Ask`; the operator writes the loosest
+    /// possible value. The effective policy must still be `Ask` and `overridden` must be false, because
+    /// nothing was raised — a route that reported the configured value as effective would show an
+    /// operator a policy the engine does not enforce, which is worse than showing nothing.
+    #[tokio::test]
+    async fn a_tool_list_reports_a_looser_override_as_having_no_effect() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| {
+            policy
+                .requiring(reader_id(), jarvis_tools::ApprovalPolicy::Auto)
+                .requiring(approval_asking_id(), jarvis_tools::ApprovalPolicy::Auto)
+        })
+        .await;
+
+        let response = app
+            .oneshot(get_request("/api/v1/tools", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let reply: jarvis_protocol::ToolListReply =
+            serde_json::from_str(&body_text(response).await)
+                .unwrap_or_else(|error| panic!("decode tool list: {error}"));
+
+        let asking = reply
+            .tools
+            .iter()
+            .find(|tool| tool.id == approval_asking_id().to_string())
+            .unwrap_or_else(|| panic!("the asking tool must be listed"));
+        assert_eq!(
+            asking.effective_approval,
+            jarvis_tools::ApprovalPolicy::Ask,
+            "a looser override must not lower the tool's own `Ask`"
+        );
+        assert!(
+            !asking.overridden,
+            "an override that changed nothing must not read as having changed something"
+        );
+    }
+
+    /// **A denial is reported as a denial, and the reason list is not the only way to see it.**
+    #[tokio::test]
+    async fn the_tool_list_reports_a_denied_tool_as_denied() {
+        let (app, presented, _profile) =
+            tool_router_with_policy(|policy| policy.denying(reader_id())).await;
+
+        let response = app
+            .oneshot(get_request("/api/v1/tools", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let reply: jarvis_protocol::ToolListReply =
+            serde_json::from_str(&body_text(response).await)
+                .unwrap_or_else(|error| panic!("decode tool list: {error}"));
+
+        let entry = reply
+            .tools
+            .iter()
+            .find(|tool| tool.id == reader_id().to_string())
+            .unwrap_or_else(|| panic!("a denied tool is still registered and must be listed"));
+        assert!(
+            entry.denied,
+            "the denial must be visible without making a call"
+        );
+        // The tool is still *callable* — the adapter works and the file can be read. The denial is a
+        // policy fact rather than an availability one, and conflating them would send an operator to fix
+        // a grant when the remedy is a configuration line.
+        assert!(
+            entry.callable,
+            "a denied tool is available and refused, not broken"
+        );
+    }
+
+    /// **The list route refuses rather than returning an empty list when no pipeline exists.**
+    ///
+    /// An empty `200` would read as "no tools are configured", while the truth is "this daemon cannot serve
+    /// tools" — and the remedies differ, since the second is a missing roots grant or an MCP document.
+    #[tokio::test]
+    async fn the_tool_list_is_not_found_without_a_pipeline() {
+        let (app, presented, _profile) = test_router().await;
+
+        let response = app
+            .oneshot(get_request("/api/v1/tools", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an absent pipeline is not an empty tool list: {}",
+            body_text(response).await
+        );
+    }
+
+    /// **The preview computes the decision the engine would reach, and reports why.**
+    ///
+    /// The value an operator configuring policy actually needs: the effect of a call on a real tool,
+    /// without making one. Both halves are asserted — the decision and the reason code — because a preview
+    /// that returned only an outcome would leave the operator reproducing the decision by hand, which is
+    /// the defect `PolicyDecision`'s reason code exists to prevent.
+    #[tokio::test]
+    async fn the_preview_reports_the_decision_and_its_reason() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
+
+        // The read tool is risk 0, `Auto`, and the default workspace allows it — so the control is `allow`.
+        let allowed = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/tools/{}/preview", reader_id()),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let reply: jarvis_protocol::ToolPreviewReply =
+            serde_json::from_str(&body_text(allowed).await)
+                .unwrap_or_else(|error| panic!("decode preview: {error}"));
+        assert_eq!(reply.decision, "allow");
+        assert_eq!(reply.reason, "allowed");
+        assert_eq!(reply.declared_risk, jarvis_tools::Risk::Minimal);
+        assert_eq!(reply.effective_risk, jarvis_tools::Risk::Minimal);
+        assert!(reply.required_strength.is_none());
+        assert!(reply.escalated_by.is_empty());
+    }
+
+    /// **A preview names the escalation as the reason the risk rose.**
+    ///
+    /// The context a caller supplies is the only thing that can raise a risk without the tool changing, so
+    /// the reply must distinguish the *declared* risk from the effective one and list what raised it. A
+    /// reply that reported only the effective risk would make a held call look like a badly declared tool.
+    #[tokio::test]
+    async fn the_preview_reports_escalation_separately_from_the_declared_risk() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
+
+        let response = app
+            .oneshot(post_json(
+                &format!("/api/v1/tools/{}/preview", reader_id()),
+                &presented,
+                r#"{"escalation":["bulk"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(response).await
+        );
+        let reply: jarvis_protocol::ToolPreviewReply =
+            serde_json::from_str(&body_text(response).await)
+                .unwrap_or_else(|error| panic!("decode preview: {error}"));
+
+        assert_eq!(
+            reply.declared_risk,
+            jarvis_tools::Risk::Minimal,
+            "the tool's own declaration is unchanged by the context"
+        );
+        assert_eq!(
+            reply.effective_risk,
+            jarvis_tools::Risk::High,
+            "a bulk target raises the risk to the documented level"
+        );
+        assert_eq!(
+            reply.escalated_by,
+            vec![jarvis_core::EscalationSignal::Bulk]
+        );
+        assert_eq!(
+            reply.decision, "require_approval",
+            "a risk-3 call is held rather than allowed"
+        );
+        assert_eq!(reply.reason, "approval_required");
+    }
+
+    /// **The preview writes nothing and runs nothing.**
+    ///
+    /// The property that makes it safe to expose at all: an operator must not be able to fill the ledger by
+    /// inspecting it, and a preview must not consume an idempotency key so that the real call becomes a
+    /// duplicate. Asserted by the call table being empty before and after, because a preview that recorded
+    /// a `requested` row would look identical in its own response.
+    #[tokio::test]
+    async fn the_preview_records_no_call() {
+        let (app, presented, root) = tool_router_with_policy(|policy| policy).await;
+
+        let before = count_tool_calls(&root).await;
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    &format!("/api/v1/tools/{}/preview", reader_id()),
+                    &presented,
+                    "{}",
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            count_tool_calls(&root).await,
+            before,
+            "a preview must record nothing, however many times it is asked"
+        );
+    }
+
+    /// **A preview of a tool that does not exist is a `404`, not a refusal.**
+    ///
+    /// A refusal would make a typo indistinguishable from a policy denial, and the two have opposite
+    /// remedies: one is an identifier to correct, the other a configuration line to change.
+    #[tokio::test]
+    async fn the_preview_of_an_unknown_tool_is_not_found() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
+
+        let response = app
+            .oneshot(post_json(
+                "/api/v1/tools/jarvis.nope.missing/preview",
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown tool must not read as a policy refusal: {}",
+            body_text(response).await
+        );
+    }
+
+    /// **A preview refuses a request body that tries to supply authority.**
+    ///
+    /// The rule every route here follows: the actor's scopes and the workspace policy come from the daemon,
+    /// never from the request. `deny_unknown_fields` makes an attempt to name them a `422` rather than an
+    /// ignored value, which is what stops the preview becoming a way to ask "what if I had more".
+    #[tokio::test]
+    async fn the_preview_refuses_a_body_that_names_authority() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
+
+        let response = app
+            .oneshot(post_json(
+                &format!("/api/v1/tools/{}/preview", reader_id()),
+                &presented,
+                r#"{"scopes":["files.read","mcp.call"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a body naming scopes must be refused rather than ignored: {}",
+            body_text(response).await
+        );
+    }
+
+    /// **An unknown claimed strength is refused rather than defaulted.**
+    ///
+    /// The direction that matters: a defaulted strength would compute a preview for a channel that
+    /// established *less* than the caller asked about, and every wrong answer there is a preview that looks
+    /// more permissive than reality.
+    #[tokio::test]
+    async fn the_preview_refuses_an_unknown_strength() {
+        let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
+
+        let response = app
+            .oneshot(post_json(
+                &format!("/api/v1/tools/{}/preview", reader_id()),
+                &presented,
+                r#"{"claimed_strength":"strong"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an unknown strength must be refused: {}",
+            body_text(response).await
+        );
+    }
+
+    /// The read tool's identifier, as the filesystem adapter declares it.
+    fn reader_id() -> jarvis_tools::ToolId {
+        jarvis_tools::ToolId::new(jarvis_tools::READ_TOOL)
+            .unwrap_or_else(|error| panic!("the adapter's own identifier: {error}"))
+    }
+
+    /// An identifier for a tool that declares `ApprovalPolicy::Ask` at risk 0.
+    ///
+    /// Built through the approval fixture, which is the same definition the hold tests use, so the
+    /// declaration under test is the product's own and not a literal restated here.
+    fn approval_asking_id() -> jarvis_tools::ToolId {
+        jarvis_tools::ToolId::new(crate::approval_fixture::APPROVAL_TOOL)
+            .unwrap_or_else(|error| panic!("the fixture identifier: {error}"))
     }
 }

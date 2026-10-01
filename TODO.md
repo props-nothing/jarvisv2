@@ -2260,6 +2260,80 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       can never relax a tool's declaration by design; and `[policy.approval]` cannot express "ask, whatever
       the tool declares" for a tool that declares `Deny`, because `Deny` is absolute.
 
+## P3-026: The tool control plane
+
+- [x] `P3-026` Let an operator read the policy in force and preview a decision, from HTTP and the CLI.
+      **THE QUESTION `P3-025` CREATED AND COULD NOT ANSWER.** `P3-025` made a tool's approval policy
+      configurable, which made *"did my configuration take effect?"* answerable in principle and
+      unanswerable in practice: a configuration document is the **input**, while the workspace policy is what
+      `evaluate` enforces. An override is applied as a `max` at evaluation time, a denial short-circuits
+      before several checks, and the actor's scopes are derived rather than configured — so a correct document
+      still does not describe the posture in force, and the only way to learn it was to attempt a call and
+      read the refusal. There was also **no `GET /tools` at all**: `ToolRegistry::discover()` existed with no
+      route, so a CLI or control-plane UI could not enumerate what was configurable.
+      **Delivered:** `jarvis-protocol` gains `tool_api` (`ToolReply`, `ToolListReply`,
+      `ToolPreviewRequest`, `ToolPreviewReply`); `ToolPipeline` gains `policy_inventory`, `preview_call`, and
+      `workspace_policy`; `jarvisd` gains `GET /api/v1/tools` and `POST /api/v1/tools/{tool}/preview`; the CLI
+      gains a `jarvis tools <list|preview>` group with `--escalation`, `--channel`, `--strength`, and
+      `--json`. **`ADR-0123`.**
+      **⭐⭐ A PREVIEW IS A DECISION, NOT A PREDICTION, AND IT WRITES NOTHING.** `evaluate` is a pure function
+      of declared facts, so `preview_call` calls the **same** function the tool-call path calls over the same
+      workspace policy and definitions — the answer is exact for the context supplied rather than an estimate.
+      It takes no `run_id` and touches no table, because a preview that recorded a call would let an operator
+      fill the ledger by looking at it, and one that consumed an idempotency key would make the real call a
+      duplicate. The property is asserted by **counting `tool_calls` rows** before and after, because a
+      `requested` row would look identical in the preview's own response — which is why
+      `jarvis_storage::count_tool_calls` was added: an assertion on the response cannot see the write.
+      **⭐⭐ THE LIST REPORTS THE DECLARED AND THE EFFECTIVE POLICY, AND NAMES AN OVERRIDE AS ONE.** Both values
+      are reported because they differ for a reason worth seeing: a tool held by the workspace *threshold*
+      looks identical to one held by its own *declaration* unless both are visible. `overridden` is **derived**
+      rather than stored, so the flag cannot disagree with the two policies it describes. The reply also
+      carries the workspace ceiling and threshold, so one tool's posture is readable against the ceiling it
+      sits under. **Falsified**: making the projection report `declared` as `effective` fails with
+      `left: Auto, right: Ask`, so the assertion is not vacuous.
+      **⭐ THE CLOSED SETS ARE `jarvis-core`'s TYPES ON THE WIRE, WHICH IS `ADR-0122`'s PAYOFF.** This crate
+      depends on `jarvis-core` and **not on `jarvis-tools`**, so a `String` field plus a hand-written
+      membership check was the only alternative — and three such checks were written and then **deleted** once
+      the move made `Risk`, `ApprovalPolicy`, and `EscalationSignal` nameable. A mistyped policy is now a `422`
+      naming the field rather than a default, and a default here would be the *most permissive* reading of a
+      value the caller mistyped. `EscalationSignal` moved to core in this slice for exactly that reason.
+      `AuthenticationStrength` deliberately stays a name on the wire: core's type of that name means what an
+      answering channel *did* establish, so substituting it would let a ceiling be recorded as an observation.
+      **⭐ THREE STATUSES STAY DISTINCT BECAUSE THE REMEDIES DIFFER.** An unknown tool is `404` rather than a
+      refusal, because a typo and a policy denial have opposite remedies. No tool surface at all is `404`
+      rather than an empty list, because "nothing is configured" and "this daemon cannot serve tools" are
+      different deployment facts. A **denied** tool is still `callable: true`, because the denial is a policy
+      fact rather than an availability one — conflating them would send an operator to fix a grant when the
+      remedy is a configuration line.
+      **⭐ A CALLER SUPPLIES CONTEXT; THE DAEMON SUPPLIES AUTHORITY.** A preview body carries only `channel`,
+      `claimed_strength`, and `escalation` — the parts of the call only the caller knows. Scopes, the workspace
+      policy, and the definition come from the daemon, and `deny_unknown_fields` makes an attempt to name them
+      a `422` rather than an ignored value. A test asserts a body naming `scopes` is refused, so the preview
+      cannot become an authorization oracle.
+      **⭐⭐ A TEST CAUGHT AN OFF-BY-ONE IN THE CLI FLAG PARSER.** `preview_request` scanned from index 2, which
+      is the **tool identifier** rather than the first flag — so every preview would have failed with
+      `unknown tools option "jarvis.files.read"`. It was caught because the parser is tested **directly**
+      rather than through the rendered output: a rendering test would have shown a plausible error and the
+      cause would have looked like a bad identifier. Two more CLI tests assert that an unknown escalation,
+      channel, or strength is a **usage error** rather than an ignored flag, because silently dropping an
+      escalation computes the preview for a call *without* it and reads as more permissive than the user asked
+      about — with a `--json` control so a parser that refused every flag cannot pass.
+      Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` (adds 10 gateway
+      route tests, 3 CLI parser tests, 3 core signal tests, and the storage count; 134 daemon tests, 50
+      suites), `cargo deny check` ok.
+      **Limits, recorded rather than glossed:** the surface is **read-only** — editing policy at runtime needs
+      the durable workspace row and reload path `ADR-0122` records as absent; the list is **unbounded**,
+      relying on `MAX_REGISTERED_TOOLS` rather than a page parameter; a preview **cannot express a
+      hypothetical authority**, deliberately, since accepting scopes or a workspace policy would make it an
+      authorization oracle; and a preview does **not** read a target out of the tool's arguments, so the
+      escalation signals are the caller's to supply — the same limitation `call_remote_tool` records for the
+      same reason. Two CLI observations checked rather than assumed: an **unknown sub-verb** reports daemon
+      unreachability before naming the sub-verb, because the client is built before `tools::run` is called —
+      **verified to match `jarvis memory` exactly**, so this is the established convention rather than a bug in
+      the new group, and changing it here alone would make the two groups inconsistent; and `jarvis tools list`
+      against a daemon with **no tool surface** exits through the `Denied` path, which is the documented
+      mapping for a refusal (the `404` body's remedy text is what distinguishes it).
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

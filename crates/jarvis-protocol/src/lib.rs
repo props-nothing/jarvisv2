@@ -6,6 +6,7 @@ mod memory_api;
 mod rest;
 mod run_api;
 mod session;
+mod tool_api;
 mod version;
 mod wire;
 pub use approval::{ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalReply};
@@ -28,6 +29,7 @@ pub use session::{
     AdmittedClient, ClientContext, ClientSession, HANDSHAKE_TIMEOUT, MAX_REQUESTS_PER_CONNECTION,
     Responder, ServerContext, SessionError, serve,
 };
+pub use tool_api::{ToolListReply, ToolPreviewReply, ToolPreviewRequest, ToolReply};
 pub use version::{
     MAX_SUPPORTED_PROTOCOL, MIN_SUPPORTED_PROTOCOL, NegotiationError, PROTOCOL_VERSION, negotiate,
 };
