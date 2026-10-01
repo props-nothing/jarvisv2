@@ -132,3 +132,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0112](0112-a-prescribed-call-with-no-builder.md) | A prescribed call with no builder, and a body that made a request's own doc false | Accepted |
 | [0113](0113-the-value-that-survives-is-the-one-that-did-not-hold-it.md) | The value that survives the `watch` is the one the renewal needs, and it was the one that did not hold it | Accepted |
 | [0114](0114-a-path-identifier-validated-but-not-encoded.md) | A path identifier that was validated but not encoded, and the asymmetry that hid it | Accepted |
+| [0115](0115-one-acknowledgement-vocabulary.md) | One mechanism's acknowledgement was a decision and its twin's was a bool that was always true | Accepted |

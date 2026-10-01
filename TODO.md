@@ -5663,6 +5663,43 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     builder) fails rather than passing.
   - **NEW LIMITS:** no request is sent, so the encoding is proved against the builder's own output rather than a
     provider's response; a fourth builder would justify extracting the encoding into a shared URL helper.
+- [ ] `P5-005` **(continued — one acknowledgement vocabulary for both push mechanisms)**: `ChannelIngest`'s
+  `acknowledges() -> bool` becomes `acknowledgement() -> DeliveryAck`, the same type `GmailIngest` returns; the
+  four existing assertions are tightened to name the specific `DeliveryAck`. **2 new tests (so 492 in the
+  crate).** **`ADR-0115`.** Three guards falsified A-B-A.
+  - **⭐⭐ THE FINDING: ONE INGEST ANSWERED WITH A DECISION AND ITS TWIN WITH A `bool` THAT WAS ALWAYS `true`.**
+    `GmailIngest::acknowledgement()` returns a three-state `DeliveryAck` (`Accept` / `Retry` /
+    `AbandonAndAcknowledge`); `ChannelIngest::acknowledges()` returned `bool` and **always `true`**, so a caller
+    could not tell **a delivery it acted on** from **one it deliberately dropped** — opposite downstream
+    consequences (work done versus work irrecoverably discarded), and only one should be recorded as a success.
+    The `bool`'s doc even said *"a future variant that should be retried … has a place to say `false`"*: it
+    reasoned about the **retry** dimension (always `false` here) and never noticed the other dimension, *which
+    kind of yes*, that its sibling carries. **⭐ The same sibling-asymmetry shape `ADR-0107` and `ADR-0114` found
+    — two things that should behave alike, each internally consistent, invisible until read side by side.**
+  - **⭐ A METHOD WHOSE RETURN IS CONSTANT IS THE SHAPE TO CHECK.** "All variants return `true`" is true of the
+    *acknowledgement* and false of the *reason*, and the reason is the half a caller acts on. **A value that is
+    always the same is either a fact worth asserting or a type that is missing a variant.**
+  - **⭐ ONE METHOD, NOT TWO NAMES.** The richer type loses nothing because `DeliveryAck::acknowledges()` is the
+    predicate, so a caller wanting "does this acknowledge" asks `outcome.acknowledgement().acknowledges()` — the
+    old name is **not** kept as a shim, because two names for one question is the duplication this repository
+    removes everywhere else.
+  - **⭐ THE `ADR-0094` ARGUMENT IS UNCHANGED AND NOW CARRIED BY A TYPE.** Every variant still acknowledges
+    (none of the three refusals is repaired by another attempt, so refusing would be charged to the whole
+    subscription) — only **which reason** becomes visible, and a call site now reads `AbandonAndAcknowledge`
+    instead of trusting a `true`.
+  - **⭐⭐ THE PARITY IS ASSERTED AS A CROSS-MECHANISM EQUIVALENCE, NOT A COMMENT.** Two tests drive the **same**
+    outcome kind through **both** mechanisms and assert the acknowledgements are equal — accepted
+    (`Changed` ↔ `Changed`) → `Accept`; unroutable and refused → `AbandonAndAcknowledge` — so a future
+    divergence fails a test. Reverting to the "always `Accept`" behaviour is **detected by that parity test**,
+    confirmed by mutation.
+  - **⭐ THREE GUARDS FALSIFIED A-B-A:** (1) the refusals reporting `Accept` → detected; (2) an accepted delivery
+    reporting a drop → detected; (3) reverting to always-`Accept` → detected by the parity test.
+  - **⭐ THE FOUR EXISTING ASSERTIONS WERE TIGHTENED, NOT RELAXED** — each `assert!(outcome.acknowledges())`
+    became an `assert_eq!(outcome.acknowledgement(), …)` naming the **specific** value, so the tests pin the
+    reason as well as the acknowledgement (the "assert the specific value, not `is_ok`" rule).
+  - **NEW LIMITS:** no handler sends an acknowledgement yet, so the `Accept`/`AbandonAndAcknowledge` distinction
+    reaches a metric only when a push handler exists; a transient store failure is still not an ingest outcome,
+    so `DeliveryAck::Retry` has no user in either mechanism.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

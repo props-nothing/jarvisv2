@@ -782,7 +782,10 @@ fn a_verified_change_on_a_registered_channel_is_the_one_outcome_that_syncs() {
         Some("acct-alpha"),
         "the sync must run under the account that registered the channel"
     );
-    assert!(outcome.acknowledges());
+    // **The work is accepted, which is a `DeliveryAck::Accept` and not merely "acknowledged".** The typed
+    // answer distinguishes a delivery the connector acted on from one it deliberately dropped; a `bool`
+    // collapsed the two. A routable change is `Accept`; a refusal is `AbandonAndAcknowledge`.
+    assert_eq!(outcome.acknowledgement(), DeliveryAck::Accept);
 }
 
 #[test]
@@ -800,7 +803,11 @@ fn a_verified_sync_handshake_is_accepted_but_syncs_nothing() {
         None,
         "a handshake reports no change, so nothing syncs"
     );
-    assert!(outcome.acknowledges(), "accepted, so not retried");
+    assert_eq!(
+        outcome.acknowledgement(),
+        DeliveryAck::Accept,
+        "accepted, so not retried"
+    );
 }
 
 #[test]
@@ -830,7 +837,13 @@ fn the_seam_is_where_the_composition_was_found_and_it_rejects_a_failed_token() {
         None,
         "a rejected delivery must not sync, even though its channel routes"
     );
-    assert!(outcome.acknowledges(), "recorded and dropped, not retried");
+    // **The half the old `bool` erased.** A rejected delivery is acknowledged because a redelivery cannot
+    // repair a failed control — but it is a `DeliveryAck::AbandonAndAcknowledge`, not an `Accept`: the
+    // connector dropped it deliberately and that must be recorded as a drop, not as work done.
+    assert_eq!(
+        outcome.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
 }
 
 #[test]
@@ -977,8 +990,19 @@ fn every_ingest_outcome_acknowledges_because_none_is_repaired_by_retrying() {
         ingest("channel-missing", None, "exists", &registrations),
     ];
     for outcome in &all {
-        assert!(outcome.acknowledges(), "{outcome:?} must be acknowledged");
+        assert!(
+            outcome.acknowledgement().acknowledges(),
+            "{outcome:?} must be acknowledged"
+        );
     }
+    // **And the two kinds of yes are distinguished, which is the finding.** `Changed` and `Handshake` are
+    // `Accept` (the delivery passed every control); the refusals are `AbandonAndAcknowledge` (dropped on
+    // purpose). A `bool` returned `true` for all of them, so a caller could not tell a success from a
+    // deliberate drop.
+    assert_eq!(all[0].acknowledgement(), DeliveryAck::Accept);
+    assert_eq!(all[1].acknowledgement(), DeliveryAck::Accept);
+    assert_eq!(all[2].acknowledgement(), DeliveryAck::AbandonAndAcknowledge);
+    assert_eq!(all[3].acknowledgement(), DeliveryAck::AbandonAndAcknowledge);
     // And only `Changed` starts work, so acceptance is not a synonym for "act".
     let syncing = all
         .iter()

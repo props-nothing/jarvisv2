@@ -422,3 +422,154 @@ fn gmail_has_no_handshake_outcome_because_its_opening_notification_is_unmarked()
         assert_ne!(outcome.acknowledgement(), DeliveryAck::Retry);
     }
 }
+
+#[test]
+fn the_two_ingest_paths_agree_that_a_routable_delivery_is_accept() {
+    // **The asymmetry this slice fixes, asserted as a property rather than left to a comment.** The Gmail ingest
+    // returned a three-state `DeliveryAck` while the Calendar ingest returned a `bool` that was always `true`,
+    // so the two siblings answered one question with two vocabularies — and a caller of the `bool` could not
+    // tell a delivery it **acted on** from one it **deliberately dropped**. This drives the accepted outcome of
+    // **both** mechanisms and asserts they classify identically, so a future change that made one path say
+    // `Accept` where the other says `AbandonAndAcknowledge` fails here rather than silently.
+    use crate::google::channel::ingest_channel_delivery;
+
+    let registration = registration_for("channel-alpha", None);
+    let accepted = ingest_channel_delivery(
+        &delivery(&calendar_headers("channel-alpha", None, "exists", "10")),
+        std::slice::from_ref(&registration),
+    );
+    assert_eq!(accepted.acknowledgement(), DeliveryAck::Accept);
+    let gmail_change = ingest_gmail_delivery(
+        &delivery_body("person@example.invalid", "1", None),
+        &[account("acct-1", "person@example.invalid")],
+    );
+    assert_eq!(gmail_change.acknowledgement(), DeliveryAck::Accept);
+    assert_eq!(
+        accepted.acknowledgement(),
+        gmail_change.acknowledgement(),
+        "both mechanisms must agree that an accepted delivery is `Accept`"
+    );
+    // Neither ever answers `Retry` from an ingest decision: the transient-failure answer belongs to the caller
+    // that acted, and ingest decides what the delivery IS.
+    assert_ne!(accepted.acknowledgement(), DeliveryAck::Retry);
+}
+
+#[test]
+fn the_two_ingest_paths_agree_that_a_dropped_delivery_is_abandoned() {
+    // The other half of the parity property: every outcome **neither** mechanism acted on is
+    // `AbandonAndAcknowledge`, and the two agree case for case — a `bool` returned `true` for these too, which
+    // is why it could not distinguish a success from a deliberate drop.
+    use crate::google::channel::{ChannelIngest, ingest_channel_delivery};
+
+    // A Calendar delivery for a channel nothing registered — the counterpart of Gmail's unknown address.
+    let registered = registration_for("channel-alpha", None);
+    let unroutable = ingest_channel_delivery(
+        &delivery(&calendar_headers("channel-unknown", None, "exists", "11")),
+        std::slice::from_ref(&registered),
+    );
+    let gmail_missing = ingest_gmail_delivery(
+        &delivery_body("stranger@example.invalid", "1", None),
+        &[account("acct-1", "person@example.invalid")],
+    );
+    assert_eq!(
+        unroutable.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    assert_eq!(
+        gmail_missing.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    assert_eq!(
+        unroutable.acknowledgement(),
+        gmail_missing.acknowledgement(),
+        "both mechanisms must agree that an unroutable delivery is `AbandonAndAcknowledge`"
+    );
+
+    // A Calendar delivery that fails its token control — the counterpart of Gmail's unreadable body.
+    let tokened = registration_for("channel-beta", Some("registered-token"));
+    let rejected = ingest_channel_delivery(
+        &delivery(&calendar_headers(
+            "channel-beta",
+            Some("forged"),
+            "exists",
+            "12",
+        )),
+        std::slice::from_ref(&tokened),
+    );
+    let gmail_unreadable = ingest_gmail_delivery("not json", &[]);
+    assert_eq!(
+        rejected.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    assert_eq!(
+        gmail_unreadable.acknowledgement(),
+        DeliveryAck::AbandonAndAcknowledge
+    );
+    assert_eq!(
+        rejected.acknowledgement(),
+        gmail_unreadable.acknowledgement(),
+        "both mechanisms must agree that a refused delivery is `AbandonAndAcknowledge`"
+    );
+
+    // The two types expose the **same** vocabulary, which is the finding: a caller that handles one handles the
+    // other, and neither collapses "done" and "dropped" into one value.
+    let _: DeliveryAck = ChannelIngest::Handshake.acknowledgement();
+    let _: DeliveryAck = gmail_missing.acknowledgement();
+}
+
+/// A registration for a channel, with an optional token. Fixture helper for the two parity tests.
+fn registration_for(
+    channel_id: &str,
+    token: Option<&str>,
+) -> crate::google::channel::ChannelRegistration {
+    crate::google::channel::ChannelRegistration::new(
+        channel_id.to_owned(),
+        "ret08u3rv24htgh289g".to_owned(),
+        reference("acct-1"),
+        token.map(|value| must(crate::auth::SecretValue::new(value), "a token")),
+        instant(1_426_325_213),
+    )
+}
+
+/// The full required Calendar header set for a delivery naming a channel. Fixture helper.
+///
+/// Dynamic values are leaked (test-only) so the header slice keeps its `&'static` element type, the pattern the
+/// channel tests use.
+fn calendar_headers(
+    channel_id: &str,
+    token: Option<&str>,
+    state: &str,
+    number: &str,
+) -> Vec<(&'static str, &'static [u8])> {
+    use crate::google::channel::{
+        CHANNEL_ID_HEADER, CHANNEL_TOKEN_HEADER, MESSAGE_NUMBER_HEADER, RESOURCE_ID_HEADER,
+        RESOURCE_STATE_HEADER, RESOURCE_URI_HEADER,
+    };
+    let leak =
+        |value: &str| -> &'static [u8] { Box::leak(value.to_owned().into_boxed_str()).as_bytes() };
+    let mut headers = vec![
+        (CHANNEL_ID_HEADER, leak(channel_id)),
+        (RESOURCE_ID_HEADER, b"ret08u3rv24htgh289g".as_slice()),
+        (
+            RESOURCE_URI_HEADER,
+            b"https://www.googleapis.com/calendar/v3/calendars/primary/events".as_slice(),
+        ),
+        (RESOURCE_STATE_HEADER, leak(state)),
+        (MESSAGE_NUMBER_HEADER, leak(number)),
+    ];
+    if let Some(token) = token {
+        headers.push((CHANNEL_TOKEN_HEADER, leak(token)));
+    }
+    headers
+}
+
+/// Wraps a header slice in a `WebhookDelivery` with a zero-length body. Fixture helper.
+fn delivery<'a>(
+    headers: &'a [(&'static str, &'static [u8])],
+) -> crate::webhook::WebhookDelivery<'a> {
+    crate::webhook::WebhookDelivery {
+        path: "/webhooks/google/calendar",
+        headers,
+        body: b"",
+    }
+}

@@ -83,6 +83,7 @@ use jarvis_core::UtcTimestamp;
 
 use crate::account::AccountReference;
 use crate::auth::SecretValue;
+use crate::google::pubsub::DeliveryAck;
 use crate::webhook::WebhookDelivery;
 
 /// The header carrying the channel id the connector chose. Always present.
@@ -921,21 +922,41 @@ impl ChannelIngest {
         }
     }
 
-    /// Returns whether the sender's delivery should be **acknowledged** so it is not retried.
+    /// Returns what to answer the sender, so the delivery is acknowledged or redelivered.
     ///
-    /// **Every** variant answers `true`, and that is the decision rather than an oversight: none of the four
-    /// non-`Changed` outcomes is repaired by another attempt. A malformed body, an unregistered channel, a
+    /// # Why this is the same type the Gmail ingest returns, and not the `bool` it used to be
+    ///
+    /// This method returned `bool` and **always `true`**, while the sibling
+    /// [`GmailIngest::acknowledgement`](crate::google::routing::GmailIngest::acknowledgement) returns a
+    /// three-state [`DeliveryAck`] — "the work is done", "the delivery can never be processed", and "it should
+    /// come back". A `true` collapses the first two into one value, so a caller of this method reading
+    /// `acknowledges()` could not tell **a delivery it acted on** from **a delivery it deliberately dropped**;
+    /// the two have opposite downstream consequences (work done versus work irrecoverably discarded) and only
+    /// one of them should be recorded as a success. The doc even said *"a future variant that should be retried
+    /// … has a place to say `false`"* — but a `bool` cannot express *which kind* of yes it is, which is the half
+    /// a caller needs.
+    ///
+    /// **Every variant is still acknowledged**, and that is the decision rather than an oversight: none of the
+    /// four non-`Changed` outcomes is repaired by another attempt. A malformed body, an unregistered channel, a
     /// failed token, and a handshake all describe deliveries that will fail or repeat identically, and
     /// `ADR-0094`'s finding is that a negative acknowledgement triggers a **subscription-global** backoff — so
-    /// refusing would slow every other channel for a message that can never become actionable. This is the same
-    /// conclusion [`crate::google::routing::DeliveryRoute::unroutable_acknowledgement`] reaches, now covering
-    /// the whole ingest decision rather than the route alone.
+    /// refusing would slow every other channel for a message that can never become actionable. The difference
+    /// the type now carries is **which reason** the answer has, not whether it acknowledges.
     ///
-    /// It is a method rather than an omitted fact so a caller reads the intent, and so a future variant that
-    /// *should* be retried (a transient store failure, say) has a place to say `false`.
+    /// [`DeliveryAck::Accept`] for [`Self::Handshake`] and [`Self::Changed`] — the delivery passed every
+    /// control, and for `Changed` the work is accepted as well; [`DeliveryAck::AbandonAndAcknowledge`] for the
+    /// three refusals, which are acknowledged precisely because they can never be repaired.
     #[must_use]
-    pub const fn acknowledges(&self) -> bool {
-        true
+    pub const fn acknowledgement(&self) -> DeliveryAck {
+        match self {
+            Self::Handshake | Self::Changed { .. } => DeliveryAck::Accept,
+            // The three refusals: recorded and dropped, because a redelivery cannot change a local fact (the
+            // account set, the stored token) or a malformed payload. See `DeliveryAck::AbandonAndAcknowledge`
+            // for why refusing would be charged to the whole subscription.
+            Self::Unreadable(_) | Self::Unroutable(_) | Self::Rejected(_) => {
+                DeliveryAck::AbandonAndAcknowledge
+            }
+        }
     }
 }
 
