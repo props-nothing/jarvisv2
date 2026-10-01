@@ -417,27 +417,44 @@ fn the_history_fixture_pair_separates_the_page_token_from_the_durable_cursor() {
         Err(error) => panic!("the documented history shape must parse: {error}"),
     };
 
-    // Mid-walk: both a page token and a history id, and they are different values.
+    // Mid-walk: both a page token and a history id, and they are different values -- and the id is explicitly
+    // **not storable**, because the reference ties storing to the absence of the token.
     assert_eq!(mid.next_page_token.as_deref(), Some("0987654321"));
-    assert_eq!(mid.history_id.as_deref(), Some("12347"));
-    assert_ne!(
-        mid.history_id, mid.next_page_token,
-        "the two are distinct fields and must never be interchanged"
+    assert_eq!(
+        mid.position,
+        jarvis_connectors::google::client::HistoryPosition::UnfinishedWalk {
+            stated_history_id: "12347".to_owned()
+        },
+        "a page with more to come states a position a caller may not store"
     );
-    // Last page: NO page token, and the history id is still present -- which is the whole reason a caller may
-    // advance a durable cursor from the response at all.
+    assert_eq!(mid.position.storable(), None);
+    assert!(!mid.position.is_storable());
+    // Last page: NO page token, so the id is the one the reference sanctions storing.
     assert_eq!(
         last.next_page_token, None,
         "the last page carries no page token"
     );
-    assert_eq!(last.history_id.as_deref(), Some("12348"));
+    assert_eq!(
+        last.position,
+        jarvis_connectors::google::client::HistoryPosition::Storable {
+            history_id: "12348".to_owned()
+        }
+    );
+    assert_eq!(last.position.storable(), Some("12348"));
 
-    // And the consequence is asserted rather than described: only the last page's history id is a position a
-    // caller could store, because the page token is absent there and present mid-walk.
+    // And the consequence is asserted rather than described: **the two pages are told apart by the type**, so
+    // a caller cannot store the mid-walk id even by transposing the fields. The predicate below is the rule the
+    // reference states, and the enum is what makes it impossible to ignore.
     assert!(
-        last.next_page_token.is_none() && last.history_id.is_some(),
+        last.next_page_token.is_none() && last.position.is_storable(),
         "a durable cursor comes from the field that survives the end of the walk"
     );
+    assert!(
+        mid.next_page_token.is_some() && !mid.position.is_storable(),
+        "and the mid-walk page is refused the same treatment by the token beside it"
+    );
+    // The two ids are genuinely different values, so the assertions above cannot pass by coincidence.
+    assert_ne!(last.position.storable(), mid.position.storable());
 }
 
 #[test]

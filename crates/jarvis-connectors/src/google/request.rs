@@ -1206,18 +1206,22 @@ struct HistoryEntry {
 
 /// A parsed history page.
 ///
-/// Carries the **new `historyId`** alongside the message ids the change set touched. The page token and the
-/// history id are **different fields with different lifetimes** and are kept apart for the same reason
-/// `CalendarPage` keeps its two tokens apart: the page token continues *this* walk (and expires when it ends),
-/// while the history id is the durable position a *future* sync starts from.
+/// Carries the mailbox's stated position alongside the message ids the change set touched, as a
+/// [`HistoryPosition`](client::HistoryPosition) rather than a bare id — because whether that id may be **stored**
+/// depends on the **page token beside it**. The reference states the rule in `startHistoryId`'s description,
+/// not in the response field's: *"If you receive no `nextPageToken` in the response, there are no updates to
+/// retrieve and you can store the returned `historyId` for a future request."*
+///
+/// Three fields that were previously described as two kinds of token now have three distinct lifetimes, and
+/// conflating any two of them loses either an unfinished walk or a mailbox that stated no position.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryPage {
     /// The message identifiers the change set touched.
     pub ids: Vec<String>,
     /// The token for the next page, when the change set was larger than one page.
     pub next_page_token: Option<String>,
-    /// The mailbox's **new** position, which is the next sync cursor.
-    pub history_id: Option<String>,
+    /// The mailbox's position, **qualified** by whether this page ended the walk.
+    pub position: client::HistoryPosition,
 }
 
 /// A parsed Calendar page, which carries **two** continuation tokens and they are not interchangeable.
@@ -1334,8 +1338,8 @@ pub fn parse_history_page(status: u16, body: &str) -> Result<HistoryPage, Reques
             .flat_map(|entry| entry.messages)
             .map(|message| message.id)
             .collect(),
+        position: client::HistoryPosition::of_page(parsed.history_id, next_page_token.as_deref()),
         next_page_token,
-        history_id: parsed.history_id,
     })
 }
 

@@ -622,6 +622,106 @@ pub enum SyncSignal {
     Refused(RetryDecision),
 }
 
+/// Whether a `history.list` page's `historyId` may be **stored** as a sync cursor.
+///
+/// # The rule, and the sentence it actually comes from
+///
+/// The response's `historyId` field is described by the reference as nothing more than *"The ID of the
+/// mailbox's current history record."* — it says **nothing** about storing it. The rule that governs storing is
+/// stated **once**, in `startHistoryId`'s description instead:
+///
+/// > "If you receive no `nextPageToken` in the response, there are no updates to retrieve and you can store the
+/// > returned `historyId` for a future request."
+///
+/// So a page's `historyId` is the mailbox's position **at the moment that page was produced**, and a walk with
+/// more pages to come has not consumed the changes up to it yet. Storing that id would position the **next**
+/// sync past the changes still sitting in the un-walked pages — and because those pages are read into a store
+/// this connector does not re-read, the loss is **silent**: a page token that expired un-walked, and a cursor
+/// that claims everything before it has been consumed. The mailbox's next change then arrives as an
+/// incremental sync from a position that skipped a suffix.
+///
+/// # Why this is a value rather than a sentence
+///
+/// **It was a sentence, in three places, and none of them was load-bearing**: a comment in the renderer saying
+/// the id is "the durable cursor", a field doc on [`HistoryPage`](crate::google::request::HistoryPage) saying
+/// it is "the next sync cursor", and the tool's own **output schema** telling a model *"This is the next sync
+/// cursor, and it is NOT the same field as `next_page_token`."* Every one of those statements is **true of a
+/// final page and false of a continuing one**, so a reader — or a model — following the schema stores an id
+/// the provider never said to store. The rule is therefore attached to the two fields it depends on, and the
+/// signal producer takes **this** rather than a bare `&str`, so a caller cannot supply an id without having
+/// established that it is storable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryPosition {
+    /// The response carried **no** page token, so the walk is complete and this id covers every change read.
+    ///
+    /// The only state the reference sanctions storing.
+    Storable {
+        /// The mailbox's position, safe to keep as the next sync's `startHistoryId`.
+        history_id: String,
+    },
+    /// The response carried a page token, so the walk **continues** and this id is not yet a position.
+    ///
+    /// The id is kept rather than discarded because it is still *information* — it is the mailbox's position
+    /// at the moment of this page, which a diagnostic about a stalled walk wants to show — and discarding it
+    /// would make "the page stated an id we may not use" indistinguishable from "the page stated none".
+    UnfinishedWalk {
+        /// The id, which the caller must **not** store.
+        stated_history_id: String,
+    },
+    /// The response stated no `historyId` at all, on a successful read.
+    ///
+    /// Distinct from [`Self::UnfinishedWalk`] because nothing here is being withheld: there is simply no
+    /// position. **This is not "the mailbox is unchanged"** — an unchanged mailbox is a *conclusion* that needs
+    /// a position to be stated, and reading an absent id as one would let a connector record a sync it never
+    /// completed.
+    Unstated,
+}
+
+impl HistoryPosition {
+    /// Reads a page's stated `historyId` and page token into the position those two facts establish.
+    ///
+    /// **The one place the provider's rule is encoded**: an id is storable exactly when the page carried **no**
+    /// page token. It takes both fields together rather than either alone, because neither answers the question
+    /// by itself — an id with no token is storable, an id with a token is not, and no id is not a position at
+    /// all — which is why folding the rule into an `Option<String>` at the parser (as this code did) loses the
+    /// distinction no matter which `Option` it becomes.
+    ///
+    /// A **blank** id (empty, or only whitespace) is treated as absent rather than as a position: it satisfies
+    /// "a field was present" while denoting nothing, which is the same reading
+    /// [`crate::account::VerifiedAccount::new`] takes for a provider identifier, and storing it would be storing
+    /// a cursor that names no position.
+    #[must_use]
+    pub fn of_page(stated_history_id: Option<String>, next_page_token: Option<&str>) -> Self {
+        let stated = stated_history_id.filter(|id| !id.trim().is_empty());
+        match (stated, next_page_token) {
+            // The reference's rule, positively: no page token, so the walk is complete and the id may be kept.
+            (Some(history_id), None) => Self::Storable { history_id },
+            // An id on a page with more to come is information, not a position.
+            (Some(stated_history_id), Some(_)) => Self::UnfinishedWalk { stated_history_id },
+            (None, _) => Self::Unstated,
+        }
+    }
+
+    /// Returns the position to store, which exists only when the walk completed.
+    ///
+    /// Named `storable` rather than `history_id` on purpose: an accessor named for the value would be reached
+    /// for by a caller that has not asked the question, which is the mistake this type exists to make
+    /// impossible. There is deliberately **no** accessor that returns the id in every state.
+    #[must_use]
+    pub fn storable(&self) -> Option<&str> {
+        match self {
+            Self::Storable { history_id } => Some(history_id),
+            Self::UnfinishedWalk { .. } | Self::Unstated => None,
+        }
+    }
+
+    /// Returns whether this page's id may be stored as the next sync's position.
+    #[must_use]
+    pub const fn is_storable(&self) -> bool {
+        matches!(self, Self::Storable { .. })
+    }
+}
+
 /// **Not `Copy`**, unlike the enums around it, and the reason is [`Self::Refused`]: it carries a
 /// [`RetryDecision`], which holds an optional provider request id — a `String`. Losing `Copy` is the honest
 /// cost of carrying *why* rather than a bare verdict.
@@ -942,9 +1042,10 @@ pub const fn gmail_history_status_cannot_prove_usable(status: u16) -> bool {
 /// - **`404`** — the cursor is unusable. The response cannot distinguish pruned history from an absent
 ///   mailbox, and both causes begin with a full sync, so the wrong reading is self-correcting. See
 ///   [`gmail_history_status_cannot_prove_usable`].
-/// - **`200`** — the read succeeded, so the mailbox's new `historyId` (when the response carried one)
-///   advances the cursor. A `200` with no id means the mailbox was unchanged, which
-///   [`advance_gmail_history`] handles by keeping the previous cursor rather than inventing a position.
+/// - **`200`** — the read succeeded, so the page's [`HistoryPosition`] decides the cursor. Only a page with
+///   **no** `nextPageToken` carries a storable id, and a page that stated none advances nothing. The position
+///   is an argument rather than a bare id so that this cannot be called with a value the provider never
+///   sanctioned storing.
 /// - **anything else** — carried with the caller's classification rather than swallowed.
 ///
 /// # What is deliberately NOT a dead cursor
@@ -955,7 +1056,7 @@ pub const fn gmail_history_status_cannot_prove_usable(status: u16) -> bool {
 #[must_use]
 pub fn gmail_history_signal(
     status: u16,
-    history_id: Option<&str>,
+    position: &HistoryPosition,
     refusal: RetryDecision,
 ) -> SyncSignal {
     if gmail_history_status_cannot_prove_usable(status) {
@@ -963,7 +1064,11 @@ pub fn gmail_history_signal(
     }
     if status == 200 {
         return SyncSignal::Advanced {
-            history_id: history_id.map(str::to_owned),
+            // `UnfinishedWalk` and `Unstated` both advance nothing, and that is correct rather than a collapse:
+            // neither yields a storable position, and `advance_gmail_history` reads `None` as "keep the
+            // previous cursor". The distinction between them is preserved in [`HistoryPosition`], which is
+            // where a caller asks *why* there is no position.
+            history_id: position.storable().map(str::to_owned),
         };
     }
     SyncSignal::Refused(refusal)

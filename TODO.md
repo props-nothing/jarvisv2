@@ -5339,6 +5339,59 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     caller performs it per channel; a caller that stops fewer than all of an account's channels gets no refusal
     from this module, only a plan to read — unchanged from `ADR-0095`. `gmail_exposure` cannot report
     `AlreadyEnded` even though the caller holds the watch's `expiration`: a wiring gap, not a missing fact.
+- [ ] `P5-005` **(continued — a rule stated in another field's description)**: `google::client` gains
+  `HistoryPosition { Storable, UnfinishedWalk, Unstated }` + `of_page`; `gmail_history_signal` takes the type
+  rather than an `Option<&str>`; `HistoryPage.history_id` becomes `position`; the `gmail_history_list` **output
+  schema's** description states the condition. **2 new tests (so 477 in the crate; 1750 in the workspace).**
+  **`ADR-0108`.** Two guards falsified A-B-A. A fifth claim was found while writing the control for the second.
+  - **⭐⭐ THE FINDING: THE RULE THAT GOVERNS STORING A VALUE IS IN ANOTHER FIELD'S DESCRIPTION.** The
+    `history.list` response's `historyId` is described only as *"The ID of the mailbox's current history
+    record."* The condition is stated **once**, in **`startHistoryId`'s** description: *"If you receive no
+    `nextPageToken` in the response, there are no updates to retrieve and you can store the returned `historyId`
+    for a future request."* So a page's id is the mailbox's position **at the moment that page was produced**, and
+    a walk with more pages has not consumed the changes up to it. **⭐ Ask of a rule you are relying on: which
+    field's description actually states it — the field you are storing, or one you only ever send?**
+  - **⭐⭐ AND FOUR LAYERS OF THIS CRATE ASSERTED THE UNCONDITIONAL FORM, each true of a final page and false of a
+    continuing one.** (1) a renderer comment (*"the durable cursor"*); (2) `HistoryPage`'s field doc (*"the next
+    sync cursor"*); (3) the **output schema's description** (*"This is the next sync cursor…"*); (4)
+    `gmail_history_signal`'s doc inferring *"the mailbox was unchanged"* from an **absent** id the reference does
+    not document as optional. **The third is the one that decides the design: an output schema's `description`
+    is not documentation for a repository reader — it is an INSTRUCTION TO A MODEL**, delivered in the model's
+    own channel. A model told "this is the next sync cursor" stores it. **⭐ A schema description is
+    executable-adjacent prose: it is read by the component that acts, so an error in it is a behaviour, not a
+    typo.**
+  - **⭐ THE DEFECT WAS NOT THE WORDING — IT WAS THAT NO TYPE ASKED THE QUESTION.** The parser produced
+    `Option<String>`, the renderer emitted it whenever it was `Some`, and the signal producer took
+    `Option<&str>` — so every layer could *describe* the field as a cursor without any layer having to *decide*
+    whether it was one. **Four rounds of correcting prose would not have caught this; one type that makes the
+    question unskippable does.** The producer now cannot be called with a bare id.
+  - **⭐ THREE VARIANTS, NOT A `bool`.** `UnfinishedWalk` and `Unstated` both fail to yield a position and differ
+    in *why*: a stated-but-unusable id is **information a diagnostic about a stalled walk wants**, and the second
+    must not be read as "the mailbox is unchanged" — which is exactly claim (4). Collapsing them would restore
+    that inference in the type system's own vocabulary (`ADR-0035`).
+  - **⭐ THE RULE NEEDS BOTH FIELDS, SO ITS ENCODING TAKES BOTH.** `of_page(id, next_page_token)`: an id with no
+    token is storable, an id with a token is not, and no id is not a position — which is why folding it into an
+    `Option<String>` at the parser loses the distinction **whichever way the `Option` points**. A blank id is
+    treated as absent (the reading `VerifiedAccount::new` already takes). `storable()` is named for the
+    **question** rather than the value, and there is deliberately **no** accessor returning the id in every state.
+  - **⭐ THE RENDERER STILL EMITS THE ID ON A CONTINUING PAGE.** Withholding it would make *"the page stated an id
+    you may not use"* identical to *"the page stated nothing"*; the condition now travels with the value through
+    the description **plus** the presence of `next_page_token` — the exact fact the provider's rule keys on.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A, both compiling.** (1) `of_page` returning `Storable` regardless of the token
+    → **detected by two tests.** (2) `storable()` returning the id for `UnfinishedWalk` → **detected by three**,
+    including the end-to-end signal assertion (`left: Advanced { history_id: Some("12347") }`,
+    `right: … { None }`).
+  - **⭐ A FIFTH CLAIM WAS MINE, FOUND BY WRITING THE CONTROL.** My first version of the end-to-end test stated an
+    id **smaller** than the fixture cursor's, and it failed — not on the storable rule but on
+    `advance_gmail_history`'s **monotonic** guard, which refused a backwards move. So the test would have been
+    checking a different guard and *passing for the wrong reason* had the id happened to be larger. The id is now
+    greater than the fixture's, **with the reason recorded in the test**: a fixture that triggers a different guard
+    is the same defect as one that cannot separate two behaviours.
+  - **NEW LIMITS:** **nothing stores a cursor** — there is no sync loop — so the rule is representable and tested
+    rather than enforced on a store. No live walk has run: the path is exercised against the two hand-built
+    fixtures. A `200` whose page states **no** id advances nothing and is `Unstated`, explicitly *not* "the
+    mailbox is unchanged"; the reference does not mark `historyId` optional, so that shape is not one the provider
+    documents — which is why the inference is refused rather than guessed.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

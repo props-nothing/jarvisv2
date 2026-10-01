@@ -356,11 +356,20 @@ fn read_output(segment: &str, response: &TransportResponse) -> Option<String> {
                 if let Some(token) = page.next_page_token {
                     value["next_page_token"] = serde_json::Value::String(token);
                 }
-                // The history id is the **durable cursor**, rendered separately from the page token for the
-                // same reason the calendar path keeps its sync token separate: one continues this walk, the
-                // other positions a future sync.
-                if let Some(history_id) = page.history_id {
-                    value["history_id"] = serde_json::Value::String(history_id);
+                // The position is rendered **whenever the page stated one**, including on a continuing page
+                // where it may not be stored — because the schema's description carries the condition, and
+                // withholding the value would make "the page stated an id you may not use" look like "the page
+                // stated nothing". The distinction reaches the model through the description plus the presence
+                // of `next_page_token`, which is exactly the fact the provider's rule keys on.
+                //
+                // This is the same "render what arrived, and say what it means" rule the optional fields here
+                // follow (`ADR-0083`) — with the addition that the *meaning* is now stated rather than assumed.
+                if let client::HistoryPosition::Storable { history_id }
+                | client::HistoryPosition::UnfinishedWalk {
+                    stated_history_id: history_id,
+                } = &page.position
+                {
+                    value["history_id"] = serde_json::Value::String(history_id.clone());
                 }
                 value.to_string()
             }),

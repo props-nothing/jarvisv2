@@ -667,11 +667,21 @@ fn a_history_page_keeps_the_cursor_and_the_page_token_apart() {
     )
     .unwrap_or_else(|_| panic!("the history fixture must be readable"));
     let page = must(parse_history_page(200, &text), "the documented shape");
-    assert_eq!(page.history_id.as_deref(), Some("12347"));
+    assert_eq!(page.ids.len(), 2);
+    // The mid-walk fixture carries a page token **and** a history id, so the id is stated but **not storable**
+    // -- the reference ties storing to the absence of the token, and a walk with more to come has not consumed
+    // the changes up to this position.
     assert_eq!(page.next_page_token.as_deref(), Some("0987654321"));
-    assert_ne!(
-        page.history_id, page.next_page_token,
-        "the page token and the history id are different fields"
+    assert_eq!(
+        page.position,
+        client::HistoryPosition::UnfinishedWalk {
+            stated_history_id: "12347".to_owned()
+        }
+    );
+    assert_eq!(page.position.storable(), None);
+    assert!(
+        !page.position.is_storable(),
+        "a page with a token beside it states a position the provider never said to store"
     );
     // Both history records contributed their messages, so the change set is flat rather than one id per record.
     assert_eq!(page.ids.len(), 2);

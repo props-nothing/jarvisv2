@@ -516,21 +516,43 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
     // A 404 is the dead-cursor signal, and it is the SAME status the classifier reads as permanent — so the
     // two are asserted together, because that coincidence is exactly the ambiguity the predicate names.
     assert_eq!(
-        gmail_history_signal(404, None, not_found.clone()),
+        gmail_history_signal(404, &HistoryPosition::Unstated, not_found.clone()),
         SyncSignal::CursorUnusable
     );
     assert_eq!(not_found.class, RetryClass::Permanent);
 
-    // A 200 advances, carrying the position the response stated.
+    // A 200 advances, carrying the position the response stated -- **and only when the page ended the walk**,
+    // which is the reference's rule: "If you receive no nextPageToken in the response, there are no updates to
+    // retrieve and you can store the returned historyId for a future request."
     assert_eq!(
-        gmail_history_signal(200, Some("12347"), refused.clone()),
+        gmail_history_signal(
+            200,
+            &HistoryPosition::Storable {
+                history_id: "12347".to_owned()
+            },
+            refused.clone()
+        ),
         SyncSignal::Advanced {
             history_id: Some("12347".to_owned())
         }
     );
-    // A 200 with no id is an unchanged mailbox — an ordinary outcome that advances nothing, not a refusal.
+    // **The mid-walk page advances NOTHING, and this is the assertion the type exists for.** Its id is stated
+    // and not storable, so an incremental sync keeps the previous cursor rather than re-anchoring past the
+    // changes still sitting in un-walked pages.
     assert_eq!(
-        gmail_history_signal(200, None, refused.clone()),
+        gmail_history_signal(
+            200,
+            &HistoryPosition::UnfinishedWalk {
+                stated_history_id: "12347".to_owned()
+            },
+            refused.clone()
+        ),
+        SyncSignal::Advanced { history_id: None },
+        "a page with more to come must not yield a position, however plausible its id looks"
+    );
+    // A 200 with no id at all is an ordinary outcome that advances nothing, not a refusal.
+    assert_eq!(
+        gmail_history_signal(200, &HistoryPosition::Unstated, refused.clone()),
         SyncSignal::Advanced { history_id: None }
     );
 
@@ -546,7 +568,7 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
             None,
         );
         assert_eq!(
-            gmail_history_signal(status, None, decision.clone()),
+            gmail_history_signal(status, &HistoryPosition::Unstated, decision.clone()),
             SyncSignal::Refused(decision),
             "{status} is not a dead cursor"
         );
@@ -558,7 +580,7 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
             &cursor(),
             &gmail_history_signal(
                 404,
-                None,
+                &HistoryPosition::Unstated,
                 classify(
                     GoogleApi::Gmail,
                     404,
@@ -575,6 +597,135 @@ fn a_history_status_becomes_the_signal_the_cursor_decision_consumes() {
     );
     assert_eq!(outcome.advance, SyncAdvance::HistoryPruned);
     assert!(outcome.cursor.is_none());
+}
+
+#[test]
+fn a_mid_walk_page_keeps_the_previous_cursor_rather_than_jumping_over_unread_changes() {
+    // **The consequence of the storable rule, asserted where a stored position is produced.** A signal-level
+    // assertion shows the signal; this shows the *cursor* is unaffected -- which is the fact that matters,
+    // because storing this id here would position the next sync past every change still sitting in the pages
+    // the walk never read.
+    //
+    // **The id is chosen greater than the fixture cursor's `1234567890` deliberately**, so the two cases below
+    // differ in the page token alone. A smaller id would be refused by the *monotonic* guard instead, and the
+    // test would then pass or fail for a reason unrelated to the rule it exists to check.
+    let refused = classify(
+        GoogleApi::Gmail,
+        403,
+        GoogleErrorReason::Unrecognised,
+        None,
+        None,
+    );
+    let mid_walk = must(
+        advance_gmail_history(
+            &cursor(),
+            &gmail_history_signal(
+                200,
+                &HistoryPosition::UnfinishedWalk {
+                    stated_history_id: "1234567891".to_owned(),
+                },
+                refused.clone(),
+            ),
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a mid-walk 200 must produce an outcome",
+    );
+    assert_eq!(mid_walk.advance, SyncAdvance::Advanced);
+    assert_eq!(
+        mid_walk.cursor.as_ref().and_then(|cursor| cursor.token()),
+        cursor().token(),
+        "the previous cursor must survive a page that stated an id it may not store"
+    );
+    // The control: a **completed** walk with the same id does re-anchor -- same id, same status, same account,
+    // and the only difference is that no page token accompanied it. So the assertion above is about the token
+    // beside the id and not about a 200 being unable to advance at all.
+    let completed = must(
+        advance_gmail_history(
+            &cursor(),
+            &gmail_history_signal(
+                200,
+                &HistoryPosition::Storable {
+                    history_id: "1234567891".to_owned(),
+                },
+                refused,
+            ),
+            &account(),
+            &version(),
+            now(),
+        ),
+        "a completed 200 must produce an outcome",
+    );
+    assert_eq!(
+        completed.cursor.as_ref().and_then(|cursor| cursor.token()),
+        Some("1234567891")
+    );
+    assert_ne!(mid_walk.cursor, completed.cursor);
+}
+
+#[test]
+fn a_pages_history_id_is_storable_exactly_when_no_page_token_accompanied_it() {
+    // **The provider's rule, in the one place it is encoded.** The reference states it in `startHistoryId`'s
+    // description rather than in the response field's: *"If you receive no nextPageToken in the response, there
+    // are no updates to retrieve and you can store the returned historyId for a future request."* So the two
+    // fields have to be read **together** -- which is why this constructor takes both, and why folding the rule
+    // into an `Option<String>` at the parser (as the code did) loses it whichever way the `Option` points.
+    assert_eq!(
+        HistoryPosition::of_page(Some("12348".to_owned()), None),
+        HistoryPosition::Storable {
+            history_id: "12348".to_owned()
+        },
+        "an id with no token beside it is the one state the reference sanctions storing"
+    );
+    assert_eq!(
+        HistoryPosition::of_page(Some("12347".to_owned()), Some("0987654321")),
+        HistoryPosition::UnfinishedWalk {
+            stated_history_id: "12347".to_owned()
+        },
+        "an id on a page with more to come is information, not a position"
+    );
+    assert_eq!(
+        HistoryPosition::of_page(None, None),
+        HistoryPosition::Unstated
+    );
+    // An id on a page with **no** token and an id on a page **with** one are the only two states that differ by
+    // the token alone, and they must not be the same value -- otherwise the rule has no representation.
+    assert_ne!(
+        HistoryPosition::of_page(Some("12347".to_owned()), None),
+        HistoryPosition::of_page(Some("12347".to_owned()), Some("t")),
+        "the same id must not be equally storable with and without a page token"
+    );
+    // A blank id is treated as absent rather than as a position: it satisfies "a field was present" while
+    // denoting nothing, and storing it would store a cursor naming no position.
+    for blank in ["", "   ", "\t"] {
+        assert_eq!(
+            HistoryPosition::of_page(Some(blank.to_owned()), None),
+            HistoryPosition::Unstated,
+            "a blank history id must not become a storable position"
+        );
+    }
+    // And `is_storable` and `storable` agree in all four cases, so neither is a second opinion.
+    for position in [
+        HistoryPosition::Storable {
+            history_id: "1".to_owned(),
+        },
+        HistoryPosition::UnfinishedWalk {
+            stated_history_id: "1".to_owned(),
+        },
+        HistoryPosition::Unstated,
+    ] {
+        assert_eq!(position.is_storable(), position.storable().is_some());
+    }
+    // The mid-walk state keeps the id readable, so "the page stated an id you may not store" is distinguishable
+    // from "the page stated none" -- the distinction the schema's description asks a reader to make.
+    assert_eq!(
+        HistoryPosition::UnfinishedWalk {
+            stated_history_id: "99999".to_owned()
+        }
+        .storable(),
+        None
+    );
 }
 
 #[test]

@@ -364,6 +364,17 @@ const GMAIL_HISTORY_INPUT: &str = r#"{
 }"#;
 
 /// The output schema of `gmail_history_list`.
+///
+/// # Why `history_id`'s description states a **condition**
+///
+/// It previously read *"This is the next sync cursor, and it is NOT the same field as `next_page_token`."*
+/// — **two claims, one true and one false.** The contrast with `next_page_token` is right and worth saying.
+/// But "this is the next sync cursor" is true only of a **final** page: the reference states the storing rule
+/// in `startHistoryId`'s description, *"If you receive no `nextPageToken` in the response, there are no updates
+/// to retrieve and you can store the returned `historyId` for a future request"*, and a model reading the
+/// output schema has no way to know that from the response field, whose own description says only *"The ID of
+/// the mailbox's current history record."* So the description now carries the condition and the **direction** of
+/// the mistake it prevents, because a model deciding whether to persist this value needs both.
 const GMAIL_HISTORY_OUTPUT: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
@@ -372,7 +383,7 @@ const GMAIL_HISTORY_OUTPUT: &str = r#"{
     "next_page_token": { "type": ["string", "null"] },
     "history_id": {
       "type": ["string", "null"],
-      "description": "The mailbox's new position. This is the next sync cursor, and it is NOT the same field as next_page_token."
+      "description": "The mailbox's current position, and NOT the same field as next_page_token. May be stored as the next sync's start only when next_page_token is absent: a page that carries a token has not been walked to the end, and storing its history_id skips the changes in the pages that follow."
     }
   },
   "required": ["message_ids"],
