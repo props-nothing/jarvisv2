@@ -725,6 +725,94 @@ fn the_calendar_channel_sync_fixture_is_the_handshake_and_not_a_change() {
 }
 
 #[test]
+fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
+    // **The composition, proved against the recorded wire shapes.** ADR-0103 joined the read, verify and route
+    // steps; this drives that single entry point with the fixtures and shows every layer agreeing end to end --
+    // the delivery parses from its headers, routes by the channel id, verifies against the registration's token,
+    // and yields exactly one account or a named refusal. A unit test proves each layer; this proves the seam.
+    use jarvis_connectors::google::channel::{
+        ChannelIngest, ChannelRegistration, ChannelTokenCheck, ingest_channel_delivery,
+    };
+    use jarvis_connectors::{AccountReference, SecretValue};
+
+    let reference = |value: &str| match AccountReference::new(value) {
+        Ok(reference) => reference,
+        Err(error) => panic!("a valid account reference: {error}"),
+    };
+    let secret = |value: &str| match SecretValue::new(value) {
+        Ok(secret) => secret,
+        Err(error) => panic!("a valid token: {error}"),
+    };
+
+    // The change fixture's channel and token, from the file itself.
+    let registrations = [ChannelRegistration::new(
+        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        reference("acct-example"),
+        Some(secret("target=myApp-myCalendarChannelDest")),
+    )];
+
+    // A helper that ingests a fixture as a delivery.
+    let ingest = |name: &str, registrations: &[ChannelRegistration]| {
+        let text = fixture(name);
+        let raw = fixture_headers(&text);
+        let headers: Vec<(&str, &[u8])> = raw
+            .iter()
+            .map(|(header, value)| (header.as_str(), value.as_bytes()))
+            .collect();
+        let delivery = jarvis_connectors::WebhookDelivery {
+            path: "/webhooks/google/calendar",
+            headers: &headers,
+            body: b"",
+        };
+        ingest_channel_delivery(&delivery, registrations)
+    };
+
+    // The change fixture, with the registration's matching token: the ONE outcome that syncs.
+    assert_eq!(
+        ingest("calendar_channel_message.json", &registrations),
+        ChannelIngest::Changed {
+            account: reference("acct-example")
+        },
+        "a verified change routes to the account that registered the channel"
+    );
+    // The sync fixture, same registration: accepted, but a handshake, so nothing syncs -- which is the whole
+    // reason the two fixtures exist as a pair.
+    assert_eq!(
+        ingest("calendar_channel_sync.json", &registrations),
+        ChannelIngest::Handshake
+    );
+    // No registrations: the delivery is well-formed but cannot be verified, so it is `Unroutable` -- never
+    // `Rejected`, because there is no stored token to have failed a comparison against.
+    assert_eq!(
+        ingest("calendar_channel_message.json", &[]),
+        ChannelIngest::Unroutable(jarvis_connectors::google::channel::ChannelRoute::Unknown)
+    );
+    // A registration whose token differs: the channel routes, and the token control fails.
+    let wrong_token = [ChannelRegistration::new(
+        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        reference("acct-example"),
+        Some(secret("a-different-token")),
+    )];
+    assert_eq!(
+        ingest("calendar_channel_message.json", &wrong_token),
+        ChannelIngest::Rejected(ChannelTokenCheck::Mismatch)
+    );
+    // A registration **without** a token: the channel verifies as `Absent` and the change still syncs, which is
+    // the guide's optional-token case rather than a failure.
+    let untokened = [ChannelRegistration::new(
+        "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        reference("acct-example"),
+        None,
+    )];
+    assert_eq!(
+        ingest("calendar_channel_message.json", &untokened),
+        ChannelIngest::Changed {
+            account: reference("acct-example")
+        }
+    );
+}
+
+#[test]
 fn every_fixture_is_json_and_declares_itself() {
     // A sweep, so a new fixture is held to the same standard as these. A file that is not JSON, or that does
     // not declare its provenance, fails here rather than being noticed by a reader.

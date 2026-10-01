@@ -503,7 +503,7 @@ pub fn verify_channel_token(
 /// rather than a [`SecretValue`] with a sentinel: [`verify_channel_token`] reads `None` as
 /// [`ChannelTokenCheck::Absent`] (not a refusal), and a caller cannot express "I forgot the token" as distinct
 /// from "there is none".
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ChannelRegistration {
     /// The channel id the connector chose for this watch. The value a delivery echoes back.
     pub channel_id: String,
@@ -573,9 +573,11 @@ impl fmt::Debug for ChannelRegistration {
 pub enum ChannelRoute {
     /// Exactly one registration names this channel.
     ///
-    /// The only route that may be applied without a person, and the reference is carried so the caller does not
-    /// have to search again — a second lookup would be a second place the comparison is decided.
-    Exact(AccountReference),
+    /// The only route that may be applied without a person, and **it carries the whole [`ChannelRegistration`]**, not
+    /// only its [`AccountReference`] — because the token that *proves* the delivery lives on the registration, and a
+    /// route that discarded it would force the verifier to re-scan the registrations and decide the match a second time
+    /// (`ADR-0103`). The account and the control that proves it therefore come from **one** match.
+    Exact(ChannelRegistration),
     /// More than one registration carries this channel id.
     ///
     /// Reachable when a channel id is reused — the guide *recommends* a UUID precisely so it is unique — and
@@ -601,9 +603,25 @@ impl ChannelRoute {
     /// `Some` for [`Self::Exact`] alone, so no accessor returns an arbitrarily chosen account from an ambiguous
     /// route.
     #[must_use]
-    pub const fn account(&self) -> Option<&AccountReference> {
+    pub fn account(&self) -> Option<&AccountReference> {
         match self {
-            Self::Exact(reference) => Some(reference),
+            Self::Exact(registration) => Some(&registration.account),
+            Self::Ambiguous { .. } | Self::Unknown => None,
+        }
+    }
+
+    /// Returns the matched registration, when there is exactly one.
+    ///
+    /// **The control that proves the delivery travels with the account that acts on it.** This is the whole
+    /// reason [`Self::Exact`] carries the registration rather than only its `AccountReference` (`ADR-0103`):
+    /// verifying the channel token needs the stored value, and fetching it by a *second* scan of the
+    /// registrations would decide the match twice — the account you act on and the token you verified could
+    /// then come from two lookups that merely happen to agree. Returning the registration makes them the same
+    /// lookup.
+    #[must_use]
+    pub const fn registration(&self) -> Option<&ChannelRegistration> {
+        match self {
+            Self::Exact(registration) => Some(registration),
             Self::Ambiguous { .. } | Self::Unknown => None,
         }
     }
@@ -647,7 +665,7 @@ pub fn route_channel(
     registrations: &[ChannelRegistration],
 ) -> ChannelRoute {
     let named = message.channel_id.as_str();
-    let mut matched: Option<&AccountReference> = None;
+    let mut matched: Option<&ChannelRegistration> = None;
     let mut count: usize = 0;
     for registration in registrations {
         // **Byte-exact**, because the channel id is the connector's own value and it is compared against the
@@ -657,16 +675,192 @@ pub fn route_channel(
         if registration.channel_id == named {
             count += 1;
             // Kept only for the single-match case; a second match makes the route `Ambiguous`, so retaining a
-            // second reference would be a selection nothing uses.
+            // second registration would be a selection nothing uses.
             if matched.is_none() {
-                matched = Some(&registration.account);
+                matched = Some(registration);
             }
         }
     }
     match (count, matched) {
-        (1, Some(reference)) => ChannelRoute::Exact(reference.clone()),
+        (1, Some(registration)) => ChannelRoute::Exact(registration.clone()),
         (n, _) if n > 1 => ChannelRoute::Ambiguous { accounts: n },
         (_, _) => ChannelRoute::Unknown,
+    }
+}
+
+/// What ingesting one Calendar notification concluded, and therefore what to do with it.
+///
+/// # Five variants, and the three questions a push handler must answer
+///
+/// Ingesting a delivery answers three questions in order — *is it well-formed*, *is it really for a channel we
+/// registered*, and *is it a change or the handshake* — and only **one** answer means "act on it". Each variant
+/// names which question the delivery stopped at, because the answers call for **different actions**: two are
+/// refusals (record and drop), one is a **retry**, one is **act**, and one needs **no action at all**.
+///
+/// | variant | well-formed? | verified? | a change? | what to do |
+/// | --- | --- | --- | --- | --- |
+/// | `Unreadable` | no | — | — | record the drop |
+/// | `Unroutable` | yes | — (not checkable) | — | record the drop |
+/// | `Rejected` | yes | **no** | — | record the drop |
+/// | `Handshake` | yes | yes | **no** | accept, act on nothing |
+/// | `Changed` | yes | yes | **yes** | **accept and sync** |
+///
+/// # Why not `Result<Option<AccountReference>, _>`
+///
+/// That shape would have to encode "verified but a handshake" and "verified and a change" as `Ok(None)` and
+/// `Ok(Some(..))` — a `None` that means *two* things: "not routable" and "routable but not a change". Those
+/// need opposite handling (drop versus accept-and-do-nothing), so the `Option` would collapse exactly the
+/// distinction [`ChannelRoute`] already refuses to collapse. A `Result` also cannot separate a **refusal**
+/// from a **retry**, which is the difference between this and [`crate::google::pubsub`]'s acknowledgement
+/// decision: a delivery this connector cannot route is never repaired by another attempt, so it is
+/// acknowledged rather than refused (`ADR-0097`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChannelIngest {
+    /// The delivery's headers could not be read into a [`ChannelMessage`].
+    ///
+    /// Carries the refusal so a caller can record **which** header or value was wrong. A delivery this
+    /// connector does not understand is **acknowledged and recorded**, never refused — a message it can never
+    /// process would otherwise be redelivered forever, and a negative acknowledgement is subscription-global
+    /// (`ADR-0094`).
+    Unreadable(ChannelMessageError),
+    /// The channel is not one this connector registered, or several registrations claim it.
+    ///
+    /// The route is carried because [`ChannelRoute::Ambiguous`] and [`ChannelRoute::Unknown`] are different
+    /// operator signals — a registration collision is a defect here, a channel that matches nothing is a stray
+    /// or forged delivery — even though **both** are acknowledged and dropped.
+    Unroutable(ChannelRoute),
+    /// The channel is registered, but the delivery failed its token control.
+    ///
+    /// Carries the [`ChannelTokenCheck`]: a [`ChannelTokenCheck::Mismatch`] is a wrong value, a
+    /// [`ChannelTokenCheck::TokenRequired`] is none at all, and both are refusals
+    /// ([`ChannelTokenCheck::is_rejection`]). This is the variant that closes the gap the composing step found:
+    /// before it, a caller could route and verify but had no single answer that said *the channel verified and
+    /// this delivery failed it*.
+    Rejected(ChannelTokenCheck),
+    /// The channel verified, and the delivery is the `sync` **handshake** rather than a change.
+    ///
+    /// Separated from [`Self::Changed`] by the same rule `ADR-0100` records: the first message on a channel
+    /// reports that notifications are starting, not that anything changed. A caller **accepts** and acts on
+    /// nothing, and this is distinct from a refusal because the delivery was perfectly good — the difference
+    /// between "drop this" and "there is nothing to do".
+    Handshake,
+    /// The channel verified, and the delivery reports a change to a resource this account watches.
+    ///
+    /// The **only** variant that starts work, and it carries the account whose stored credential the sync must
+    /// use. A full [`ChannelRegistration`] is **not** carried, deliberately: a sync needs the account, and
+    /// handing the token onward would put the channel's anti-spoofing control into a component that has no use
+    /// for it.
+    Changed {
+        /// The account whose credential syncs the changed resources.
+        account: AccountReference,
+    },
+}
+
+impl ChannelIngest {
+    /// Returns whether the delivery should be **accepted** as a well-formed, verified notification.
+    ///
+    /// True for [`Self::Handshake`] and [`Self::Changed`] — the two outcomes in which the delivery passed every
+    /// control. A handshake is *accepted* even though it starts no work: "accepted" is what tells the sender to
+    /// keep the message, which is the opposite of a delivery that failed a check.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self, Self::Handshake | Self::Changed { .. })
+    }
+
+    /// Returns the account whose credential should sync, when a sync is warranted.
+    ///
+    /// `Some` for [`Self::Changed`] **alone**. Every other variant returns `None`, so a caller cannot start a
+    /// sync from a handshake (no change), a rejection (a failed control), or an unreadable delivery (unknown).
+    /// The name is the question a caller asks before doing work, rather than "what did we decide", so a missed
+    /// arm reads as "nothing to sync" rather than as a silent default.
+    #[must_use]
+    pub const fn account_to_sync(&self) -> Option<&AccountReference> {
+        match self {
+            Self::Changed { account } => Some(account),
+            Self::Unreadable(_) | Self::Unroutable(_) | Self::Rejected(_) | Self::Handshake => None,
+        }
+    }
+
+    /// Returns whether the sender's delivery should be **acknowledged** so it is not retried.
+    ///
+    /// **Every** variant answers `true`, and that is the decision rather than an oversight: none of the four
+    /// non-`Changed` outcomes is repaired by another attempt. A malformed body, an unregistered channel, a
+    /// failed token, and a handshake all describe deliveries that will fail or repeat identically, and
+    /// `ADR-0094`'s finding is that a negative acknowledgement triggers a **subscription-global** backoff — so
+    /// refusing would slow every other channel for a message that can never become actionable. This is the same
+    /// conclusion [`crate::google::routing::DeliveryRoute::unroutable_acknowledgement`] reaches, now covering
+    /// the whole ingest decision rather than the route alone.
+    ///
+    /// It is a method rather than an omitted fact so a caller reads the intent, and so a future variant that
+    /// *should* be retried (a transient store failure, say) has a place to say `false`.
+    #[must_use]
+    pub const fn acknowledges(&self) -> bool {
+        true
+    }
+}
+
+/// Ingests one Calendar notification: reads it, verifies its channel, and decides what to do.
+///
+/// # This is the composition, and composing found a defect it could not have found piecewise
+///
+/// Read ([`parse_channel_message`]), verify ([`verify_channel_token`]) and route ([`route_channel`]) were each
+/// correct alone and **nothing called them together** — the seam `ADR-0069` warns about, and the *same* gap
+/// `ADR-0098` closed for the Gmail connect flow. **Joining them exposed that no single answer could express the
+/// real outcomes:** a caller would have had to route (getting an account), *then* look the registration up
+/// again to get the token to verify with — two lookups deciding one match — and the result still could not be
+/// one value that meant "the channel verified and the delivery is the handshake". [`ChannelIngest`] is that
+/// value, and [`ChannelRoute::Exact`] carrying the whole registration is what lets the order be
+/// route → verify **without a second scan**.
+///
+/// # The order, and why it is this order
+///
+/// 1. **Read.** A delivery whose headers do not parse has nothing to route or verify, so this is first. Its
+///    refusal is an ingest outcome rather than an error, because a delivery this connector cannot read is
+///    acknowledged and recorded, not refused (`ADR-0094`).
+/// 2. **Route.** Verification needs the stored token, and the stored token belongs to a registration — so the
+///    channel must be found before its token can be checked. A channel that is not registered **cannot be
+///    verified at all**, which is exactly why [`Self::Unroutable`] is not a variant *with* a token check: there
+///    is no value to compare against, and reporting "rejected" would imply a comparison happened.
+/// 3. **Verify.** Once the registration is found, the token check runs. A failure here is a **rejection**,
+///    distinct from unroutable, because a control *was* present and failed.
+/// 4. **Classify.** Only a verified, non-handshake delivery warrants a sync, so the `sync` state is read last —
+///    after the delivery has proved it is really for this channel. Reading it first would let an unauthenticated
+///    delivery steer whether work happens, even if only to the "handshake" branch.
+///
+/// # What it does not do
+///
+/// It does not receive the delivery (there is no endpoint), does not sync anything, and does not record the
+/// drop — it decides, and hands back the account to act on.
+#[must_use]
+pub fn ingest_channel_delivery(
+    delivery: &WebhookDelivery<'_>,
+    registrations: &[ChannelRegistration],
+) -> ChannelIngest {
+    // 1. Read. A refusal here ends the decision: nothing downstream has a channel or a token to work with.
+    let message = match parse_channel_message(delivery) {
+        Ok(message) => message,
+        Err(error) => return ChannelIngest::Unreadable(error),
+    };
+    // 2. Route. The registration carries `account` **and** the stored token, so the next step needs no second
+    //    lookup — the defect that composing this function exposed.
+    let route = route_channel(&message, registrations);
+    let Some(registration) = route.registration() else {
+        // `Ambiguous` or `Unknown`, both carried so the caller can tell a collision from a stray delivery.
+        return ChannelIngest::Unroutable(route);
+    };
+    // 3. Verify, against **this** registration's token — the one whose account the route selected.
+    let check = verify_channel_token(registration.token(), &message);
+    if !check.may_be_acted_on() {
+        return ChannelIngest::Rejected(check);
+    }
+    // 4. Classify. `Absent` (no token registered) reaches here and may be acted on, which is the guide's
+    //    optional-token case rather than a failure — so an un-tokened channel still syncs on a real change.
+    if message.is_sync() {
+        ChannelIngest::Handshake
+    } else {
+        ChannelIngest::Changed {
+            account: registration.account.clone(),
+        }
     }
 }
 

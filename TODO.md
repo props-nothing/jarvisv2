@@ -5058,6 +5058,46 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `ADR-0098` names). The Calendar push path is now end-to-end **on paper** (name → read → verify → route); what
     is missing is a handler that receives a delivery, and the Gmail `OidcIdToken` verifier (Unresolved Question
     9, still open).
+- [ ] `P5-005` **(continued — composing the push path is what decides, and the seam changed a type)**:
+  `ingest_channel_delivery(delivery, registrations) -> ChannelIngest` composes read → route → verify →
+  classify; `ChannelIngest { Unreadable, Unroutable, Rejected, Handshake, Changed{account} }` with
+  `is_accepted`/`account_to_sync`/`acknowledges`; and **`ChannelRoute::Exact` now carries the whole
+  `ChannelRegistration`** (with a `registration()` accessor). **9 new lib tests + 1 harness test (so 453 in the
+  crate, 18 fixture).** **`ADR-0103`.** Completes the Calendar push path the previous three slices built one
+  piece at a time. Three guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: THE SEAM IS WHERE A *TYPE* HAD TO CHANGE, AND NO PER-PIECE TEST COULD SHOW IT.** Read
+    (`ADR-0100`), verify (`ADR-0101`) and route (`ADR-0102`) were each green alone and **nothing called them
+    together** — `ADR-0069`'s "two tested halves do not test the seam", and `ADR-0098`'s "the join was the
+    missing step", a **third** time. Composing them showed that `ChannelRoute::Exact` carried an
+    `AccountReference` but **the token that proves the delivery lives on the registration** — so a caller would
+    route, then scan the registrations **again** to get the token: two lookups deciding one match, and the
+    account acted on and the token verified could come from two scans that merely happened to agree. `Exact` now
+    carries the registration. **⭐ General rule: when a composition forces a value to be *fetched* rather than
+    *carried*, the missing field is the finding — here, the control that proves what the account may act on.**
+  - **⭐⭐ AND NO SINGLE ANSWER COULD EXPRESS THE OUTCOMES.** A `Result<Option<AccountReference>, _>` would encode
+    *handshake* and *unroutable* as the same `None`, and those need **opposite** handling (accept-and-do-nothing
+    vs drop); a `Result` also cannot separate a refusal from a retry. `ChannelIngest` has **five** variants for
+    the three questions a push handler asks — *well-formed?* *really ours?* *a change?* — and only **one**
+    (`Changed`) starts work. `is_accepted` and `account_to_sync` are **different questions**: a handshake is
+    *accepted* (the sender keeps the message) but *syncs nothing*.
+  - **⭐ ROUTING RUNS BEFORE VERIFICATION, SO AN UNREGISTERED CHANNEL IS `Unroutable`, NEVER `Rejected`.** The
+    token cannot be checked without the registration that holds it, so for an unregistered channel **no
+    comparison happened** — and `Rejected` would claim a control failed when none was present (`ADR-0101`'s
+    "missing control ≠ failed control", at the composition). The order is also why the `sync` state is read
+    **last**: an unauthenticated delivery must not steer whether work happens, even into the "no-op" branch.
+  - **⭐ AN UN-TOKENED CHANNEL STILL SYNCS ON A REAL CHANGE.** `ChannelTokenCheck::Absent` **may be acted on**, so
+    a correctly configured channel registered without a token is not silently dead — but its `sync` message is
+    still a `Handshake`, so accepting a change does not accept everything.
+  - **⭐ EVERY OUTCOME ACKNOWLEDGES.** None of the four non-`Changed` results is repaired by retrying, and a
+    negative ack is **subscription-global** (`ADR-0094`), so refusing would slow every other channel for a
+    message that can never become actionable. `acknowledges()` is a method so a future variant that *should* be
+    retried has a place to say `false`. `Changed` carries only the **account**, not the registration — a sync
+    needs the account, and handing the token onward puts the anti-spoofing control into a component with no use
+    for it.
+  - **NEW LIMITS:** **nothing receives the delivery** — no endpoint, no channel store — so this is a decision with
+    tests, not a running handler. It does not record the drop, sync anything, or deduplicate a redelivery
+    (`X-Goog-Message-Number` is read but unused, per `ADR-0100`). The Gmail `OidcIdToken` verifier is still
+    unbuilt (Unresolved Question 9), so the Gmail path has no equivalent composition.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

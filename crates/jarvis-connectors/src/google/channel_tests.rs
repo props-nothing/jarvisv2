@@ -572,3 +572,284 @@ fn a_registration_redacts_its_token_and_the_route_uses_only_the_id() {
     // And a registration with NO token is a recorded choice, surfaced as `None` rather than a sentinel.
     assert_eq!(registration("channel-beta", "acct-beta").token(), None);
 }
+
+/// Full header set for a delivery naming a channel, in a given state, with an optional token.
+///
+/// Dynamic values are leaked (test-only) so the header slice keeps its `&'static` element type rather than
+/// parameterising the fixture helpers.
+fn headers_for(
+    channel_id: &str,
+    token: Option<&str>,
+    state: &str,
+) -> Vec<(&'static str, &'static [u8])> {
+    let id: &'static [u8] = Box::leak(channel_id.to_owned().into_boxed_str()).as_bytes();
+    let state: &'static [u8] = Box::leak(state.to_owned().into_boxed_str()).as_bytes();
+    let mut headers = vec![
+        (CHANNEL_ID_HEADER, id),
+        (RESOURCE_ID_HEADER, b"ret08u3rv24htgh289g".as_slice()),
+        (
+            RESOURCE_URI_HEADER,
+            b"https://www.googleapis.com/calendar/v3/calendars/primary/events".as_slice(),
+        ),
+        (RESOURCE_STATE_HEADER, state),
+        (MESSAGE_NUMBER_HEADER, b"10".as_slice()),
+    ];
+    if let Some(token) = token {
+        headers.push((
+            CHANNEL_TOKEN_HEADER,
+            Box::leak(token.to_owned().into_boxed_str()).as_bytes(),
+        ));
+    }
+    headers
+}
+
+/// Ingests a delivery for a channel, in a state, with optional token.
+fn ingest(
+    channel_id: &str,
+    token: Option<&str>,
+    state: &str,
+    registrations: &[ChannelRegistration],
+) -> ChannelIngest {
+    let headers = headers_for(channel_id, token, state);
+    ingest_channel_delivery(&delivery(&headers, &[]), registrations)
+}
+
+/// A registration with a token.
+fn registration_with_token(channel_id: &str, account: &str, token: &str) -> ChannelRegistration {
+    ChannelRegistration::new(
+        channel_id.to_owned(),
+        must(
+            crate::account::AccountReference::new(account),
+            "a valid account reference",
+        ),
+        Some(stored(token)),
+    )
+}
+
+#[test]
+fn a_verified_change_on_a_registered_channel_is_the_one_outcome_that_syncs() {
+    // The happy path, and the only variant that starts work: the delivery is well-formed, its channel is
+    // registered, its token matches, and it reports a change.
+    let registrations = [registration_with_token(
+        "channel-alpha",
+        "acct-alpha",
+        "target=myApp-myChannelDest",
+    )];
+    let outcome = ingest(
+        "channel-alpha",
+        Some("target=myApp-myChannelDest"),
+        "exists",
+        &registrations,
+    );
+    assert!(outcome.is_accepted(), "a verified change is accepted");
+    assert_eq!(
+        outcome
+            .account_to_sync()
+            .map(crate::account::AccountReference::as_str),
+        Some("acct-alpha"),
+        "the sync must run under the account that registered the channel"
+    );
+    assert!(outcome.acknowledges());
+}
+
+#[test]
+fn a_verified_sync_handshake_is_accepted_but_syncs_nothing() {
+    // The `sync` message is accepted -- it is a well-formed, verified delivery -- yet it starts no work,
+    // because the first message on a channel reports that notifications are starting, not a change (`ADR-0100`).
+    // `is_accepted` and `account_to_sync` are therefore **different questions**: acceptance tells the sender to
+    // keep the message; `account_to_sync` tells the caller whether to do work.
+    let registrations = [registration("channel-alpha", "acct-alpha")];
+    let outcome = ingest("channel-alpha", None, "sync", &registrations);
+    assert_eq!(outcome, ChannelIngest::Handshake);
+    assert!(outcome.is_accepted(), "a handshake is accepted");
+    assert_eq!(
+        outcome.account_to_sync(),
+        None,
+        "a handshake reports no change, so nothing syncs"
+    );
+    assert!(outcome.acknowledges(), "accepted, so not retried");
+}
+
+#[test]
+fn the_seam_is_where_the_composition_was_found_and_it_rejects_a_failed_token() {
+    // **The gap composing these three functions exposed.** Read, verify and route were each correct alone and
+    // nothing joined them; joining them showed a caller could not get one answer meaning "the channel verified
+    // and this delivery failed it". Here the channel routes, the token does not match, and the outcome is
+    // `Rejected` rather than `Changed` -- the branch that did not exist before this function.
+    let registrations = [registration_with_token(
+        "channel-alpha",
+        "acct-alpha",
+        "target=myApp-myChannelDest",
+    )];
+    let outcome = ingest(
+        "channel-alpha",
+        Some("target=myApp-forged"),
+        "exists",
+        &registrations,
+    );
+    assert_eq!(
+        outcome,
+        ChannelIngest::Rejected(ChannelTokenCheck::Mismatch)
+    );
+    assert!(!outcome.is_accepted(), "a failed control is not accepted");
+    assert_eq!(
+        outcome.account_to_sync(),
+        None,
+        "a rejected delivery must not sync, even though its channel routes"
+    );
+    assert!(outcome.acknowledges(), "recorded and dropped, not retried");
+}
+
+#[test]
+fn a_registered_channel_whose_delivery_carries_no_token_is_rejected_not_accepted() {
+    // The other refusal: a token was registered and the delivery presented none. Distinct from a mismatch (no
+    // value vs a wrong value) but the same operational reading -- refuse -- and the two are told apart by the
+    // carried `ChannelTokenCheck`.
+    let registrations = [registration_with_token(
+        "channel-alpha",
+        "acct-alpha",
+        "target=myApp-myChannelDest",
+    )];
+    let outcome = ingest("channel-alpha", None, "exists", &registrations);
+    assert_eq!(
+        outcome,
+        ChannelIngest::Rejected(ChannelTokenCheck::TokenRequired)
+    );
+    assert!(!outcome.is_accepted());
+    assert_eq!(outcome.account_to_sync(), None);
+}
+
+#[test]
+fn an_unregistered_or_ambiguous_channel_is_unroutable_and_carries_which() {
+    // Routing runs **before** verification, because a token cannot be checked without the registration that
+    // holds it. So a channel that is not registered is `Unroutable`, never `Rejected` -- reporting "rejected"
+    // would imply a comparison happened when there was no value to compare against. And the two unroutable
+    // cases are told apart by the carried route, because a collision is a defect here while a stray delivery is
+    // not.
+    let registrations = [registration("channel-alpha", "acct-alpha")];
+    let unknown = ingest("channel-gamma", None, "exists", &registrations);
+    assert_eq!(unknown, ChannelIngest::Unroutable(ChannelRoute::Unknown));
+    assert!(!unknown.is_accepted());
+    assert_eq!(unknown.account_to_sync(), None);
+    // A collision: two registrations for the same channel id.
+    let collided = [
+        registration("channel-alpha", "acct-one"),
+        registration("channel-alpha", "acct-two"),
+    ];
+    assert_eq!(
+        ingest("channel-alpha", None, "exists", &collided),
+        ChannelIngest::Unroutable(ChannelRoute::Ambiguous { accounts: 2 })
+    );
+}
+
+#[test]
+fn an_unreadable_delivery_is_distinct_from_an_unroutable_one() {
+    // A delivery whose headers do not parse stops at the **first** step, so it is `Unreadable` -- carrying the
+    // specific refusal -- not `Unroutable`, which would imply the channel was read and simply not found. The two
+    // are different layers (the wire shape vs this connector's records) and a diagnostic must not conflate them.
+    // A delivery with no channel id at all is the minimal unreadable shape.
+    let headers: Vec<(&str, &[u8])> = headers_for("channel-alpha", None, "exists")
+        .into_iter()
+        .filter(|(name, _)| *name != CHANNEL_ID_HEADER)
+        .collect();
+    let outcome = ingest_channel_delivery(&delivery(&headers, &[]), &[]);
+    assert_eq!(
+        outcome,
+        ChannelIngest::Unreadable(ChannelMessageError::Missing {
+            header: CHANNEL_ID_HEADER
+        })
+    );
+    assert!(!outcome.is_accepted());
+    assert_eq!(outcome.account_to_sync(), None);
+}
+
+#[test]
+fn an_untokened_channel_still_syncs_on_a_real_change() {
+    // The guide makes the token optional, so a channel registered **without** one reports `Absent` -- which
+    // **may be acted on** -- and a real change still syncs. This is the case that would be lost if `Absent` were
+    // treated as a refusal: a correctly configured, un-tokened channel would never sync.
+    let registrations = [registration("channel-alpha", "acct-alpha")];
+    assert_eq!(registrations[0].token(), None, "registered without a token");
+    let outcome = ingest("channel-alpha", None, "exists", &registrations);
+    assert_eq!(
+        outcome,
+        ChannelIngest::Changed {
+            account: must(
+                crate::account::AccountReference::new("acct-alpha"),
+                "a valid account reference"
+            )
+        }
+    );
+    assert!(outcome.account_to_sync().is_some());
+    // The control: a **handshake** on the same un-tokened channel still does not sync, so `Absent` accepting a
+    // change does not mean it accepts everything.
+    assert_eq!(
+        ingest("channel-alpha", None, "sync", &registrations),
+        ChannelIngest::Handshake
+    );
+}
+
+#[test]
+fn the_account_acted_on_and_the_token_verified_come_from_one_registration() {
+    // **The property `ChannelRoute::Exact` carrying the whole registration exists for.** Two registrations, each
+    // with its **own** token. A delivery for channel B carrying B's token routes to B and verifies against
+    // **B's** token. A mutant that fetched the token with a second scan -- or verified against A's -- would
+    // reject this, which is exactly the "two lookups that merely happen to agree" hazard.
+    let registrations = [
+        registration_with_token("channel-alpha", "acct-alpha", "token-alpha"),
+        registration_with_token("channel-beta", "acct-beta", "token-beta"),
+    ];
+    // B's delivery with B's token: accepted, and routes to B.
+    let accepted = ingest("channel-beta", Some("token-beta"), "exists", &registrations);
+    assert_eq!(
+        accepted
+            .account_to_sync()
+            .map(crate::account::AccountReference::as_str),
+        Some("acct-beta")
+    );
+    // B's delivery carrying **A's** token: the route still selects B (by id), and verification runs against
+    // B's token, so A's token is a mismatch -- proving the token checked is the matched registration's.
+    assert_eq!(
+        ingest(
+            "channel-beta",
+            Some("token-alpha"),
+            "exists",
+            &registrations
+        ),
+        ChannelIngest::Rejected(ChannelTokenCheck::Mismatch),
+        "the token checked must be the matched registration's, not another channel's"
+    );
+}
+
+#[test]
+fn every_ingest_outcome_acknowledges_because_none_is_repaired_by_retrying() {
+    // The acknowledgement rule, over **every** variant: a malformed body, an unregistered channel, a failed
+    // token and a handshake all fail or repeat identically, and a negative acknowledgement is subscription-
+    // global (`ADR-0094`) -- so refusing would slow every other channel for a message that can never become
+    // actionable. Asserted as a table so a future variant that *should* be retried has to say so explicitly.
+    let registrations = [registration_with_token(
+        "channel-alpha",
+        "acct-alpha",
+        "token-alpha",
+    )];
+    let all = [
+        ingest(
+            "channel-alpha",
+            Some("token-alpha"),
+            "exists",
+            &registrations,
+        ),
+        ingest("channel-alpha", Some("token-alpha"), "sync", &registrations),
+        ingest("channel-alpha", Some("wrong"), "exists", &registrations),
+        ingest("channel-missing", None, "exists", &registrations),
+    ];
+    for outcome in &all {
+        assert!(outcome.acknowledges(), "{outcome:?} must be acknowledged");
+    }
+    // And only `Changed` starts work, so acceptance is not a synonym for "act".
+    let syncing = all
+        .iter()
+        .filter(|outcome| outcome.account_to_sync().is_some())
+        .count();
+    assert_eq!(syncing, 1, "exactly one of the four outcomes syncs");
+}
