@@ -245,6 +245,151 @@ fn a_cursor_with_a_position_resumes_incrementally_and_names_the_kind_with_it() {
 }
 
 #[test]
+fn a_just_connected_account_syncs_from_its_anchor_rather_than_reading_the_whole_mailbox() {
+    // **The finding: the anchor had a reader and no consumer.** `parse_watch_response` reads the `watch`
+    // response's `historyId` and calls it *"the anchor a first sync starts from"*, and the only way to begin a
+    // sync was `FullSync` — so a just-connected mailbox was read end to end. The push guide's own worked example
+    // says otherwise: *"Pass `1234567890` as the `startHistoryId` to `history.list`"*, where `1234567890` **is**
+    // the watch response's `historyId`. So the first sync is `history.list` from the anchor, which returns the
+    // changes since the watch was set rather than the mailbox's contents.
+    let anchored = must(
+        establish_account_with_anchor(
+            reference("acct-1"),
+            &profile("user@example.com"),
+            AuthMethod::OAuthPkce,
+            &scopes(),
+            instant(1_700_000_000),
+            &[],
+        ),
+        "a fresh account must connect",
+    );
+    assert_eq!(anchored.anchor.as_deref(), Some("1234567890"));
+    assert_eq!(anchored.origin, SyncOrigin::Profile);
+    let start = must(
+        SyncCursor::new(
+            SyncCursorKind::Start,
+            None,
+            reference("acct-1"),
+            "1.0.0",
+            instant(1_700_000_000),
+        ),
+        "a start cursor",
+    );
+    let point = anchored.resume(&start);
+    assert_eq!(
+        point,
+        ResumePoint::FromAnchor {
+            anchor: "1234567890".to_owned(),
+            origin: SyncOrigin::Profile
+        }
+    );
+    // **And it is NOT a full sync**, which is the whole point: the mailbox is not read.
+    assert!(!point.requires_full_sync());
+    // The anchor is not a *position*, and `position()` says so — the cursor it will become does not exist yet,
+    // and a caller that took the anchor as one would have the two ids in the guide's example confused.
+    assert_eq!(point.position(), None);
+    assert_eq!(point.anchor(), Some("1234567890"));
+
+    // The `watch` entry point anchors at the same moment from the other source.
+    let watch = must(
+        crate::google::watch::parse_watch_response(
+            r#"{"historyId": "1234567890", "expiration": "1431990098200"}"#,
+        ),
+        "the guide's watch response",
+    );
+    let from_watch = must(
+        establish_account_from_watch(
+            reference("acct-2"),
+            &profile("other@example.com"),
+            AuthMethod::OAuthPkce,
+            &scopes(),
+            instant(1_700_000_000),
+            &[],
+            &watch,
+        ),
+        "a watch-anchored account must connect",
+    );
+    assert_eq!(
+        from_watch.resume(&start),
+        ResumePoint::FromAnchor {
+            anchor: "1234567890".to_owned(),
+            origin: SyncOrigin::WatchResponse
+        },
+        "the anchor is the same kind of value from either source, and the source is carried rather than guessed"
+    );
+
+    // **The control, and it is what keeps the branch honest.** A full sync is still reachable and still the
+    // deliberate choice: the guide names it as the branch for *"If you need to process changes before this
+    // historyId"*, which is a different question — do you want the mailbox as it stands?
+    assert_eq!(
+        resume_ignoring_anchor(&start, "1234567890", SyncOrigin::Profile),
+        ResumePoint::FullSync
+    );
+    assert!(
+        resume_ignoring_anchor(&start, "1234567890", SyncOrigin::Profile).requires_full_sync(),
+        "wanting the mailbox's existing contents is a full sync, not an anchor"
+    );
+    // And an account whose response stated **no** anchor falls back to the full sync rather than anchoring at
+    // nothing — the `None` is what makes that representable.
+    let unanchored = must(
+        establish_account_with_anchor(
+            reference("acct-3"),
+            &GmailProfile {
+                email_address: "third@example.com".to_owned(),
+                history_id: None,
+            },
+            AuthMethod::OAuthPkce,
+            &scopes(),
+            instant(1_700_000_000),
+            &[],
+        ),
+        "an account with no anchor must still connect",
+    );
+    assert_eq!(unanchored.anchor, None);
+    assert_eq!(unanchored.resume(&start), ResumePoint::FullSync);
+}
+
+#[test]
+fn a_stored_position_outranks_an_anchor_because_the_anchor_is_historical() {
+    // Split from the anchor test above rather than left in it: the property is about a **different** input — a
+    // cursor that already has a position — and the reason it needs its own case is that the wrong answer is a
+    // *silent duplicate* rather than a miss.
+    let anchored = must(
+        establish_account_with_anchor(
+            reference("acct-1"),
+            &profile("user@example.com"),
+            AuthMethod::OAuthPkce,
+            &scopes(),
+            instant(1_700_000_000),
+            &[],
+        ),
+        "a fresh account must connect",
+    );
+    let synced = must(
+        SyncCursor::new(
+            SyncCursorKind::MonotonicMarker,
+            Some("9876543210".to_owned()),
+            reference("acct-1"),
+            "1.0.0",
+            instant(1_700_000_000),
+        ),
+        "a synced cursor",
+    );
+    assert_eq!(anchored.resume(&synced), resume_from(&synced));
+    assert_eq!(
+        anchored.resume(&synced),
+        ResumePoint::FromPosition {
+            position: "9876543210".to_owned(),
+            kind: SyncCursorKind::MonotonicMarker
+        },
+        "the anchor must not displace a position the account actually has: re-reading the window between the \
+         watch and the first stored position is a duplicate, and a silent one"
+    );
+    assert_eq!(anchored.resume(&synced).anchor(), None);
+    assert!(!anchored.resume(&synced).requires_full_sync());
+}
+
+#[test]
 fn a_start_cursor_is_a_full_sync_decision_rather_than_a_missing_value() {
     // `SyncCursorKind::Start`'s doc is explicit that a full sync "is a decision with consequences (cost, time,
     // possibly a rate-limit budget), and an absent value would make it the default a caller stumbles into." So

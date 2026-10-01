@@ -5448,6 +5448,61 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `seconds_from_edge` convention, rather than deleting accessors whose absence would leave a page token
     unreadable while the sync token is not); `Rejected` is unreachable against a conforming provider by design,
     so it is exercised only by the test that deliberately keeps the impossible body.
+- [ ] `P5-005` **(continued — a first sync with two documented branches and one expressible)**: `google::connection`
+  gains `ResumePoint::FromAnchor`, `SyncOrigin { WatchResponse, Profile }`,
+  `resume_anchored`/`resume_ignoring_anchor`, `AnchoredAccount`, and the `establish_account_with_anchor` /
+  `establish_account_from_watch` entry points; `ResumePoint::position()` returns `None` for `FromAnchor` and a new
+  `anchor()` accessor returns it. **2 new tests (so 480 in the crate; 1753 in the workspace).** **`ADR-0110`.**
+  Two guards falsified A-B-A. Joins the anchor that two modules had parsed and described to the step that
+  decides where a sync begins.
+  - **⭐⭐ THE FINDING: A FIRST SYNC HAD TWO DOCUMENTED BRANCHES AND THE CONNECTOR COULD EXPRESS ONE.** The push
+    guide, immediately after defining the anchor, **forks**: *"Your client receives notifications for all changes
+    **after** that `historyId`. **If you need to process changes before this `historyId`**, refer to Synchronize
+    clients with Gmail."* Branch one is `history.list` **from the anchor** — the changes since the `watch`, then
+    a position of its own. Branch two is the mailbox's **existing contents**. `resume_from` answered `FullSync`
+    for every `Start` cursor, so **only branch two existed**, and a just-connected mailbox was read end to end at
+    `5 + 20N` quota units to discover nothing had happened since the `watch`. **⭐⭐ Generalisation: when a
+    provider's sentence contains an "if you need X instead", that is a FORK — enumerate the branches and check
+    each is expressible, because implementing the second one looks complete from the inside.**
+  - **⭐⭐ AND THE ANCHOR HAD A PARSER, A FIELD, TWO MODULES OF JUSTIFICATION, AND NO CONSUMER.** `watch.rs` calls
+    it *"the anchor a first sync starts from"*; `request.rs` says the profile's `historyId` *"yields the mailbox's
+    current position without consuming a message"* and that **either can seed a first sync**. **Neither could
+    seed anything.** This is `ADR-0092`'s "a response field with no reader" from the other side: a value that IS
+    read, is documented as the input to a step, and whose step cannot accept it. **⭐ A doc comment that says what
+    a value is FOR is a claim about a consumer — check the consumer exists before believing it.**
+  - **⭐ `position()` RETURNS `None` FOR AN ANCHOR, AND THAT IS THE POINT.** An anchor is not a position —
+    nothing has been synced from it. The guide's trap is exactly that the two are distinct strings which
+    plausibly fit each other (`1234567890` vs `9876543210`, both spelled `historyId`), so the type now refuses
+    the reading the guide warns against: `FromAnchor` carries no `position`, and `anchor()` is separate.
+  - **⭐ `requires_full_sync()` IS TRUE ONLY FOR `FullSync`.** An anchored start does **not** read the mailbox
+    from the beginning, so a caller asking "is this expensive" gets the right answer for both incremental cases
+    without knowing which it holds — and the property is what makes the branch a decision rather than a default.
+  - **⭐ A STORED POSITION OUTRANKS AN ANCHOR, AND THE WRONG DIRECTION IS A SILENT DUPLICATE.** Once anything has
+    been synced the anchor is historical; preferring it would re-read the window between the `watch` and the
+    first stored position, and `history.list` would simply return records the store already holds — a duplicate,
+    not a miss, and therefore invisible. **The opposite failure direction from `ADR-0090`'s, which is why it
+    needed its own assertion.**
+  - **⭐ TWO BRANCHES ARE TWO FUNCTIONS, NOT A FLAG.** The difference in cost is orders of magnitude, and a
+    `bool` at a call site (`resume_from(cursor, false)`) says nothing about which branch is which. The expensive
+    branch is `resume_ignoring_anchor` — a **name**, so a caller cannot reach it by omitting an argument — and it
+    takes the anchor and discards it, which is what keeps the two signatures alike enough that neither is called
+    by accident.
+  - **⭐ `SyncOrigin` IS AN ENUM, NOT A `bool`** (`ADR-0035`): the sources differ in *cost* — a profile read needs
+    only a credential and 1 quota unit, a `watch` also needs a Pub/Sub topic — so a caller choosing between them
+    is choosing a cost, and the origin is carried rather than inferred so a log line says **where** a starting
+    point came from. `establish_account` now shares one body with the two anchored entry points, and carries no
+    anchor of its own — a deliberate limit rather than an oversight.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A, both compiling.** (1) `resume_anchored` **never anchoring** → detected
+    (`left: FullSync`, `right: FromAnchor { … }`). (2) the **position-outranks-anchor** check disabled →
+    detected (`left: FromAnchor { … }`, `right: FromPosition { … }`).
+  - **⭐ A DOC COMMENT THAT WAS AN OVERSTATEMENT IS NOW CHECKABLE.** `GmailProfile`'s own doc said *"**either**
+    can seed a first sync"* about the profile and watch anchors — true of the **values** and false of the
+    **connector**, which could seed nothing from either. It is now true of the code, and the code is what runs.
+  - **NEW LIMITS:** no request sent, no account stored, no sync runs, so `FromAnchor` reaches a real
+    `history.list` only when a sync loop exists. The anchor's **age** is not modelled — a long-held anchor used
+    now may have been pruned, which arrives as the documented `404`/resync path rather than as a local refusal.
+    And **nothing records which branch a deployment chose**: a caller picks per call, so a connector that used
+    branch two for every account would still pay the cost the branch exists to avoid.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

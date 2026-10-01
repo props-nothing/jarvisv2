@@ -718,6 +718,25 @@ Reading the response's id as "the new position" type-checks and is wrong, and it
 anchor does not move when the mailbox changes, so a sync that stored it as the position would re-read the same
 window on every run.
 
+**And the guide documents TWO branches for a first sync, not one.** The sentence immediately after the anchor's
+definition is a fork, and the connector could express only the second:
+
+> "The response contains the current mailbox `historyId` for the user. **Your client receives notifications for
+> all changes after that `historyId`.** If you need to process changes **before** this `historyId`, refer to
+> Synchronize clients with Gmail."
+
+- **Branch one** — `history.list` *from the anchor*, which returns the changes since the `watch` was set
+  (typically none) and yields a position of its own. The mailbox is not read.
+- **Branch two** — the mailbox's **existing** contents, which is what *"changes before this `historyId`"*
+  means, at `5 + 20N` quota units for *N* messages.
+
+The anchor had a parser, a field on [`WatchResponse`] and two modules' worth of justification, and **no consumer**
+— `resume_from` answered `FullSync` for every `Start` cursor, so a just-connected mailbox was read end to end.
+Implemented as `ResumePoint::FromAnchor` + `SyncOrigin` + `resume_anchored`/`resume_ignoring_anchor` and the
+anchored `establish_account_*` entry points (`ADR-0110`). **The two branches are two functions rather than a
+flag**, because a `bool` at a call site says nothing about which branch is which while the difference in cost is
+orders of magnitude.
+
 **Why the example is the load-bearing part.** A one-value example cannot falsify a conflation of two
 same-typed fields — every reading of it passes. The `1234567890`/`9876543210` pair can, which is why the
 connector's test asserts the anchor is the first **and** `assert_ne!`s it against the second. The
@@ -1181,6 +1200,17 @@ where every line looks equally done is a plan nobody can audit.
   Gmail producer's did — its only detector was the integration test. The missing unit test was written and the
   same mutant then fails in `--lib` too, **confirmed by mutation rather than assumed**. What is **not** built:
   no sync loop, so `storable` and `page_token` have no production consumer and each says so.
+- **A test that a just-connected account syncs from its anchor rather than reading the whole mailbox**, added
+  once the anchor's documented consumer was checked and found not to exist. **WRITTEN** by `ADR-0110`:
+  `ResumePoint::FromAnchor` + `SyncOrigin` + `resume_anchored`/`resume_ignoring_anchor`, and the
+  `establish_account_with_anchor` / `establish_account_from_watch` entry points returning `AnchoredAccount`. Both
+  documented branches are asserted — the anchored start **and** the full sync the guide names for *"changes
+  before this `historyId`"* — plus the guard that a **stored position outranks a historical anchor**, because the
+  wrong direction there is a silent duplicate rather than a miss. **Two guards falsified A-B-A**: `resume_anchored`
+  never anchoring, and the position check disabled. What is **not** built: no request is sent, no account is
+  stored, no sync runs, and the anchor's **age** is not modelled — a
+  long-held anchor used now may have been pruned, which arrives as the documented `404`/resync path rather than
+  as a local refusal.
 - **Opt-in live smoke test** behind credentials and a cost gate, as `tools-and-connectors.md` requires.
   **Not written.**
 
@@ -1400,5 +1430,6 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-10-01 | Calendar **push guide** re-read (footer **2026-09-11**, unchanged) for the **`stop` permission rule**, plus its *Stop notifications* section for the call's arity | Verbatim: *"This method requires that you provide at least the channel's `id` and the `resourceId` properties… Note that if the Google Calendar API has several types of resources that have `watch` methods, there's only one `stop` method."* and *"Each notification channel is associated both with a particular user and a particular resource (or set of resources)."* So a channel is identified by a **pair** and **one account may need several calls** — the fact that makes Calendar's stop a different `TeardownStep` from `users.stop` rather than an instance of it. On permission, the two rules keyed on creation: *"If the channel was created by a regular user account, only the same user from the same client (as identified by the OAuth 2.0 client IDs from the auth tokens) who created the channel can stop the channel. If the channel was created by a service account, any user from the same client can stop the channel."* The discriminating fact is the **`client_id` inside the token**, which this crate exposes only as a rendered header value (`ADR-0061`) and which a JWT access token would carry as the **unverified** `aud`/`azp` claims (`ADR-0064`) — so the rule is recorded as a **limit** and a violation surfaces as the provider's `403`. Also re-confirmed from the same section: *"The `expiration` property controls when the notifications stop automatically"*, and the stop's own response is empty. Implemented as `calendar_channel_stop` + `TeardownStep::StopCalendarChannel` + `calendar_exposure`, `ADR-0107`. |
 | 2026-10-01 | Gmail **`users.history.list` reference** re-fetched (`…/gmail/api/reference/rest/v1/users.history/list`, footer **2026-04-15**, unchanged) to check what the **response's `historyId`** says about storing it | **The field says nothing about it:** *"historyId | string | The ID of the mailbox's current history record."* The storing rule is stated **once**, in `startHistoryId`'s description: *"If you receive no nextPageToken in the response, there are no updates to retrieve and you can store the returned historyId for a future request."* So the page's id is the mailbox's position **at the moment that page was produced**, and a walk with more to come has not consumed the changes up to it. Also re-confirmed verbatim: *"History IDs increase chronologically but are not contiguous with random gaps in between valid IDs"*, *"Supplying an invalid or out of date startHistoryId typically returns an HTTP 404"*, *"A historyId is typically valid for at least a week, but in some rare circumstances may be valid for only a few hours"*, and *"If you receive an HTTP 404 error response, your application should perform a full sync"* — the facts behind the `404`-means-resync reading. Also noted: `historyId` is **not** marked optional in the response schema, so a `200` with no id is not a shape the provider documents — which is why `Unstated` refuses to infer "the mailbox is unchanged". Implemented as `HistoryPosition` + `of_page` + the qualified signal parameter, `ADR-0108`. |
 | 2026-10-01 | Calendar **`events.list` reference** re-fetched (`.../calendar/v3/reference/events/list`, footer **2026-07-29**, unchanged) for the two continuation tokens the output schema declared with **no descriptions** | The mutual exclusion is stated in **each field's own description**, not in prose elsewhere: `nextPageToken` is *"Token used to access the next page of this result. **Omitted if no further results are available, in which case `nextSyncToken` is provided.**"* and `nextSyncToken` is *"Token used at a later point in time to retrieve only the entries that have changed since this result was returned. **Omitted if further results are available, in which case `nextPageToken` is provided.**"* So a page carries **at most one**. Also re-confirmed from the same page: `maxResults` *"By default the value is 250 events. The page size can never be larger than 2500 events."*; *"Incomplete pages can be detected by a non-empty nextPageToken field"*; and the `syncToken` description's list of parameters that cannot accompany it (`iCalUID orderBy privateExtendedProperty q sharedExtendedProperty timeMin timeMax updatedMin`), which is `ADR-0084`'s list. Implemented as `CalendarContinuation` + `of_page` + schema descriptions, `ADR-0109`. |
+| 2026-10-01 | Gmail **push guide** re-fetched (`.../gmail/api/guides/push`, footer **2026-09-15**, unchanged) for the **two branches** a first sync has, and the `users.history.list` reference for what a `startHistoryId` of the anchor yields | The *Watch response* section names the anchor and then **forks**, verbatim: *"The response contains the current mailbox `historyId` for the user. **Your client receives notifications for all changes after that `historyId`.** If you need to process changes **before** this `historyId`, refer to Synchronize clients with Gmail."* So there are **two** documented first-sync branches � `history.list` from the anchor, or the mailbox's existing contents � and the connector could express only the second, because `resume_from` answered `FullSync` for every `Start` cursor while `WatchResponse::anchor` and `GmailProfile::history_id` both had readers and no consumer. Also re-confirmed: the worked example's two numbers (*"Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist `9876543210` as the last known `historyId`"*) and *"Additionally, a successful `watch` call immediately sends a notification to your Cloud Pub/Sub topic"* (the opening notification `ADR-0104` records as unmarked). The profile's `historyId` is the second anchor source and costs 1 quota unit rather than a message read. Implemented as `ResumePoint::FromAnchor` + `SyncOrigin` + `resume_anchored`/`resume_ignoring_anchor` + `AnchoredAccount`, `ADR-0110`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

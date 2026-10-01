@@ -100,6 +100,14 @@ impl ConnectError {
 
 /// Builds the [`VerifiedAccount`] for a mailbox that has just been authorised, refusing a duplicate.
 ///
+/// # Which entry point to use
+///
+/// This one **does not anchor** the first sync, and that is a deliberate limit rather than an oversight: a
+/// caller that connected by reading `users.getProfile` holds a `historyId` that *can* seed a first sync (see
+/// [`establish_account_with_anchor`]), and one that has neither a profile anchor nor a watch has nothing to
+/// anchor from — so this function's answer is `FullSync` and it never claims otherwise. The distinction is the
+/// same one the two resume functions draw, at the point where the account is created.
+///
 /// # Every argument is a value, and none is read from anywhere
 ///
 /// Same reasoning as every other decision in this module family: a connector or a store would make the rule
@@ -128,6 +136,149 @@ pub fn establish_account(
     verified_at: UtcTimestamp,
     existing: &[VerifiedAccount],
 ) -> Result<VerifiedAccount, ConnectError> {
+    establish_account_inner(
+        reference,
+        profile,
+        method,
+        granted_scopes,
+        verified_at,
+        existing,
+        None,
+    )
+}
+
+/// Builds the [`VerifiedAccount`] for a mailbox, **keeping the profile's `historyId` as a first-sync anchor**.
+///
+/// # Why the same profile is read two ways
+///
+/// [`GmailProfile`] carries `historyId` — *"The ID of the mailbox's current history record"* — and the sync
+/// guide's rule is that a first sync may start from *"the `historyId` of the most recent message"*, so a profile
+/// read yields an anchor **without consuming a message** and for **one quota unit**. The same value is therefore
+/// two things depending on what the caller wants: a cheap way to seed an incremental first sync, and something
+/// to ignore entirely when the mailbox's existing contents are wanted.
+///
+/// The distinction is not representable in the account — [`crate::account::VerifiedAccount`] holds an identity
+/// and a grant, not a sync position — so it is expressed where it is used, by which of these two functions
+/// produced the account. **A caller that calls this one and then syncs from `FullSync` would discard the anchor
+/// it just kept**, which is why the two functions exist rather than a flag: a flag would be a second place the
+/// same decision is made, and `ADR-0035`'s rule applies to a `bool` standing for two different first syncs.
+///
+/// # Errors
+///
+/// The same as [`establish_account`], and for the same reasons — the anchor is carried, not validated here.
+pub fn establish_account_with_anchor(
+    reference: AccountReference,
+    profile: &GmailProfile,
+    method: AuthMethod,
+    granted_scopes: &[String],
+    verified_at: UtcTimestamp,
+    existing: &[VerifiedAccount],
+) -> Result<AnchoredAccount, ConnectError> {
+    let account = establish_account_inner(
+        reference,
+        profile,
+        method,
+        granted_scopes,
+        verified_at,
+        existing,
+        Some(SyncOrigin::Profile),
+    )?;
+    // The anchor is `profile.history_id`, which `parse_profile` has already bounded and filtered — an empty or
+    // whitespace-only id arrives as `None` rather than as an empty anchor, so a profile that stated no position
+    // yields an account whose first sync is a full one rather than one anchored at nothing.
+    let anchor = profile.history_id.clone();
+    Ok(AnchoredAccount {
+        account,
+        anchor,
+        origin: SyncOrigin::Profile,
+    })
+}
+
+/// A connected account and the anchor its first sync may start from.
+///
+/// Returned only by [`establish_account_with_anchor`] and [`establish_account_from_watch`]. The anchor is
+/// **optional**, because a profile or a watch response can state no `historyId` — and an `Option` here is the
+/// honest shape rather than a defaulted string: `None` means the first sync has nothing to start from, which is
+/// [`ResumePoint::FullSync`], and a caller that treated a missing anchor as present would ask the provider to
+/// list history from a position nobody stated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnchoredAccount {
+    /// The account, for storing.
+    pub account: VerifiedAccount,
+    /// The `historyId` a first `history.list` may start from, when the response stated one.
+    pub anchor: Option<String>,
+    /// Which response the anchor came from.
+    pub origin: SyncOrigin,
+}
+
+impl AnchoredAccount {
+    /// Decides where this account's first sync begins.
+    ///
+    /// The bridge between connecting and syncing, and the one place the two halves meet: an anchor with a `Start`
+    /// cursor becomes [`ResumePoint::FromAnchor`], and no anchor stays [`ResumePoint::FullSync`]. A caller that
+    /// wants the mailbox's existing contents uses [`resume_ignoring_anchor`] directly instead, which is a
+    /// visible choice rather than a flag.
+    #[must_use]
+    pub fn resume(&self, cursor: &SyncCursor) -> ResumePoint {
+        match self.anchor.as_deref() {
+            Some(anchor) => resume_anchored(cursor, anchor, self.origin),
+            None => ResumePoint::FullSync,
+        }
+    }
+}
+
+/// Builds the [`VerifiedAccount`] for a mailbox whose `watch` has just been established.
+///
+/// The second anchor source: the `users.watch` response's `historyId`, which the push guide says means *"Your
+/// client receives notifications for all changes **after** that `historyId`"* — so it anchors a first sync at the
+/// moment notifications begin, which is exactly the point an incremental sync should start from.
+///
+/// # Errors
+///
+/// The same as [`establish_account`]. The watch response is assumed to have been read already; a caller that has
+/// not read one has no anchor and should use [`establish_account`].
+pub fn establish_account_from_watch(
+    reference: AccountReference,
+    profile: &GmailProfile,
+    method: AuthMethod,
+    granted_scopes: &[String],
+    verified_at: UtcTimestamp,
+    existing: &[VerifiedAccount],
+    watch: &crate::google::watch::WatchResponse,
+) -> Result<AnchoredAccount, ConnectError> {
+    let account = establish_account_inner(
+        reference,
+        profile,
+        method,
+        granted_scopes,
+        verified_at,
+        existing,
+        Some(SyncOrigin::WatchResponse),
+    )?;
+    Ok(AnchoredAccount {
+        account,
+        anchor: Some(watch.anchor.clone()),
+        origin: SyncOrigin::WatchResponse,
+    })
+}
+
+/// The shared body of the three ways to connect an account.
+///
+/// `origin` is taken and used only to make the three call sites state which anchor they are working from —
+/// including the one that has none — so a reader of any entry point can see the branch without following it.
+fn establish_account_inner(
+    reference: AccountReference,
+    profile: &GmailProfile,
+    method: AuthMethod,
+    granted_scopes: &[String],
+    verified_at: UtcTimestamp,
+    existing: &[VerifiedAccount],
+    origin: Option<SyncOrigin>,
+) -> Result<VerifiedAccount, ConnectError> {
+    // Recorded so that the three entry points differ in one visible place rather than in three copies of the
+    // duplicate check. It is not used to alter the account: an anchor is a sync fact, not an identity one, and
+    // `VerifiedAccount` deliberately holds no position (`ADR-0098`).
+    let _ = origin;
     for account in existing {
         // A **case-insensitive** comparison, and the direction is argued in the module doc: routing refuses to
         // *act* on a case-only near-match, and this refuses to *create* one.
@@ -199,25 +350,84 @@ pub enum ResumePoint {
         /// authoritative.
         kind: SyncCursorKind,
     },
-    /// The account has no position, so the sync must be a **full** one.
+    /// The account has **no stored position**, and the connector holds an **anchor** it has never synced from.
+    ///
+    /// This is the state a just-connected account is in, and it is **not** a full sync: `history.list` from the
+    /// anchor returns exactly the changes since the anchor — typically none — rather than the whole mailbox.
+    /// Reaching for a full sync here would download the mailbox's entire contents to discover that nothing had
+    /// happened since the `watch`, and the guide's own worked example makes the opposite direction explicit.
+    ///
+    /// [`Self::FullSync`] is kept for the case the anchor cannot serve — see [`SyncOrigin`] — because collapsing
+    /// the two would make "we know where to start" and "we must read everything" the same answer.
+    FromAnchor {
+        /// The token to send, and always a [`SyncCursorKind::MonotonicMarker`]: every Gmail anchor the connector
+        /// can obtain is a `historyId`.
+        anchor: String,
+        /// Which **source** the anchor came from, so a caller can say where its starting point came from rather
+        /// than only what it is.
+        origin: SyncOrigin,
+    },
+    /// The account has no position **and no anchor**: the sync must read the mailbox from the beginning.
     FullSync,
+}
+
+/// Where an unsynced account's **anchor** came from.
+///
+/// Two sources, and the guide offers them for different moments: a `watch` response anchors *now* (the mailbox's
+/// position at the moment the lease began), while `users.getProfile` anchors *now* as well but costs one quota
+/// unit and no watch. The distinction is kept because the two are obtainable at different times — a profile read
+/// needs only a credential, while a watch also needs a Pub/Sub topic — so a caller choosing between them is
+/// choosing a cost rather than a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncOrigin {
+    /// The `historyId` a `users.watch` response returned ([`crate::google::watch::WatchResponse`]).
+    WatchResponse,
+    /// The `historyId` a `users.getProfile` response returned ([`crate::google::request::GmailProfile`]).
+    Profile,
+}
+
+impl SyncOrigin {
+    /// Returns the stable snake-case code, for a log line and a test.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WatchResponse => "watch_response",
+            Self::Profile => "profile",
+        }
+    }
 }
 
 impl ResumePoint {
     /// Returns the position, when there is one.
+    ///
+    /// **`None` for [`Self::FromAnchor`] as well as for [`Self::FullSync`]**, and the naming is what makes that
+    /// correct rather than surprising: an anchor is not a *position* — nothing has been synced from it yet — it
+    /// is where a sync should *begin*. A caller that treated it as a position would have the cursor it is about
+    /// to create and the value that seeds it confused, which is the conflation the two ids in the guide's worked
+    /// example invite. Use [`Self::anchor`] for the anchor.
     #[must_use]
     pub fn position(&self) -> Option<&str> {
         match self {
             Self::FromPosition { position, .. } => Some(position),
-            Self::FullSync => None,
+            Self::FromAnchor { .. } | Self::FullSync => None,
+        }
+    }
+
+    /// Returns the anchor to start from, when the account has one and no position.
+    #[must_use]
+    pub fn anchor(&self) -> Option<&str> {
+        match self {
+            Self::FromAnchor { anchor, .. } => Some(anchor),
+            Self::FromPosition { .. } | Self::FullSync => None,
         }
     }
 
     /// Returns whether this is a full sync.
     ///
-    /// The predicate a scheduler calls, and it is **true only for a cursor with no position** — so a full sync
-    /// is never the default a caller falls into, which is the property [`SyncCursorKind::Start`] exists to
-    /// make representable.
+    /// The predicate a scheduler calls, and it is **true only for a cursor with no position and no anchor** — so
+    /// a full sync is never the default a caller falls into, which is the property [`SyncCursorKind::Start`]
+    /// exists to make representable. Both an anchored start and a stored position answer `false`, because
+    /// neither reads the mailbox from the beginning.
     #[must_use]
     pub const fn requires_full_sync(&self) -> bool {
         matches!(self, Self::FullSync)
@@ -259,6 +469,71 @@ pub fn resume_from(cursor: &SyncCursor) -> ResumePoint {
         // already knows why (`ADR-0067`).
         _ => ResumePoint::FullSync,
     }
+}
+
+/// Decides where a **first** sync begins for an account whose `watch` has just been established.
+///
+/// # Why this exists: the anchor had a reader and no consumer
+///
+/// [`parse_watch_response`](crate::google::watch::parse_watch_response) reads the `watch` response's `historyId`
+/// and calls it *"the anchor a first sync starts from"*, and **nothing ever started a sync from it** — the only
+/// way to begin was [`ResumePoint::FullSync`], so a just-connected mailbox was read end to end. The guide's own
+/// example is explicit that this is unnecessary:
+///
+/// > "Pass `1234567890` as the `startHistoryId` to `history.list`. Afterward, you can persist `9876543210` as the
+/// > last known `historyId`."
+///
+/// — where `1234567890` **is** the watch response's `historyId`. So the first sync is `history.list` *from the
+/// anchor*, which returns the changes since the watch was set (typically none) rather than the mailbox.
+///
+/// A caller that wants the mailbox's **existing** contents uses [`resume_ignoring_anchor`] instead, which is a
+/// separate function because the two differ in cost by orders of magnitude: the guide says *"If you need to
+/// process changes before this `historyId`, refer to Synchronize clients with Gmail"* — a second branch, and
+/// choosing it should be a visible decision rather than a default.
+///
+/// A **`Start` cursor** is the precondition, and any other is a contract error rather than an input: an account
+/// that already has a position resumes from it via [`resume_from`], and an anchored start is only meaningful for
+/// a mailbox nothing has synced from yet. Rather than add an error variant for a state the caller cannot reach
+/// without ignoring [`resume_from`]'s own answer, this function is written to be called on a `Start` cursor —
+/// and a non-`Start` one is reported as a full sync, which is the conservative direction: it can never silently
+/// start an incremental sync from an anchor it was not meant to use.
+#[must_use]
+pub fn resume_anchored(cursor: &SyncCursor, anchor: &str, origin: SyncOrigin) -> ResumePoint {
+    if cursor.token().is_some() {
+        // A stored position outranks an anchor: the account has been synced, so the anchor is historical. Using
+        // it would re-read the window between the watch and the first stored position — a duplicate rather than
+        // a miss, but a silent one, and the position is the better answer in every case.
+        return resume_from(cursor);
+    }
+    ResumePoint::FromAnchor {
+        anchor: anchor.to_owned(),
+        origin,
+    }
+}
+
+/// Decides where a synced-outcome **first** sync begins when the mailbox's existing contents are wanted.
+///
+/// The deliberate branch: `history.list` from an anchor reports only what changed **after** it, so a caller that
+/// needs the mailbox as it stands must sync from the beginning and take the anchor only as the point at which to
+/// stop — which is what the guide means by *"If you need to process changes before this `historyId`"*.
+///
+/// It takes the same inputs and returns [`ResumePoint::FullSync`] unconditionally, including when the account
+/// **does** have a stored position: a caller that asked for the mailbox is asking for a full read, and quietly
+/// returning a stored position instead would answer a different question. That is why it is a function rather
+/// than "call [`resume_from`] and ignore the anchor" — the two answers are not interchangeable, and the name
+/// says which question is being asked.
+#[must_use]
+pub fn resume_ignoring_anchor(
+    cursor: &SyncCursor,
+    anchor: &str,
+    origin: SyncOrigin,
+) -> ResumePoint {
+    // The arguments are taken and deliberately unused: a caller has them because it just read the response that
+    // produced them, and dropping them from the signature would make the two functions unalike in a way that
+    // invites calling the wrong one. The anchor is not *forgotten* — a caller that wants it stores it as the
+    // point where the full sync ends, which is the position `history.list` will report.
+    let _ = (cursor, anchor, origin);
+    ResumePoint::FullSync
 }
 
 #[cfg(test)]
