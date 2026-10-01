@@ -4970,6 +4970,50 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     records). And **`not_exists` semantics were not established by the page read** — the guide lists the value
     but does not define it for a caller — so treating it as actionable rests on the fail-safe direction rather
     than on a quoted rule.
+- [ ] `P5-005` **(continued — a missing control and a failed one are not the same answer)**: the channel-token
+  **verifier** — `verify_channel_token(stored, delivery)` returning a four-variant `ChannelTokenCheck`
+  (`Verified`, `Absent`, `Mismatch`, `TokenRequired`) with `may_be_acted_on()`/`is_rejection()`, plus
+  `MAX_CHANNEL_TOKEN_BYTES`. **4 new tests (so 440 in the crate).** **`ADR-0101`.** Completes the "surfaced,
+  not verified" limit `ADR-0099`/`ADR-0100` each recorded, and **closes the constant-time-comparison half** of
+  the research record's Unresolved Question 9. Two guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: A `bool` CANNOT SEPARATE "A MISSING CONTROL" FROM "A FAILED ONE", AND THE TWO HAVE
+    OPPOSITE READINGS.** A Calendar delivery has a **zero-length body**, so the echoed channel token is the
+    **only** control — and `matches(stored, delivery) -> bool` would read `false` for both *"the channel was
+    registered without a token, so there is nothing to check"* (`Absent`) and *"the channel is protected and
+    this delivery failed the check"* (`Mismatch`/`TokenRequired`). One is a documented configuration that must
+    **not** alert; the other is a forged or misrouted delivery that must. A predicate that cannot tell them
+    apart makes a caller either **page on a correct configuration** or **accept a delivery that failed its only
+    control**. `ADR-0035`'s "a boolean standing for more than two situations is an enum", where the collapsed
+    states have **opposite operational readings**.
+  - **⭐⭐ AND THE ANSWER IS TWO PAIRS, ONLY ONE MEMBER OF EACH A REFUSAL.** `Verified`/`Absent` may be acted on;
+    `Mismatch`/`TokenRequired` may not. **`Absent` is not a refusal** — the token is optional (*"Only present if
+    defined"*), so a delivery without one for an un-tokened channel is the documented shape, and refusing it
+    would fail closed on a correct configuration. **`TokenRequired` ≠ `Mismatch`**: a wrong value versus no
+    value, and a diagnostic saying "mismatch" for a delivery carrying nothing sends an operator hunting a value
+    that was never sent.
+  - **⭐⭐ ⚠ A GUARD IN MY OWN FIRST DRAFT COULD DECIDE NOTHING, AND ITS TEST COULD NOT TELL.** The first version
+    checked `presented.chars().count() > MAX` and returned `Mismatch` before comparing — but
+    `SecretValue::matches` **already** refuses a different-length candidate immediately, so the guard changed
+    **no input's answer** while itself being an **unbounded `O(n)` walk of attacker input**: it added exactly the
+    cost it claimed to prevent. The test I wrote for it **passed under a mutation removing the guard**, which is
+    how the redundancy went unnoticed. **`ADR-0066`'s family in a new form: not a guard that can never *fire*,
+    but one that can never *decide*.** Fix: removed the guard; renamed the constant to `MAX_CHANNEL_TOKEN_BYTES`
+    and made its doc say **stated, not enforced, and why** (so a later reader does not add the guard back); and
+    rewrote the test to assert the **observable** property — an over-long candidate is a `Mismatch` *because its
+    length differs*, and a value **at** the documented maximum **verifies**, so the absence of a hidden ceiling
+    is demonstrable. **⭐ Before adding a check, ask which input it changes the answer for — if none, it is not a
+    check but a cost.**
+  - **⭐ THE COMPARISON IS EXACT AND CONSTANT-TIME, REUSING THE CRATE'S OWN ROUTINE.** `SecretValue::matches`
+    (`ADR-0055`, the OAuth `state`'s comparison) rather than `==`, because the stored token **is** a secret an
+    attacker learns one byte at a time, and a short-circuiting compare leaks its prefix. Five near-misses
+    pinned — prefix, superstring, case variant, trailing space, empty — each a rule a looser comparison would
+    accept; and a **different but well-formed** token is a `Mismatch`, so `Verified` is not a constant.
+  - **NEW LIMITS:** **nothing calls `verify_channel_token`** — no delivery endpoint and no channel store, so it is
+    a decision with tests rather than enforced behaviour. The `OidcIdToken` (Gmail Pub/Sub) verifier is **still
+    unbuilt** (no JWKS reader, no `aud`/`iss`/`exp` check), so Unresolved Question 9 is **half closed** (the
+    constant-time comparison) and half open (the JWT). `WebhookSupport` still declares `Polling` (cardinality).
+    And the verifier checks **only the token** — that a delivery names a resource this channel watches is a
+    separate control it does not perform.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

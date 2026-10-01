@@ -57,12 +57,15 @@
 //!
 //! **No notification has been received.** The header names, the three states, the zero-length body and the
 //! message rules are transcribed from the dated Calendar push guide in `docs/research/integrations/google.md`.
-//! And the `X-Goog-Channel-Token` is **surfaced, not verified**: comparing it against the value the connector
-//! stored is a *verifier*, and building one is `P5-010`'s work (`ADR-0099`). This module's job is to make the
-//! value readable, which is the precondition for any verifier at all.
+//! The `X-Goog-Channel-Token` is **verified as well as surfaced** ([`verify_channel_token`], `ADR-0101`): the
+//! connector stores the value it registered, [`verify_channel_token`] compares it in constant time, and the
+//! four situations an absent or mismatched token can produce are **named** rather than collapsed into a
+//! `bool`. What stays unverified is anything *live* — no channel has been registered and no notification
+//! received — so the comparison is proved against values this crate builds.
 
 use std::fmt;
 
+use crate::auth::SecretValue;
 use crate::webhook::WebhookDelivery;
 
 /// The header carrying the channel id the connector chose. Always present.
@@ -86,6 +89,16 @@ pub const RESOURCE_STATE_HEADER: &str = "x-goog-resource-state";
 
 /// The header carrying the message number. Always present.
 pub const MESSAGE_NUMBER_HEADER: &str = "x-goog-message-number";
+
+/// The maximum channel token **Google** accepts, in octets, stated rather than enforced.
+///
+/// The guide gives *"Maximum length: 256 characters"* for the `token` property a `watch` request carries, so a
+/// conforming provider never sends a longer value back. **Nothing in this crate needs to enforce it, which is
+/// why this is a stated fact and not a guard:** the verification below compares a candidate against the stored
+/// token, and that comparison already rejects a different-length candidate in constant time — so no input can
+/// reach a walk of an attacker-sized value. A check that rejected an over-long value "before the comparison"
+/// would be redundant *and* would itself be an unbounded walk, which is why there is none (`ADR-0101`).
+pub const MAX_CHANNEL_TOKEN_BYTES: usize = 256;
 
 /// What triggered a Calendar notification.
 ///
@@ -226,9 +239,11 @@ impl ChannelMessage {
 
     /// Returns the echoed channel token, when the delivery carried one.
     ///
-    /// **Surfaced rather than compared**, deliberately: comparing it against the stored value is a *verifier*,
-    /// and a verifier needs the value the connector registered, which this crate does not hold. Returning it
-    /// makes a verifier possible; it does not pretend one exists (`ADR-0099`).
+    /// **The reader, not the check.** This returns whatever the delivery carried, so it is deliberately *not* a
+    /// statement that the value is the one the connector registered — that comparison is [`verify_channel_token`],
+    /// which a caller must run before acting. This accessor exists so the verifier (and a test) can reach the
+    /// value without the field being public, and the value can still be presented for comparison without ever
+    /// being printed (`ADR-0091`).
     #[must_use]
     pub fn channel_token(&self) -> Option<&str> {
         self.channel_token.as_deref()
@@ -354,6 +369,116 @@ pub fn parse_channel_message(
         expiration,
         channel_token,
     })
+}
+
+/// What verifying a delivery's channel token concluded.
+///
+/// # Why four variants and not a `bool`, and why the pair is not two
+///
+/// A `bool` could answer "did it match", but the four situations differ in what they mean and what a caller
+/// should do — and, read as a `bool`, two of them (`Absent` and `Mismatch`) collapse into "false" even though
+/// one is a missing control and one is a failed comparison.
+///
+/// **The four are two pairs, and only one member of each pair is a refusal**, which is the distinction worth
+/// naming rather than a `bool`:
+///
+/// - [`Verified`](Self::Verified) — the delivery carried a token that matches the stored one.
+/// - [`Absent`](Self::Absent) — **not a refusal**: the connector registered the channel **without** a token, so
+///   the guide's *"Only present if defined"* applies and a delivery without one is the documented shape. There
+///   is simply no control to check.
+/// - [`Mismatch`](Self::Mismatch) — **a refusal**: the channel is watched with a token, and this delivery's
+///   token does not match it, which is what a forged or misrouted delivery looks like.
+/// - [`TokenRequired`](Self::TokenRequired) — **a refusal**: the channel is watched with a token and the
+///   delivery presented none, so it cannot prove it is for this channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelTokenCheck {
+    /// The delivery carried a token, and it matches the value the connector stored for the channel.
+    Verified,
+    /// The connector registered the channel with no token, so there is no control to check.
+    ///
+    /// **Not a refusal**, and reachable only because the guide makes the token optional: *"Only present if
+    /// defined"*. A delivery that carries no token for such a channel is the documented shape, not a failure.
+    Absent,
+    /// The channel is watched with a token, and this delivery's token does not match it.
+    Mismatch,
+    /// The channel is watched with a token, and the delivery presented none.
+    ///
+    /// Distinct from [`Self::Mismatch`] because the two describe different wire facts — a wrong value versus
+    /// no value — and from [`Self::Absent`] because a control **is** configured here. The remedy is the same
+    /// as a mismatch (refuse), which is why both are refusals, but a diagnostic that said "mismatch" for a
+    /// delivery carrying no token at all would send an operator to look for a wrong value that was never sent.
+    TokenRequired,
+}
+
+impl ChannelTokenCheck {
+    /// Returns whether the delivery may be acted on.
+    ///
+    /// True for [`Self::Verified`] and [`Self::Absent`] **only** — the two states in which the delivery did
+    /// not fail a control: one passed it, and the other had none to fail. Both refusals answer `false`.
+    #[must_use]
+    pub const fn may_be_acted_on(self) -> bool {
+        matches!(self, Self::Verified | Self::Absent)
+    }
+
+    /// Returns whether this is a refusal rather than an accepted delivery.
+    ///
+    /// The complement of [`Self::may_be_acted_on`], named because a caller wiring an alert needs the negative
+    /// reading: a [`Self::Mismatch`] or a [`Self::TokenRequired`] is either an attacker or a broken deployment
+    /// and deserves attention, while [`Self::Absent`] is a channel the operator chose not to protect and must
+    /// not page anyone — the distinction `WebhookRejection::indicates_an_authenticity_failure` draws.
+    #[must_use]
+    pub const fn is_rejection(self) -> bool {
+        !self.may_be_acted_on()
+    }
+}
+
+/// Verifies a delivery's echoed channel token against the value the connector stored for its channel.
+///
+/// # The comparison is constant-time, and it is the one control on this path
+///
+/// A Calendar delivery has a **zero-length body**, so there is no MAC to check — the same fact that made
+/// `ADR-0099` widen the webhook contract for a body-independent authenticator. The echoed token is therefore
+/// the **only** thing that distinguishes a delivery Google sent for a channel this connector created from one
+/// anyone who knows the endpoint could post. So the comparison must not short-circuit: a byte-at-a-time early
+/// return leaks the stored token's prefix, and the stored token *is* the secret. This uses
+/// [`SecretValue::matches`], the same constant-time routine the OAuth `state` is compared with (`P5-002`),
+/// rather than a `==` — one implementation, one place to audit.
+///
+/// # The bound is Google's, and it is not enforced here on purpose
+///
+/// The guide documents a maximum channel-token length ([`MAX_CHANNEL_TOKEN_BYTES`]), but this function does
+/// **not** check it — because the comparison below already refuses any candidate of a different length, in
+/// constant time, before walking it. A separate "is the candidate too long" guard would be **redundant** and
+/// would itself scan the attacker-supplied value, so it would add work without adding a refusal. This is the
+/// `ADR-0066` rule the other way round: not a guard that can never fire, but a guard that can never *decide*
+/// anything the comparison has not already decided.
+///
+/// # What this does not check
+///
+/// **Nothing about the resource.** That a delivery names a resource this channel watches — and not merely a
+/// channel this connector registered — is a separate control (`security.md`'s "wrong endpoint" row), and this
+/// function answers only the token question. [`ChannelTokenCheck::Absent`] says *no control was present*, not
+/// *the resource was verified*.
+#[must_use]
+pub fn verify_channel_token(
+    stored: Option<&SecretValue>,
+    delivery: &ChannelMessage,
+) -> ChannelTokenCheck {
+    match stored {
+        // No token was registered for the channel, so there is nothing to compare. The guide makes the token
+        // optional, so this is the documented case rather than a failure to authenticate.
+        None => ChannelTokenCheck::Absent,
+        Some(expected) => match delivery.channel_token() {
+            // A token was registered but the delivery carried none: it cannot prove it is for this channel, so
+            // it is refused rather than read as "no control". This is the arm a `bool` would have hidden.
+            None => ChannelTokenCheck::TokenRequired,
+            // `matches` is constant-time with respect to content and refuses a different-length candidate
+            // immediately, so an over-long delivery is a `Mismatch` without a walk of the candidate. See the
+            // doc above for why there is no separate bound check.
+            Some(presented) if expected.matches(presented) => ChannelTokenCheck::Verified,
+            Some(_) => ChannelTokenCheck::Mismatch,
+        },
+    }
 }
 
 #[cfg(test)]

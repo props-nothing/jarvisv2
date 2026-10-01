@@ -293,3 +293,140 @@ fn the_channel_token_header_is_the_one_the_echoed_authenticator_names() {
     );
     assert!(scheme.authenticates());
 }
+
+/// A registered channel token, as the connector would hold it.
+fn stored(value: &str) -> crate::auth::SecretValue {
+    must(
+        crate::auth::SecretValue::new(value),
+        "a valid registered channel token",
+    )
+}
+
+/// A parsed message whose delivery carries the given channel token (or none).
+fn message_with_token(token: Option<&str>) -> ChannelMessage {
+    let mut headers = change_headers();
+    if let Some(token) = token {
+        headers.push((CHANNEL_TOKEN_HEADER, token.as_bytes()));
+    }
+    must(
+        parse_channel_message(&delivery(&headers, &[])),
+        "a message with the given token parses",
+    )
+}
+
+#[test]
+fn a_registered_token_verifies_only_against_the_exact_echoed_value() {
+    // The positive case and the security-relevant one: a token that matches verifies, and any *other* value is
+    // a mismatch -- not merely "not verified", because a mismatch is a forged or misrouted delivery.
+    let expected = stored("target=myApp-myChannelDest");
+    let exact = message_with_token(Some("target=myApp-myChannelDest"));
+    assert_eq!(
+        verify_channel_token(Some(&expected), &exact),
+        ChannelTokenCheck::Verified
+    );
+    // Five near-misses, each one a rule a looser comparison would accept. The token is a shared secret, so the
+    // comparison is exact: a prefix, a superstring, a case difference, a trailing space, and an empty value are
+    // all mismatches.
+    for near_miss in [
+        "target=myApp-myChannelDes",   // prefix
+        "target=myApp-myChannelDestX", // superstring
+        "TARGET=MYAPp-mychanneldest",  // case differs
+        "target=myApp-myChannelDest ", // trailing space
+        "",                            // empty
+    ] {
+        assert_eq!(
+            verify_channel_token(Some(&expected), &message_with_token(Some(near_miss))),
+            ChannelTokenCheck::Mismatch,
+            "`{near_miss}` must not verify against a different stored token"
+        );
+    }
+    // And a **different but well-formed** token is a mismatch, so `Verified` is not a constant.
+    let other = stored("target=myApp-otherChannel");
+    assert_eq!(
+        verify_channel_token(Some(&other), &exact),
+        ChannelTokenCheck::Mismatch,
+        "the same delivery must not verify against a different channel's token"
+    );
+}
+
+#[test]
+fn a_missing_token_is_required_or_absent_depending_on_what_was_registered() {
+    // **The pair that a `bool` would collapse.** A delivery with no token is the documented shape when the
+    // channel was registered without one (`Absent`, and it may be acted on), and a refusal when one was
+    // registered (`TokenRequired`). Same delivery, opposite answers -- so the stored value is what decides, and
+    // neither state is reachable from the other.
+    let without = message_with_token(None);
+    assert_eq!(
+        verify_channel_token(None, &without),
+        ChannelTokenCheck::Absent,
+        "no stored token means there is no control to check"
+    );
+    assert!(
+        ChannelTokenCheck::Absent.may_be_acted_on(),
+        "an absent control is not a failed one"
+    );
+    let expected = stored("target=myApp-myChannelDest");
+    assert_eq!(
+        verify_channel_token(Some(&expected), &without),
+        ChannelTokenCheck::TokenRequired,
+        "a registered token with no presented one cannot prove the channel"
+    );
+    assert!(
+        !ChannelTokenCheck::TokenRequired.may_be_acted_on(),
+        "a missing token against a registered one is a refusal"
+    );
+    // **`Absent` and `TokenRequired` are distinguishable**, which is the reason this is an enum: read as a
+    // `bool` both would be "no token", and an operator would not know whether a control was configured.
+    assert_ne!(ChannelTokenCheck::Absent, ChannelTokenCheck::TokenRequired);
+}
+
+#[test]
+fn only_the_two_refusal_states_are_rejections_and_the_pair_reads_the_same_both_ways() {
+    // The mapping a caller wires to an alert: the two refusals are rejections, the two non-refusals are not,
+    // and `is_rejection` is exactly the complement of `may_be_acted_on`. Asserted over **every** variant, so a
+    // future variant that forgot one accessor fails here rather than defaulting to "accepted".
+    let table = [
+        (ChannelTokenCheck::Verified, true),
+        (ChannelTokenCheck::Absent, true),
+        (ChannelTokenCheck::Mismatch, false),
+        (ChannelTokenCheck::TokenRequired, false),
+    ];
+    for (check, may_be_acted_on) in table {
+        assert_eq!(check.may_be_acted_on(), may_be_acted_on, "{check:?}");
+        assert_eq!(
+            check.is_rejection(),
+            !may_be_acted_on,
+            "{check:?} must be the exact complement"
+        );
+    }
+    // **An `Absent` must NOT page anyone.** A channel the operator registered without a token is a deliberate
+    // choice, not an attack -- the same "a replay must not page" rule `WebhookRejection` draws -- so treating
+    // every non-`Verified` answer as suspicious would alert on a documented configuration.
+    assert!(!ChannelTokenCheck::Absent.is_rejection());
+}
+
+#[test]
+fn a_candidate_of_a_different_length_is_refused_without_a_bound_check() {
+    // The comparison is constant-time with respect to **content** and refuses a different-length candidate
+    // immediately, so there is deliberately **no separate bound check** (`ADR-0101`): a guard that rejected an
+    // over-long candidate "before the comparison" would itself walk the attacker-supplied value and decide
+    // nothing the comparison has not already decided. What this proves is the observable behaviour that makes
+    // such a guard unnecessary — an oversized candidate is a mismatch, and the check is not what refuses it.
+    let at_bound = "y".repeat(MAX_CHANNEL_TOKEN_BYTES);
+    let expected = stored(&at_bound);
+    // A candidate ONE byte longer than the bound, sharing the stored token as a prefix: refused as a mismatch.
+    let over = format!("{at_bound}y");
+    assert_eq!(
+        verify_channel_token(Some(&expected), &message_with_token(Some(&over))),
+        ChannelTokenCheck::Mismatch,
+        "a longer candidate cannot verify, because its length differs from the stored token's"
+    );
+    // The control, and the assertion that shows there is no hidden bound: the token exactly at the bound, with
+    // identical content, **verifies** — so the refusal above is the length, not a 256-character ceiling.
+    assert_eq!(
+        verify_channel_token(Some(&expected), &message_with_token(Some(&at_bound))),
+        ChannelTokenCheck::Verified,
+        "a value at the documented maximum is accepted, so nothing enforces the maximum as a guard"
+    );
+    assert_eq!(MAX_CHANNEL_TOKEN_BYTES, 256, "the guide's stated maximum");
+}
