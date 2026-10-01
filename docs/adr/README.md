@@ -128,3 +128,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0108](0108-a-rule-stated-in-another-fields-description.md) | A rule stated in another field's description, and a cursor the schema told a model to store | Accepted |
 | [0109](0109-a-constraint-three-layers-knew-and-the-test-contradicted.md) | A constraint three layers knew and the test contradicted, and a guard whose only detector was in another binary | Accepted |
 | [0110](0110-a-first-sync-with-two-documented-branches.md) | A first sync with two documented branches and one expressible, and an anchor with a reader and no consumer | Accepted |
+| [0111](0111-a-bound-and-a-lease-are-different-inputs.md) | A bound and a lease are different inputs, so the exposure that took one could not report the state the other reaches | Accepted |

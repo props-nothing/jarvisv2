@@ -31,7 +31,7 @@
 //! set of resources)"` and that `"there's only one `stop` method"` — so an account watching three calendars
 //! needs **three** calls, and `channels.stop` has no per-user form at all. Hence two variants: a caller that
 //! performed one stop and reported "notifications stopped" would be wrong for whichever mechanism it skipped,
-//! and the two mechanisms' leases are not even the same length (see [`notification_exposure`]).
+//! and the two mechanisms' leases are not even the same length (see [`NotificationExposure`]).
 //!
 //! # Why that ordering mistake costs more than a failed call
 //!
@@ -70,9 +70,15 @@
 //! The **count** of channels is also a caller's fact rather than this module's: a plan says which effects to
 //! perform, not how many times, so a caller with three channels performs [`TeardownStep::StopCalendarChannel`]
 //! three times and no plan is needed per channel.
+//!
+//! **The exposure figures are now lease-aware for both mechanisms** — [`gmail_watch_exposure`] reports a Gmail
+//! watch's *own* remaining lease and [`NotificationExposure::AlreadyEnded`] from its `expiration`, where
+//! [`gmail_exposure`] stays the answer for a caller holding only the mechanism's stated bound. What is still
+//! absent is the **wiring**: nothing computes the [`WatchLapse`] and nothing calls either exposure function,
+//! because there is no caller to hand them a lease.
 
 use crate::google::channel::ChannelLease;
-use crate::google::watch::WATCH_RENEWAL_BOUND_SECONDS;
+use crate::google::watch::{WATCH_RENEWAL_BOUND_SECONDS, WatchLapse};
 
 /// One half of an account teardown.
 ///
@@ -259,14 +265,15 @@ pub const TEARDOWN_PLAN: [PlannedStep; 3] = [
 ///
 /// # Why the mechanism is not a parameter here
 ///
-/// Gmail's exposure and a Calendar channel's are computed by **[
-/// `gmail_exposure`]** and **[
-/// `calendar_exposure`]** rather than by one function taking a mechanism flag, because the two need *different
-/// inputs* — a stated constant versus a lease. A flag would have to be paired with an `Option` lease that is
-/// meaningless in one branch, which is the shape that lets a caller pass a Calendar lease to a Gmail figure. A
-/// `PushMechanism` enum was drafted for this and **removed**, because its only use would have been an equality
-/// assertion in its own test: naming the mechanism is what the *function choice* already does, and a value
-/// nothing consumes is the defect `ADR-0092` records.
+/// The exposure is computed by **[
+/// `gmail_exposure`]** (the mechanism's stated bound), **[
+/// `gmail_watch_exposure`]** (a Gmail watch's own lease) and **[
+/// `calendar_exposure`]** (a channel's lease) rather than by one function taking a mechanism flag, because the
+/// mechanisms need *different inputs* and offer *different documents*. A flag would have to be paired with an
+/// `Option` lease that is meaningless in one branch, which is the shape that lets a caller pass a Calendar lease
+/// to a Gmail figure. A `PushMechanism` enum was drafted for this and **removed**, because its only use would
+/// have been an equality assertion in its own test: naming the mechanism is what the *function choice* already
+/// does, and a value nothing consumes is the defect `ADR-0092` records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotificationExposure {
     /// The stop was accepted. The provider says new notifications stop within a few minutes, and states no
@@ -282,25 +289,33 @@ pub enum NotificationExposure {
     },
     /// The lease had **already** ended, so a stop that failed costs nothing: there is nothing left to silence.
     ///
-    /// Reachable only for [`PushMechanism::CalendarChannel`], because a Calendar channel's expiry is known from
-    /// its own `watch` response and can therefore be compared to a clock before the teardown runs. Gmail's
-    /// exposure cannot reach this state, and the reason is a real asymmetry rather than an omission: the mailbox
-    /// watch's expiry is read from a `watch` response too, but this function is given the **documented bound**
-    /// rather than a lease, so it has no instant to compare — see the note on [`gmail_exposure`].
+    /// Reachable from **both** mechanisms, but only when the lease *instant* is known.
+    /// [`calendar_exposure`] always has one — a channel has no stated bound, only its own expiry — while Gmail
+    /// reaches it through [`gmail_watch_exposure`] and never through the bound-only [`gmail_exposure`]. The
+    /// distinction is not cosmetic: a caller that holds the watch's `expiration` and is given the bound instead
+    /// is told a clean teardown leaves an open window, which is an overstatement of a teardown with nothing
+    /// left to silence.
     AlreadyEnded {
         /// How long ago the lease ended, in seconds. At least zero.
         ended_seconds_ago: i64,
     },
 }
 
-/// Returns what a teardown of a **Gmail** mailbox watch leaves exposed for notifications.
+/// Returns what a teardown of a **Gmail** mailbox watch leaves exposed, **from the bound alone**.
 ///
-/// Takes the documented bound rather than a lease, and that is a recorded limit rather than a design choice:
-/// a caller *does* hold the watch's `expiration` (`crate::google::watch::parse_watch_response`), so a lease-aware
-/// form could report [`NotificationExposure::AlreadyEnded`] for Gmail too. It is not built because nothing
-/// calls this yet and because the two mechanisms' figures come from different documents — so the Calendar form
-/// is written where the lease is unavoidable (a channel has **no** stated bound, only its own expiry) and this
-/// one keeps the provider's stated constant.
+/// # What this can and cannot answer
+///
+/// Google publishes a bound for the mailbox-watch mechanism — *"You must call the `watch` method at least once
+/// every 7 days"* ([`WATCH_RENEWAL_BOUND_SECONDS`]) — and a caller that has **only** that bound can still
+/// answer the question this function answers: after an unstopped teardown, notifications can keep arriving for
+/// **up to** the bound. So this is the honest figure for a caller holding the mechanism's stated limit rather
+/// than a particular watch.
+///
+/// It **cannot** report [`NotificationExposure::AlreadyEnded`], and that is a fact about its input rather than
+/// an omission: a *bound* is how long a watch may live, not when **this** watch dies, so there is no instant to
+/// compare against a clock. A caller that holds the watch's own `expiration` — which
+/// `crate::google::watch::parse_watch_response` reads — should use [`gmail_watch_exposure`] instead, because
+/// reporting the bound in that case **overstates** a teardown whose lease had already ended.
 #[must_use]
 pub const fn gmail_exposure(stop_succeeded: bool) -> NotificationExposure {
     if stop_succeeded {
@@ -309,6 +324,47 @@ pub const fn gmail_exposure(stop_succeeded: bool) -> NotificationExposure {
         NotificationExposure::UntilTheLeaseLapses {
             seconds: WATCH_RENEWAL_BOUND_SECONDS,
         }
+    }
+}
+
+/// Returns what a teardown of a **Gmail** mailbox watch leaves exposed, given **the watch's own lease**.
+///
+/// # Why this is a second function rather than a third argument to [`gmail_exposure`]
+///
+/// `ADR-0107` recorded this as a **wiring gap rather than a missing fact**: the caller *does* hold the watch's
+/// `expiration` (`crate::google::watch::parse_watch_response`), so Gmail could report
+/// [`NotificationExposure::AlreadyEnded`] exactly as [`calendar_exposure`] does — but [`gmail_exposure`] takes
+/// the mechanism's bound and therefore has no instant to compare. Closing that gap means taking a lease, and a
+/// lease is a different *input*, not a different *policy*: folding it into `gmail_exposure` as an
+/// `Option<WatchLapse>` would give every existing caller a second argument to pass `None` and would make the
+/// bound and the lease two shapes of one call, which is the flag-with-a-meaningless-`Option` shape
+/// [`NotificationExposure`]'s own doc rejects for the mechanism itself.
+///
+/// **The two are not interchangeable and both stay.** [`gmail_exposure`] is the answer for a caller with the
+/// mechanism's limit (a schedule that must renew *before* any watch lapses); this one is the answer for a
+/// caller disconnecting an account whose lease it just read. Naming which input is held is the same choice
+/// [`calendar_exposure`] makes by taking a [`ChannelLease`] where a Gmail caller would otherwise reach for a
+/// constant.
+///
+/// # A lapsed lease outranks a successful stop, for the reason [`calendar_exposure`] records
+///
+/// The answer then does not depend on the call at all: nothing can arrive from a watch whose lease has ended,
+/// whether or not a stop was attempted. That property comes from the match being on the lease variant — the
+/// variants are mutually exclusive, so no arm order decides anything — while the **`stop_succeeded` guard on
+/// the live arm** is what actually changes an answer, and is the one a test can falsify.
+#[must_use]
+pub fn gmail_watch_exposure(lease: WatchLapse, stop_succeeded: bool) -> NotificationExposure {
+    match lease {
+        WatchLapse::Lapsed { for_seconds } => NotificationExposure::AlreadyEnded {
+            ended_seconds_ago: for_seconds,
+        },
+        WatchLapse::Alive { .. } if stop_succeeded => NotificationExposure::SettlingWithinMinutes,
+        // The **live** lease's remaining seconds, not [`WATCH_RENEWAL_BOUND_SECONDS`]: the watch's own expiry
+        // is the narrower and therefore the honest figure (the reference warns the actual expiry "may return
+        // shorter than requested"). Falling back to the bound here would overstate a nearly-expired watch.
+        WatchLapse::Alive { for_seconds } => NotificationExposure::UntilTheLeaseLapses {
+            seconds: for_seconds,
+        },
     }
 }
 

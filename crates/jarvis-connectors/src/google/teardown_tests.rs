@@ -250,6 +250,68 @@ fn a_calendar_channels_exposure_is_its_own_lease_and_an_ended_channel_exposes_no
 }
 
 #[test]
+fn a_gmail_watch_expiry_outranks_a_stop_and_reports_its_own_lease() {
+    // **The wiring gap `ADR-0107` recorded, closed.** That ADR noted the caller **does** hold the watch's
+    // `expiration`, so Gmail could report `AlreadyEnded` just as a Calendar channel does — but `gmail_exposure`
+    // takes the mechanism's *bound* rather than a lease and therefore has no instant to compare. A caller
+    // holding the real lease must not be told the bound: after a watch has already lapsed, a teardown reported
+    // as leaving "up to seven days" of exposure overstates one with nothing left to silence.
+    let alive = |for_seconds| WatchLapse::Alive { for_seconds };
+    let lapsed = |for_seconds| WatchLapse::Lapsed { for_seconds };
+
+    // A live watch that was not stopped exposes **its own** remaining lease, not the seven-day mechanism bound:
+    // the watch's expiry is the narrower and therefore the honest figure (the reference warns it "may return
+    // shorter than requested").
+    assert_eq!(
+        gmail_watch_exposure(alive(120_000), false),
+        NotificationExposure::UntilTheLeaseLapses { seconds: 120_000 }
+    );
+    // And the figure is genuinely the lease's rather than the constant, so a caller cannot have been handed the
+    // bound by accident.
+    assert_ne!(
+        gmail_watch_exposure(alive(120_000), false),
+        gmail_exposure(false),
+        "a caller holding the lease must not be given the mechanism's bound"
+    );
+
+    // The state Gmail could not reach before, and the one that matters for a clean disconnect.
+    assert_eq!(
+        gmail_watch_exposure(lapsed(300), false),
+        NotificationExposure::AlreadyEnded {
+            ended_seconds_ago: 300
+        }
+    );
+    // A lapsed lease outranks a successful stop: the answer no longer depends on the call at all, which is the
+    // property `calendar_exposure` records and this function must share.
+    assert_eq!(
+        gmail_watch_exposure(lapsed(300), true),
+        gmail_watch_exposure(lapsed(300), false)
+    );
+
+    // The falsifiable guard is the `stop_succeeded` on the live arm — removing it makes a live, unstopped watch
+    // report `SettlingWithinMinutes`, which this detects. Reordering the arms would change nothing, because
+    // `Lapsed` and `Alive` are disjoint variants (the lesson `ADR-0107` records for the Calendar counterpart).
+    assert_ne!(
+        gmail_watch_exposure(alive(1), false),
+        NotificationExposure::SettlingWithinMinutes,
+        "a live watch that was never stopped must not be reported as settling: the stop is what shortens it"
+    );
+    assert_eq!(
+        gmail_watch_exposure(alive(1), true),
+        NotificationExposure::SettlingWithinMinutes
+    );
+
+    // The bound-only function keeps its answer for a caller that has only the limit, so both entry points stay
+    // reachable and neither becomes dead code.
+    assert_eq!(
+        gmail_exposure(false),
+        NotificationExposure::UntilTheLeaseLapses {
+            seconds: WATCH_RENEWAL_BOUND_SECONDS
+        }
+    );
+}
+
+#[test]
 fn every_step_has_a_distinct_name_for_a_plan_a_log_and_a_test() {
     // A stable name per step, so a recorded plan is legible and a test names what it asserts. Asserted distinct
     // because two steps sharing a name would make a plan ambiguous in a log — the same reason `SyncCursorKind`

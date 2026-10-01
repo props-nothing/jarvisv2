@@ -817,6 +817,66 @@ fn a_calendar_pages_continuation_decides_the_signal_and_only_a_completed_walk_ad
 }
 
 #[test]
+fn a_calendar_continuations_accessors_agree_and_the_two_tokens_are_never_both_readable() {
+    // **The sibling test that `HistoryPosition` has and `CalendarContinuation` lacked.** `ADR-0109` recorded an
+    // asymmetry: the Gmail producer's accessor-agreement was covered and the Calendar one was not, so a mutant
+    // routing a page token through as the sync position survived the whole `--lib` suite. This closes the other
+    // half — `storable` and `page_token` cannot both yield a token, and each matches its own variant.
+    let continuations = [
+        CalendarContinuation::MorePages {
+            page_token: "P".to_owned(),
+        },
+        CalendarContinuation::WalkComplete {
+            sync_token: "S".to_owned(),
+        },
+        CalendarContinuation::NothingFurther,
+        CalendarContinuation::Rejected {
+            page_token: "P".to_owned(),
+            sync_token: "S".to_owned(),
+        },
+    ];
+    for continuation in &continuations {
+        // The two accessors are disjoint: the provider allows **at most one** token, so no value can offer both
+        // a page to fetch and a position to store. This is the invariant a single `Option<&str>` accessor could
+        // not express, and the one a caller relies on when it decides which to use.
+        assert!(
+            !(continuation.storable().is_some() && continuation.page_token().is_some()),
+            "a page cannot be both continued and complete: {continuation:?}"
+        );
+    }
+    // Each accessor names its own variant, so a position is reachable only from a completed walk and a page
+    // token only from a continuing one — the same shape as `HistoryPosition::storable`.
+    assert_eq!(
+        CalendarContinuation::of_page(Some("P".to_owned()), Some("S".to_owned())).storable(),
+        None,
+        "a nonconforming page must yield neither a position nor a next page: there is no way to tell which \
+         token the provider meant"
+    );
+    assert_eq!(
+        CalendarContinuation::of_page(Some("P".to_owned()), Some("S".to_owned())).page_token(),
+        None
+    );
+    // And the state is actionable rather than merely representable, which is what makes it reportable.
+    assert!(
+        CalendarContinuation::of_page(Some("P".to_owned()), Some("S".to_owned()))
+            .is_nonconforming()
+    );
+    for conforming in &continuations[..3] {
+        assert!(!conforming.is_nonconforming());
+    }
+    // The accessor answers agree with the variant match in every case, so neither is a second opinion.
+    assert_eq!(
+        CalendarContinuation::of_page(None, Some("S".to_owned()))
+            .storable()
+            .is_some(),
+        matches!(
+            CalendarContinuation::of_page(None, Some("S".to_owned())),
+            CalendarContinuation::WalkComplete { .. }
+        )
+    );
+}
+
+#[test]
 fn a_calendar_410_requires_a_resync_and_a_400_does_not() {
     // Google's sync guide: a 410 "should trigger a full wipe of the client's store and a new full sync", while
     // 400 is a disallowed query restriction — the caller's mistake. Conflating them would discard a whole

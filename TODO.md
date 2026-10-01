@@ -5503,6 +5503,56 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     now may have been pruned, which arrives as the documented `404`/resync path rather than as a local refusal.
     And **nothing records which branch a deployment chose**: a caller picks per call, so a connector that used
     branch two for every account would still pay the cost the branch exists to avoid.
+- [ ] `P5-005` **(continued — a bound and a lease are different inputs)**: `google::teardown` gains
+  `gmail_watch_exposure(lease: WatchLapse, stop_succeeded)` beside the unchanged `gmail_exposure(stop_succeeded)`;
+  the `AlreadyEnded` variant doc, the module doc and a stale `notification_exposure` reference are corrected.
+  **2 new tests (so 482 in the crate; 1755 in the workspace).** **`ADR-0111`.** Two guards falsified A-B-A.
+  Closes the wiring gap `ADR-0107` recorded as its own revisit condition.
+  - **⭐⭐ THE FINDING: A BOUND AND A LEASE ARE DIFFERENT *INPUTS*, NOT TWO ENCODINGS OF ONE.** `ADR-0107` built
+    `gmail_exposure` from Google's **mechanism bound** — *"at least once every 7 days"* — and
+    `calendar_exposure` from a channel's **own lease**, then recorded that Gmail's figure was one-sided: the
+    caller **does** hold the watch's `expiration` (`parse_watch_response` reads it; `watch_lapse` turns it into
+    `WatchLapse`), so `AlreadyEnded` *could* be reachable but was not. **⭐ "We hold the value" ≠ "the value the
+    function takes"** — the same shape `ADR-0106` records for one expiry in three encodings, where the form the
+    code held was the unusable one.
+  - **⭐⭐ A SECOND FUNCTION, NOT AN `Option` PARAMETER.** `gmail_exposure(Option<WatchLapse>, bool)` would give
+    every existing call site a `None` to pass and would make the mechanism's limit and this watch's expiry two
+    spellings of one call — the flag-with-a-meaningless-`Option` shape `NotificationExposure`'s own doc already
+    rejects for the mechanism itself. **⭐ `ADR-0107` removed a `PushMechanism` enum because a value that only
+    distinguishes two mechanisms is a consumerless value; the same argument applies to the INPUT, so the
+    function choice names which input is held.**
+  - **⭐ THE BOUND-ONLY FIGURE IS KEPT, NOT REPLACED.** A scheduler deciding when to renew holds the mechanism's
+    limit and **no** particular watch — that is the caller `WATCH_RENEWAL_BOUND_SECONDS` exists for. Two inputs,
+    two functions, both asserted reachable, so neither becomes dead code.
+  - **⭐ THE LIVE ARM REPORTS THE LEASE'S OWN SECONDS, NOT THE BOUND.** The reference warns a watch's actual
+    expiry *"may return shorter than requested"*, so falling back to the bound for a live lease overstates a
+    nearly-expired watch in the exact direction the bound-only figure was already wrong. A falsification
+    replaces `for_seconds` with `WATCH_RENEWAL_BOUND_SECONDS` and the test detects it.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A**, both compiling: (1) inverting the `stop_succeeded` guard → detected
+    (`left: SettlingWithinMinutes`, `right: UntilTheLeaseLapses { seconds: 120000 }`); (2) the live arm's
+    `for_seconds` → `WATCH_RENEWAL_BOUND_SECONDS` → detected (`left: … { seconds: 604800 }`, `right: … {
+    seconds: 120000 }`). A third mutation — reordering the arms — changes nothing, because `Lapsed` and `Alive`
+    are disjoint variants: `ADR-0107`'s lesson applied rather than re-learned.
+  - **⭐⭐ A SIBLING TEST ASYMMETRY WAS CLOSED, AND THE SAME MUTANT IS NOW CAUGHT IN `--lib`.** `ADR-0109` found
+    that `calendar_signal`'s 200 arm had no unit test while Gmail's did, so a mutant routing a **page token
+    through as the sync position** survived the whole `--lib` suite. `CalendarContinuation::storable` and
+    `page_token` were still exercised only *through* `calendar_signal`; a test now asserts directly that the two
+    accessors are **disjoint** (no value offers both a page to fetch and a position to store) and that `Rejected`
+    yields neither. Making `storable` return the page token is now **detected by `--lib`**, confirmed by
+    mutation.
+  - **⭐⭐ TWO DEFECTS WERE FOUND IN THE RECORD ITSELF WHILE APPENDING TO IT.** (1) A **dangling intra-doc link
+    to the `PushMechanism` enum that `ADR-0107` removed** — in the doc paragraph that *says* the enum was
+    removed; `cargo doc` warnings are not denied, so nothing compiled it. (2) **The findings were numbered
+    `…20, 22, 23`** — `ADR-0108`'s commit renamed the then-existing Finding 21 to 23 and inserted a new Finding
+    22, leaving **no Finding 21**, and two subsequent slices appended without noticing. **⭐ A gap in a numbered
+    series reads as a DELETED finding**, and a duplicate/omission of that shape is only visible while appending —
+    which is what found it. Renumbered to contiguous `21`/`22`; nothing outside the record cites a Finding by
+    number, which is what made the renumber safe.
+  - **NEW LIMITS:** no teardown executor, so nothing computes the `WatchLapse` and calls either exposure
+    function; `users.stop` still deliberately absent; **the stop permission rule still cannot be checked
+    locally** (the client id lives inside the credential). A convenience that reads a `WatchResponse`'s
+    `expiration` into a `WatchLapse` is **not** built, because it would be a second reader of a value with one
+    caller — the consumerless-value defect the same slice's own argument invokes.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
