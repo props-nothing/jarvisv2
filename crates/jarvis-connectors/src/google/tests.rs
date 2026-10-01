@@ -114,23 +114,45 @@ fn the_webhook_declaration_does_not_invent_a_polling_interval() {
             assert!(!interval.is_documented(), "nothing documents one");
         }
         other => {
-            panic!("Google must declare polling, because neither push mechanism fits: {other:?}")
+            panic!(
+                "Google declares polling: one connector holds one webhook value while Google has two push \
+                 mechanisms, and neither verifier is built. Got {other:?}"
+            )
         }
     }
 }
 
 #[test]
-fn a_push_declaration_is_not_used_because_neither_google_mechanism_fits() {
-    // The finding this slice's predecessor recorded, restated as a test so a later reader cannot "improve"
-    // the manifest by switching to `Push`. `WebhookSupport::Push` carries a `SignatureScheme`, whose
-    // algorithms are keyed MACs or an Ed25519 signature over the **body**. Gmail's Pub/Sub delivery is an
-    // OIDC bearer JWT with an unsigned body, and a Calendar channel delivery has a **zero-length** body.
-    // Neither is expressible, and `SignatureAlgorithm` has no OIDC variant — so claiming `Push` would mean
-    // naming an algorithm that does not describe how the delivery is authenticated.
+fn a_push_declaration_is_not_used_even_though_both_google_mechanisms_are_now_expressible() {
+    // This test's predecessor asserted that Google could not declare `Push` because `SignatureAlgorithm` had no
+    // variant for an OIDC bearer JWT or an echoed channel token. That was true, and it is **no longer** — the
+    // contract now names both (`ADR-0099`). So the test is corrected rather than left to pass on a stale
+    // premise: it now proves the mechanisms ARE expressible (so expressibility is not the reason) and only
+    // then asserts the manifest still declares `Polling`, whose real reason is that one connector holds one
+    // `WebhookSupport` value while Google has two push mechanisms, and that neither verifier is built.
+    use crate::webhook::{SignatureAlgorithm, SignatureEncoding, SignatureScheme};
+    let gmail = SignatureScheme::new(
+        SignatureAlgorithm::OidcIdToken,
+        "authorization",
+        // A header-token authenticator presents an opaque value, so its encoding is `raw` — a non-raw encoding
+        // is refused, which is the rule this construction also exercises.
+        SignatureEncoding::Raw,
+    );
+    let calendar = SignatureScheme::new(
+        SignatureAlgorithm::EchoedChannelToken,
+        "x-goog-channel-token",
+        SignatureEncoding::Raw,
+    );
+    assert!(
+        gmail.is_ok() && calendar.is_ok(),
+        "both Google push mechanisms must now be expressible: {gmail:?} / {calendar:?}"
+    );
+    // And the manifest still does not claim push, for the reasons the module doc gives (cardinality and an
+    // absent verifier) rather than for the expressibility reason that no longer holds.
     let manifest = manifest();
     assert!(
         !matches!(manifest.webhook(), WebhookSupport::Push { .. }),
-        "neither Google push mechanism can be expressed as a body signature"
+        "the connector declares polling until one mechanism can be named, bound, and verified"
     );
 }
 

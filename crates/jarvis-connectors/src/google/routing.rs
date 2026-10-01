@@ -11,12 +11,15 @@
 //!
 //! # The trust that bounds it, and why the address selects rather than authorises
 //!
-//! **The delivery is not authenticated, and this record says so.** `P5-004`'s Finding 1 establishes that
-//! neither Google mechanism fits [`crate::manifest::WebhookSupport::Push`]: Gmail's push is an **OIDC bearer
-//! JWT** rather than an HMAC over the body, and Calendar's is an **echoed channel token over a zero-length
-//! body** — while `SignatureScheme` is HMAC-family only. So the connector currently has **no way to verify that
-//! a delivery came from Google at all**, and that is recorded as an unresolved question rather than papered
-//! over.
+//! **The delivery is not authenticated *by this crate*, and this record says so.** `P5-004`'s Finding 1
+//! establishes that neither Google mechanism is a MAC over the body: Gmail's push is an **OIDC bearer JWT**
+//! and Calendar's is an **echoed channel token** over a zero-length body. The webhook contract can now **name**
+//! both ([`crate::webhook::SignatureAlgorithm::OidcIdToken`] and
+//! [`crate::webhook::SignatureAlgorithm::EchoedChannelToken`]), which was the contract gap Finding 1 recorded —
+//! but naming an authenticator is not verifying one, and **no verifier is built**: there is no JWKS reader for
+//! the JWT and no stored channel token to compare against. So a delivery reaching this function has not been
+//! authenticated, and that is why the rules below are shaped the way they are rather than because the type
+//! could not describe the scheme.
 //!
 //! **A consequence that must not be skipped: the address in the payload is untrusted input.** It is a string a
 //! caller of the endpoint supplies, so a routing decision that treated it as authority would let a forged

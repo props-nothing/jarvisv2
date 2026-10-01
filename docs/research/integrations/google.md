@@ -384,7 +384,29 @@ Consequences to record honestly:
    channel-token check needs only a constant-time comparison, but it authenticates *the channel* rather than
    the *body*, so it belongs to a different threat model than the one `WebhookRejection` encodes.
 
-**This is recorded as blocking for the push half of `P5-005`** (Unresolved Question 1), not resolved here.
+**RESOLVED 2026-10-01 (`ADR-0099`), and the resolution splits the finding in two.** The page was re-read the
+same day, so the facts above are unchanged; what changed is the contract. The gap's own name was the clue: it
+asked for "a webhook authenticated by an OIDC bearer JWT or an echoed channel token", and **neither mechanism
+covers the body while both still authenticate a delivery.** `SignatureAlgorithm` had one axis — which MAC over
+the body — and used it to answer a different question, "what authenticates this delivery", for which it is the
+wrong axis. `OidcIdToken` and `EchoedChannelToken` are now variants, and `covers_the_body` names the property
+that was being asked for all along.
+
+- **Consequence 1 is closed.** Both schemes are constructible, so a push endpoint authenticated by either can
+  now be *declared*. `ADR-0057`'s rule is what made the missing variants the right fix rather than a widened
+  `None`.
+- **Consequence 3 is partly answered and partly still open.** Naming an authenticator is not verifying one, so
+  the JWKS/certificate-rotation work and the channel-token comparison are **still unbuilt** — they move from
+  "blocked on an inexpressible declaration" to `P5-010`'s "webhook signature/replay tests", which is exactly
+  the item this finding was said to block.
+- **Consequence 2 stands, and for a corrected reason.** One connector holds **one** `WebhookSupport` value and
+  Google has **two** push mechanisms with different headers *and* different bindings, so declaring one would be
+  as incomplete as declaring neither; neither verifier existing is a second reason. The connector therefore
+  keeps `Polling`, which is still true of what runs today — but the claim that the mechanisms *cannot be
+  expressed* is now false and has been corrected in the connector's prose.
+
+**The contract half is resolved; the verification half is recorded as blocking for `P5-010`, not for `P5-005`'s
+declaration, and Unresolved Question 1 is superseded by Unresolved Question 9 below.**
 
 ### Finding 2 — Stale sync cursors arrive as ordinary HTTP status codes on a read
 
@@ -963,17 +985,32 @@ where every line looks equally done is a plan nobody can audit.
   catches the difference uses one of the three printable-ASCII payloads that force it. See `ADR-0088` and
   Finding 11.
 - **A Calendar sync-message fixture**, including that it can arrive *before* the `watch` response and that
-  `X-Goog-Message-Number` is `1` for it. **Not written.**
+  `X-Goog-Message-Number` is `1` for it. **WRITTEN** by `ADR-0100`: `google::channel` reads the notification
+  from `X-Goog-*` **headers** (the delivery has a zero-length body), `is_sync()` distinguishes the handshake
+  from a change, and two fixtures (`calendar_channel_sync.json`, `calendar_channel_message.json`) are swept by
+  the fixture-declaration test. The "arrives before the watch response" and "number is 1" facts are recorded in
+  the module doc and carried by the sync fixture — but **detection is by the state, not the number**, because
+  the number is documented as non-sequential. What is **not** built is anything that *receives* a notification:
+  no endpoint, no channel registration, and no channel-token comparison (Unresolved Question 9).
 - **An unauthenticated-delivery test** for whichever push mechanism is chosen, asserting the refusal **fails
-  closed** — the same shape as `P5-001`'s falsified guard. **Not written.**
+  closed** — the same shape as `P5-001`'s falsified guard. **Not written, and now partly unblocked.** The
+  mechanism can be *named* (`ADR-0099`), so a test can assert that a delivery with **no** token header, a
+  malformed bearer value, or a channel token that does not match the stored one is **refused** rather than
+  accepted. What it cannot yet do is exercise a **valid** delivery, because no verifier exists (Unresolved
+  Question 9) — so the failing-closed half is writable and the accepting half is not, and they must ship
+  together or the test proves only that everything is refused.
 - **A renewal test.** A watch whose lease is near expiry must be renewed before it lapses, and the Gmail 7-day
-  bound must be asserted, because a lapsed watch stops notifications **silently**. **Not written.**
+  bound must be asserted, because a lapsed watch stops notifications **silently**. **WRITTEN** by `ADR-0087`:
+  `WATCH_RENEWAL_BOUND_SECONDS` is asserted equal to `604_800` and its relationship to
+  `WATCH_RENEWAL_RECOMMENDED_SECONDS` (`604_800 > 86_400`) is what makes `Overdue` reachable, and
+  `every_state_except_not_yet_asks_for_a_renewal` pins the cadence. What is **not** built is the caller that
+  acts on the advice — no scheduler renews anything yet.
 - **Opt-in live smoke test** behind credentials and a cost gate, as `tools-and-connectors.md` requires.
   **Not written.**
 
 ### Fixtures present, and what they are not
 
-`crates/jarvis-connectors/tests/fixtures/google/` holds **twelve** files, tested by `tests/google_fixtures.rs`:
+`crates/jarvis-connectors/tests/fixtures/google/` holds **fourteen** files, tested by `tests/google_fixtures.rs`:
 
 | Fixture | Shape source |
 | --- | --- |
@@ -989,11 +1026,17 @@ where every line looks equally done is a plan nobody can audit.
 | `calendar_error_410_full_sync_required.json` | the Calendar error resource, 410 + `fullSyncRequired` (**resync**) |
 | `calendar_error_410_resource_deleted.json` | the Calendar error resource, 410 + `deleted` (**no action**) |
 | `calendar_error_400_time_range_empty.json` | the Calendar error resource, 400 + `timeRangeEmpty` |
+| `calendar_channel_message.json` | a Calendar **push notification** (a change): `X-Goog-*` headers, **zero-length body** |
+| `calendar_channel_sync.json` | a Calendar **push notification** (the `sync` handshake): state `sync`, number `1` |
 
-The fixture count has been raised twice as files were added (six, then nine, now twelve), and it is corrected
-each time rather than left to drift: a fixture directory whose stated size is stale reads as "nothing changed"
-to the next reader. The three Calendar error fixtures are a **same-status pair plus a control** — the two `410`s
-have opposite documented remedies, so they are what makes "every 410 wipes the store" falsifiable.
+The fixture count has been raised three times as files were added (six, then nine, twelve, now fourteen), and it
+is corrected each time rather than left to drift: a fixture directory whose stated size is stale reads as
+"nothing changed" to the next reader. The three Calendar error fixtures are a **same-status pair plus a
+control** — the two `410`s have opposite documented remedies, so they are what makes "every 410 wipes the store"
+falsifiable. The two **channel** fixtures are the opposite wire **shape** from every other file here: they are a
+**request** (method, path, headers) rather than a response body, because a Calendar notification has no body —
+so they are the one pair whose `headers` object is parsed as headers rather than as JSON the code reads
+(`ADR-0100`).
 
 **Every one is hand-built, not captured**, and each file says so twice: in `_not_a_capture: true` and in prose.
 The test suite **asserts the marker**, so a file that dropped it fails rather than passing as an apparent
@@ -1046,13 +1089,14 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 
 ## Unresolved Questions
 
-1. **How should JARVIS declare a webhook that is authenticated by an OIDC bearer JWT or an echoed channel
-   token, when `WebhookSupport::Push` names only an HMAC over the body?** *Impact:* Gmail and Calendar push
-   cannot be declared truthfully, so `P5-005` must either declare `Polling` (correct, and loses latency) or a
-   change to `jarvis-connectors`' webhook contract is required first. *Blocks:* the push half of `P5-005`, and
-   `P5-010`'s "webhook signature/replay tests" for any provider using either scheme — which is both Google
-   APIs, so it is not a corner case. *Not decided here*: widening the contract adds a network dependency
-   (JWKS) to a path `P5-001` kept pure, and the alternative is a permanent polling declaration.
+1. ~~**How should JARVIS declare a webhook that is authenticated by an OIDC bearer JWT or an echoed channel
+   token, when `WebhookSupport::Push` names only an HMAC over the body?**~~ **RESOLVED 2026-10-01 by
+   `ADR-0099`.** The contract now names both: `SignatureAlgorithm::OidcIdToken` and
+   `SignatureAlgorithm::EchoedChannelToken`, with `covers_the_body` as the axis that separates a body signature
+   from a header token. The page was re-read the same day and its facts were unchanged, so this was a contract
+   gap rather than a misreading. The *verification* half — JWKS fetching, certificate rotation, `aud`/`iss`/`exp`
+   checking, and a stored-value comparison for the channel token — is **not** built and is recorded as
+   Unresolved Question 9. *Blocks now:* nothing; the contract question is closed.
 2. **What category does each Calendar read scope have?** The Gmail page states categories per scope; the
    Calendar page lists scopes without them, and the consent page gives the category *table* but not the
    mapping. *Impact:* the connector cannot state its verification burden, and `P5-006` will hit the same gap
@@ -1096,6 +1140,17 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
    the retry (`ADR-0082`); if a `404` is genuinely transient, refusing costs a failed sync that a single retry
    would have fixed. *Blocks:* nothing, because the refusal is the fail-closed direction and a full re-sync is
    the documented fallback — but it should be settled by the live smoke test rather than by argument.
+9. **What verifies an `OidcIdToken` or `EchoedChannelToken` delivery, and where does the JWKS dependency live?**
+   The contract can now **name** both mechanisms (`ADR-0099`, closing Question 1), but nothing **verifies** them.
+   An OIDC ID token needs signature validation against Google's rotating certificates (JWKS fetching, key
+   rotation, `aud`/`iss`/`exp` checking) — a network dependency inside a webhook path `P5-001` deliberately kept
+   as a pure function of its arguments — while an echoed channel token needs a stored value compared in constant
+   time, which is a **secret** the connector must hold but that `WebhookSupport::Push`'s `SignatureScheme` has no
+   field for. *Impact:* Gmail and Calendar push cannot be declared **and acted on** until this is settled, and
+   the same *shape* of question (how does a provider authenticate a push the connector cannot MAC?) is the one
+   `P5-006` must ask of Microsoft Graph — this record makes **no claim** about Microsoft's mechanism, which is
+   `P5-006`'s to establish from its own sources. *Blocks:* `P5-010`'s "webhook signature/replay tests" for any
+   header-token provider; nothing in `P5-005`'s declaration, which stays `Polling`.
 
 ## Verification Log
 
@@ -1137,5 +1192,9 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-09-30 | `users.getProfile` **method reference** fetched (`developers.google.com/workspace/gmail/api/reference/rest/v1/users/getProfile`, last updated **2026-04-15**) for the account-identity operation | *"Gets the current user's Gmail profile"*, `GET …/users/me/profile`, **empty request body**, response `{ "emailAddress": string, "messagesTotal": integer, "threadsTotal": integer, "historyId": string }`. **Its accepted scopes are `mail.google.com/`, `gmail.modify`, `gmail.compose`, `gmail.readonly`, `gmail.metadata` — `openid` is NOT among them**, which corrects a comment in this repo that named `openid` as "the operation this scope exists for". So the Gmail read scope is what makes the profile readable, and `openid` is requested for the `id_token` the exchange receives (unverified). `historyId` is *"The ID of the mailbox's current history record"*, so this is a second way to obtain a sync anchor, of the same kind as the watch response's (Finding 13). Declared as `gmail_profile_read`, 1 quota unit (`ADR-0096`). |
 | 2026-09-30 | **Audit of what the record already establishes about routing a delivery**, not a new page fetch — cross-checking Findings 1 and 12 against the connector's types | `emailAddress` is the **only** field in a push payload that names a mailbox (`messageId` is *"unrelated to Gmail messages"*; `historyId` is meaningful only within one mailbox), so attribution means matching that address against the addresses the connector holds. The channel cannot be authenticated (Finding 1), so the address is untrusted — and the consequence is bounded by two facts rather than by trust: a route selects **which mailbox to read** (the sync uses that account's own token), and the notified `historyId` is **not trusted as a position** (`history.list` runs from the stored cursor, so a forged id cannot cause a *missed* change). Byte-exact matching with a **reported-not-applied** case-only near-match, since Google publishes no canonicalisation rule for `emailAddress` (`ADR-0097`). |
 | 2026-10-01 | **Audit of the record's identity facts against the connect-time step**, not a new page fetch — Findings 17 and 18 read together | `users.getProfile`'s `emailAddress` becomes the account's `provider_account_id`, which is the value a push delivery is matched against, so the connect step decides whether that lookup is single-valued. A second account for one address is refused, because two rows carrying one address make the router answer `Ambiguous` (unactionable without a person) and the duplicate is invisible — it looks like two mailboxes. Case-insensitive comparison **in this direction** (refuse to create) is the opposite of the router's (refuse to act), and both are the same restraint: neither acts on an uncertain case-match. The profile carries no display name, so the account stores `None` rather than the address as one (`ADR-0098`). |
+| 2026-10-01 | **Cloud Pub/Sub push-authentication page** re-fetched (`docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions`, page footer now **2026-09-30**) for Finding 1's resolution | **The facts were unchanged, so Finding 1 was a contract gap rather than a misreading.** Re-confirmed: the JWT is *"an OpenIDConnect JWT"* sent in the **`Authorization` header** (`"Authorization" : "Bearer …"`), RS256 with a `kid`; the claims are `aud`, `azp`, `email`, `email_verified`, `sub`, `exp`, `iat`, `iss`; validation is *"Checking the token integrity by using signature validation"* **plus** *"Ensuring that the email and audience claims in the token match the values set in the push subscription configuration"*; *"The tokens attached to requests sent to push endpoints may be up to an hour old"*; and **the body is not signed** (there is no body signature to check). So the two facts the widened contract rests on — a header token, no body coverage — are both confirmed verbatim. Grounds `SignatureAlgorithm::OidcIdToken` and `ADR-0099`. |
+| 2026-10-01 | **Calendar push guide** re-fetched (`developers.google.com/workspace/calendar/api/guides/push`, page footer **2026-09-11**, unchanged) for Finding 1's second mechanism | Re-confirmed `X-Goog-Channel-Token` is the anti-spoofing control and is **client-set then echoed**: *"an arbitrary string value to use as a channel token … you can use the token to verify that each incoming message is for a channel that your application created—to ensure that the notification is not being spoofed"*, echoed in the `X-Goog-Channel-Token` header. The delivery *"do[es] not include a message body"* / `Content-Length: 0`, so **a MAC over the body is not merely absent but impossible**, and the header is *"Sometimes present"* / *"Only present if defined"* — a token that may not be sent at all. Grounds `SignatureAlgorithm::EchoedChannelToken` and `ADR-0099`. |
+| 2026-10-01 | **Cross-check of Finding 1's resolution against `jarvis-connectors`** — no page fetched, a re-read of the contract this record was said to be blocked on (`ADR-0099`) | The blocker's own words were "authenticated by an OIDC bearer JWT or an echoed channel token", and **neither covers the body while both authenticate a delivery** — so the missing thing was an axis, not a value. `SignatureAlgorithm` gains `OidcIdToken` and `EchoedChannelToken`; `covers_the_body`/`is_body_independent` name the axis (and are provably **not** `is_keyed_mac`: Ed25519 covers the body with a key, an echoed token needs a key and covers no body). A body-independent authenticator must declare `SignatureEncoding::Raw`, refused otherwise, because there is no signature whose bytes could be hex or base64. The manifest's push guard still refuses only `None`. **Verification is still unbuilt**, so the connector keeps `Polling` — for cardinality (one `WebhookSupport` value, two mechanisms) and the absent verifier, not because the mechanisms cannot be expressed. Question 1 marked resolved; the verification half recorded as Question 9. |
+| 2026-10-01 | **Calendar push guide** re-read (page footer **2026-09-11**, unchanged) for the notification **message** rather than for Finding 1 | The header set, the **zero-length body** (`Content-Length: 0`), and the **`sync` message** verbatim: *"the Google Calendar API sends a `sync` message to indicate that notifications are starting"*, *"It's safe to ignore the `sync` notification"*, and *"Due to network timing issues, it's possible to receive the `sync` message even before you receive the `watch` method response."* The state table: `sync` delivered *"A new channel was successfully created"*; `exists` *"There was a change to a resource"*; `not_exists` listed but **not defined** for a caller. `X-Goog-Message-Number` *"is always 1 for sync messages"* **but** *"Message numbers increase for each subsequent message on the channel, but they're not sequential"* — so the number is **not** a discriminator. `X-Goog-Channel-Expiration` is *"expressed in human-readable format"* (e.g. `Tue, 19 Nov 2013 01:13:52 GMT`) — the **opposite** of the Gmail lease's epoch-millis string, so the two are read by different code. Implemented as `google::channel`, with the handshake predicate `is_sync` (`ADR-0100`). |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**

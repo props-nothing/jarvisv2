@@ -1,0 +1,24 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "Calendar notification channel push (the `sync` handshake)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/push",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "The research record lists 'a Calendar sync-message fixture, including that it can arrive before the watch response and that X-Goog-Message-Number is 1 for it' as NOT WRITTEN. This is NOT a recorded notification; it reproduces the guide's documented `sync` message.",
+  "_the_point_of_this_fixture": "THE `sync` MESSAGE IS NOT A CHANGE. The guide: 'the Google Calendar API sends a `sync` message to indicate that notifications are starting' and 'It's safe to ignore the `sync` notification'. So the FIRST message on a channel is a handshake, and a caller that acted on every delivery would start a spurious read the moment it created a channel. `ChannelMessage::is_sync()` is the predicate that prevents it, and this fixture is its positive case.",
+  "_message_number_1": "The guide states the sync message's X-Goog-Message-Number is always 1. That is a fact ABOUT the sync message and NOT a way to detect one: the state is the discriminator, and the change fixture deliberately carries a different number so a caller keying on the number would be shown to be inferring from an accident.",
+  "_can_arrive_before_the_watch_response": "The guide: 'Due to network timing issues, it's possible to receive the sync message even before you receive the watch method response.' So a caller must not assume it already holds the channel metadata when the first message lands -- recorded in the module doc, not enforced here.",
+  "_sanitized": "No real channel id, resource id, address, or calendar id appears here; the values are the guide's own examples.",
+  "method": "POST",
+  "path": "/webhooks/google/calendar",
+  "headers": {
+    "X-Goog-Channel-ID": "4ba78bf0-6a47-11e2-bcfd-0800200c9a66",
+    "X-Goog-Channel-Token": "target=myApp-myCalendarChannelDest",
+    "X-Goog-Channel-Expiration": "Tue, 19 Nov 2013 01:13:52 GMT",
+    "X-Goog-Resource-ID": "ret08u3rv24htgh289g",
+    "X-Goog-Resource-URI": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+    "X-Goog-Resource-State": "sync",
+    "X-Goog-Message-Number": "1"
+  },
+  "body": ""
+}

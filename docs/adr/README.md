@@ -116,3 +116,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0096](0096-a-requirement-with-no-consumer.md) | A requirement with no consumer, and a scope justified by the wrong operation | Accepted |
 | [0097](0097-a-delivery-names-a-mailbox-and-nothing-mapped-it.md) | A delivery names a mailbox, and nothing mapped it to an account | Accepted |
 | [0098](0098-one-address-one-account.md) | One address, one account — and the opposite direction from routing | Accepted |
+| [0099](0099-a-delivery-can-be-authenticated-without-covering-the-body.md) | A delivery can be authenticated without covering the body | Accepted |
+| [0100](0100-a-delivery-is-not-always-a-change.md) | A delivery is not always a change | Accepted |

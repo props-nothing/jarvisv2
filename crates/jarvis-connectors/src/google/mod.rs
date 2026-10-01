@@ -33,7 +33,19 @@
 //!   back to `history.list` "after a period with no notifications" and states no floor. `PollingInterval`
 //!   exists so that this can be said rather than fabricated — `Documented(60)` here would be a claim about
 //!   Google that no source supports.
+//!
+//!   The reason `Push` is *not* declared is no longer that the contract cannot express Google's mechanism:
+//!   [`SignatureAlgorithm::OidcIdToken`](crate::webhook::SignatureAlgorithm::OidcIdToken) and
+//!   [`EchoedChannelToken`](crate::webhook::SignatureAlgorithm::EchoedChannelToken) now name Gmail's Pub/Sub
+//!   bearer JWT and Calendar's echoed channel token. The reason is that **one connector holds one
+//!   `WebhookSupport` value, and Google's two mechanisms are two** — an OIDC JWT in `Authorization` with an
+//!   account-in-body binding, and a channel token in `X-Goog-Channel-Token` with an account-in-header binding.
+//!   Declaring one would be as incomplete as declaring neither, and `polling` is what is true of the connector
+//!   as a whole. Declaring `Push` would also demand webhook signature/replay readiness items the connector
+//!   cannot yet satisfy, because **neither verifier is built** — the authenticator can now be *named*, which is
+//!   a contract fact, but nothing compares it (`P5-010` owns that).
 
+pub mod channel;
 pub mod client;
 pub mod connection;
 pub mod credential;
@@ -200,9 +212,13 @@ impl GoogleConnector {
             "Google LLC",
             Self::operations(),
             Self::auth_methods(),
-            // See the module doc: polling with an interval nobody has established. `Push` is **not** used,
-            // because neither Google mechanism fits `WebhookSupport::Push` (an OIDC bearer JWT, and an
-            // echoed channel token over a zero-length body) — the finding `P5-004` recorded.
+            // See the module doc: polling with an interval nobody has established. `Push` is **not** used, but
+            // the reason is no longer that the contract cannot express Google's mechanism — the authenticator
+            // variants now name both of them. The reason is cardinality: this manifest has **one** `webhook`
+            // field, Google's push is **two** mechanisms (an OIDC bearer JWT with an account-in-body binding,
+            // and an echoed channel token with an account-in-header binding), and neither verifier is built, so
+            // declaring `Push` would be as incomplete as declaring neither and would also demand webhook
+            // signature/replay readiness items nothing can satisfy. `polling` is true of the connector today.
             WebhookSupport::Polling {
                 interval: PollingInterval::Unknown,
             },

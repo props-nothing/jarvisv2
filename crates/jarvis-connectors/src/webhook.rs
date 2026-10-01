@@ -17,13 +17,22 @@
 //! to prevent. What this module owns is the **decision**: whether a delivery is acceptable, and which of the
 //! security controls refused it. `P5-002` supplies the comparison and calls this.
 //!
-//! # Everything here checks *before* parsing
+//! # Everything here checks *before* parsing — and that survives a token authenticator
 //!
 //! `A12` (a `P6` case, whose contract is nonetheless fixed here) says a delivery that fails a check must be
 //! "rejected before trusted parsing/workflow execution". The ordering is the security property: a signature
 //! over a **re-serialized** body verifies a different document than the one that arrived, which is how a
 //! JSON parser's key-order or duplicate-key behaviour becomes an injection. So [`WebhookDelivery`] carries the
 //! values a control needs and nothing that has been interpreted.
+//!
+//! **That rule is a statement about verification, and [`SignatureAlgorithm::covers_the_body`] is the axis that
+//! bounds it.** A body signature can only be checked against the raw bytes, and there is no body to read for a
+//! header token, so "before parsing" costs nothing to honour in either family. What a token authenticator *does*
+//! add is a different pre-parse obligation, and it is the reason the two families are named rather than merged:
+//! an OIDC ID token must have its `aud`/`iss`/`exp` claims checked against **configuration** the connector
+//! holds, which is a verification this module deliberately does not perform (there is no JWKS reader here) —
+//! recorded as Unresolved Question 1 in `docs/research/integrations/google.md` rather than implied by a
+//! variant name.
 
 use std::fmt;
 
@@ -49,12 +58,26 @@ pub const MAX_TIMESTAMP_SKEW_SECONDS: u64 = 300;
 /// delivery" — and conflating them would either refuse legitimate retries or allow a replay.
 pub const MAX_REPLAY_WINDOW_SECONDS: u64 = 3_600;
 
-/// The signature algorithm a provider uses.
+/// How a provider authenticates a delivery.
 ///
-/// A closed set, and `None` exists because a provider may authenticate deliveries another way (a bearer
-/// token in a header, an IP allowlist). Representable rather than absent, because a manifest that omitted the
-/// scheme would be indistinguishable from one whose author did not consider the question — the same reasoning
-/// as [`crate::manifest::WebhookSupport::Unsupported`].
+/// # Three families, and the axis that separates them is whether the **body** is covered
+///
+/// | family | covers the body | examples |
+/// | --- | --- | --- |
+/// | body signature | yes | [`HmacSha256`](Self::HmacSha256), [`HmacSha1`](Self::HmacSha1), [`Ed25519`](Self::Ed25519) |
+/// | header token | no | [`OidcIdToken`](Self::OidcIdToken), [`EchoedChannelToken`](Self::EchoedChannelToken) |
+/// | nothing | no | [`None`](Self::None) |
+///
+/// [`covers_the_body`](Self::covers_the_body) is that axis. **Before the two header-token variants existed,
+/// this enum was body-signature-only and a provider whose authentication is a bearer JWT or an echoed opaque
+/// string could not be declared at all** — Google's Gmail (Pub/Sub OIDC JWT) and Calendar (`X-Goog-Channel-Token`)
+/// push mechanisms are exactly those two, so the connector had to declare `polling` to stay truthful. A closed
+/// set remains closed: a genuinely new scheme is a new variant, and an author who cannot name theirs must not
+/// reach for [`None`](Self::None), which says *no* control is present rather than *an unnamed* one.
+///
+/// Representable rather than absent, because a manifest that omitted the scheme would be indistinguishable from
+/// one whose author did not consider the question — the same reasoning as
+/// [`crate::manifest::WebhookSupport::Unsupported`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureAlgorithm {
@@ -72,6 +95,29 @@ pub enum SignatureAlgorithm {
     /// different body than the one delivered — is **not** representable, and that limit is deliberate rather
     /// than an omission: naming such an algorithm would invite a verifier to compare the wrong bytes.
     Ed25519,
+    /// The provider presents an **`OpenID` Connect ID token** in a header, typically
+    /// `Authorization: Bearer <jwt>`.
+    ///
+    /// # Why this is a variant and not a body signature
+    ///
+    /// Google's Cloud Pub/Sub push authentication is exactly this: the service signs an RS256 JWT and sends
+    /// it in the `Authorization` header, and **the request body is not signed at all**. Verification is
+    /// signature validation against Google's rotating certificates, followed by the `email` and `aud` claims
+    /// matching the push subscription's configuration. A scheme that named this as an
+    /// [`HmacSha256`](Self::HmacSha256) would tell a verifier to compare a MAC over bytes that carry none,
+    /// and a scheme that could not name it at all forced this connector to declare `polling` (see
+    /// [`covers_the_body`](Self::covers_the_body)).
+    OidcIdToken,
+    /// The provider echoes a **shared value the connector itself chose**, and verification is a
+    /// constant-time comparison against the stored value rather than a MAC.
+    ///
+    /// Google Calendar notification channels are this: `X-Goog-Channel-Token` is "an arbitrary client-set
+    /// string, echoed back", presented by the documentation as the way "to verify that each incoming message
+    /// is for a channel that your application created". The delivery has a **zero-length** body, so there is
+    /// nothing to sign even in principle. The comparison authenticates *the channel* — that this delivery
+    /// names a watch this connector registered — which is weaker than a body MAC and is named separately for
+    /// that reason, not folded into one "other" bucket.
+    EchoedChannelToken,
     /// The provider supplies no signature, so another mechanism must bind the delivery.
     ///
     /// Refused for a [`WebhookSupport::Push`](crate::manifest::WebhookSupport::Push) declaration by
@@ -79,6 +125,12 @@ pub enum SignatureAlgorithm {
     /// is an unauthenticated write into the platform — the "webhook spoof" row of `security.md`'s table with
     /// its control removed. Representable rather than absent so that an author must **state** the absence; a
     /// scheme that omitted it would be indistinguishable from one whose author never considered the question.
+    ///
+    /// **This is the value an author reaches for when the truth is "my provider has a scheme I cannot
+    /// name".** It is the wrong answer to that situation: `none` says *nothing* authenticates the delivery,
+    /// while an unnameable-but-present authenticator must be added here as a variant. The distinction is what
+    /// [`is_body_independent`](Self::is_body_independent) and the module's own history are for — the three
+    /// Google mechanisms are the three ways a delivery can be authenticated *without* a body MAC.
     None,
 }
 
@@ -90,6 +142,8 @@ impl SignatureAlgorithm {
             Self::HmacSha256 => "hmac_sha256",
             Self::HmacSha1 => "hmac_sha1",
             Self::Ed25519 => "ed25519",
+            Self::OidcIdToken => "oidc_id_token",
+            Self::EchoedChannelToken => "echoed_channel_token",
             Self::None => "none",
         }
     }
@@ -99,10 +153,39 @@ impl SignatureAlgorithm {
     /// Both HMAC variants are; [`Self::Ed25519`] is not, because it is verified with a **public** key rather
     /// than a shared secret. The property it asks about is "does verifying require a secret", which is what a
     /// provider's onboarding and a secret-storage decision depend on — it is *not* "does this cover the raw
-    /// bytes", which both HMAC and Ed25519 do and a signature over a parsed structure does not.
+    /// bytes", which [`covers_the_body`](Self::covers_the_body) asks and a signature over a parsed structure
+    /// does not.
     #[must_use]
     pub const fn is_keyed_mac(self) -> bool {
         matches!(self, Self::HmacSha256 | Self::HmacSha1)
+    }
+
+    /// Returns whether the algorithm authenticates the **raw body bytes**.
+    ///
+    /// The property a body-signature verifier needs, and the one that **was not asked** when an
+    /// OIDC-JWT-authenticated push endpoint could not be declared: `HmacSha256`, `HmacSha1` and `Ed25519` all
+    /// cover the bytes, while [`Self::OidcIdToken`], [`Self::EchoedChannelToken`] and [`Self::None`] do not.
+    ///
+    /// **It is not the same question as [`is_keyed_mac`](Self::is_keyed_mac)**, which asks whether verifying
+    /// needs a shared secret: Ed25519 covers the body with a public key, and an echoed channel token needs a
+    /// secret but covers no body at all. Keeping the two axes separate is what lets a caller ask for the one
+    /// it actually depends on.
+    #[must_use]
+    pub const fn covers_the_body(self) -> bool {
+        matches!(self, Self::HmacSha256 | Self::HmacSha1 | Self::Ed25519)
+    }
+
+    /// Returns whether this authenticator leaves the body **uncovered**, so the module's raw-bytes rule does
+    /// not apply to it.
+    ///
+    /// The negation [`covers_the_body`](Self::covers_the_body), named so that the module doc's "every check
+    /// runs before parsing" holds *because* no check here verifies the body. Three cases, and the reason the
+    /// name is not `is_oidc`: an OIDC ID token covers a header, an echoed channel token covers a header, and
+    /// [`Self::None`] covers nothing — the honest grouping is "has no body to read", not "one particular
+    /// algorithm".
+    #[must_use]
+    pub const fn is_body_independent(self) -> bool {
+        !self.covers_the_body()
     }
 }
 
@@ -111,6 +194,15 @@ impl SignatureAlgorithm {
 /// The header name and encoding are provider-specific and both matter: a verifier that read the wrong header
 /// would find nothing and refuse every delivery, and one that decoded base64 when the provider sent hex would
 /// compare two different strings and refuse every delivery too — a failure that looks like a wrong secret.
+///
+/// # `encoding` is a claim about a *signature*, so it does not apply to a token
+///
+/// [`SignatureAlgorithm::covers_the_body`] distinguishes the two families. The body-covering algorithms present
+/// an **encoding of computed bytes**, so [`SignatureEncoding`] says which one. A body-independent authenticator
+/// ([`SignatureAlgorithm::OidcIdToken`], [`SignatureAlgorithm::EchoedChannelToken`], [`SignatureAlgorithm::None`])
+/// presents an opaque value in a header — a JWT or an echoed string — and there is **no encoding to claim**, so
+/// [`SignatureScheme::new`] requires [`SignatureEncoding::Raw`] for it. That refusal is `ADR-0057`'s rule once
+/// more: a field that cannot be given an honest value for a variant should not be forced to take one.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SignatureScheme {
     /// The algorithm.
@@ -158,6 +250,10 @@ impl SignatureScheme {
     /// lowercase. The token-character check is what stops a header name from carrying a colon or a space,
     /// which would make the lookup silently find nothing — a failure whose symptom is "every signature is
     /// wrong", one step away from the real cause.
+    ///
+    /// Returns [`SignatureError::Encoding`] when a **body-independent** algorithm declares an encoding other
+    /// than [`SignatureEncoding::Raw`] — there is no signature whose bytes could be hex or base64, so the
+    /// encoding would be a claim about a wire form that does not exist.
     pub fn new(
         algorithm: SignatureAlgorithm,
         header: impl Into<String>,
@@ -182,6 +278,16 @@ impl SignatureScheme {
                          lookup agrees with the wire's case-insensitive rule",
             });
         }
+        // A body-independent authenticator presents an opaque header value, so an encoding of a signature's
+        // bytes is a claim that cannot be true. `Raw` means "the header value is consumed as it arrived",
+        // which is the only honest description of a bearer JWT or an echoed channel token.
+        if algorithm.is_body_independent() && encoding != SignatureEncoding::Raw {
+            return Err(SignatureError::Encoding {
+                reason: "a body-independent authenticator (an OIDC ID token, an echoed channel token, or \
+                         `none`) presents an opaque header value, so its encoding must be `raw`: there is no \
+                         signature whose bytes could be hex- or base64-encoded",
+            });
+        }
         Ok(Self {
             algorithm,
             header,
@@ -190,6 +296,10 @@ impl SignatureScheme {
     }
 
     /// Returns whether this scheme authenticates a delivery.
+    ///
+    /// Every algorithm except [`SignatureAlgorithm::None`] does, whether it covers the body
+    /// ([`SignatureAlgorithm::covers_the_body`]) or an opaque token in a header. `None` is the one value that
+    /// says *no* control is present, and the manifest refuses it for a push declaration.
     #[must_use]
     pub const fn authenticates(&self) -> bool {
         !matches!(self.algorithm, SignatureAlgorithm::None)
@@ -488,6 +598,17 @@ pub enum SignatureError {
     /// The delivery binding is unusable.
     #[error("the webhook binding is unusable: {reason}")]
     Binding {
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// The encoding is unusable for the algorithm.
+    ///
+    /// A distinct variant from [`Self::Header`] because the remedy differs: a bad header name is a typo, while
+    /// an encoding on a body-independent authenticator is a misunderstanding of the mechanism — the author
+    /// believed a signature is present, which is the premise a reviewer must correct. Reporting it as a header
+    /// problem would send them to the wrong half of the value.
+    #[error("the signature encoding is unusable: {reason}")]
+    Encoding {
         /// What is wrong.
         reason: &'static str,
     },

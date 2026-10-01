@@ -4854,6 +4854,122 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     sync loop — so both are decisions with tests rather than enforced behaviour (the "convention with tests,
     not a mechanism" limit `ADR-0091`/`ADR-0095` carry); the duplicate check is a **scan of a slice** rather
     than a store uniqueness constraint; and the two causes of `FullSync` stay unseparated by design.
+- [ ] `P5-005` **(continued — a delivery can be authenticated without covering the body)**: the webhook contract
+  gains the two authenticators Google's push mechanisms use — `SignatureAlgorithm::OidcIdToken` (an RS256 JWT in
+  the `Authorization` header, Gmail via Cloud Pub/Sub) and `EchoedChannelToken` (a client-set string echoed in
+  `X-Goog-Channel-Token`, Calendar channels) — plus `covers_the_body`/`is_body_independent` and a refusal of a
+  signature encoding for a body-independent authenticator. **2 new tests (so 426 in the crate).** **`ADR-0099`.**
+  This **resolves Unresolved Question 1** of the Google record, which two adjacent slices had named as
+  *blocking*. Two guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: ONE AXIS WAS BEING USED TO ANSWER TWO QUESTIONS, AND THE UNASKED ONE WAS THE PROVIDER'S.**
+    `ADR-0054`'s contract had a single axis — *which MAC over the raw body* — and used it to answer a different
+    question: *what authenticates this delivery*. A provider whose authentication is a **header token** (a
+    bearer JWT, a shared string) therefore had **no representation at all**, and the finding was recorded for two
+    rounds as "Gmail and Calendar push cannot be *expressed*". The finding's own name was the clue — it says
+    "authenticated by an OIDC bearer JWT **or** an echoed channel token" — because **neither covers the body and
+    both authenticate a delivery**. So the missing thing was not a value but an axis, and `covers_the_body` is
+    it. **⭐ GENERALISATION: when a type answers two questions with one accessor, the unasked question is the one
+    a new provider will need.** The variants are the consequence; the axis is the fix.
+  - **⭐⭐ AND `ADR-0054`'s PROSE ALREADY KNEW THE AXIS, AND NAMED IT IN A SENTENCE WITH NO ACCESSOR.** Its doc
+    for `is_keyed_mac` argues that "*a keyed MAC and an asymmetric signature both cover the body, but only the
+    MAC requires the verifier to hold a secret*" — i.e. it states "*covers the body*" as a property in its own
+    right, then exposes an accessor for only the second half. **A distinction stated in prose and absent from
+    the code is the recurring defect of this phase (`0067`–`0098`)**, and this is the first instance where the
+    prose was **correct and complete** and the code still could not answer the question: the sentence is a
+    description, not an interface, and nothing forced it to be one.
+  - **⭐ `covers_the_body` IS PROVABLY NOT `is_keyed_mac`, AND THE TWO DISAGREE IN BOTH DIRECTIONS.** Ed25519 is
+    `is_keyed_mac == false` with `covers_the_body == true` (a public key still signs the bytes); an echoed
+    channel token is `is_keyed_mac == false` with `covers_the_body == false` (a secret that covers no bytes).
+    A single test asserts both cross-cases, so a later collapse of the two accessors fails rather than silently
+    making one question stand for the other.
+  - **⭐ `None` IS CORRECTED FROM "ANOTHER MECHANISM" TO "NO MECHANISM", AND THAT WAS THE TRAP.** Its doc had
+    offered "*a bearer token in a header*" as an example of another way to authenticate that `None` made
+    representable — but `None` means **nothing** authenticates the delivery, so the only honest way to represent
+    a bearer-token authenticator was always a new variant. An author following the old doc would reach for
+    `None` when the truth was "an authenticator I cannot name", producing a declaration that reads as *no
+    control* — the webhook-spoof row with its control removed, in the one place the manifest refuses it.
+  - **⭐ A BODY-INDEPENDENT AUTHENTICATOR MAY NOT CLAIM A SIGNATURE ENCODING (`SignatureError::Encoding`).**
+    `encoding` describes how a **signature's** bytes are presented; a token presents an opaque header value, so
+    there is nothing to hex-decode. `Raw` is the honest value and anything else is refused — `ADR-0057`'s rule
+    (a field that cannot take an honest value for a variant is refused rather than defaulted) applied to a
+    sibling field of the scheme. It is a distinct error from `Header` because the remedy differs: a bad name is
+    a typo, an encoding on a token is a **misunderstanding of the mechanism**, and reporting it as a header
+    problem sends a reviewer to the wrong half of the value.
+  - **⭐ THE MANIFEST'S PUSH GUARD IS UNCHANGED AND STILL REFUSES ONLY `None`.** `!scheme.authenticates()`
+    keeps its exact meaning ("no control is present"), and the acceptance test now round-trips **every**
+    authenticator — including the two header tokens — so the guard is provably **not** a synonym for "not an
+    HMAC". The falsification makes the point: mutating it to `!covers_the_body()` made a **truthful** OIDC push
+    declaration refused, which is the over-broad-guard direction.
+  - **⭐⭐ BUT THE CONNECTOR STILL DECLARES `Polling`, FOR A CORRECTED REASON, AND CORRECTING THE REASON WAS
+    PART OF THE WORK.** Making the mechanisms expressible does **not** make Google's push declarable: one
+    connector holds **one** `WebhookSupport` value while Google has **two** push mechanisms with different
+    headers *and* different bindings, and **neither verifier is built** (no JWKS reader for the JWT, no stored
+    value for the channel token). So flipping to `Push` would trade one incomplete declaration for another and
+    would also demand webhook signature/replay readiness items nothing can satisfy. Three places of connector
+    prose said the mechanisms "cannot be expressed" — now false — and each is corrected (`ADR-0074`/`ADR-0096`:
+    a comment naming a module is a claim about code, and the code changed).
+  - **⭐ A TEST'S PREMISE WAS CORRECTED RATHER THAN LEFT GREEN ON A STALE REASON.** `a_push_declaration_is_not_used_because_neither_google_mechanism_fits`
+    asserted the *unexpressibility* that no longer holds. It is rewritten to **prove the mechanisms are
+    expressible** (both schemes construct) and only then assert the manifest still declares `Polling` — so it
+    fails for the reason that is still true rather than passing for one that is not.
+  - **NEW LIMITS:** naming an authenticator is **not** verifying one — no JWKS fetching, certificate rotation,
+    `aud`/`iss`/`exp` checking, or channel-token comparison exists, so the authentication gap `ADR-0097`
+    recorded is **narrowed from "cannot be declared" to "is declared but unverified"** (Unresolved Question 9,
+    which `P5-010` owns). `WebhookSupport` remains **one mechanism per connector**, which is why the two
+    mechanisms cannot both be declared. And nothing *sends* or *receives* a delivery, so every rule here is a
+    decision about values the crate owns.
+- [ ] `P5-005` **(continued — a delivery is not always a change)**: new `google::channel` module — the
+  **Calendar notification-channel push message**, read from `X-Goog-*` **headers** because the delivery has a
+  **zero-length body**. `ResourceState { Sync, Exists, NotExists }`, `ChannelMessage` (with `is_sync()` and a
+  redacted `channel_token()`), `parse_channel_message`, and `ChannelMessageError`. Two fixtures
+  (`calendar_channel_message.json`, `calendar_channel_sync.json`) and 2 harness tests. **10 new lib tests (so
+  436 in the crate).** **`ADR-0100`.** This writes the research record's own *"Calendar sync-message fixture"*
+  item, which was open. Three guards falsified A-B-A with compiling mutants.
+  - **⭐⭐ THE FINDING: A PUSH CONSUMER MUST DISTINGUISH "A MESSAGE ARRIVED" FROM "A RESOURCE CHANGED", AND BOTH
+    GOOGLE MECHANISMS MAKE THOSE DIFFER ON THE FIRST MESSAGE.** Calendar sends a **`sync`** message when a
+    channel is created — *"to indicate that notifications are starting"*, and *"It's safe to ignore"* — so the
+    first delivery is a **handshake, not a change**. Gmail says the same in its own words (`ADR-0092`: a
+    successful `watch` *"immediately sends a notification, so the first delivery is not a change"*). A consumer
+    that equated the two would do one spurious read the moment it began watching, on **both** providers.
+  - **⭐⭐ AND `ADR-0099` HAD JUST NAMED A CONTROL WHOSE INPUT NOTHING COULD PARSE.** That round taught the
+    webhook contract to *name* an echoed channel token as an authenticator — over a header that **no reader
+    looked at**, because `google::pubsub` models the Gmail envelope and **nothing modelled the Calendar
+    mechanism at all**. That is `ADR-0092`'s "a value with no reader" inverted: the *contract* produced the
+    requirement and no code consumed the wire form. This slice closes the **read** layer; the **compare** layer
+    (the verifier) stays open and is named.
+  - **⭐ AN UNKNOWN RESOURCE STATE IS REFUSED, BECAUSE NEITHER DEFAULT IS SAFE.** Treating an unrecognised
+    `X-Goog-Resource-State` as `exists` (a change) acts on a message the connector does not understand; treating
+    it as a non-change ignores a possible change. Refusing names the value instead of choosing a direction for
+    the caller — and it is the mutant the test kills (`unwrap_or(Exists)`, the fail-open direction).
+  - **⭐ DETECTION IS BY THE DECLARED DISCRIMINATOR, NOT THE ACCIDENTAL ONE.** `X-Goog-Message-Number` *"is
+    always 1 for sync messages"* — but also *"not sequential"*, so `number == 1` classifies any early message as
+    a handshake. `is_sync()` reads the **state**, and the fixtures deliberately pair a `sync` numbered `1` with
+    an `exists` numbered `10`, so the number cannot be what is under test.
+  - **⭐ TWO EXPIRATIONS WITH CONTRADICTORY ENCODINGS, READ BY DIFFERENT CODE.** `X-Goog-Channel-Expiration` is
+    *"human-readable format"* (a date string) while the Gmail watch lease's `expiration` is an **epoch-millis
+    string** (`ADR-0087`). Sharing a reader would force it to guess an encoding, so this module keeps the value
+    **as text** and does not share one — the `ADR-0082` shape ("one classifier for two APIs") applied to a pair
+    of values.
+  - **⭐ THE ECHOED TOKEN IS SURFACED AND REDACTED, AND SURFACING IS NOT VERIFYING.** `channel_token()` returns
+    it (a verifier needs the value), the field is **private**, and the hand-written `Debug` prints
+    `[REDACTED], N chars` (`ADR-0091`) — because the token is the anti-spoofing control and a value in a log is
+    a value an attacker could replay. Comparing it is `P5-010`'s work, and this crate does not hold the stored
+    value the comparison needs.
+  - **⭐ HEADER READS DISTINGUISH ABSENT, AMBIGUOUS, AND NON-UTF-8.** `single_header` collapses all three into
+    `None`; this module separates them, because an absent header is the provider sending less than documented,
+    an ambiguous one is a wire attack, and a non-UTF-8 one is an encoding fault. Ambiguity is **refused**, so
+    the wrong value cannot win.
+  - **⚠ A TEST-AUTHORING DEFECT FOUND BY A FAILING TEST: A HARDCODED LENGTH THAT DUPLICATED A COMPUTED VALUE.**
+    The redaction test asserted `"34 chars"` (then `"25"`); the token `target=myApp-myChannelDest` is **26**
+    characters, so it failed for a mistyped constant, not for the behaviour. Fixed by deriving the length from
+    the token (`token.len()`). **A literal that restates a value the code already computes is a second source of
+    truth, and it is wrong exactly when nothing else is.**
+  - **NEW LIMITS:** **nothing receives a Calendar notification** — no delivery endpoint, no channel registration,
+    and no channel-token comparison, so this reads a message from headers the crate owns rather than observed
+    data. `WebhookSupport` still declares `Polling` for the connector (the cardinality reason `ADR-0099`
+    records). And **`not_exists` semantics were not established by the page read** — the guide lists the value
+    but does not define it for a caller — so treating it as actionable rests on the fail-safe direction rather
+    than on a quoted rule.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

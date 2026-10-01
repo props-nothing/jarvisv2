@@ -68,9 +68,10 @@ fn an_exact_match_is_the_only_route_applied_without_a_person() {
 
 #[test]
 fn the_comparison_is_byte_exact_so_a_neighbouring_address_is_not_a_match() {
-    // **The security-relevant property.** The address is untrusted input from an unauthenticated endpoint
-    // (Finding 1: neither Google mechanism fits `WebhookSupport::Push`), so a comparison that matched loosely
-    // would let one delivery choose another mailbox's account. None of these is the stored address.
+    // **The security-relevant property.** The address is untrusted input from an endpoint this connector has
+    // **no verifier for** (Finding 1: neither Google mechanism is a body MAC; the contract can now *name* the
+    // two header-token schemes, but nothing compares them), so a comparison that matched loosely would let one
+    // delivery choose another mailbox's account. None of these is the stored address.
     let accounts = [account("acct-1", "person@example.invalid")];
     for near_miss in [
         // A different local part on the same domain.

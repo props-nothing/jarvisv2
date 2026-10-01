@@ -1,0 +1,24 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "Calendar notification channel push (an ordinary resource change)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/push",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures, and the research record lists 'a Calendar sync-message fixture' as NOT WRITTEN. This is NOT a recorded notification. It reproduces the `X-Goog-*` header set the Calendar push guide publishes for a CHANGE message, at the documented zero-length body.",
+  "_the_point_of_this_fixture": "A CALENDAR NOTIFICATION HAS NO BODY. The guide's example shows `Content-Length: 0` and every value in `X-Goog-*` HEADERS, which is the opposite of the Gmail Pub/Sub envelope (a JSON body whose payload is base64). Two consequences this fixture pins: the parser must read headers only, so a body of any content cannot change the result; and the message cannot be MAC-verified, because there is nothing to sign -- which is why ADR-0099 had to add an authenticator that does not cover the body.",
+  "_header_casing": "The keys here use the guide's `X-Goog-*` spelling, which is NOT lowercase. The parser looks headers up case-insensitively, so this fixture also proves the lookup does not depend on the fixture's casing.",
+  "_the_token_is_redacted": "X-Goog-Channel-Token is the anti-spoofing control, so the value used here is the guide's own non-secret example and the parser must never print it (ADR-0091). The unit test asserts the Debug rendering omits it.",
+  "_sanitized": "No real channel id, resource id, address, or calendar id appears here; the values are the guide's own examples.",
+  "method": "POST",
+  "path": "/webhooks/google/calendar",
+  "headers": {
+    "X-Goog-Channel-ID": "4ba78bf0-6a47-11e2-bcfd-0800200c9a66",
+    "X-Goog-Channel-Token": "target=myApp-myCalendarChannelDest",
+    "X-Goog-Channel-Expiration": "Tue, 19 Nov 2013 01:13:52 GMT",
+    "X-Goog-Resource-ID": "ret08u3rv24htgh289g",
+    "X-Goog-Resource-URI": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+    "X-Goog-Resource-State": "exists",
+    "X-Goog-Message-Number": "10"
+  },
+  "body": ""
+}

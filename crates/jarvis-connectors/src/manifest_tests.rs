@@ -1049,7 +1049,10 @@ fn a_push_declaration_that_verifies_nothing_is_refused() {
                 crate::SignatureScheme::new(
                     crate::SignatureAlgorithm::None,
                     "x-signature",
-                    crate::SignatureEncoding::Hex,
+                    // `Raw`, because `none` is body-independent: there is no signature whose bytes could be
+                    // hex. The encoding rule is separate from the "no authenticator" rule this test pins, so a
+                    // wrong encoding here would make the refusal come from the wrong guard.
+                    crate::SignatureEncoding::Raw,
                 ),
                 "a well-formed header",
             ),
@@ -1081,7 +1084,19 @@ fn a_push_declaration_that_verifies_something_is_accepted() {
         crate::SignatureAlgorithm::HmacSha256,
         crate::SignatureAlgorithm::HmacSha1,
         crate::SignatureAlgorithm::Ed25519,
+        // The two header-token families, added by this round: a provider authenticated by an OIDC bearer JWT
+        // or an echoed channel token is authenticated, and refusing it would reproduce the very gap that made
+        // Google's push mechanisms undeclarable.
+        crate::SignatureAlgorithm::OidcIdToken,
+        crate::SignatureAlgorithm::EchoedChannelToken,
     ] {
+        // The encoding follows the family, because a body-independent authenticator has no signature bytes to
+        // encode — the rule is checked in `webhook_tests` and this test exercises the accepting direction.
+        let encoding = if algorithm.covers_the_body() {
+            crate::SignatureEncoding::Hex
+        } else {
+            crate::SignatureEncoding::Raw
+        };
         assert!(
             ConnectorManifest::new(
                 id("example"),
@@ -1092,11 +1107,7 @@ fn a_push_declaration_that_verifies_something_is_accepted() {
                 auth_methods(),
                 WebhookSupport::Push {
                     scheme: must(
-                        crate::SignatureScheme::new(
-                            algorithm,
-                            "x-signature",
-                            crate::SignatureEncoding::Hex,
-                        ),
+                        crate::SignatureScheme::new(algorithm, "x-signature", encoding,),
                         "a well-formed header",
                     ),
                     binding: binding(),

@@ -14,8 +14,16 @@ fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
 }
 
 fn scheme(algorithm: SignatureAlgorithm, header: &str) -> SignatureScheme {
+    // The encoding must match the family: a body-covering signature has bytes to encode, a body-independent
+    // authenticator presents an opaque header value. Choosing per algorithm here keeps the helper honest and
+    // leaves the refusal of a mismatched pair to its own test.
+    let encoding = if algorithm.covers_the_body() {
+        SignatureEncoding::Hex
+    } else {
+        SignatureEncoding::Raw
+    };
     must(
-        SignatureScheme::new(algorithm, header, SignatureEncoding::Hex),
+        SignatureScheme::new(algorithm, header, encoding),
         "a valid signature scheme",
     )
 }
@@ -133,18 +141,52 @@ fn a_scheme_says_whether_it_authenticates_the_raw_bytes() {
             algorithm.is_keyed_mac(),
             "{algorithm:?} must be recognised as a keyed MAC"
         );
+        assert!(algorithm.covers_the_body(), "{algorithm:?} signs the body");
         assert!(scheme(algorithm, "x-signature").authenticates());
     }
     assert!(!SignatureAlgorithm::Ed25519.is_keyed_mac());
+    assert!(
+        SignatureAlgorithm::Ed25519.covers_the_body(),
+        "Ed25519 covers the body with a public key, which is why `covers_the_body` is not `is_keyed_mac`"
+    );
     assert!(scheme(SignatureAlgorithm::Ed25519, "x-signature").authenticates());
     // `None` exists because a provider may authenticate another way, and it is named so a manifest that
     // declares it is visibly weaker rather than silently so.
     let unauthenticated = scheme(SignatureAlgorithm::None, "x-signature");
     assert!(!unauthenticated.authenticates());
+    // The two header-token families cover the body **not at all** yet still authenticate — the exact pair of
+    // facts that made Gmail and Calendar push undeclarable before they existed.
+    for algorithm in [
+        SignatureAlgorithm::OidcIdToken,
+        SignatureAlgorithm::EchoedChannelToken,
+    ] {
+        assert!(
+            !algorithm.covers_the_body(),
+            "{algorithm:?} authenticates a header, not the body"
+        );
+        assert!(
+            algorithm.is_body_independent(),
+            "{algorithm:?} is body-independent"
+        );
+        assert!(
+            scheme(algorithm, "authorization").authenticates(),
+            "{algorithm:?} is an authenticator even without a body signature"
+        );
+    }
+    // `None` is body-independent but authenticates nothing: the axis `covers_the_body` is orthogonal to
+    // `authenticates`, and collapsing them would let `None` read as a mechanism.
+    assert!(SignatureAlgorithm::None.is_body_independent());
+    assert!(!unauthenticated.authenticates());
+    // `covers_the_body` and `is_keyed_mac` are different questions, proved by a case where they disagree:
+    // Ed25519 is keyed-mac-false yet body-covering, and an echoed channel token is the reverse.
+    assert!(!SignatureAlgorithm::EchoedChannelToken.is_keyed_mac());
+    assert!(!SignatureAlgorithm::EchoedChannelToken.covers_the_body());
     let codes: Vec<&str> = [
         SignatureAlgorithm::HmacSha256,
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::Ed25519,
+        SignatureAlgorithm::OidcIdToken,
+        SignatureAlgorithm::EchoedChannelToken,
         SignatureAlgorithm::None,
     ]
     .iter()
@@ -158,6 +200,62 @@ fn a_scheme_says_whether_it_authenticates_the_raw_bytes() {
         codes.len(),
         "the algorithm codes must be distinct"
     );
+}
+
+#[test]
+fn a_body_independent_authenticator_may_not_claim_a_signature_encoding() {
+    // `encoding` describes how a **signature's bytes** are presented. A body-independent authenticator presents
+    // an opaque header value — a bearer JWT or an echoed string — so there are no bytes whose encoding could be
+    // hex or base64, and a scheme claiming one would tell a verifier to decode something that is not a
+    // signature. `Raw` ("consume the header value as it arrived") is the only honest value, and the refusal is
+    // `ADR-0057`'s rule: a field that cannot take an honest value for a variant is refused rather than defaulted.
+    for algorithm in [
+        SignatureAlgorithm::OidcIdToken,
+        SignatureAlgorithm::EchoedChannelToken,
+        SignatureAlgorithm::None,
+    ] {
+        let refused = SignatureScheme::new(algorithm, "authorization", SignatureEncoding::Base64);
+        match refused {
+            Err(SignatureError::Encoding { reason }) => {
+                assert!(
+                    reason.contains("raw"),
+                    "the refusal must name the value: {reason}"
+                );
+            }
+            other => {
+                panic!("{algorithm:?} with a signature encoding must be refused, got {other:?}")
+            }
+        }
+        // And the body-covering algorithms are unaffected: an encoding is exactly what they need.
+        assert!(
+            SignatureScheme::new(
+                SignatureAlgorithm::HmacSha256,
+                "x-signature",
+                SignatureEncoding::Base64
+            )
+            .is_ok(),
+            "a body signature needs its encoding and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn the_two_google_push_mechanisms_are_now_declarable() {
+    // The finding this round closes (Unresolved Question 1): Gmail's Pub/Sub delivery is an OIDC bearer JWT with
+    // an **unsigned body**, and Calendar's is an echoed `X-Goog-Channel-Token` over a **zero-length** body.
+    // Neither is a MAC over bytes, so neither could be expressed before `OidcIdToken`/`EchoedChannelToken`
+    // existed and the connector had to declare `polling`. This pins both mechanisms as constructible schemes.
+    let gmail = scheme(SignatureAlgorithm::OidcIdToken, "authorization");
+    assert!(gmail.authenticates() && gmail.algorithm.is_body_independent());
+    // Calendar's token arrives in the documented header, lowercase, and is consumed verbatim.
+    let calendar = scheme(
+        SignatureAlgorithm::EchoedChannelToken,
+        "x-goog-channel-token",
+    );
+    assert!(calendar.authenticates() && calendar.algorithm.is_body_independent());
+    assert_eq!(calendar.encoding, SignatureEncoding::Raw);
+    // The header name is a real one, so `SignatureScheme`'s lowercase token rule accepts it unmodified.
+    assert_eq!(calendar.header, "x-goog-channel-token");
 }
 
 #[test]

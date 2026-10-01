@@ -60,6 +60,35 @@ fn assert_declared_shape(text: &str) {
     );
 }
 
+/// Reads a fixture's `headers` object into `(name, value)` pairs.
+///
+/// A header fixture is a **different shape** from the JSON-body fixtures: a Calendar notification has no body
+/// and every value in `X-Goog-*` headers, so the document records the header set rather than a response body.
+/// The names are kept **exactly as the fixture spells them** (the guide's `X-Goog-*` form), because feeding
+/// them to the parser unchanged is what proves the lookup is case-insensitive — lowercasing here would hide a
+/// lowercase-only lookup that would refuse every real delivery.
+fn fixture_headers(text: &str) -> Vec<(String, String)> {
+    let value: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(error) => panic!("a header fixture must be JSON: {error}"),
+    };
+    let Some(headers) = value["headers"].as_object() else {
+        panic!("a header fixture must carry a `headers` object");
+    };
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("header `{name}` must be a string"))
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn the_gmail_list_fixture_parses_to_identifiers_and_a_page_token() {
     let text = fixture("gmail_messages_list.json");
@@ -594,6 +623,105 @@ fn a_successful_calendar_read_advances_the_cursor_from_the_sync_token() {
             "{status}"
         );
     }
+}
+
+#[test]
+fn the_calendar_channel_change_fixture_parses_from_headers_with_no_body() {
+    // The fixture that writes the research record's "Calendar sync-message fixture" item. A Calendar
+    // notification is the **opposite shape** from the Gmail Pub/Sub envelope: a zero-length body and every
+    // value in `X-Goog-*` headers. So this proves two things at once -- the headers parse, and the parser reads
+    // **no body**, which is why a Calendar delivery has nothing to MAC.
+    let text = fixture("calendar_channel_message.json");
+    assert_declared_shape(&text);
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(value["body"], "", "the documented body is zero-length");
+
+    // **The keys are the guide's `X-Goog-*` spelling, not lowercase.** The parser looks headers up
+    // case-insensitively, so feeding the fixture's own casing proves the lookup does not depend on it -- a
+    // lowercase-only lookup would find nothing and refuse every real delivery.
+    let raw = fixture_headers(&text);
+    let headers: Vec<(&str, &[u8])> = raw
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    let delivery = jarvis_connectors::WebhookDelivery {
+        path: "/webhooks/google/calendar",
+        headers: &headers,
+        body: b"",
+    };
+    let message = match jarvis_connectors::google::channel::parse_channel_message(&delivery) {
+        Ok(message) => message,
+        Err(error) => panic!("the documented channel message must parse: {error}"),
+    };
+    assert_eq!(
+        message.resource_state,
+        jarvis_connectors::google::channel::ResourceState::Exists
+    );
+    assert!(
+        !message.is_sync(),
+        "an `exists` message is a change, not the handshake"
+    );
+    assert_eq!(message.channel_id, "4ba78bf0-6a47-11e2-bcfd-0800200c9a66");
+    assert_eq!(message.message_number, 10);
+    // The token is surfaced (a verifier needs it) and the expiration is the guide's human-readable form.
+    assert_eq!(
+        message.channel_token(),
+        Some("target=myApp-myCalendarChannelDest")
+    );
+    assert_eq!(
+        message.expiration.as_deref(),
+        Some("Tue, 19 Nov 2013 01:13:52 GMT")
+    );
+    // And a non-empty body must not change the result, which is the "nothing to sign" property in code.
+    let with_body = jarvis_connectors::WebhookDelivery {
+        path: "/webhooks/google/calendar",
+        headers: &headers,
+        body: b"{\"an\":\"unexpected body\"}",
+    };
+    assert_eq!(
+        message,
+        match jarvis_connectors::google::channel::parse_channel_message(&with_body) {
+            Ok(message) => message,
+            Err(error) => panic!("a body is ignored, not refused: {error}"),
+        },
+        "the body is not read, so it cannot change the message"
+    );
+}
+
+#[test]
+fn the_calendar_channel_sync_fixture_is_the_handshake_and_not_a_change() {
+    // The specific item the research record named: "a Calendar sync-message fixture, including that it can
+    // arrive before the watch response and that `X-Goog-Message-Number` is `1` for it". The first message on a
+    // channel is a handshake, and a caller that acted on every delivery would start a spurious read the moment
+    // it created a channel.
+    let text = fixture("calendar_channel_sync.json");
+    assert_declared_shape(&text);
+    let raw = fixture_headers(&text);
+    let headers: Vec<(&str, &[u8])> = raw
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    let delivery = jarvis_connectors::WebhookDelivery {
+        path: "/webhooks/google/calendar",
+        headers: &headers,
+        body: b"",
+    };
+    let message = match jarvis_connectors::google::channel::parse_channel_message(&delivery) {
+        Ok(message) => message,
+        Err(error) => panic!("the documented sync message must parse: {error}"),
+    };
+    assert!(message.is_sync(), "the sync message is the handshake");
+    assert_eq!(message.message_number, 1, "the guide states it is always 1");
+    // **The number is not the discriminator.** The change fixture is numbered 10 and THIS one is numbered 1,
+    // but a caller keying on the number would classify an `exists` message numbered 1 as a handshake -- so the
+    // property asserted is the state, and the two fixtures together show the number is incidental.
+    assert_eq!(
+        message.resource_state,
+        jarvis_connectors::google::channel::ResourceState::Sync
+    );
 }
 
 #[test]
