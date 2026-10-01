@@ -33,7 +33,7 @@ use crate::error::{ModelError, ModelErrorKind};
 use crate::identity::{ModelId, ProviderId};
 use crate::port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
 use crate::request::{ChatMessage, ChatRequest};
-use crate::response::{ChatResponse, FinishReason, OutputContent};
+use crate::response::{ChatResponse, FinishReason, OutputContent, ToolCall};
 use crate::stream::{StreamEnvelope, StreamEvent};
 use crate::usage::TokenUsage;
 
@@ -55,6 +55,17 @@ pub enum Turn {
         reason: FinishReason,
         /// Usage to report, if any.
         usage: Option<TokenUsage>,
+    },
+    /// Answer with text, but only once a tool call has been served.
+    ///
+    /// A convenience the executor loop's own tests use: a scripted conversation that requests a tool
+    /// and then answers is what makes "the model asked for a tool, the loop ran it, and the answer
+    /// reflects the result" a deterministic assertion rather than a live one.
+    ToolCall {
+        /// The invocations to request.
+        calls: Vec<ToolCall>,
+        /// Text produced alongside the calls, which may be empty.
+        text: String,
     },
     /// Fail with this normalized error.
     Fail(ModelErrorKind),
@@ -95,6 +106,15 @@ impl Turn {
     #[must_use]
     pub fn transient_failure() -> Self {
         Self::Fail(ModelErrorKind::Transient)
+    }
+
+    /// A turn that requests one tool call and no text.
+    #[must_use]
+    pub fn tool_call(id: &str, name: &str, arguments: &str) -> Self {
+        Self::ToolCall {
+            calls: vec![ToolCall::new(id, name, arguments)],
+            text: String::new(),
+        }
     }
 
     /// A turn that fails because the provider refused the output.
@@ -164,6 +184,12 @@ pub struct ScriptedModel {
     /// were replayed" would have nothing to assert against and would pass for a daemon that sent
     /// only the latest question. Recording the request is what makes that assertable.
     seen: Mutex<Vec<Vec<ChatMessage>>>,
+    /// The tools offered on every request served, in call order.
+    ///
+    /// Recorded for the same reason as the messages: the offered tool surface is a property of the
+    /// **request**, so "the model was offered the registered tools" is unassertable without it, and an
+    /// executor that never attached a tool surface would otherwise satisfy every result-shaped test.
+    seen_tools: Mutex<Vec<Vec<crate::request::ToolSpec>>>,
 }
 
 impl ScriptedModel {
@@ -197,6 +223,7 @@ impl ScriptedModel {
             cursor: Mutex::new(0),
             cancellation: None,
             seen: Mutex::new(Vec::new()),
+            seen_tools: Mutex::new(Vec::new()),
             // A scripted model declares what it is: local, streaming, and usage-reporting. The
             // placement is `Local` because nothing leaves the process, which makes a
             // `Sensitivity::Internal` destination able to receive any content — the point of a
@@ -204,7 +231,11 @@ impl ScriptedModel {
             capabilities: ModelCapabilities::unknown()
                 .with_streaming(Support::Supported)
                 .with_usage_on_stream(Support::Supported)
-                .with_tool_calls(Support::Unsupported)
+                // A scripted turn can request tools, so support is declared rather than denied: the
+                // executor loop must be exercisable end to end with a deterministic adapter, and a
+                // capability the scripted model can actually exercise must not be reported as
+                // unsupported.
+                .with_tool_calls(Support::Supported)
                 .with_placement(Some(Placement::Local)),
         })
     }
@@ -235,10 +266,25 @@ impl ScriptedModel {
             .map_or_else(|_| Vec::new(), |seen| seen.clone())
     }
 
-    /// Records one request's messages.
+    /// Returns the tools offered on every request this adapter has served, in call order.
+    ///
+    /// The offered tool surface is a property of the request, not of the answer, so this is what makes
+    /// "the model was offered the registered tools" assertable. An executor that never attached a tool
+    /// surface would otherwise satisfy every result-shaped test.
+    #[must_use]
+    pub fn seen_tools(&self) -> Vec<Vec<crate::request::ToolSpec>> {
+        self.seen_tools
+            .lock()
+            .map_or_else(|_| Vec::new(), |tools| tools.clone())
+    }
+
+    /// Records one request's messages and offered tools.
     fn record(&self, request: &ChatRequest) {
         if let Ok(mut seen) = self.seen.lock() {
             seen.push(request.messages().to_vec());
+        }
+        if let Ok(mut tools) = self.seen_tools.lock() {
+            tools.push(request.tools().to_vec());
         }
     }
 
@@ -284,13 +330,19 @@ impl ScriptedModel {
     async fn resolve(
         &self,
         turn: &Turn,
-    ) -> Result<(Vec<String>, FinishReason, Option<TokenUsage>), ModelError> {
+    ) -> Result<(Vec<String>, FinishReason, Option<TokenUsage>, Vec<ToolCall>), ModelError> {
         match turn {
             Turn::Answer {
                 fragments,
                 reason,
                 usage,
-            } => Ok((fragments.clone(), *reason, *usage)),
+            } => Ok((fragments.clone(), *reason, *usage, Vec::new())),
+            Turn::ToolCall { calls, text } => Ok((
+                vec![text.clone()],
+                FinishReason::ToolCalls,
+                Some(TokenUsage::new(11, 7)),
+                calls.clone(),
+            )),
             Turn::Fail(kind) => Err(ModelError::from_static(*kind, failure_message(*kind))),
             Turn::Slow { delay_ms, then } => {
                 // The delay is a real sleep so the runtime can schedule a racing cancellation.
@@ -310,8 +362,9 @@ impl ScriptedModel {
         fragments: &[String],
         reason: FinishReason,
         usage: Option<TokenUsage>,
+        calls: &[ToolCall],
     ) -> Vec<StreamEnvelope> {
-        let mut events = Vec::with_capacity(fragments.len() + 3);
+        let mut events = Vec::with_capacity(fragments.len() + calls.len() + 3);
         events.push(StreamEvent::Started);
         for fragment in fragments {
             events.push(StreamEvent::TextDelta {
@@ -320,6 +373,11 @@ impl ScriptedModel {
         }
         if let Some(usage) = usage {
             events.push(StreamEvent::Usage { usage });
+        }
+        // The calls precede the terminal event, matching the adapter's rule that a complete
+        // invocation is surfaced before the turn is reported ended.
+        for call in calls {
+            events.push(StreamEvent::ToolCall { call: call.clone() });
         }
         events.push(StreamEvent::Finished { reason });
         events
@@ -366,13 +424,17 @@ impl ModelGateway for ScriptedModel {
         self.check_cancelled()?;
         self.record(&request);
         let turn = self.next_turn()?;
-        let (fragments, reason, usage) = self.resolve(&turn).await?;
+        let (fragments, reason, usage, calls) = self.resolve(&turn).await?;
 
         let text = fragments.concat();
+        let mut output = vec![OutputContent::Text { text }];
+        for call in calls {
+            output.push(OutputContent::ToolCall { call });
+        }
         Ok(ChatResponse::new(
             self.provider.clone(),
             request.model().clone(),
-            vec![OutputContent::Text { text }],
+            output,
             reason,
         )
         .with_usage(usage))
@@ -382,8 +444,8 @@ impl ModelGateway for ScriptedModel {
         self.check_cancelled()?;
         self.record(&request);
         let turn = self.next_turn()?;
-        let (fragments, reason, usage) = self.resolve(&turn).await?;
-        let events = Self::events(&fragments, reason, usage);
+        let (fragments, reason, usage, calls) = self.resolve(&turn).await?;
+        let events = Self::events(&fragments, reason, usage, &calls);
         // A scripted stream is fully realized before it is returned, which is what makes it
         // deterministic: there is no provider state that could deliver events in a different order.
         Ok(Box::pin(futures_util::stream::iter(
@@ -492,6 +554,7 @@ mod tests {
             &["a".to_owned(), "b".to_owned()],
             FinishReason::Stop,
             Some(TokenUsage::new(1, 1)),
+            &[],
         );
         let mut validator = StreamValidator::new();
         // Skip the second delta, exactly as a lost network chunk would.

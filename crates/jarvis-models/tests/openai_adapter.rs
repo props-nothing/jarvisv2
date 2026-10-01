@@ -499,11 +499,57 @@ async fn placement_is_local_only_for_a_loopback_authority() {
 }
 
 #[tokio::test]
-async fn a_tool_call_fragment_is_not_reported_as_a_complete_invocation() {
-    // Streaming tool calls arrive in fragments; reporting one early would ask JARVIS
-    // to authorize a call whose arguments are still incomplete.
+async fn a_fragmented_tool_call_is_reassembled_and_surfaced_only_once_it_is_complete() {
+    // Streaming tool calls arrive in fragments across chunks. The property that survives is not
+    // "never surface a tool call" but "never surface an INCOMPLETE one": a consumer that reported the
+    // first chunk would ask JARVIS to authorize a call whose arguments are still being written, and a
+    // consumer that reported every chunk would present one call as several. So this fixture drives the
+    // fragments to completion and asserts the reassembled call is surfaced exactly once.
     let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
         b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let mut stream = provider.stream(request()).await.expect("stream starts");
+
+    let mut validator = StreamValidator::new();
+    let mut tool_call_events = 0_usize;
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+        let envelope = item.expect("healthy stream");
+        if matches!(envelope.event(), StreamEvent::ToolCall { .. }) {
+            tool_call_events += 1;
+        }
+        validator.accept(envelope).expect("ordered");
+    }
+    let summary = validator.finish().expect("stream finished");
+    assert_eq!(
+        summary.tool_calls().len(),
+        1,
+        "the two fragments must reassemble into exactly one call"
+    );
+    let call = &summary.tool_calls()[0];
+    assert_eq!(call.name(), "search");
+    assert_eq!(
+        call.arguments(),
+        r#"{"q":"rust"}"#,
+        "the argument fragments must be concatenated in arrival order"
+    );
+    assert_eq!(
+        tool_call_events, 1,
+        "an incomplete call must never be surfaced: exactly one ToolCall event, at completion"
+    );
+    assert_eq!(summary.finish_reason(), Some(FinishReason::ToolCalls));
+}
+
+#[tokio::test]
+async fn an_incomplete_tool_call_is_not_surfaced() {
+    // A turn that ends — or is truncated — before the fragments reassemble into a usable call must not
+    // produce a `ToolCall`. A call with no name cannot be authorized and one with no id cannot be
+    // answered, so emitting it would ask JARVIS to act on a request it cannot satisfy. This is the
+    // half of the original contract that the reassembly change preserves.
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
         b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
     ])]);
     let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
@@ -518,9 +564,107 @@ async fn a_tool_call_fragment_is_not_reported_as_a_complete_invocation() {
     let summary = validator.finish().expect("stream finished");
     assert!(
         summary.tool_calls().is_empty(),
-        "an incomplete tool call must not be surfaced"
+        "a call with no name must not be surfaced, however complete its arguments look"
     );
+    // The terminal reason is still the provider's, so a consumer can tell the turn ended on tool
+    // calls rather than inferring completion from an empty result.
     assert_eq!(summary.finish_reason(), Some(FinishReason::ToolCalls));
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_are_kept_in_index_order() {
+    // A turn may request several tools at once, interleaving their fragments. Grouping by arrival
+    // order rather than by the provider's `index` would scramble them, so the reassembler sorts by
+    // index and this fixture delivers the highest index first to prove it.
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"second\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"first\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let mut stream = provider.stream(request()).await.expect("stream starts");
+
+    let mut validator = StreamValidator::new();
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+        validator
+            .accept(item.expect("healthy stream"))
+            .expect("ordered");
+    }
+    let summary = validator.finish().expect("stream finished");
+    let names: Vec<&str> = summary
+        .tool_calls()
+        .iter()
+        .map(jarvis_models::ToolCall::name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["first", "second"],
+        "calls must be ordered by the provider's index, not by arrival order"
+    );
+}
+
+#[tokio::test]
+async fn offered_tools_reach_the_request_body_and_an_empty_list_is_omitted() {
+    // The model can only request tools it was offered. A request with no tools must not send an empty
+    // `tools` array, because some compatible servers reject it.
+    let transport = ScriptedTransport::new(vec![Reply::Body(r#"{"choices":[]}"#)]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let _ = provider.complete(request()).await;
+    let body = transport.last_request().unwrap_or_default();
+    assert!(
+        !body.contains("\"tools\""),
+        "an empty tool list must be omitted: {body}"
+    );
+
+    let schema = serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}});
+    let with_tools = request().with_tools(vec![jarvis_models::ToolSpec::new(
+        "files.read",
+        "Read a file",
+        schema.clone(),
+    )]);
+    let transport = ScriptedTransport::new(vec![Reply::Body(r#"{"choices":[]}"#)]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let _ = provider.complete(with_tools).await;
+    let body = transport.last_request().unwrap_or_default();
+    assert!(
+        body.contains("\"files.read\""),
+        "the tool name must reach the request: {body}"
+    );
+    assert!(
+        body.contains("\"parameters\""),
+        "the schema must reach the request: {body}"
+    );
+    assert!(
+        body.contains("\"type\":\"function\""),
+        "a function tool must be declared as such: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_assistant_tool_call_turn_is_replayed_before_its_result() {
+    // A `tool` result is only interpretable when the assistant turn that requested the call is also in
+    // the request, so the adapter must serialize an assistant message's tool calls. Without this the
+    // provider rejects a tool result that answers a call it never saw.
+    let call = jarvis_models::ToolCall::new("call_1", "files.read", r#"{"path":"a.txt"}"#);
+    let messages = vec![
+        ChatMessage::user("read a.txt"),
+        ChatMessage::assistant_tool_calls("", vec![call]),
+        ChatMessage::tool("call_1", "contents"),
+    ];
+    let transport = ScriptedTransport::new(vec![Reply::Body(r#"{"choices":[]}"#)]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let request = ChatRequest::new(model_id("gpt-oss:20b"), messages, CorrelationId::new());
+    let _ = provider.complete(request).await;
+
+    let body = transport.last_request().unwrap_or_default();
+    assert!(
+        body.contains("\"role\":\"assistant\"") && body.contains("\"tool_calls\""),
+        "the assistant turn must carry its tool calls: {body}"
+    );
+    assert!(
+        body.contains("\"tool_call_id\":\"call_1\""),
+        "the tool result must name the call it answers: {body}"
+    );
 }
 
 #[test]

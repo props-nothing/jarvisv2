@@ -2047,6 +2047,56 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P3-021` Add a remote or disposable sandbox backend (a hosted or short-lived worker) behind the same
       contracts, and prove resource limits, crash isolation, output bounding, and cleanup on the adapter
       boundary. The `P3-011` port is unchanged, so this is an adapter slice and not a protocol change.
+- [x] `P3-022` Make the model a caller of the tool pipeline: offer it the registry's tools and drive the
+      documented tool round trip, so the pipeline's model-facing consumer exists.
+      **THE GAP THIS CLOSES WAS RECORDED BY `P2-009` ITSELF.** `MAX_MODEL_CALLS` was `1` with the comment
+      *"One, because `P2-009` does not plan or use tools"*; `ChatRequest` had **no `tools` field**, so
+      `ToolRegistry::discover()` — the model-facing tool surface — had no consumer; and the `OpenAI` adapter
+      deliberately did not decode streaming `tool_calls`. The platform could serve tools over HTTP and as an
+      MCP server and could run a tool a caller named, but **the model could not ask for one**: a user asking
+      JARVIS to read a file received an answer generated without it. The whole policy/approval/audit pipeline
+      was a capability a caller could use and not one the agent could reach.
+      **Delivered in two crates, split along the dependency direction:**
+      - `jarvis-models` gained the provider-neutral contract: `ToolSpec` (name, description, input schema),
+        `ChatRequest::with_tools`, an assistant turn that carries `tool_calls`, and the `OpenAI` wire
+        mappings (`WireToolDefinition`, outgoing `WireToolCall`, `WireMessage.tool_calls`). Streaming
+        tool-call fragments are reassembled by `WireToolAccumulator` — grouped by the provider's `index`, not
+        arrival order — and emitted **once**, at the turn's finish, so a partially written invocation never
+        reaches the domain. `tool_choice` is deliberately **not** sent (`auto` is the server default with
+        `tools` present, and the research record excludes the field as non-interoperable).
+      - `apps/jarvisd` turned `execute_run` into `execute_run_with_tools`: a bounded loop over the documented
+        state machine. The offered set is re-derived from `ToolRegistry::discover()` on every call, so it is
+        always the current registry and the tool `ToolSpec` schema is the definition the pipeline validates
+        against — one statement of the contract. Each invocation goes through `ToolPipeline::call_tool`, and
+        the actor is built from the **stored run** (workspace + run id), never from the model.
+      **⭐⭐ A TEST FOUND THE RE-ENTRY DEFECT, WHICH IS THE POINT OF WRITING THE TEST FIRST.** The first
+      version of the loop ran the tool, observed it, and then went `Observing → Responding` — answering from
+      a transcript the model had **not yet seen**. The tool ran and the answer ignored it. The test asserting
+      two model calls failed with `left: 1, right: 2`, and the fix is the planning re-entry
+      (`Executing → Observing → Planning`) that makes the loop a loop. **A tool round trip has three edges,
+      not two, and only the missing third produces the defect** — the run looked successful either way.
+      **⭐ THE OFFERED TOOL SURFACE IS A PROPERTY OF THE REQUEST, SO IT IS ASSERTED ON THE REQUEST.**
+      `ScriptedModel::seen_tools()` was added beside `seen_messages()` for exactly the reason the messages
+      one exists: an executor that attached no tools would satisfy every result-shaped assertion, so "the
+      model was offered the registered tools" is unassertable without recording the request's own tool list.
+      **⭐ A REFUSAL IS FED BACK, A CONFIGURATION FAULT IS NOT.** A policy denial, schema violation, unknown
+      tool, or adapter fault becomes the tool **result** the model reads (with its reason code) so the loop
+      continues and the model can recover — a test asserts an unknown tool does not fail the run. A **missing
+      tool surface**, by contrast, fails the run, because an answer claiming to have used a tool nothing ran
+      is the failure the system prompt warns against. **⭐ A HELD CALL PARKS THE RUN** at `AwaitingApproval`
+      and stops; the approval and resume routes complete it, so the executor does not hold a promise
+      `security.md` assigns to those routes.
+      **Preserved deliberately:** the old contract test asserted a *fragment* is never surfaced; that
+      property is kept and strengthened — an invocation missing its id or name is still dropped, while a
+      complete one is now surfaced exactly once. **`ADR-0119`.** Gates: `cargo fmt --check`,
+      `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test
+      --workspace --all-features --locked` (adds 20 model tests and 3 daemon loop tests, including the
+      end-to-end "the model calls a real filesystem tool and answers from its result"), `cargo deny check` ok.
+      **Limits, recorded rather than glossed:** the executor does not itself resume a decided call (the routes
+      do); `MAX_TOOL_CALLS` is a fixed bound rather than policy-derived; the tool surface is offered whole
+      with no selection rule (fine at the current tool count, named in `ADR-0119` as the condition for a
+      selection or pagination rule); and no live provider has been called, so the loop is proven against the
+      scripted adapter and the offline wire fixtures, not a real streaming provider.
 
 ## P4: Memory And Context
 

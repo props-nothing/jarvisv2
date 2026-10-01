@@ -136,3 +136,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0116](0116-a-field-with-a-producer-and-no-reader.md) | A field with a producer and no reader, and the two values that had to agree | Accepted |
 | [0117](0117-a-skill-is-a-procedure-not-a-permission.md) | A skill is a procedure, not a permission | Accepted |
 | [0118](0118-a-diagnostic-that-contradicts-the-predicate.md) | A diagnostic that contradicts the predicate the platform gates on | Accepted |
+| [0119](0119-the-model-may-request-a-tool-and-rust-decides.md) | The model may request a tool; deterministic policy still decides whether it runs | Accepted |

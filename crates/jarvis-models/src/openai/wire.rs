@@ -16,12 +16,52 @@ use crate::response::{FinishReason, OutputContent, ToolCall};
 use crate::usage::TokenUsage;
 
 /// One outgoing message.
+///
+/// `content` is `Option` rather than a bare string because an assistant turn that only requested
+/// tool calls carries an empty content, and some providers reject a `null` content field while
+/// others require it to be present. Serializing `""` for the empty text and omitting nothing keeps
+/// the request valid on the interoperable set of servers.
 #[derive(Serialize)]
 pub(super) struct WireMessage<'a> {
     pub(super) role: &'a str,
     pub(super) content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tool_call_id: Option<&'a str>,
+    /// The tool calls an assistant turn requested, omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) tool_calls: Vec<WireOutgoingToolCall<'a>>,
+}
+
+/// One tool call an assistant turn requested, in the shape a provider reads.
+#[derive(Serialize)]
+pub(super) struct WireOutgoingToolCall<'a> {
+    pub(super) id: &'a str,
+    #[serde(rename = "type")]
+    pub(super) kind: &'static str,
+    pub(super) function: WireOutgoingFunction<'a>,
+}
+
+/// The name and argument text of an outgoing tool call.
+#[derive(Serialize)]
+pub(super) struct WireOutgoingFunction<'a> {
+    pub(super) name: &'a str,
+    pub(super) arguments: &'a str,
+}
+
+/// One tool offered to the model, in the provider's shape.
+#[derive(Serialize)]
+pub(super) struct WireToolDefinition<'a> {
+    #[serde(rename = "type")]
+    pub(super) kind: &'static str,
+    pub(super) function: WireToolFunction<'a>,
+}
+
+/// The function a tool definition declares.
+#[derive(Serialize)]
+pub(super) struct WireToolFunction<'a> {
+    pub(super) name: &'a str,
+    pub(super) description: &'a str,
+    pub(super) parameters: &'a serde_json::Value,
 }
 
 /// Returns the wire role name for a domain role.
@@ -59,11 +99,26 @@ pub(super) struct WireChatRequest<'a> {
     pub(super) temperature: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) stop: Vec<&'a str>,
+    /// The tools offered to the model, absent when none are.
+    ///
+    /// `tool_choice` is deliberately **not** sent: the research record
+    /// (`docs/research/integrations/openai-compatible-model-api.md`) excludes it from the shared
+    /// contract because its spelling is not interoperable across compatible servers, and `auto` —
+    /// the only value JARVIS would ever want — is the server's default when `tools` is present.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) tools: Vec<WireToolDefinition<'a>>,
 }
 
 /// A tool invocation as returned by the provider.
 #[derive(Deserialize)]
 pub(super) struct WireToolCall {
+    /// The position of this call within the turn.
+    ///
+    /// A streaming turn delivers a call's fragments across several chunks, each tagged with the same
+    /// index; the index is what lets the reassembler group fragments belonging to one invocation.
+    /// Absent in a non-streaming response, which carries each call whole.
+    #[serde(default)]
+    pub(super) index: Option<u64>,
     #[serde(default)]
     pub(super) id: Option<String>,
     #[serde(default)]
@@ -144,15 +199,17 @@ pub(super) struct WireChatResponse {
 
 /// The delta of a streaming choice.
 ///
-/// `tool_calls` is deliberately absent. Streaming tool calls arrive as fragments that
-/// must be reassembled before they mean anything, and a partially assembled
-/// invocation must never be reported as a complete one. Because the field is not
-/// decoded, a fragment is structurally incapable of reaching the domain layer; it is
-/// added together with the reassembly logic rather than as an ignored placeholder.
+/// `tool_calls` fragments arrive across chunks and are reassembled by the adapter before any
+/// invocation reaches the domain layer. The field is decoded here so the reassembler can see the
+/// fragments, but a fragment is **never** surfaced as a complete call: only the reassembled result
+/// (`WireToolAccumulator::finish`) becomes a `StreamEvent::ToolCall`, and only once, at the point the
+/// provider finishes the turn.
 #[derive(Deserialize)]
 pub(super) struct WireDelta {
     #[serde(default)]
     pub(super) content: Option<String>,
+    #[serde(default)]
+    pub(super) tool_calls: Vec<WireToolCall>,
 }
 
 /// One choice in a streaming chunk.
@@ -309,6 +366,115 @@ pub(super) fn output_items(message: Option<&WireResponseMessage>) -> Vec<OutputC
     items
 }
 
+/// Projects domain tool specifications into the provider's definition shape.
+///
+/// The parameters are borrowed rather than cloned, because a schema can be large and the wire
+/// request only serializes them.
+pub(super) fn tool_definitions(tools: &[crate::request::ToolSpec]) -> Vec<WireToolDefinition<'_>> {
+    tools
+        .iter()
+        .map(|tool| WireToolDefinition {
+            // The provider's discriminator for a function tool. Constant because only function tools
+            // are sent; a provider-specific tool type is not something this adapter speaks.
+            kind: "function",
+            function: WireToolFunction {
+                name: tool.name(),
+                description: tool.description(),
+                parameters: tool.parameters(),
+            },
+        })
+        .collect()
+}
+
+/// Reassembles an assistant turn's tool calls from streaming fragments.
+///
+/// # Why this type exists rather than decoding each fragment into a `ToolCall`
+///
+/// A streaming turn delivers one invocation across many chunks: the first carries the identifier and
+/// name, and subsequent chunks append argument text. A consumer that reported the first chunk would
+/// ask JARVIS to authorize a call whose arguments are still being written, and a consumer that
+/// reported each chunk would present one call as several. So fragments are **accumulated** here and
+/// the whole turn is emitted once, when the provider signals the turn is finished.
+///
+/// # Ordering by index
+///
+/// The provider tags each fragment with the index of the call it belongs to, so fragments are grouped
+/// by index rather than by arrival order. Grouping by arrival order would be correct only when a turn
+/// interleaves nothing, which is not guaranteed once a model requests several tools at once.
+#[derive(Default)]
+pub(super) struct WireToolAccumulator {
+    /// Per-index partial invocations, in first-seen order.
+    slots: Vec<ToolSlot>,
+}
+
+/// A partial invocation under construction.
+#[derive(Default)]
+struct ToolSlot {
+    index: u64,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl WireToolAccumulator {
+    /// Applies the fragments from one chunk.
+    ///
+    /// A fragment whose `index` is absent is treated as index `0`, which is what a provider that does
+    /// not tag single-call turns produces. The identifier and name are kept from the first fragment
+    /// that carries them rather than overwritten, because a later chunk normally sends neither and a
+    /// provider that repeated one would not be changing it.
+    pub(super) fn observe(&mut self, fragments: &[WireToolCall]) {
+        for fragment in fragments {
+            let index = fragment.index.unwrap_or_default();
+            // Find the slot for this index, or append one. `if let` over the position rather than a
+            // `match` on it, because the miss arm has a side effect and clippy reads a one-pattern
+            // `match` as a destructure.
+            let position =
+                if let Some(position) = self.slots.iter().position(|slot| slot.index == index) {
+                    position
+                } else {
+                    self.slots.push(ToolSlot {
+                        index,
+                        ..ToolSlot::default()
+                    });
+                    self.slots.len().saturating_sub(1)
+                };
+
+            let slot = &mut self.slots[position];
+            if let Some(id) = fragment.id.as_ref() {
+                slot.id.get_or_insert_with(|| id.clone());
+            }
+            if let Some(function) = fragment.function.as_ref() {
+                if let Some(name) = function.name.as_ref() {
+                    slot.name.get_or_insert_with(|| name.clone());
+                }
+                if let Some(arguments) = function.arguments.as_ref() {
+                    slot.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    /// Produces the reassembled calls.
+    ///
+    /// An invocation with no identifier or no name is **dropped** rather than emitted, for the same
+    /// reason `output_items` drops one: a call with no identifier cannot be answered and one with no
+    /// name cannot be authorized, so emitting it would ask JARVIS to act on an unusable request. The
+    /// slots are returned in index order so the output matches what a non-streaming response would
+    /// have produced.
+    pub(super) fn finish(mut self) -> Vec<ToolCall> {
+        self.slots.sort_by_key(|slot| slot.index);
+        self.slots
+            .into_iter()
+            .filter_map(|slot| {
+                let id = slot.id?;
+                let name = slot.name?;
+                Some(ToolCall::new(id, name, slot.arguments))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +568,7 @@ mod tests {
             content: Some("text".to_owned()),
             tool_calls: Some(vec![
                 WireToolCall {
+                    index: Some(0),
                     id: None,
                     function: Some(WireFunctionCall {
                         name: Some("search".to_owned()),
@@ -409,10 +576,12 @@ mod tests {
                     }),
                 },
                 WireToolCall {
+                    index: Some(1),
                     id: Some("call_1".to_owned()),
                     function: None,
                 },
                 WireToolCall {
+                    index: Some(2),
                     id: Some("call_2".to_owned()),
                     function: Some(WireFunctionCall {
                         name: Some("read".to_owned()),
@@ -426,6 +595,91 @@ mod tests {
         assert_eq!(items.len(), 2, "only the complete call survives");
         assert!(matches!(items[0], OutputContent::Text { .. }));
         assert!(matches!(items[1], OutputContent::ToolCall { .. }));
+    }
+
+    #[test]
+    fn streaming_fragments_reassemble_into_one_call_with_concatenated_arguments() {
+        let mut accumulator = WireToolAccumulator::default();
+        accumulator.observe(&[WireToolCall {
+            index: Some(0),
+            id: Some("call_1".to_owned()),
+            function: Some(WireFunctionCall {
+                name: Some("search".to_owned()),
+                arguments: Some("{\"q\":".to_owned()),
+            }),
+        }]);
+        // A later chunk carries only argument text, which is the shape a provider sends.
+        accumulator.observe(&[WireToolCall {
+            index: Some(0),
+            id: None,
+            function: Some(WireFunctionCall {
+                name: None,
+                arguments: Some("\"rust\"}".to_owned()),
+            }),
+        }]);
+
+        let calls = accumulator.finish();
+        assert_eq!(calls.len(), 1, "one invocation, however many fragments");
+        assert_eq!(calls[0].id(), "call_1");
+        assert_eq!(calls[0].name(), "search");
+        assert_eq!(calls[0].arguments(), "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn fragments_of_several_calls_are_grouped_by_index_not_arrival_order() {
+        let mut accumulator = WireToolAccumulator::default();
+        // Index 1 arrives first, exactly the interleaving that arrival-order grouping would scramble.
+        accumulator.observe(&[WireToolCall {
+            index: Some(1),
+            id: Some("b".to_owned()),
+            function: Some(WireFunctionCall {
+                name: Some("second".to_owned()),
+                arguments: Some("{}".to_owned()),
+            }),
+        }]);
+        accumulator.observe(&[WireToolCall {
+            index: Some(0),
+            id: Some("a".to_owned()),
+            function: Some(WireFunctionCall {
+                name: Some("first".to_owned()),
+                arguments: Some("{}".to_owned()),
+            }),
+        }]);
+
+        let calls = accumulator.finish();
+        let names: Vec<&str> = calls.iter().map(ToolCall::name).collect();
+        assert_eq!(names, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn an_incomplete_invocation_is_dropped_rather_than_emitted() {
+        let mut accumulator = WireToolAccumulator::default();
+        // An id with no name: usable neither to answer nor to authorize.
+        accumulator.observe(&[WireToolCall {
+            index: Some(0),
+            id: Some("call_1".to_owned()),
+            function: Some(WireFunctionCall {
+                name: None,
+                arguments: Some("{}".to_owned()),
+            }),
+        }]);
+        assert!(
+            accumulator.finish().is_empty(),
+            "a call with no name must not be surfaced"
+        );
+    }
+
+    #[test]
+    fn a_short_description_of_a_tool_is_projected_into_the_provider_shape() {
+        let schema = serde_json::json!({"type": "object"});
+        let tools = vec![crate::request::ToolSpec::new("files.read", "Read", schema)];
+        let projected = tool_definitions(&tools);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].kind, "function");
+        assert_eq!(projected[0].function.name, "files.read");
+        let json = serde_json::to_string(&projected).unwrap_or_else(|_| String::new());
+        assert!(json.contains("\"type\":\"function\""), "wire shape: {json}");
+        assert!(json.contains("\"parameters\""), "wire shape: {json}");
     }
 
     #[test]

@@ -124,6 +124,20 @@ impl OpenAiCompatibleProvider {
                 role: wire::role_wire_name(message.role()),
                 content,
                 tool_call_id: message.tool_call_id(),
+                // An assistant turn that requested tools carries them when replayed, so a following
+                // tool result is interpretable. Borrowed from the message, which owns the calls.
+                tool_calls: message
+                    .tool_calls()
+                    .iter()
+                    .map(|call| wire::WireOutgoingToolCall {
+                        id: call.id(),
+                        kind: "function",
+                        function: wire::WireOutgoingFunction {
+                            name: call.name(),
+                            arguments: call.arguments(),
+                        },
+                    })
+                    .collect(),
             })
             .collect();
 
@@ -139,6 +153,7 @@ impl OpenAiCompatibleProvider {
                 .temperature_milli()
                 .map(|value| f64::from(value) / 1000.0),
             stop: request.stop().iter().map(String::as_str).collect(),
+            tools: wire::tool_definitions(request.tools()),
         };
 
         serde_json::to_string(&wire).map_err(|_| {
@@ -417,6 +432,11 @@ struct StreamState {
     validator: StreamValidator,
     /// Events decoded from one provider chunk but not yet delivered.
     pending: VecDeque<StreamEvent>,
+    /// Partial tool invocations accumulated across chunks.
+    ///
+    /// Reassembled here and emitted **once** when the turn finishes, so a fragment is never reported
+    /// as a complete call.
+    tool_calls: wire::WireToolAccumulator,
     sequence: u64,
     /// A terminal event has been accepted.
     terminal: bool,
@@ -431,6 +451,7 @@ impl StreamState {
             decoder: SseDecoder::new(),
             validator: StreamValidator::new(),
             pending: VecDeque::new(),
+            tool_calls: wire::WireToolAccumulator::default(),
             sequence: 0,
             terminal: false,
             exhausted: false,
@@ -468,8 +489,9 @@ impl StreamState {
 
         let choice = chunk.choices.first();
 
-        if let Some(content) = choice
-            .and_then(|value| value.delta.as_ref())
+        let delta = choice.and_then(|value| value.delta.as_ref());
+
+        if let Some(content) = delta
             .and_then(|delta| delta.content.as_ref())
             .filter(|content| !content.is_empty())
         {
@@ -478,8 +500,13 @@ impl StreamState {
             });
         }
 
-        // Tool call deltas arrive in fragments across chunks; assembling them is a
-        // later slice, so a fragment is not reported as a complete invocation.
+        // Tool-call fragments are accumulated rather than emitted. The provider finishes the turn
+        // with a finish reason, and the reassembled invocations are emitted then — one event per
+        // call — so a partially written invocation never reaches the domain layer.
+        if let Some(fragments) = delta.map(|delta| delta.tool_calls.as_slice()) {
+            self.tool_calls.observe(fragments);
+        }
+
         if let Some(usage) = chunk.usage.as_ref() {
             self.pending.push_back(StreamEvent::Usage {
                 usage: usage.to_usage(),
@@ -487,6 +514,12 @@ impl StreamState {
         }
 
         if let Some(label) = choice.and_then(|value| value.finish_reason.as_deref()) {
+            // The reassembled calls precede the terminal event, so a consumer reading the stream in
+            // order sees the invocations before it sees the turn end. An accumulator that observed no
+            // fragments (a text-only turn) yields nothing here, so a plain answer is unaffected.
+            for call in std::mem::take(&mut self.tool_calls).finish() {
+                self.pending.push_back(StreamEvent::ToolCall { call });
+            }
             self.pending.push_back(StreamEvent::Finished {
                 reason: wire::finish_reason(Some(label)),
             });

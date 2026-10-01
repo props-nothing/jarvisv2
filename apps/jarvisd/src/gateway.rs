@@ -246,10 +246,19 @@ async fn start_run(
             if let Some(executor) = &state.executor {
                 let database = Arc::clone(&state.database);
                 let executor = Arc::clone(executor);
+                // The composed tool pipeline, when one exists, so the run is an agent loop rather than a
+                // single model call. `None` for a profile with no tool surface, in which case the run
+                // answers without tools — the behavior every run had before tools were wired here.
+                let tools = state.tools.clone();
                 let run_id = reply.run_id.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        crate::executor::execute_run(&database, executor.model(), &run_id).await
+                    if let Err(error) = crate::executor::execute_run_with_tools(
+                        &database,
+                        executor.model(),
+                        tools.as_ref(),
+                        &run_id,
+                    )
+                    .await
                     {
                         tracing::error!(
                             run_id,

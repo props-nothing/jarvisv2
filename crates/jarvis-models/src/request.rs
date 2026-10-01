@@ -123,6 +123,13 @@ pub struct ChatMessage {
     role: Role,
     content: MessageContent,
     tool_call_id: Option<String>,
+    /// The tool calls an assistant turn requested.
+    ///
+    /// A tool result is only meaningful to a provider when the assistant request it answers is also
+    /// present, so an assistant turn that asked for tools must carry them when it is replayed. The
+    /// vector is empty for every other role, and `is_consistent` enforces that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<crate::response::ToolCall>,
 }
 
 impl ChatMessage {
@@ -133,6 +140,7 @@ impl ChatMessage {
             role,
             content,
             tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -161,6 +169,25 @@ impl ChatMessage {
             role: Role::Tool,
             content: MessageContent::Text(value.into()),
             tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Creates an assistant message that requested tool calls.
+    ///
+    /// The `content` is the text the assistant produced alongside the calls, which may be empty. The
+    /// calls are carried on the message because a provider rejects a `tool` result whose originating
+    /// assistant turn is absent, so replaying the call is what makes the result interpretable.
+    #[must_use]
+    pub fn assistant_tool_calls(
+        content: impl Into<String>,
+        calls: Vec<crate::response::ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: MessageContent::Text(content.into()),
+            tool_call_id: None,
+            tool_calls: calls,
         }
     }
 
@@ -193,16 +220,85 @@ impl ChatMessage {
         self.tool_call_id.as_deref()
     }
 
+    /// Returns the tool calls this assistant turn requested.
+    ///
+    /// Empty for every role but `Assistant`, and empty for an assistant turn that only produced text.
+    #[must_use]
+    pub fn tool_calls(&self) -> &[crate::response::ToolCall] {
+        &self.tool_calls
+    }
+
     /// Returns whether the message is internally consistent.
     ///
-    /// A tool result without a correlation identifier cannot be matched to the call
-    /// it answers, and a non-tool message carrying one would misrepresent history.
+    /// Three rules, each the reason a field exists:
+    ///
+    /// - **A tool result must name the call it answers.** Without the correlation identifier the
+    ///   provider cannot match the result to its request.
+    /// - **Only a tool result may carry that identifier.** A user or system message carrying one
+    ///   would misrepresent the transcript.
+    /// - **Only an assistant turn may carry tool calls.** A tool result that itself requested tools,
+    ///   or a user turn that did, is not a shape any provider produces, and forwarding it would ask
+    ///   the provider to interpret a turn nobody could have sent.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        match self.role {
+        let id_ok = match self.role {
             Role::Tool => self.tool_call_id.is_some(),
             _ => self.tool_call_id.is_none(),
+        };
+        let calls_ok = match self.role {
+            Role::Assistant => true,
+            _ => self.tool_calls.is_empty(),
+        };
+        id_ok && calls_ok
+    }
+}
+
+/// A provider-neutral tool description offered to a model.
+///
+/// The schema is the tool's validated input schema, carried as a JSON value. This crate deliberately
+/// does not depend on `jarvis-tools`, so the projection *from* a canonical `ToolDefinition` *to* a
+/// `ToolSpec` happens at the composition root (the daemon), which already depends on both. Stating it
+/// that way keeps the dependency direction: an adapter never learns a JARVIS tool's effects, risk, or
+/// approval policy, because those are decided by policy from the registered definition and are not
+/// part of what a model is asked to choose.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl ToolSpec {
+    /// Creates a tool specification.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
         }
+    }
+
+    /// Returns the name the model calls, which is the canonical tool identifier.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the concise description.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Returns the JSON Schema a model's arguments are validated against.
+    #[must_use]
+    pub const fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
     }
 }
 
@@ -220,6 +316,13 @@ pub struct ChatRequest {
     max_output_tokens: Option<u32>,
     temperature_milli: Option<u16>,
     stop: Vec<String>,
+    /// Tools the model may request.
+    ///
+    /// Empty for a request that offers no tools, which is what a caller that has none registered
+    /// sends. An empty list is omitted from the request body rather than sent as `[]`, because a
+    /// provider that receives an empty `tools` array may reject the request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolSpec>,
     /// When true, the adapter must request token usage from the provider.
     ///
     /// Usage is requested explicitly so a streaming run persists a cost record
@@ -238,8 +341,16 @@ impl ChatRequest {
             max_output_tokens: None,
             temperature_milli: None,
             stop: Vec::new(),
+            tools: Vec::new(),
             include_usage: true,
         }
+    }
+
+    /// Offers these tools to the model.
+    #[must_use]
+    pub fn with_tools(mut self, value: Vec<ToolSpec>) -> Self {
+        self.tools = value;
+        self
     }
 
     /// Sets the output token ceiling.
@@ -309,6 +420,12 @@ impl ChatRequest {
         &self.stop
     }
 
+    /// Returns the tools the model may request.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolSpec] {
+        &self.tools
+    }
+
     /// Returns whether usage accounting was requested.
     #[must_use]
     pub const fn include_usage(&self) -> bool {
@@ -376,6 +493,42 @@ mod tests {
         let mut message = ChatMessage::user("hello");
         message.tool_call_id = Some("call_1".to_owned());
         assert!(!message.is_consistent());
+    }
+
+    #[test]
+    fn only_an_assistant_turn_may_carry_tool_calls() {
+        let call = crate::response::ToolCall::new("call_1", "files.read", "{}");
+
+        let assistant = ChatMessage::assistant_tool_calls("", vec![call.clone()]);
+        assert!(assistant.is_consistent());
+        assert_eq!(assistant.tool_calls().len(), 1);
+
+        // A user turn that requested tools is a shape no provider produces, and forwarding it would
+        // ask the provider to interpret a turn nobody could have sent.
+        let mut user = ChatMessage::user("hello");
+        user.tool_calls = vec![call];
+        assert!(
+            !user.is_consistent(),
+            "a non-assistant message must not carry tool calls"
+        );
+    }
+
+    #[test]
+    fn an_offered_tool_carries_its_name_description_and_schema() {
+        let schema = serde_json::json!({"type": "object"});
+        let spec = ToolSpec::new("files.read", "Read a file", schema.clone());
+        assert_eq!(spec.name(), "files.read");
+        assert_eq!(spec.description(), "Read a file");
+        assert_eq!(spec.parameters(), &schema);
+
+        let request =
+            ChatRequest::new(model(), vec![ChatMessage::user("hi")], CorrelationId::new())
+                .with_tools(vec![spec]);
+        assert_eq!(request.tools().len(), 1);
+        assert!(
+            request.tools().is_empty() || request.tools()[0].name() == "files.read",
+            "the offered tool must be the one added"
+        );
     }
 
     #[test]

@@ -1000,6 +1000,17 @@ impl ToolPipeline {
             .await
     }
 
+    /// Returns the registry the pipeline resolves tools against.
+    ///
+    /// Offered so the executor can offer the model exactly the tools the pipeline can run, from the
+    /// same source dispatch was verified against. Deriving the model-facing list any other way would be
+    /// a second statement of which tools exist, and the two could disagree in the direction that
+    /// matters: a tool offered to a model that the pipeline then refuses as unknown.
+    #[must_use]
+    pub const fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
     /// Reads one stored call, which is what a resume begins from.
     ///
     /// # Errors

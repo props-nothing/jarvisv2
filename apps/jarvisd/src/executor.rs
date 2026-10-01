@@ -39,17 +39,19 @@ use std::sync::Arc;
 use jarvis_core::{
     ContextBudget, ContextItem, ContextPriority, ContextSource, ContextSourceKind, ContextTrust,
     CorrelationId, EventSummary, InclusionReason, MemoryType, NewMessage, RetrievedMemory,
-    RunErrorCode, RunEventKind, RunEventPayload, RunState, RunTransition, Sensitivity, SystemClock,
-    UtcTimestamp, assemble_context,
+    RunErrorCode, RunEventKind, RunEventPayload, RunState, RunTransition, Sensitivity,
+    SessionChannel, SystemClock, UtcTimestamp, assemble_context,
 };
 use jarvis_models::{
     ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, StreamEvent,
-    StreamValidator,
+    StreamValidator, ToolSpec,
 };
 use jarvis_storage::{
     DatabaseError, NewRunEvent, SqliteDatabase, StoredRun, TerminalTransition, append_run_event,
     find_run, settle_run,
 };
+
+use crate::tool_pipeline::{ToolPipeline, ToolPipelineOutcome};
 
 /// Characters of the objective carried in the first context item's source reference.
 ///
@@ -126,9 +128,28 @@ const MODEL_MEMORY_TYPES: [MemoryType; 5] = [
 
 /// Model calls allowed for one run before it is failed rather than looped.
 ///
-/// One, because `P2-009` does not plan or use tools: a second call would mean the loop is retrying
-/// blindly, and a bounded retry policy belongs with the step planner rather than here.
-const MAX_MODEL_CALLS: u32 = 1;
+/// A run is now an agent loop: the model may request a tool, the loop runs it through the policy
+/// pipeline, feeds the result back, and the model answers. The bound is what makes that loop
+/// **bounded** — a model that keeps requesting tools cannot spin forever, and a run that exhausted the
+/// budget is reported as failed rather than left open. Eight round trips is well above a typical
+/// request (one to decide, one to answer) and small enough that a pathological loop stops quickly and
+/// cheaply.
+const MAX_MODEL_CALLS: u32 = 8;
+
+/// Tool calls executed for one run before it is failed rather than looped.
+///
+/// Separate from the model-call bound because the two count different things: one model call may
+/// request several tools, so a single call could otherwise drive an unbounded number of executions. The
+/// bound is on **effects**, which is the quantity a runaway loop actually multiplies.
+const MAX_TOOL_CALLS: u32 = 16;
+
+/// Characters of a tool result carried back to the model.
+///
+/// The tool's own output is already bounded (`jarvis_tools::BoundedOutput`), but the model's context is
+/// not unlimited and a result should be one turn, not a document. Truncation is on a character boundary
+/// and the elision is stated, so a model reading a short result knows it was cut rather than assuming
+/// the tool returned little.
+const MAX_TOOL_RESULT_CHARS: usize = 4_000;
 
 /// Events read back when locating a run's completed answer.
 ///
@@ -138,11 +159,13 @@ const MAX_EVENTS_READ: u32 = 1_000;
 
 /// The system prompt for a native run.
 ///
-/// Authoritative text, and the only instruction-bearing content in the request. Kept short and
-/// factual: this slice produces an answer, and a larger prompt would imply a tool or memory surface
-/// that does not exist yet.
+/// Authoritative text, and the only instruction-bearing content in the request. It states the tool
+/// discipline plainly because a model that narrates an action it did not take is the failure this
+/// prompt exists to prevent: a tool the run cannot call is reported as unavailable rather than
+/// described as done.
 const SYSTEM_POLICY: &str = "You are JARVIS, a local assistant. Answer the user's request directly and concisely. \
-Do not claim to have performed actions you did not perform.";
+Use the tools you are offered when they are needed, and base your answer on their results. \
+Do not claim to have performed actions you did not perform: if a tool is unavailable or fails, say so.";
 
 /// Maximum characters of an error message copied into an event payload.
 ///
@@ -214,7 +237,12 @@ impl Executor {
     }
 }
 
-/// Drives one run to a terminal state.
+/// Drives one run to a terminal state without a tool surface.
+///
+/// A thin wrapper over [`execute_run_with_tools`] with no pipeline. Kept because the executor's own
+/// tests drive runs with no tools — the single-shot behavior every run had before tools were wired in —
+/// and a production caller composes through the daemon, which always passes whatever pipeline it built
+/// (possibly `None` for a profile with no tool surface).
 ///
 /// Returns the settled run, or the storage failure that ended the attempt. A provider failure is
 /// **not** an `Err`: it settles the run as failed and is returned as `Ok(settled)`, because the
@@ -224,9 +252,66 @@ impl Executor {
 ///
 /// Returns [`DatabaseError`] when a run event or the settlement cannot be persisted, which leaves
 /// the run open and is therefore a real failure rather than a run outcome.
+#[cfg(test)]
 pub async fn execute_run(
     database: &Arc<SqliteDatabase>,
     model: &dyn ModelGateway,
+    run_id: &str,
+) -> Result<StoredRun, DatabaseError> {
+    execute_run_with_tools(database, model, None, run_id).await
+}
+
+/// The transcript and tool budget a run loop carries between iterations.
+///
+/// Bundled into one value so the loop does not thread two independent `&mut` parameters through every
+/// step — the transcript it extends and the counter that bounds executions are both agent-loop state,
+/// and keeping them together is what makes `generate` readable rather than a wall of arguments.
+#[derive(Default)]
+struct RunLoopState {
+    /// The messages the next model call is sent, extended in place by each tool round trip.
+    messages: Vec<ChatMessage>,
+    /// Tool executions performed so far, bounded by [`MAX_TOOL_CALLS`].
+    tool_calls: u32,
+}
+
+impl RunLoopState {
+    /// Increments the execution counter and reports whether the run is over budget.
+    ///
+    /// Returns `true` when the next call would exceed [`MAX_TOOL_CALLS`], so a caller fails the run
+    /// rather than executing it.
+    fn over_tool_budget(&mut self) -> bool {
+        self.tool_calls += 1;
+        self.tool_calls > MAX_TOOL_CALLS
+    }
+}
+
+/// Drives one run to a terminal state, running model-requested tools through the policy pipeline.
+///
+/// This is the agent loop. Where [`execute_run`] answered in a single model call, this drives the
+/// documented state machine for real: the model is offered the daemon's registered tools, a turn that
+/// requests them is satisfied through [`ToolPipeline`] (which is where schema validation, policy,
+/// approval, idempotency, and audit live), the results are fed back as tool-result messages, and the
+/// loop repeats until the model answers or a bound is reached.
+///
+/// `tools` is optional for the same reason the executor is: a deployment with no registry and no
+/// adapters composes a run executor with no tool surface, and a run under it answers without tools
+/// rather than failing. When `tools` is `None` the loop is exactly the single-call loop it was, so the
+/// existing single-shot behavior is preserved rather than replaced.
+///
+/// # The states, and why they are entered rather than skipped
+///
+/// `Planning → Executing → Observing → Planning` is the tool round trip, and `Observing → Responding`
+/// is the final answer. The loop records each transition as an event, so a client replaying the stream
+/// sees *what the run did* rather than a jump from planning to an answer.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when a run event or the settlement cannot be persisted. A model or tool
+/// failure is a **run outcome** and settles the run, returning `Ok(settled)`.
+pub async fn execute_run_with_tools(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    tools: Option<&Arc<ToolPipeline>>,
     run_id: &str,
 ) -> Result<StoredRun, DatabaseError> {
     let run = find_run(database, run_id).await?;
@@ -243,23 +328,23 @@ pub async fn execute_run(
     let mut calls = 0_u32;
     let mut current = run;
     let correlation_id = CorrelationId::new();
-    // The request the model will be sent, produced by the context assembly step. Held here so the
-    // manifest and the request describe the same selection.
-    let mut request_messages: Vec<ChatMessage> = Vec::new();
+    // The transcript and the tool budget travel together across loop iterations: the transcript is
+    // **extended in place** by each tool round trip (it carries the assistant turn that requested a
+    // tool and the tool result that answered it, because a provider rejects a `tool` message whose
+    // originating assistant turn is absent), and the budget counts executions rather than calls.
+    let mut state = RunLoopState::default();
 
     loop {
         // A settlement ends the loop. Without this guard, a run that `fail`, `complete`, or
         // `check_cancellation` just settled re-enters the match below and is settled a second
-        // time, which the domain refuses. That surfaced as
-        // `TerminalStateImmutable { from: Failed }` rather than as anything about settlement
-        // ordering, which is why it is worth a comment.
+        // time, which the domain refuses.
         if current.state().is_terminal() {
             return Ok(current);
         }
 
         current = match current.state() {
             RunState::Received => {
-                current = advance(
+                advance(
                     database,
                     &current,
                     RunState::ContextBuilding,
@@ -268,8 +353,7 @@ pub async fn execute_run(
                     r#"{"state":"context_building"}"#,
                     correlation_id,
                 )
-                .await?;
-                current
+                .await?
             }
             RunState::ContextBuilding => {
                 // The assembled request is held across the loop rather than rebuilt in `generate`,
@@ -277,14 +361,10 @@ pub async fn execute_run(
                 let (advanced, messages) =
                     assemble_and_record(database, model, &current, &model_id, correlation_id)
                         .await?;
-                request_messages = messages;
-                current = advanced;
-                current
+                state.messages = messages;
+                advanced
             }
-            RunState::Planning => {
-                current = enter_execution(database, &current, correlation_id).await?;
-                current
-            }
+            RunState::Planning => enter_execution(database, &current, correlation_id).await?,
             RunState::Executing => {
                 calls += 1;
                 if calls > MAX_MODEL_CALLS {
@@ -301,28 +381,34 @@ pub async fn execute_run(
                     )
                     .await;
                 }
-                current = generate(
+                generate(
                     database,
                     model,
+                    tools,
                     &current,
                     &model_id,
-                    &request_messages,
+                    &mut state,
                     correlation_id,
                 )
-                .await?;
-                current
+                .await?
             }
             RunState::Observing => {
-                current = enter_responding(database, &current, correlation_id).await?;
-                current
+                // A final answer is being produced; a tool round trip re-enters planning instead, and
+                // that decision was made by `generate` when it appended the tool results.
+                enter_responding(database, &current, correlation_id).await?
+            }
+            RunState::AwaitingApproval => {
+                // Parked on a human decision. The decision and the resumed execution arrive through the
+                // approval and resume routes, which drive this run again; reaching here in the loop
+                // means the daemon was restarted while the run waited, so the run is left parked rather
+                // than advanced on a decision nothing has taken.
+                return Ok(current);
             }
             RunState::Responding => {
                 return complete(database, &current, correlation_id).await;
             }
-            // `AwaitingApproval` and every terminal state are not reachable in this slice: nothing
-            // requests approval yet, and a terminal state is returned above. Reaching here would
-            // mean the state machine moved somewhere this executor does not drive, so it is
-            // reported rather than guessed at.
+            // Every terminal state is returned above. Reaching here would mean the state machine moved
+            // somewhere this executor does not drive, so it is reported rather than guessed at.
             other => {
                 return fail(
                     database,
@@ -535,6 +621,36 @@ async fn assemble_and_record(
         advanced,
         messages_from_manifest(&manifest, &history, &memories, run.objective())?,
     ))
+}
+
+/// Builds the model-facing tool specifications from the daemon's registered tools.
+///
+/// The schema is the tool's **input schema** and nothing else: effects, risk, scopes, and the approval
+/// policy are deliberately absent, because a model chooses *what* to call and deterministic policy
+/// decides *whether it may* — offering policy fields would invite a model to reason about its own
+/// authority, which is exactly the trust boundary the pipeline exists to hold. The description is the
+/// canonical one, so the model reads the same sentence an operator does.
+///
+/// The schema is read through the registry (`definition.input_schema()`) rather than reconstructed, so
+/// the schema the model is offered is the one the pipeline validates arguments against — one statement
+/// of the contract, not two that could disagree.
+fn tool_specs(tools: &Arc<ToolPipeline>) -> Vec<ToolSpec> {
+    tools
+        .registry()
+        .discover()
+        .tools
+        .iter()
+        .map(|summary| {
+            let parameters = jarvis_tools::ToolId::new(&summary.id)
+                .ok()
+                .and_then(|id| tools.registry().get(&id).ok())
+                .map_or_else(
+                    || serde_json::json!({ "type": "object" }),
+                    |definition| definition.input_schema().document().clone(),
+                );
+            ToolSpec::new(summary.id.clone(), summary.description.clone(), parameters)
+        })
+        .collect()
 }
 
 /// Builds the bounded summary of what assembly decided, for the run event.
@@ -941,16 +1057,46 @@ async fn consume_stream(
     }
 }
 
-/// Calls the model once and records the answer or the failure.
+/// Calls the model once, records the answer or the failure, and runs any requested tools.
+///
+/// # What this returns, and which state the run is in afterwards
+///
+/// A turn that produces **text and no tool calls** is the final answer: the events are recorded and the
+/// run advances to `Observing`, which leads to `Responding` and completion.
+///
+/// A turn that requests **tools** is not the final answer. The invocations are run through
+/// [`ToolPipeline`] — where schema validation, policy, approval, idempotency, and audit live — the
+/// results are appended to the transcript as tool-result messages, and the run moves to `Observing` and
+/// then **back to `Planning`** rather than to `Responding`. That is the loop: the model reasons again
+/// over the results. `observe_tools` performs the planning re-entry.
+///
+/// # A held tool parks the run
+///
+/// A call policy holds for human approval moves the run to `AwaitingApproval` and **stops**: nothing is
+/// fed back to the model, because the effect has not happened. The decision and resume arrive through
+/// the approval and resume routes, which complete the call directly rather than through this loop — so
+/// the executor parks a run truthfully and does not hold a promise those routes already keep.
+///
+/// # Usage is recorded every call
+///
+/// Not only on the last one, because an agent loop makes several billable calls and a run that recorded
+/// only the final usage would understate its cost by every round trip but one.
 async fn generate(
     database: &Arc<SqliteDatabase>,
     model: &dyn ModelGateway,
+    tools: Option<&Arc<ToolPipeline>>,
     run: &StoredRun,
     model_id: &ModelId,
-    messages: &[ChatMessage],
+    state: &mut RunLoopState,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
-    let request = ChatRequest::new(model_id.clone(), messages.to_vec(), correlation_id);
+    // The tool surface is re-derived from the registry on every call rather than carried in the
+    // transcript, so the offered set is always the current one and there is one statement of it.
+    let specs = tools.map_or_else(Vec::new, tool_specs);
+    let mut request = ChatRequest::new(model_id.clone(), state.messages.clone(), correlation_id);
+    if !specs.is_empty() {
+        request = request.with_tools(specs);
+    }
 
     let stream = match model.stream(request).await {
         Ok(stream) => stream,
@@ -1001,6 +1147,42 @@ async fn generate(
         .await;
     }
 
+    // Usage is recorded for every call, not only the last, because an agent loop is several billable
+    // calls and recording only the final one understates the run's cost.
+    if let Some(usage) = summary.usage() {
+        append(
+            database,
+            run,
+            RunEventKind::UsageUpdated,
+            None,
+            &format!(
+                r#"{{"input_tokens":{},"output_tokens":{},"cached_input_tokens":{}}}"#,
+                usage.input_tokens(),
+                usage.output_tokens(),
+                usage.cached_input_tokens()
+            ),
+            correlation_id,
+        )
+        .await?;
+    }
+
+    // A turn that requested tools is not the answer. The invocations are executed and their results fed
+    // back, and the run is observed and then planned again — `run_tool_round` owns that whole path so
+    // this function stays about one model call.
+    if !summary.tool_calls().is_empty() {
+        return run_tool_round(
+            database,
+            tools,
+            run,
+            state,
+            summary.tool_calls(),
+            &text,
+            correlation_id,
+        )
+        .await;
+    }
+
+    // No tool calls: this is the final answer.
     append(
         database,
         run,
@@ -1015,25 +1197,6 @@ async fn generate(
     )
     .await?;
 
-    // Usage is recorded because a streamed run that omits it leaves a cost record missing with no
-    // sign that it is missing.
-    if let Some(usage) = summary.usage() {
-        append(
-            database,
-            run,
-            RunEventKind::UsageUpdated,
-            None,
-            &format!(
-                r#"{{"input_tokens":{},"output_tokens":{},"cached_input_tokens":{}}}"#,
-                usage.input_tokens(),
-                usage.output_tokens(),
-                usage.cached_input_tokens(),
-            ),
-            correlation_id,
-        )
-        .await?;
-    }
-
     advance(
         database,
         run,
@@ -1044,6 +1207,272 @@ async fn generate(
         correlation_id,
     )
     .await
+}
+
+/// Runs every tool call one model turn requested, then re-enters planning.
+///
+/// The whole tool round trip lives here: the assistant turn that requested the calls is appended, the
+/// actor is built from the **stored run**, each call is executed through the policy pipeline, and the
+/// result is fed back. A held call parks the run; otherwise the run is observed and planned again.
+///
+/// # The actor is built from the run, never from the model
+///
+/// The workspace and run come from the run row rather than from the model, because a model that could
+/// name its own workspace would widen its own authority; the scope set is the daemon's own grant. A
+/// rejected fixed literal is an authoring error, so the run fails rather than the model being told a
+/// tool is unavailable when the real fault is the daemon's own scope constant.
+async fn run_tool_round(
+    database: &Arc<SqliteDatabase>,
+    tools: Option<&Arc<ToolPipeline>>,
+    run: &StoredRun,
+    state: &mut RunLoopState,
+    requested: &[jarvis_models::ToolCall],
+    text: &str,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    let Some(tools) = tools else {
+        // A model asked for a tool no pipeline is composed for. This is a configuration fault reported
+        // as a run failure rather than silently answering without the tool, because an answer that
+        // claims to have used a tool nothing ran is the failure the system prompt warns against.
+        return fail(
+            database,
+            run,
+            RunErrorCode::new("tool_unavailable").map_err(|_| {
+                DatabaseError::InvalidRunRequest {
+                    field: "error_code",
+                }
+            })?,
+            "the model requested a tool but no tool surface is composed",
+            correlation_id,
+        )
+        .await;
+    };
+
+    // The assistant turn that requested the calls is appended **before** the results, because a provider
+    // rejects a `tool` message whose originating assistant turn is absent.
+    state.messages.push(ChatMessage::assistant_tool_calls(
+        text.to_owned(),
+        requested.to_vec(),
+    ));
+
+    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+        run.workspace_id(),
+        run.id(),
+        SessionChannel::Cli,
+        jarvis_tools::AuthenticationStrength::Credential,
+        "policy-1",
+    ) else {
+        return fail(
+            database,
+            run,
+            RunErrorCode::new("tool_actor_invalid").map_err(|_| {
+                DatabaseError::InvalidRunRequest {
+                    field: "error_code",
+                }
+            })?,
+            "the daemon's fixed tool scope literals were rejected",
+            correlation_id,
+        )
+        .await;
+    };
+
+    // Each call is executed in order. A single held call parks the whole run: the effect did not happen,
+    // so nothing is fed back, and the approval and resume routes complete it — which keeps the executor
+    // from holding a promise `security.md` assigns to those routes.
+    for call in requested {
+        if state.over_tool_budget() {
+            return fail(
+                database,
+                run,
+                RunErrorCode::new("too_many_tool_calls").map_err(|_| {
+                    DatabaseError::InvalidRunRequest {
+                        field: "error_code",
+                    }
+                })?,
+                "the run exceeded its tool call budget",
+                correlation_id,
+            )
+            .await;
+        }
+
+        let result_text = match parse_arguments(call.arguments()) {
+            Some(arguments) => {
+                match run_tool_call(tools, &actor, call.name(), &arguments, correlation_id).await {
+                    StepOutcome::Text(text) => text,
+                    // A held call stops the run here. The assistant turn is already in the transcript,
+                    // so the run's own stream explains that it asked and then parked.
+                    StepOutcome::Held => {
+                        return park_for_approval(database, run, correlation_id).await;
+                    }
+                }
+            }
+            // Arguments that are not a JSON object cannot be validated or authorized, so the tool is not
+            // run and the model is told why. This is fed back as the result rather than failing the run,
+            // because a malformed call is a model mistake the loop can recover from — the model sees the
+            // refusal and can correct itself.
+            None => format!(
+                "error: the arguments for {} were not a JSON object and the tool was not run",
+                call.name()
+            ),
+        };
+
+        state.messages.push(ChatMessage::tool(
+            call.id(),
+            truncate_tool_result(&result_text),
+        ));
+    }
+
+    // A tool result was produced, so the run is **observed and then planned again** — not answered.
+    // Both edges are recorded (`Executing → Observing → Planning`) so a client replaying the stream sees
+    // the run interpret a result and decide to reason again, which is the tool round trip.
+    let observed = observe_tools(database, run, correlation_id).await?;
+    enter_planning(database, &observed, correlation_id).await
+}
+
+/// What running one tool step produced.
+///
+/// Two variants because a tool call has two outcomes the loop must distinguish: a result to feed back,
+/// or a park. There is deliberately **no** third "ran with no output" variant — a tool that ran and
+/// produced nothing still yields a sentence the model can read, so the two cases stay exhaustive.
+enum StepOutcome {
+    /// The tool ran (or was refused, or failed); this is what the model is told.
+    Text(String),
+    /// The call is held for approval; the run parks.
+    Held,
+}
+
+/// Runs one model-requested tool call through the policy pipeline.
+///
+/// # Why the actor is built from the run
+///
+/// The same rule the HTTP tool route follows: the workspace and run come from the **stored run**, not
+/// from the model, because a model that could name its own workspace would widen its own authority. The
+/// scope set is the daemon's own grant, derived rather than accepted. The channel is `Cli` and the
+/// strength is `Credential`, which is what a daemon-originated run has actually established. The actor
+/// is built once by the caller and passed here, so every call in one turn runs under the same authority.
+/// Builds the sentence a tool result contributes to the model's transcript.
+///
+/// A tool that produced output contributes it. A tool that ran and produced none still contributes a
+/// sentence, so the model is never handed an empty result it would have to guess about: a confirmed
+/// effect with no text says so, and any other terminal outcome reports its own name.
+fn tool_result_text(result: &jarvis_tools::ToolCallResult) -> String {
+    result.output().map_or_else(
+        || match result.outcome().as_str() {
+            // A confirmed effect that produced no text is still an outcome the model must know about,
+            // so it is stated rather than left empty.
+            "confirmed" => "ok (the action was performed)".to_owned(),
+            other => format!("the tool reported: {other}"),
+        },
+        |output| output.content().to_owned(),
+    )
+}
+
+async fn run_tool_call(
+    tools: &Arc<ToolPipeline>,
+    actor: &crate::tool_actor::ToolActor,
+    tool: &str,
+    arguments: &serde_json::Value,
+    correlation_id: CorrelationId,
+) -> StepOutcome {
+    match tools
+        .call_tool(tool, arguments.clone(), actor, correlation_id)
+        .await
+    {
+        Ok(ToolPipelineOutcome::Executed(result)) => StepOutcome::Text(tool_result_text(&result)),
+        Ok(ToolPipelineOutcome::AwaitingApproval { .. }) => StepOutcome::Held,
+        // A refusal and a fault are both fed back as the result, so the loop continues and the model can
+        // reconsider. Failing the run instead would end a conversation over one denied or mistyped call.
+        // The reason code is included because it is what makes the refusal actionable.
+        Ok(ToolPipelineOutcome::Refused { reason_code }) => {
+            StepOutcome::Text(format!("the tool was refused by policy: {reason_code}"))
+        }
+        Err(error) => StepOutcome::Text(format!(
+            "the tool call could not be completed: {}",
+            truncate(&error.to_string(), MAX_EVENT_ERROR_CHARS)
+        )),
+    }
+}
+
+/// Records the move into `Observing` when a tool result was produced.
+///
+/// The transition is `Executing → Observing`, which is the only edge from `Executing`. `enter_planning`
+/// then re-enters `Planning` (via `Observing → Planning`), which is the tool round trip.
+async fn observe_tools(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    advance(
+        database,
+        run,
+        RunState::Observing,
+        RunEventKind::StateChanged,
+        Some("interpreting the tool result"),
+        r#"{"state":"observing"}"#,
+        correlation_id,
+    )
+    .await
+}
+
+/// Records the move back into `Planning` after a tool result was interpreted.
+///
+/// The transition is `Observing → Planning`. Without it a tool round trip would go `Observing →
+/// Responding` — the answer produced from a transcript the model has not seen — which is exactly the
+/// defect a loop without a planning re-entry produces: the tool ran, and the answer ignored it. A test
+/// asserting two model calls is what found this.
+async fn enter_planning(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    advance(
+        database,
+        run,
+        RunState::Planning,
+        RunEventKind::StateChanged,
+        Some("planning with the tool result"),
+        r#"{"state":"planning"}"#,
+        correlation_id,
+    )
+    .await
+}
+
+/// Parks a run on a human decision.
+///
+/// The transition is `Executing → AwaitingApproval`, and the run stops here: the loop returns it, and
+/// the approval and resume routes re-drive the call. Nothing is fed back to the model because the effect
+/// has not happened.
+async fn park_for_approval(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    advance(
+        database,
+        run,
+        RunState::AwaitingApproval,
+        RunEventKind::ApprovalRequested,
+        Some("waiting for approval"),
+        r#"{"state":"awaiting_approval"}"#,
+        correlation_id,
+    )
+    .await
+}
+
+/// Parses tool-call argument text into a JSON object, or reports that it is not one.
+fn parse_arguments(text: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// Bounds a tool result for the model's context, stating the elision.
+fn truncate_tool_result(text: &str) -> String {
+    if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let mut bounded: String = text.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+    bounded.push_str("\n… [tool output truncated]");
+    bounded
 }
 
 /// Settles a responding run as completed.
@@ -2191,5 +2620,188 @@ mod tests {
                 || panic!("the fixture must have written a context event"),
                 |event| event.payload().to_owned(),
             )
+    }
+
+    /// A pipeline confined to `root`, over the same database the run lives in.
+    ///
+    /// The filesystem adapter is registered because its definitions are the daemon's own, so the tool the
+    /// loop executes is a real adapter's — not a test double's — which is what makes "the effect happened"
+    /// an observation about the product rather than about the fixture.
+    fn filesystem_pipeline(
+        profile: &TempProfile,
+        database: &Arc<SqliteDatabase>,
+        root: &std::path::Path,
+    ) -> Arc<ToolPipeline> {
+        let roots = jarvis_tools::WorkspaceRoots::new([root])
+            .unwrap_or_else(|error| panic!("workspace roots: {error}"));
+        // The secret store lives inside this test's own profile, never in the shared temp directory:
+        // a fixed path would let two tests' nonce files collide.
+        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
+        Arc::new(
+            ToolPipeline::with_adapters(
+                Arc::clone(database),
+                Some(roots),
+                jarvis_tools::WorkspacePolicy::default(),
+                Vec::new(),
+                secrets,
+            )
+            .unwrap_or_else(|error| panic!("compose the pipeline: {error}")),
+        )
+    }
+
+    /// **The model can now call a tool and answer from its result — the agent loop, end to end.**
+    ///
+    /// Before this slice `MAX_MODEL_CALLS` was one and the request carried no `tools` field, so the model
+    /// could not ask for a capability at all. This drives the whole path: the model is offered the
+    /// daemon's registered tools, it requests `jarvis.files.read`, the loop runs it through the policy
+    /// pipeline (schema validation, policy, the filesystem adapter, the audit ledger), the result is fed
+    /// back as a tool-result message, and the model's second turn answers from it.
+    #[tokio::test]
+    async fn the_model_can_call_a_tool_and_answer_from_its_result() {
+        let (profile, database) = database().await;
+        // A real file inside a granted root, so the filesystem adapter genuinely reads it.
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        std::fs::write(root.join("note.txt"), "the sky is blue")
+            .unwrap_or_else(|error| panic!("write the fixture file: {error}"));
+
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "read note.txt and tell me the colour").await;
+
+        // Turn one requests the tool; turn two answers. A real agent loop makes exactly two calls.
+        let model = model(vec![
+            Turn::tool_call("call_1", "jarvis.files.read", r#"{"path":"note.txt"}"#),
+            Turn::answer("The file says the sky is blue."),
+        ]);
+        let settled = execute_run_with_tools(&database, &model, Some(&tools), run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded),
+            "the run must complete after the tool round trip"
+        );
+        assert_eq!(
+            model.calls(),
+            2,
+            "one call to request the tool and one to answer from its result"
+        );
+
+        // The tool was offered on the request. Asserted on the request the adapter received, because the
+        // offered surface is a property of the request — an executor that attached no tools would
+        // otherwise satisfy every result-shaped test.
+        let offered = model.seen_tools();
+        assert!(
+            offered[0]
+                .iter()
+                .any(|spec| spec.name() == "jarvis.files.read"),
+            "the registered tool must be offered to the model: {:?}",
+            offered[0].iter().map(ToolSpec::name).collect::<Vec<_>>()
+        );
+
+        // The second request carries the assistant turn that asked and the tool result that answered,
+        // which is the shape a provider requires. Asserted on the recorded request so the transcript
+        // cannot silently omit it.
+        let requests = model.seen_messages();
+        assert_eq!(requests.len(), 2, "two model calls");
+        let second = &requests[1];
+        assert!(
+            second
+                .iter()
+                .any(|message| message.role() == jarvis_models::Role::Assistant
+                    && !message.tool_calls().is_empty()),
+            "the assistant turn that requested the tool must be replayed"
+        );
+        let result = second
+            .iter()
+            .find(|message| message.role() == jarvis_models::Role::Tool)
+            .unwrap_or_else(|| panic!("the tool result must be replayed: {second:?}"));
+        assert_eq!(result.tool_call_id(), Some("call_1"));
+        assert!(
+            result.text().contains("the sky is blue"),
+            "the model must be given the tool's actual output: {}",
+            result.text()
+        );
+
+        // The run's own stream explains what it did, so a client replaying it sees the tool round trip
+        // rather than a jump from planning to an answer.
+        let kinds = events(&database, run.id()).await;
+        assert!(
+            kinds.contains(&RunEventKind::ToolRequested),
+            "the stream must record the tool request: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&RunEventKind::OutputCompleted),
+            "the stream must record the final answer: {kinds:?}"
+        );
+    }
+
+    /// **A tool refusal is fed back so the model can answer truthfully, not so the run fails.**
+    ///
+    /// A model that asks for a tool it may not use is a normal event, not a fault. The loop tells the
+    /// model the refusal — with its reason code, which is what makes it actionable — and lets it answer.
+    /// Asserted with an unknown tool, which the pipeline refuses as a fault rather than a policy denial,
+    /// so the loop's recovery is proven for the harder case too.
+    #[tokio::test]
+    async fn a_refused_tool_call_is_fed_back_and_the_run_still_answers() {
+        let (profile, database) = database().await;
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "do something unsupported").await;
+
+        let model = model(vec![
+            Turn::tool_call("call_1", "jarvis.nonexistent.tool", "{}"),
+            Turn::answer("I could not do that, so here is what I know."),
+        ]);
+        let settled = execute_run_with_tools(&database, &model, Some(&tools), run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded),
+            "a refused tool must not fail the run"
+        );
+        let requests = model.seen_messages();
+        let result = requests[1]
+            .iter()
+            .find(|message| message.role() == jarvis_models::Role::Tool)
+            .unwrap_or_else(|| panic!("the refusal must be fed back: {:?}", requests[1]));
+        assert!(
+            result.text().contains("could not be completed"),
+            "the model must be told the call failed: {}",
+            result.text()
+        );
+    }
+
+    /// **A run with no tool surface behaves exactly as before.**
+    ///
+    /// The executor is composed with `None` when a profile has no registry and no adapters. The model must
+    /// then answer in one call with no tools offered, which is the behavior every run had before tools were
+    /// wired in.
+    #[tokio::test]
+    async fn a_run_without_a_tool_surface_offers_no_tools_and_answers_once() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "just answer").await;
+        let model = model(vec![Turn::answer("An answer with no tools.")]);
+
+        let settled = execute_run_with_tools(&database, &model, None, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+        assert_eq!(model.calls(), 1, "one call, with no tool round trip");
+        assert!(
+            model.seen_tools()[0].is_empty(),
+            "no tool surface must be offered when none is composed"
+        );
     }
 }
