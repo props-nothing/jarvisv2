@@ -27,7 +27,7 @@
 //!
 //! A health state is a fact about a moment. A connector that recorded `Connected` yesterday and reports it
 //! today is reporting something it does not know, and the requirement it violates is `security.md`'s: stale
-//! evidence must fail closed. [`ConnectorHealth::is_stale_at`] therefore takes the current instant and the
+//! evidence must fail closed. [`ConnectorHealth::is_fresh_at`] therefore takes the current instant and the
 //! freshness bound, rather than the state carrying an opinion about its own age.
 
 use std::fmt;
@@ -299,6 +299,35 @@ impl ConnectorHealth {
         match self {
             Self::NeedsReauth { reason, .. } => Some(*reason),
             _ => None,
+        }
+    }
+
+    /// Returns the scopes the account is missing, when a reauth state carries them.
+    ///
+    /// # Why this exists: the field had a producer and no reader
+    ///
+    /// [`Self::NeedsReauth`]'s `missing_scopes` is documented as *"the scopes that are missing, when the
+    /// reason is a scope loss"*, and `crate::diagnostics::diagnostics_for` emits
+    /// [`DiagnosticField::MissingScopes`](crate::diagnostics::DiagnosticField::MissingScopes) — described as
+    /// *"the list a reauth prompt needs"* — from a **separate** argument it takes from its caller. So the
+    /// state's own list was read by **nothing**: a caller that built a `ScopeLoss` reauth state and passed an
+    /// empty shortfall reported no missing scopes at all, which is the one list the reauth prompt exists to
+    /// name. That is `ADR-0092`'s "a value with a producer and no reader" and `ADR-0021`'s "two values that
+    /// must agree, with nothing making them" in one field (`ADR-0116`).
+    ///
+    /// The accessor is the reader, and `diagnostics_for` uses it, so the list the state carries reaches the
+    /// report rather than being droppable by a caller. **Empty for every state that carries none**, so a
+    /// caller branches on `is_empty` rather than matching the enum — the same accessor shape
+    /// [`Self::reauth_reason`] uses, and the reason the return is a slice rather than an `Option<&Vec>`: an
+    /// absent list and an empty one call for the same action here.
+    #[must_use]
+    pub fn missing_scopes(&self) -> &[String] {
+        match self {
+            Self::NeedsReauth { missing_scopes, .. } => missing_scopes,
+            Self::Connected { .. }
+            | Self::Degraded { .. }
+            | Self::Disconnected { .. }
+            | Self::Unknown { .. } => &[],
         }
     }
 

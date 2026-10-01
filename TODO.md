@@ -5700,6 +5700,33 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **NEW LIMITS:** no handler sends an acknowledgement yet, so the `Accept`/`AbandonAndAcknowledge` distinction
     reaches a metric only when a push handler exists; a transient store failure is still not an ingest outcome,
     so `DeliveryAck::Retry` has no user in either mechanism.
+- [ ] `P5-005` **(continued — a field with a producer and no reader)**: `ConnectorHealth` gains
+  `missing_scopes()`; `diagnostics_for` consults the state's list as well as the caller's and emits one finding;
+  a dangling `is_stale_at` doc link is corrected. **2 new tests (so 494 in the crate).** **`ADR-0116`.** Two
+  guards falsified A-B-A.
+  - **⭐⭐ THE FINDING: `NeedsReauth`'s `missing_scopes` WAS WRITTEN EVERYWHERE AND READ NOWHERE.**
+    `ConnectorHealth::NeedsReauth` carries the list, documented as *"the scopes that are missing, when the
+    reason is a scope loss"* — and there was **no accessor**, while `diagnostics_for` matched
+    `NeedsReauth { reason, .. }` (discarding the field) and emitted `MissingScopes` — described as *"the list a
+    reauth prompt needs"* — from a **separate argument**. So a caller that built a `ScopeLoss` state carrying
+    scopes and passed an empty shortfall produced a report with **no** missing-scope finding at all.
+    **⭐ `ADR-0092`'s "a value with a producer and no reader", and the field's own doc made a claim about a
+    consumer that did not exist.**
+  - **⭐⭐ AND THE TWO LISTS HAD TO AGREE WITH NOTHING MAKING THEM** (`ADR-0021`): the state's list and the
+    caller's described one fact, only one reached the report, and they could differ.
+  - **⭐ BOTH SOURCES ARE CONSULTED, DELIBERATELY** — a shortfall **without** a reauth (a partial consent the
+    account still runs under, `AccountStatus::ScopeShortfall`) is only ever in the caller's list, while a
+    `ScopeLoss` records the scopes in the **state** (the value a persisted health record holds). The union is
+    the honest answer and it closes the drop. `MissingScopes` is emitted **once**, because it describes the
+    condition rather than each scope.
+  - **⭐ THE ACCESSOR IS THE `reauth_reason()` SHAPE** — a slice, not an `Option<&Vec>`, so a caller branches on
+    `is_empty` rather than matching every variant; an absent list and an empty one call for the same action.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A:** (1) `missing_scopes()` returning empty for `NeedsReauth` → detected by
+    **both** the accessor test and the diagnostics test; (2) `diagnostics_for` reading only the caller's argument
+    → detected. A `let _ = missing_scopes;` was removed — the tell that the parameter decided nothing.
+  - **NEW LIMITS:** nothing renders the report yet, so the union's contents are asserted rather than shown; a
+    shortfall without a reauth still has no `ConnectorHealth` variant, so the caller's argument is not yet
+    redundant.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

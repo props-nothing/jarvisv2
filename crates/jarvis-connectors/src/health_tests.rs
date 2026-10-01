@@ -263,6 +263,57 @@ fn a_reauth_reason_says_whether_a_user_can_resolve_it() {
 }
 
 #[test]
+fn the_missing_scopes_on_a_reauth_state_are_reachable_and_empty_for_every_other_state() {
+    // **The reading that did not exist.** `NeedsReauth`'s `missing_scopes` was documented as "the list a reauth
+    // prompt needs" and written by every construction — and read by nothing, because `diagnostics_for` took a
+    // SEPARATE list from its caller. So a caller that built a `ScopeLoss` state and passed an empty shortfall
+    // reported no missing scopes at all. The accessor is the reader that closes that (`ADR-0116`).
+    let scope_loss = ConnectorHealth::NeedsReauth {
+        reason: ReauthReason::ScopeLoss,
+        missing_scopes: vec!["calendar.readonly".to_owned(), "gmail.readonly".to_owned()],
+        signal: signal(HealthProbe::Read, false, 0),
+    };
+    assert_eq!(
+        scope_loss.missing_scopes(),
+        ["calendar.readonly", "gmail.readonly"],
+        "the state's own list must be reachable rather than dropped"
+    );
+    // A reauth for another reason still carries the field, and an empty one is not a missing accessor: the two
+    // are told apart by matching the state, and both return a slice so a caller branches on `is_empty`.
+    let revoked = ConnectorHealth::NeedsReauth {
+        reason: ReauthReason::Revoked,
+        missing_scopes: Vec::new(),
+        signal: signal(HealthProbe::Refresh, false, 0),
+    };
+    assert!(revoked.missing_scopes().is_empty());
+    assert_eq!(revoked.reauth_reason(), Some(ReauthReason::Revoked));
+    // Every state that carries no list returns an **empty slice**, not a panic and not a default: an absent
+    // list and an empty one call for the same action, which is why the return is a slice rather than an
+    // `Option<&Vec>`.
+    let others = [
+        ConnectorHealth::Connected {
+            signal: signal(HealthProbe::Identity, true, 0),
+        },
+        ConnectorHealth::Degraded {
+            signal: signal(HealthProbe::RateLimit, false, 0),
+            retry_after: None,
+        },
+        ConnectorHealth::Disconnected {
+            signal: signal(HealthProbe::None, false, 0),
+        },
+        ConnectorHealth::Unknown {
+            signal: signal(HealthProbe::None, false, 0),
+        },
+    ];
+    for state in &others {
+        assert!(
+            state.missing_scopes().is_empty(),
+            "{state:?} carries no scope list, so the accessor must answer empty"
+        );
+    }
+}
+
+#[test]
 fn an_inconclusive_probe_is_not_evidence_and_must_not_replace_an_observation() {
     // The distinction that stops a network problem from entering reauth: "we could not reach the provider" is
     // not evidence that anything is wrong with the ACCOUNT, so an inconclusive probe must leave the previous

@@ -211,6 +211,68 @@ fn a_scope_shortfall_is_a_warning_rather_than_an_error_and_the_missing_scopes_ar
 }
 
 #[test]
+fn a_reauth_states_own_missing_scopes_reach_the_report_without_the_caller_passing_them() {
+    // **The finding this fixes.** `ConnectorHealth::NeedsReauth` holds the missing scopes and its field doc
+    // calls them "the list a reauth prompt needs" — while this function read only the caller's `missing_scopes`
+    // argument, so a caller that built a `ScopeLoss` state and passed an empty shortfall reported **nothing**
+    // about the scopes the state itself recorded. The state's list is now consulted too, so it cannot be
+    // dropped (`ADR-0116`).
+    let scope_loss = ConnectorHealth::NeedsReauth {
+        reason: ReauthReason::ScopeLoss,
+        missing_scopes: vec!["gmail.readonly".to_owned()],
+        signal: must(
+            HealthSignal::new(HealthProbe::Read, false, None, at(0)),
+            "a failed read",
+        ),
+    };
+    // The caller passes **no** scopes, and the finding is still emitted — from the state's own list.
+    let from_state = diagnostics_for(&scope_loss, crate::auth::AuthState::Connected, &[]);
+    assert!(
+        from_state
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::MissingScopes),
+        "a ScopeLoss state must report its own missing scopes without the caller supplying them"
+    );
+    assert_eq!(
+        scope_loss.missing_scopes(),
+        ["gmail.readonly"],
+        "and the list is reachable through the accessor the report now reads"
+    );
+
+    // A reauth with **no** scopes and no caller list still reports nothing — the union is empty, and the
+    // finding's own rule is that an empty shortfall is absent rather than reported as empty.
+    let revoked = ConnectorHealth::NeedsReauth {
+        reason: ReauthReason::Revoked,
+        missing_scopes: Vec::new(),
+        signal: must(
+            HealthSignal::new(HealthProbe::Refresh, false, None, at(0)),
+            "a failed refresh",
+        ),
+    };
+    assert!(
+        !diagnostics_for(&revoked, crate::auth::AuthState::Connected, &[])
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::MissingScopes),
+        "a revoke with no shortfall must not report a missing-scope finding"
+    );
+
+    // And the finding is emitted **once** even when both sources name scopes, because it describes the
+    // condition rather than each scope: two sources must not produce duplicate findings for one account.
+    let both = diagnostics_for(
+        &scope_loss,
+        crate::auth::AuthState::Connected,
+        &["calendar.readonly".to_owned()],
+    );
+    assert_eq!(
+        both.iter()
+            .filter(|finding| finding.field == DiagnosticField::MissingScopes)
+            .count(),
+        1,
+        "the state's list and the caller's must not each produce a finding"
+    );
+}
+
+#[test]
 fn a_connector_mid_flow_is_not_reported_as_a_failure() {
     // An operator running onboarding must not see an error while the user is still consenting, which is why
     // the auth state is read rather than only the health.

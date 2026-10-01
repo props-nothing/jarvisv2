@@ -334,7 +334,17 @@ pub fn diagnostics_for(
     // Missing scopes are reported at `Warning` rather than `Error`: an account with a shortfall is connected
     // and may run the operations its grant covers, so an `Error` would send an operator to fix something that
     // is working. This is the same distinction `AccountStatus::ScopeShortfall` draws.
-    if !missing_scopes.is_empty() {
+    //
+    // **The list comes from the state as well as from the argument, which is the fix `ADR-0116` records.**
+    // `ConnectorHealth::NeedsReauth` carries the missing scopes for a `ScopeLoss`, and its own field doc says
+    // they are "the list a reauth prompt needs" — while this function read only the caller's argument, so a
+    // caller that built a `ScopeLoss` state and passed an empty shortfall reported **no** missing scopes. Both
+    // sources are consulted now, because a shortfall can exist without a reauth (a partial consent the account
+    // still runs under) and a reauth can carry the scopes the state itself recorded: the union is the honest
+    // answer, and it means the list the state holds can no longer be dropped by a caller. `MissingScopes` is
+    // emitted **once**, because the finding describes the condition rather than each scope.
+    let state_scopes = health.missing_scopes();
+    if !missing_scopes.is_empty() || !state_scopes.is_empty() {
         findings.push(DiagnosticFinding::new(
             DiagnosticField::MissingScopes,
             DiagnosticSeverity::Warning,
@@ -352,7 +362,6 @@ pub fn diagnostics_for(
         ));
     }
 
-    let _ = missing_scopes;
     findings
 }
 
