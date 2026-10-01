@@ -29,6 +29,37 @@ fn connected() -> ConnectorHealth {
     }
 }
 
+/// The instant a report is assembled at, for a state observed at [`at`]`(1_700_000_000)`.
+///
+/// **One second after the observation**, so every report below is assembled against a **fresh** state unless
+/// the test says otherwise — which is what makes the staleness tests' `fresh_now` a control rather than a
+/// second convention. `ADR-0118`: whether a health state may be acted on depends on *when the report is
+/// assembled*, so every call has to supply an instant and a bound.
+fn fresh_now() -> jarvis_core::UtcTimestamp {
+    at(1_700_000_001)
+}
+
+/// The freshness bound every call site uses unless it is testing the bound itself.
+///
+/// The **platform's own default** rather than a test figure, so the reports below are assembled against the
+/// bound a deployment actually applies — a test-local bound would leave the production default unexercised.
+const FRESHNESS: u64 = crate::health::DEFAULT_FRESHNESS_SECONDS;
+
+/// `AuthState::Connected`, spelled short, because these tests pass it at nearly every call site.
+///
+/// An alias rather than a second value: a test-local `AuthState` could drift from the production variant,
+/// which is the kind of copy that makes a test pass against something the product does not use.
+const AUTH_CONNECTED: crate::auth::AuthState = crate::auth::AuthState::Connected;
+
+/// An instant `elapsed` seconds after the observation the [`connected`] fixtures carry.
+///
+/// Written as an **offset from the observation** rather than an absolute instant, so the arithmetic that
+/// decides staleness is stated where it is read: `old(bound)` is exactly at the bound and `old(bound + 1)` is
+/// one second past it, which is the pair a bound-off-by-one has to fail.
+fn old(elapsed: u64) -> jarvis_core::UtcTimestamp {
+    at(1_700_000_000 + i64::try_from(elapsed).unwrap_or(i64::MAX))
+}
+
 /// Every field the closed set offers.
 ///
 /// A **hand-written list**, and deliberately so: it is the completeness check. Adding a variant without
@@ -46,6 +77,7 @@ fn all_fields() -> Vec<DiagnosticField> {
         DiagnosticField::HealthState,
         DiagnosticField::HealthProbe,
         DiagnosticField::HealthObservedAt,
+        DiagnosticField::HealthStale,
         DiagnosticField::CursorKind,
         DiagnosticField::CursorObservedAt,
         DiagnosticField::WebhookSupport,
@@ -96,7 +128,7 @@ fn every_field_is_loggable_and_renderable_and_the_one_model_exception_is_named()
     // being added here is caught by the count rather than passing silently.
     assert_eq!(
         codes.len(),
-        20,
+        21,
         "the field set grew or shrank without this test"
     );
 }
@@ -123,7 +155,13 @@ fn no_current_field_is_withheld_from_rendering() {
     );
     // Every field a caller would receive is renderable at some level, and the findings a real state produces
     // use only renderable redactions.
-    for finding in diagnostics_for(&connected(), crate::auth::AuthState::Connected, &[]) {
+    for finding in diagnostics_for(
+        &connected(),
+        crate::auth::AuthState::Connected,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    ) {
         assert!(
             finding.redaction.is_renderable(),
             "{} must be renderable",
@@ -137,7 +175,13 @@ fn a_health_state_sets_the_finding_severity_and_an_unusable_account_is_an_error(
     // The finding an operator ranks the report by. A state that permits calls is `Info`, and one that does
     // not is `Error` — so the severity is derived from the state rather than chosen per connector, which is
     // what makes `doctor`'s output comparable across connectors.
-    let permitted = diagnostics_for(&connected(), crate::auth::AuthState::Connected, &[]);
+    let permitted = diagnostics_for(
+        &connected(),
+        crate::auth::AuthState::Connected,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
     let health_findings: Vec<&DiagnosticFinding> = permitted
         .iter()
         .filter(|finding| finding.field == DiagnosticField::HealthState)
@@ -157,7 +201,13 @@ fn a_health_state_sets_the_finding_severity_and_an_unusable_account_is_an_error(
             "a failed refresh",
         ),
     };
-    let refused = diagnostics_for(&refusing, crate::auth::AuthState::Failed, &[]);
+    let refused = diagnostics_for(
+        &refusing,
+        crate::auth::AuthState::Failed,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
     let health = refused
         .iter()
         .find(|finding| finding.field == DiagnosticField::HealthState)
@@ -187,6 +237,8 @@ fn a_scope_shortfall_is_a_warning_rather_than_an_error_and_the_missing_scopes_ar
         &connected(),
         crate::auth::AuthState::Connected,
         &["read".to_owned(), "delete".to_owned()],
+        fresh_now(),
+        FRESHNESS,
     );
     let missing = short
         .iter()
@@ -196,16 +248,28 @@ fn a_scope_shortfall_is_a_warning_rather_than_an_error_and_the_missing_scopes_ar
     // And with no shortfall the field is absent rather than reported as empty, so a caller cannot confuse
     // "nothing is missing" with "the list was not computed".
     assert!(
-        !diagnostics_for(&connected(), crate::auth::AuthState::Connected, &[])
-            .iter()
-            .any(|finding| finding.field == DiagnosticField::MissingScopes),
+        !diagnostics_for(
+            &connected(),
+            crate::auth::AuthState::Connected,
+            &[],
+            fresh_now(),
+            FRESHNESS
+        )
+        .iter()
+        .any(|finding| finding.field == DiagnosticField::MissingScopes),
         "a complete grant must not report a missing-scope finding"
     );
     // The count is always reported, because it distinguishes "nothing was granted" from "the grant is short".
     assert!(
-        diagnostics_for(&connected(), crate::auth::AuthState::Connected, &[])
-            .iter()
-            .any(|finding| finding.field == DiagnosticField::GrantedScopeCount),
+        diagnostics_for(
+            &connected(),
+            crate::auth::AuthState::Connected,
+            &[],
+            fresh_now(),
+            FRESHNESS
+        )
+        .iter()
+        .any(|finding| finding.field == DiagnosticField::GrantedScopeCount),
         "the granted-scope count is always a support fact"
     );
 }
@@ -226,7 +290,13 @@ fn a_reauth_states_own_missing_scopes_reach_the_report_without_the_caller_passin
         ),
     };
     // The caller passes **no** scopes, and the finding is still emitted — from the state's own list.
-    let from_state = diagnostics_for(&scope_loss, crate::auth::AuthState::Connected, &[]);
+    let from_state = diagnostics_for(
+        &scope_loss,
+        crate::auth::AuthState::Connected,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
     assert!(
         from_state
             .iter()
@@ -250,9 +320,15 @@ fn a_reauth_states_own_missing_scopes_reach_the_report_without_the_caller_passin
         ),
     };
     assert!(
-        !diagnostics_for(&revoked, crate::auth::AuthState::Connected, &[])
-            .iter()
-            .any(|finding| finding.field == DiagnosticField::MissingScopes),
+        !diagnostics_for(
+            &revoked,
+            crate::auth::AuthState::Connected,
+            &[],
+            fresh_now(),
+            FRESHNESS
+        )
+        .iter()
+        .any(|finding| finding.field == DiagnosticField::MissingScopes),
         "a revoke with no shortfall must not report a missing-scope finding"
     );
 
@@ -262,6 +338,8 @@ fn a_reauth_states_own_missing_scopes_reach_the_report_without_the_caller_passin
         &scope_loss,
         crate::auth::AuthState::Connected,
         &["calendar.readonly".to_owned()],
+        fresh_now(),
+        FRESHNESS,
     );
     assert_eq!(
         both.iter()
@@ -269,6 +347,165 @@ fn a_reauth_states_own_missing_scopes_reach_the_report_without_the_caller_passin
             .count(),
         1,
         "the state's list and the caller's must not each produce a finding"
+    );
+}
+
+#[test]
+fn a_state_too_old_to_act_on_is_reported_as_unusable_rather_than_as_connected() {
+    // **The finding this fixes (`ADR-0118`).** `security.md`'s "missing or stale evidence fails closed" is
+    // enforced in `health` by `permits_calls_at`, and this report read only `permits_calls()` — the state as
+    // it *was* — so a `Connected` observation from yesterday produced a report saying `connected` at `Info`
+    // about a state that permits **no call**. A diagnostic that contradicts the predicate the rest of the
+    // platform gates on is worse than a missing one: an operator reads it instead of the truth.
+    let stale_state = ConnectorHealth::Connected {
+        signal: HealthSignal::succeeded(HealthProbe::Identity, at(1_700_000_000)),
+    };
+
+    // **The boundary, on both sides, asserted through the report.** An elapsed exactly equal to the bound is
+    // fresh (`is_fresh_at` is `elapsed <= bound`) and one second more is stale — so a bound that was off by
+    // one, or ignored, fails here rather than only in the predicate the report is supposed to follow.
+    let at_bound = old(FRESHNESS);
+    assert!(
+        !diagnostics_for(&stale_state, AUTH_CONNECTED, &[], at_bound, FRESHNESS)
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::HealthStale),
+        "a state exactly at the bound is fresh in the report, not only in the predicate"
+    );
+    let stale_report = diagnostics_for(
+        &stale_state,
+        AUTH_CONNECTED,
+        &[],
+        old(FRESHNESS + 1),
+        FRESHNESS,
+    );
+
+    // The health state is an **error** rather than `Info`, which is the correction: the state cannot be acted
+    // on, and `Info` is the severity that means "nothing to do here". This is the assertion the original
+    // defect fails — it reported `Info` for a state that permits no call.
+    assert_eq!(
+        stale_report
+            .iter()
+            .find(|finding| finding.field == DiagnosticField::HealthState)
+            .map(|finding| finding.severity),
+        Some(DiagnosticSeverity::Error),
+        "a state too old to act on must not be reported at Info, which reads as 'nothing to do here'"
+    );
+    // And the staleness is **named**, rather than left for a reader to derive from the instant and their own
+    // clock — a report of a stale state that does not say so is the same gap in a different place.
+    assert!(
+        stale_report
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::HealthStale),
+        "a stale state must report that it is stale"
+    );
+
+    // **The control, and it is the point.** One second after the observation the same state is fresh: the
+    // report is `Info` and it carries no staleness finding at all — absent rather than reported as false, the
+    // rule `MissingScopes` uses, because a negative finding that is always present is one a reader stops
+    // seeing. Without this control a function that called every state stale would pass the assertions above.
+    let fresh_report = diagnostics_for(&stale_state, AUTH_CONNECTED, &[], fresh_now(), FRESHNESS);
+    assert_eq!(
+        fresh_report
+            .iter()
+            .find(|finding| finding.field == DiagnosticField::HealthState)
+            .map(|finding| finding.severity),
+        Some(DiagnosticSeverity::Info),
+        "a fresh connected state is still the ordinary case"
+    );
+    assert!(
+        !fresh_report
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::HealthStale),
+        "a fresh state must not report staleness at all, rather than reporting it as false"
+    );
+
+    // A zero bound makes every observation except one taken at exactly `now` stale, so the bound input is
+    // genuinely read rather than constant — a report that ignored its bound would pass everything above.
+    let zero_bound = diagnostics_for(&stale_state, AUTH_CONNECTED, &[], fresh_now(), 0);
+    assert!(
+        zero_bound
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::HealthStale),
+        "a zero bound must make a one-second-old state stale, or the bound is not being read"
+    );
+    assert_eq!(
+        zero_bound
+            .iter()
+            .find(|finding| finding.field == DiagnosticField::HealthState)
+            .map(|finding| finding.severity),
+        Some(DiagnosticSeverity::Error),
+        "and the state itself must be an error under that bound"
+    );
+}
+
+#[test]
+fn staleness_and_unusability_are_two_dimensions_and_a_mutant_is_why_this_exists() {
+    // **A mutant survived here, and that is the whole reason this test is separate.** The first version of the
+    // staleness code was mutated to `!health.permits_calls_at(now, bound)` in place of
+    // `!health.is_fresh_at(now, bound)` — and **the entire suite passed**, because every state the test above
+    // used was `Connected`, where the two predicates agree. They are different facts: a `NeedsReauth` observed
+    // a moment ago **permits no call** and is **fresh**, so the mutant would have told an operator "nobody has
+    // checked since" about a state that was just checked. The missing detector is a fresh state that still
+    // refuses, and this test is it.
+    let observed = at(1_700_000_000);
+    let refusing_but_fresh = ConnectorHealth::NeedsReauth {
+        reason: ReauthReason::Expired,
+        missing_scopes: Vec::new(),
+        signal: must(
+            HealthSignal::new(HealthProbe::Refresh, false, None, observed),
+            "a failed refresh",
+        ),
+    };
+    assert!(
+        !refusing_but_fresh.permits_calls_at(fresh_now(), FRESHNESS),
+        "this state refuses calls, which is the dimension that must not be conflated with staleness"
+    );
+    assert!(
+        refusing_but_fresh.is_fresh_at(fresh_now(), FRESHNESS),
+        "and it is nevertheless fresh, which is the second dimension"
+    );
+    let refusing_report = diagnostics_for(
+        &refusing_but_fresh,
+        crate::auth::AuthState::Failed,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
+    assert!(
+        !refusing_report
+            .iter()
+            .any(|finding| finding.field == DiagnosticField::HealthStale),
+        "a freshly observed refusal must not be reported as stale: it refuses for its own reason, and \
+         'nobody has checked since' would be a false claim about the evidence"
+    );
+    assert_eq!(
+        refusing_report
+            .iter()
+            .find(|finding| finding.field == DiagnosticField::HealthState)
+            .map(|finding| finding.severity),
+        Some(DiagnosticSeverity::Error),
+        "while the state itself is still an error, for its own reason rather than for staleness"
+    );
+    // And the same refusal observed beyond the bound **is** both: an error and stale, so the two findings
+    // coexist and neither suppresses the other.
+    let stale_refusal = diagnostics_for(
+        &refusing_but_fresh,
+        crate::auth::AuthState::Failed,
+        &[],
+        old(FRESHNESS + 1),
+        FRESHNESS,
+    );
+    let stale_fields: Vec<DiagnosticField> = stale_refusal
+        .iter()
+        .map(|finding| finding.field)
+        .filter(|field| {
+            *field == DiagnosticField::HealthStale || *field == DiagnosticField::HealthState
+        })
+        .collect();
+    assert_eq!(
+        stale_fields,
+        vec![DiagnosticField::HealthState, DiagnosticField::HealthStale],
+        "a stale refusal reports both, in one order, so a reader sees the reason and the age"
     );
 }
 
@@ -281,7 +518,7 @@ fn a_connector_mid_flow_is_not_reported_as_a_failure() {
         crate::auth::AuthState::Connected,
         crate::auth::AuthState::Superseded,
     ] {
-        let findings = diagnostics_for(&connected(), state, &[]);
+        let findings = diagnostics_for(&connected(), state, &[], fresh_now(), FRESHNESS);
         assert!(
             findings
                 .iter()
@@ -290,7 +527,13 @@ fn a_connector_mid_flow_is_not_reported_as_a_failure() {
         );
     }
     // A failed flow is an error, because nothing is progressing without intervention.
-    let failed = diagnostics_for(&connected(), crate::auth::AuthState::Failed, &[]);
+    let failed = diagnostics_for(
+        &connected(),
+        crate::auth::AuthState::Failed,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
     assert!(
         failed
             .iter()
@@ -307,7 +550,7 @@ fn a_connector_mid_flow_is_not_reported_as_a_failure() {
         crate::auth::AuthState::Superseded,
     ] {
         assert!(
-            diagnostics_for(&connected(), state, &[])
+            diagnostics_for(&connected(), state, &[], fresh_now(), FRESHNESS)
                 .iter()
                 .any(|finding| finding.field == DiagnosticField::AuthState),
             "{state:?} must be reported"
@@ -319,7 +562,13 @@ fn a_connector_mid_flow_is_not_reported_as_a_failure() {
 fn a_finding_is_a_value_rather_than_a_sentence_so_it_can_be_counted_and_compared() {
     // A sentence is composed for a human and cannot be aggregated, filtered, or tested. `jarvis-diagnostics`
     // set that precedent with `FindingCode`/`Severity`.
-    let findings = diagnostics_for(&connected(), crate::auth::AuthState::Connected, &[]);
+    let findings = diagnostics_for(
+        &connected(),
+        crate::auth::AuthState::Connected,
+        &[],
+        fresh_now(),
+        FRESHNESS,
+    );
     assert!(!findings.is_empty());
     for finding in &findings {
         // A finding carries no value, so it cannot leak one by being logged — which is the property that lets

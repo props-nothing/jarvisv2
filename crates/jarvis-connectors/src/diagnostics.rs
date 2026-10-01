@@ -66,7 +66,29 @@ pub enum DiagnosticField {
     /// Which probe produced the health state.
     HealthProbe,
     /// When the health state was observed.
+    ///
+    /// **The instant, and nothing said about it** — which is why [`Self::HealthStale`] exists beside it. An
+    /// operator can read the instant but only against the bound the platform applies and their own clock, and
+    /// the report carried neither; the state's own age is what the stale-evidence rule turns on, so it is a
+    /// field rather than something a reader derives.
     HealthObservedAt,
+    /// Whether the health state was **too old to act on** at the moment the report was assembled.
+    ///
+    /// # Why this is a field and not left to the reader of `HealthObservedAt`
+    ///
+    /// `security.md`'s rule for the whole platform is "missing or stale evidence fails closed", and
+    /// [`ConnectorHealth`](crate::health::ConnectorHealth) enforces it through
+    /// [`permits_calls_at`](crate::health::ConnectorHealth::permits_calls_at) — a `Connected` state from
+    /// yesterday permits nothing today. Reporting only the instant and expecting an operator to subtract it
+    /// from *their* clock is the same gap in a different place: a report that says `connected` about a state
+    /// that permits no call is **wrong at the moment it is read**, and the two facts a reader needs to see the
+    /// contradiction — the bound and now — were not in the report at all.
+    ///
+    /// Unlike every other field here it is not a value the connector produced about itself: whether a state is
+    /// stale depends on **when the report is assembled**, which is why [`diagnostics_for`] takes it as an input
+    /// rather than reading a clock (`jarvis_core::Clock` exists so time is injectable, and a report assembled
+    /// inside the crate could not be checked against a supplied instant).
+    HealthStale,
     /// Whether the cursor is a start cursor, which decides whether a run is a full resync.
     CursorKind,
     /// When the cursor was observed.
@@ -111,6 +133,7 @@ impl DiagnosticField {
             Self::HealthState => "health_state",
             Self::HealthProbe => "health_probe",
             Self::HealthObservedAt => "health_observed_at",
+            Self::HealthStale => "health_stale",
             Self::CursorKind => "cursor_kind",
             Self::CursorObservedAt => "cursor_observed_at",
             Self::WebhookSupport => "webhook_support",
@@ -277,11 +300,24 @@ impl fmt::Display for DiagnosticFinding {
 /// `P5-002`'s). Taking the values keeps the function a pure function of its arguments, so every branch is
 /// testable without a connector — the same reasoning `jarvis-sandbox`'s `sandbox_finding(support, facility)`
 /// records: an inline branch in a larger function leaves half of itself unmeasured.
+///
+/// # Why the instant is a parameter, and why that is the finding rather than a convenience
+///
+/// `security.md`'s stale-evidence rule is the one rule this module could not previously report on: the health
+/// state carries its own observation instant, and whether that state may be acted on depends on **now**. A
+/// report assembled without an instant can therefore say `connected` about a state that permits no call, and
+/// the reading that made the gap invisible was that the instant was already in the report — it was, as a
+/// field, with nothing comparing it to the bound the platform applies. So `now` and `freshness_seconds` are
+/// arguments for the same reason the health module's own `permits_calls_at` takes them: the value with the
+/// evidence (the daemon's clock) is not this crate's to read, and a report that consulted a clock internally
+/// could not be tested against a supplied instant (`ADR-0118`).
 #[must_use]
 pub fn diagnostics_for(
     health: &crate::health::ConnectorHealth,
     auth_state: crate::auth::AuthState,
     missing_scopes: &[String],
+    now: jarvis_core::UtcTimestamp,
+    freshness_seconds: u64,
 ) -> Vec<DiagnosticFinding> {
     use crate::auth::AuthState;
 
@@ -309,7 +345,15 @@ pub fn diagnostics_for(
     ];
 
     // The health state's own severity, which is the finding an operator ranks the report by.
-    let health_severity = if health.permits_calls() {
+    //
+    // **The freshness bound is applied here, and its absence was a defect** (`ADR-0118`). `permits_calls()`
+    // alone answers "does this state permit calls", which is only true of the observation as it was, and
+    // `security.md` says stale evidence fails closed — the state is a fact about a moment. So the severity is
+    // derived from `permits_calls_at`, the same combined predicate a caller is documented to use, and the
+    // staleness itself is reported as its own field below. Reporting `connected` in the `Info` position about
+    // a state that permits no call is the report being wrong at the moment it is read.
+    let stale = !health.is_fresh_at(now, freshness_seconds);
+    let health_severity = if health.permits_calls_at(now, freshness_seconds) {
         DiagnosticSeverity::Info
     } else {
         DiagnosticSeverity::Error
@@ -319,6 +363,19 @@ pub fn diagnostics_for(
         health_severity,
         Redaction::Summary,
     ));
+
+    // Staleness is reported **only when it is true**, and it is reported whether or not the state permits
+    // calls: a stale `NeedsReauth` is already an error for its own reason, and an operator reading two errors
+    // needs to know that one of them is "nobody has checked since". The field is absent rather than `false`
+    // when the state is fresh, the same rule `MissingScopes` uses — a negative finding that is always present
+    // is one a caller stops reading.
+    if stale {
+        findings.push(DiagnosticFinding::new(
+            DiagnosticField::HealthStale,
+            DiagnosticSeverity::Warning,
+            Redaction::Summary,
+        ));
+    }
 
     // A reauth reason is reported **only** when one exists, and at `Error` severity: the reason is what a
     // user acts on, so a report that omitted it would be one the operator has to reproduce the failure to

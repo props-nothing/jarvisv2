@@ -134,3 +134,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0114](0114-a-path-identifier-validated-but-not-encoded.md) | A path identifier that was validated but not encoded, and the asymmetry that hid it | Accepted |
 | [0115](0115-one-acknowledgement-vocabulary.md) | One mechanism's acknowledgement was a decision and its twin's was a bool that was always true | Accepted |
 | [0116](0116-a-field-with-a-producer-and-no-reader.md) | A field with a producer and no reader, and the two values that had to agree | Accepted |
+| [0117](0117-a-skill-is-a-procedure-not-a-permission.md) | A skill is a procedure, not a permission | Accepted |
+| [0118](0118-a-diagnostic-that-contradicts-the-predicate.md) | A diagnostic that contradicts the predicate the platform gates on | Accepted |

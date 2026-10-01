@@ -5727,6 +5727,49 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **NEW LIMITS:** nothing renders the report yet, so the union's contents are asserted rather than shown; a
     shortfall without a reauth still has no `ConnectorHealth` variant, so the caller's argument is not yet
     redundant.
+- [ ] `P5-005` **(continued â€” a diagnostic that contradicts the predicate the platform gates on)**:
+  `DiagnosticField::HealthStale` added; `diagnostics_for` takes `now` and `freshness_seconds` and derives the
+  health severity from `permits_calls_at`. **2 new tests (so 496 in the crate).** **`ADR-0118`.** Three guards
+  falsified A-B-A.
+  - **â­â­ THE FINDING: THE REPORT RANKED A STATE BY THE WRONG PREDICATE, AND THE TWO FACTS NEEDED TO SEE THE
+    CONTRADICTION WERE NOT IN THE REPORT.** `security.md`'s "missing or stale evidence fails closed" is enforced
+    by `ConnectorHealth::permits_calls_at(now, bound)` â€” whose module doc calls it *"the method a caller should
+    use"* and says calling `permits_calls` on an unfresh state *"is the defect this exists to prevent"* â€” and
+    `diagnostics_for` derived `HealthState`'s severity from **`permits_calls()`** alone. So a `Connected`
+    observation from yesterday was reported as `connected` at **`Info`** (the severity that means *nothing to
+    do here*) about a state that permits **no call**.
+  - **â­â­ THE REPORT CARRIED `HealthObservedAt` AND NEITHER THE BOUND NOR *NOW*.** So an operator could not even
+    *see* the contradiction: the rule turns on `elapsed` versus a bound, and one of the two operands was in the
+    report and the other two were not. **â­ `ADR-0092`'s "a value with a producer and no reader" â€” the instant
+    was there and nothing about it.** **â­ A diagnostic that contradicts the predicate the rest of the platform
+    gates on is worse than a missing one: it is read *instead of* the truth.**
+  - **â­ `DiagnosticField` IS DOCUMENTED AS A CLOSED SET OF FACTS A DIAGNOSTIC MAY REPORT, CHOSEN SO
+    `is_loggable()` IS TRUE FOR ALL OF IT.** "This state is too old to act on" is such a fact, and the set had
+    no variant â€” so the platform's central rule was the one thing the report could not say. The count assertion
+    (20 â†’ 21) was updated in the same change, so the new field is covered by the loggability, model-exposure,
+    renderability and distinctness assertions.
+  - **â­ `now` IS A PARAMETER, NOT A CLOCK READ** â€” the reason the health module's own `is_fresh_at` records:
+    a value that asked the system clock about its own age could not be checked against a supplied instant, and
+    `jarvis_core::Clock` exists so time is injectable. The daemon owns the clock; this function owns the policy.
+  - **â­â­ A MUTANT SURVIVED THE FIRST VERSION OF THIS CHANGE, AND THAT IS THE SECOND FINDING.** With
+    `stale = !health.permits_calls_at(now, bound)` in place of `!is_fresh_at(now, bound)` **the entire suite
+    passed** â€” every state the staleness test used was `Connected`, where the two predicates **agree**. They are
+    different facts: a `NeedsReauth` observed a moment ago **permits no call** and **is fresh**, and the mutant
+    would have told an operator "nobody has checked since" about a state that was just checked. The missing
+    detector is a state that **refuses and is fresh**; `staleness_and_unusability_are_two_dimensions_and_a_
+    mutant_is_why_this_exists` is it, and it was confirmed to fail under that mutant **after** being written.
+    **â­ A predicate with two conjuncts is exercised by a value where they DIFFER, and a fixture where they
+    agree cannot see the difference.**
+  - **â­ THREE GUARDS FALSIFIED A-B-A:** (1) the freshness inputs ignored entirely â†’ detected by **both** tests;
+    (2) staleness conflated with unusability â†’ detected by the **second** test only, after the gap was closed;
+    (3) the supplied bound ignored (`u64::MAX`) â†’ detected by both.
+  - **â­ THE SEVERITY IS DERIVED, NOT STORED, AND THE TWO FINDINGS NEITHER SUPPRESS NOR IMPLY EACH OTHER** â€” a
+    stale healthy state is an error **and** stale; a fresh refusal is an error and **not** stale; a stale
+    refusal reports both. `HealthStale` is emitted **only when true** (the `MissingScopes` rule), because a
+    negative finding that is always present is one a reader stops seeing.
+  - **NEW LIMITS:** nothing renders the report yet, so the two severities are asserted rather than shown together;
+    the report has no ordering rule beyond emission order; a second source of staleness (a cursor's age, a
+    lease's expiry) would repeat "value plus bound plus now" a third time and may deserve one type.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.
