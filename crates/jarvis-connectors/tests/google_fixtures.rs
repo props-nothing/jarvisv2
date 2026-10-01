@@ -901,11 +901,11 @@ fn the_watch_response_drives_a_renewal_decision_the_header_cannot() {
     // (comparable to a clock after one scale factor), while the notification header carries it as a
     // **human-readable date** (not comparable without a parser the crate does not have). So only the response
     // can drive a renewal decision, and this fixture is what makes that checkable.
-    use jarvis_connectors::google::channel::{
-        ChannelLease, ChannelRegistration, ChannelRenewal, channel_lease, parse_channel_watch_response,
-        renewal_decision,
-    };
     use jarvis_connectors::AccountReference;
+    use jarvis_connectors::google::channel::{
+        ChannelLease, ChannelRegistration, ChannelRenewal, channel_lease,
+        parse_channel_watch_response, renewal_decision,
+    };
     use jarvis_core::UtcTimestamp;
 
     let text = fixture("calendar_channel_watch_response.json");
