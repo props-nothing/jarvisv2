@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::google::GoogleConnector;
-use jarvis_tools::{MAX_RISK_LEVEL, ToolEffect};
+use jarvis_tools::{ApprovalPolicy, MAX_RISK_LEVEL, ToolEffect};
 
 fn must<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
     match result {

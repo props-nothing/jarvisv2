@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::effect::EffectSet;
-use crate::risk::Risk;
+// Re-exported from `jarvis-core` for the same reason `Risk` is: the configuration layer must be able
+// to name an approval policy and cannot depend on this adapter crate. Every `crate::ApprovalPolicy`
+// path therefore keeps resolving while there is one definition.
+pub use jarvis_core::ApprovalPolicy;
 
 /// Maximum seconds a tool execution may be given.
 ///
@@ -118,69 +121,6 @@ fn has_marker(namespace: &str, marker: &str) -> bool {
 }
 
 impl fmt::Display for ToolSource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Whether a human decides before the tool runs.
-///
-/// `Policy` is a real member rather than a synonym for `Ask`: it means "the workspace's policy
-/// decides from risk, effect, and context", while `Ask` means "always ask regardless of policy".
-/// Collapsing them would make a tool that must always ask indistinguishable from one whose risk
-/// happens to require asking today.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    /// Run without asking, when the actor holds the required scopes.
-    Auto,
-    /// Ask unless policy already permits it in this context.
-    Policy,
-    /// Always ask, whatever policy says.
-    Ask,
-    /// Never run, even with approval a human could give.
-    Deny,
-}
-
-impl ApprovalPolicy {
-    /// Returns the stable wire and storage name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Policy => "policy",
-            Self::Ask => "ask",
-            Self::Deny => "deny",
-        }
-    }
-
-    /// Returns whether this policy can ever permit execution.
-    #[must_use]
-    pub const fn is_runnable(self) -> bool {
-        !matches!(self, Self::Deny)
-    }
-
-    /// Returns the approval policy a baseline risk implies.
-    ///
-    /// The guidance table in `docs/architecture/tools-and-connectors.md`: risk 0 is auto when
-    /// scoped, risk 1 is auto or ask by workspace policy, risk 2 is fresh approval, and risk 3 is
-    /// always-ask or deny. This is a **default a tool may tighten**, not a ceiling it may lower —
-    /// `P3-003` is where "context can raise risk but cannot lower a hard policy floor" is enforced.
-    ///
-    /// Takes [`Risk`] rather than a number so the last arm cannot be a silent catch-all: the
-    /// previous `_ => Self::Ask` was correct for level 3 and would also have been the answer for
-    /// level 7, which no table row covers.
-    #[must_use]
-    pub const fn for_risk(risk: Risk) -> Self {
-        match risk {
-            Risk::Minimal => Self::Auto,
-            Risk::Low => Self::Policy,
-            Risk::Moderate | Risk::High => Self::Ask,
-        }
-    }
-}
-
-impl fmt::Display for ApprovalPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -501,7 +441,7 @@ impl Default for ToolSensitivity {
 mod tests {
     use super::*;
     use crate::effect::ToolEffect;
-    use crate::risk::RiskError;
+    use crate::risk::{Risk, RiskError};
 
     /// Every closed set has distinct names that round-trip through the wire form.
     #[test]
@@ -636,16 +576,10 @@ mod tests {
     /// check did not disappear, it moved to where the level is parsed.
     #[test]
     fn the_approval_default_rises_with_risk() {
-        assert_eq!(
-            ApprovalPolicy::for_risk(Risk::Minimal),
-            ApprovalPolicy::Auto
-        );
-        assert_eq!(ApprovalPolicy::for_risk(Risk::Low), ApprovalPolicy::Policy);
-        assert_eq!(
-            ApprovalPolicy::for_risk(Risk::Moderate),
-            ApprovalPolicy::Ask
-        );
-        assert_eq!(ApprovalPolicy::for_risk(Risk::High), ApprovalPolicy::Ask);
+        assert_eq!(Risk::Minimal.for_approval(), ApprovalPolicy::Auto);
+        assert_eq!(Risk::Low.for_approval(), ApprovalPolicy::Policy);
+        assert_eq!(Risk::Moderate.for_approval(), ApprovalPolicy::Ask);
+        assert_eq!(Risk::High.for_approval(), ApprovalPolicy::Ask);
         assert_eq!(
             Risk::from_level(9),
             Err(RiskError::OutOfRange),

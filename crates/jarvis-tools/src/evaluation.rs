@@ -50,7 +50,7 @@
 //! expiry is `P3-004`; the execution receipt is `P3-005`. This function is a pure function of its
 //! inputs, which is what makes the policy table testable as a table.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use jarvis_core::SessionChannel;
@@ -210,6 +210,13 @@ pub struct WorkspacePolicy {
     requires_approval_for_external_communication: bool,
     requires_strong_authentication_for_high_risk: bool,
     denied_tools: BTreeSet<ToolId>,
+    /// Per-tool approval overrides, each already verified to be a **tightening**.
+    ///
+    /// A map rather than a list of rules, because the question asked of it is "what has this
+    /// workspace said about *this* tool", and a list would make that a scan with an order that must
+    /// be defined. Entries are validated by [`Self::requiring`], which is why the field is private
+    /// and this type has no `Deserialize` path that could populate it unchecked.
+    approval_tools: BTreeMap<ToolId, ApprovalPolicy>,
 }
 
 impl Default for WorkspacePolicy {
@@ -226,6 +233,7 @@ impl Default for WorkspacePolicy {
             requires_approval_for_external_communication: true,
             requires_strong_authentication_for_high_risk: true,
             denied_tools: BTreeSet::new(),
+            approval_tools: BTreeMap::new(),
         }
     }
 }
@@ -256,6 +264,7 @@ impl WorkspacePolicy {
             requires_approval_for_external_communication,
             requires_strong_authentication_for_high_risk,
             denied_tools: BTreeSet::new(),
+            approval_tools: BTreeMap::new(),
         })
     }
 
@@ -265,7 +274,42 @@ impl WorkspacePolicy {
     /// discarded the result of a `&mut` call.
     #[must_use]
     pub fn denying(mut self, id: ToolId) -> Self {
+        // A denial also clears any approval override for the tool, because the two would contradict:
+        // `denies` is checked before the approval steps, so a lingering `Ask` entry would be
+        // unreachable state that reads as if the tool could still be approved.
+        self.approval_tools.remove(&id);
         self.denied_tools.insert(id);
+        self
+    }
+
+    /// Overrides a tool's approval policy, tightening it and never relaxing it.
+    ///
+    /// # The direction rule, and why it is enforced rather than documented
+    ///
+    /// `ADR-0017` rejects letting workspace policy relax a tool's own approval policy, because a
+    /// workspace setting would then be a way to remove a guard the tool author declared. An override
+    /// is therefore a **max** against the tool's own policy, applied at evaluation time in
+    /// [`Self::effective_approval`] — so an override can only ever move `Auto → Policy → Ask → Deny`.
+    ///
+    /// # Any policy is safe to store, including a looser one
+    ///
+    /// Because the override is applied as a `max`, storing `Auto` for a tool that declares `Ask` is
+    /// harmless: `tighter` returns the declaration. That includes `Ask` written against a tool
+    /// declaring `Deny`, which is why no translation is needed here — `tighter(Deny, Ask)` is `Deny`.
+    /// An earlier version of this function rewrote `Ask` into `Deny` "for safety" and the rewrite was
+    /// **the defect**: it made the common case ("hold this tool for approval") refuse the call
+    /// outright, and a test named for the tighter-direction case caught it. The `max` is what makes
+    /// relaxation impossible; a second guard that also changed the meaning was not a guard.
+    ///
+    /// Takes and returns `self`, matching [`Self::denying`], so an override cannot be forgotten by a
+    /// caller that discarded the result of a `&mut` call.
+    #[must_use]
+    pub fn requiring(mut self, id: ToolId, approval: ApprovalPolicy) -> Self {
+        // A denial is authoritative and is already at the top of the order, so an approval override
+        // for a denied tool would be state that `denies` short-circuits before anyone reads it.
+        if !self.denied_tools.contains(&id) {
+            self.approval_tools.insert(id, approval);
+        }
         self
     }
 
@@ -297,6 +341,26 @@ impl WorkspacePolicy {
     #[must_use]
     pub fn denies(&self, id: &ToolId) -> bool {
         self.denied_tools.contains(id)
+    }
+
+    /// Returns the approval policy in force for a tool: the **tighter** of the tool's own
+    /// declaration and any workspace override.
+    ///
+    /// A `max`, never a replacement. This is the whole mechanism of the direction rule, and it is a
+    /// method rather than an inline comparison at the call site because a reader of a security rule
+    /// can get the direction wrong from the name alone: `tighter` reads correct whether it returns
+    /// the stricter or the looser operand. The concrete cases in the tests are what settle it.
+    #[must_use]
+    pub fn effective_approval(&self, id: &ToolId, declared: ApprovalPolicy) -> ApprovalPolicy {
+        match self.approval_tools.get(id) {
+            Some(override_policy) => declared.tighter(*override_policy),
+            None => declared,
+        }
+    }
+
+    /// Returns the overrides an operator configured, in stable identifier order.
+    pub fn approval_overrides(&self) -> impl Iterator<Item = (&ToolId, ApprovalPolicy)> + '_ {
+        self.approval_tools.iter().map(|(id, policy)| (id, *policy))
     }
 }
 
@@ -783,7 +847,16 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
 
     // 6. The tool's own policy. `Deny` is absolute: it is the tool author saying this must never run
     //    automatically, and a workspace cannot relax it.
-    if !definition.approval().is_runnable() {
+    //
+    //    The **effective** policy is the tool's declaration raised by any workspace override, via
+    //    `effective_approval`'s `max`. The override is applied here rather than at the approval step
+    //    below because `Deny` must be reached **before** the approval obligation: an operator who
+    //    overrides a tool to `Deny` is asking for a refusal, and reporting it as merely held would
+    //    offer an approval that cannot change the outcome.
+    let effective_approval = request
+        .workspace
+        .effective_approval(definition.id(), definition.approval());
+    if !effective_approval.is_runnable() {
         return denied(DenyReason::ToolPolicyDenies);
     }
 
@@ -805,7 +878,7 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     //    `Policy` is deliberately **not** consulted here: it means "the workspace's policy decides",
     //    which is exactly the threshold below. Treating it as `Ask` would collapse a distinction the
     //    `ApprovalPolicy` documentation calls out as a real member rather than a synonym.
-    let tool_requires_approval = definition.approval() == ApprovalPolicy::Ask;
+    let tool_requires_approval = effective_approval == ApprovalPolicy::Ask;
     let risk_requires_approval = risk >= request.workspace.approval_threshold();
     let external_requires_approval = request
         .workspace
@@ -1202,6 +1275,164 @@ mod tests {
             decision.decision(),
             Decision::Allow,
             "`Policy` means the workspace decides, and this workspace allows a risk-0 read: {decision:?}"
+        );
+    }
+
+    /// **A workspace override may TIGHTEN a tool's own approval policy.**
+    ///
+    /// The positive half of the direction rule. A tool whose declared policy is `Auto` and whose risk
+    /// the workspace would auto-allow must be **held** once an operator overrides it to `Ask`, because
+    /// otherwise the override does nothing and an operator who configured it believes otherwise.
+    #[test]
+    fn a_workspace_override_tightens_a_tool_that_would_otherwise_run() {
+        let definition = reader();
+        // Risk 0, `Auto`, and the default threshold of `Moderate` — so without the override this is
+        // allowed, which the first assertion below establishes as the control.
+        let actor = ActorAuthority::active(ScopeSet::single(scope("files.read")));
+
+        let control = evaluate(&request(
+            &definition,
+            &WorkspacePolicy::default(),
+            actor.clone(),
+        ));
+        assert!(
+            control.is_allowed(),
+            "the control must be allowed, or this test proves nothing: {control:?}"
+        );
+
+        let overridden =
+            WorkspacePolicy::default().requiring(id("jarvis.files.read"), ApprovalPolicy::Ask);
+        let decision = evaluate(&request(&definition, &overridden, actor));
+        assert!(
+            decision.is_held(),
+            "the override must hold the call the unoverridden workspace allowed: {decision:?}"
+        );
+        assert_eq!(decision.reason(), Some(DenyReason::ApprovalRequired));
+    }
+
+    /// **The ⭐ falsification test: a workspace override must NEVER relax a tool's own approval policy.**
+    ///
+    /// The direction that matters, asserted as the adversarial case its name states. `ADR-0017`
+    /// rejects letting workspace policy relax a tool's own approval policy, because a workspace
+    /// setting would then be a way to remove a guard a tool author declared. So an override of `Auto`
+    /// on a tool declaring `Ask` must leave it **held** — the override is a `max`, not a replacement.
+    ///
+    /// A predicate like this reads correct in both directions: an implementation that *replaced* the
+    /// declaration would satisfy every tightening assertion above and would fail only here, because
+    /// this is the only test whose input is an override that is looser than the declaration.
+    #[test]
+    fn a_workspace_override_must_not_relax_a_tool_that_declares_ask() {
+        let definition = sender();
+        let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
+
+        // The override asks for LESS than the tool declares. It must be ignored.
+        let relaxed =
+            WorkspacePolicy::default().requiring(id("jarvis.mail.send"), ApprovalPolicy::Auto);
+        let decision = evaluate(&request(&definition, &relaxed, actor.clone()));
+        assert!(
+            decision.is_held(),
+            "an override must not lower the tool's own `Ask`: {decision:?}"
+        );
+        assert_eq!(
+            decision.reason(),
+            Some(DenyReason::ApprovalRequired),
+            "a relaxed override must not change the reason the call is held"
+        );
+
+        // And the unoverridden control is held for the same reason, so the override genuinely did
+        // nothing rather than coincidentally producing a hold by another route.
+        let control = evaluate(&request(&definition, &WorkspacePolicy::default(), actor));
+        assert_eq!(control.reason(), decision.reason());
+    }
+
+    /// **An override to `Deny` is a refusal, not a hold.**
+    ///
+    /// `Deny` must be reached at the tool-policy step *before* the approval obligation, because
+    /// reporting it as held would offer an approval that cannot change the outcome — the same
+    /// reasoning that puts workspace denials before the approval steps.
+    #[test]
+    fn a_workspace_override_to_deny_is_refused_rather_than_held() {
+        let definition = reader();
+        let actor = ActorAuthority::active(ScopeSet::single(scope("files.read")));
+        let denied =
+            WorkspacePolicy::default().requiring(id("jarvis.files.read"), ApprovalPolicy::Deny);
+
+        let decision = evaluate(&request(&definition, &denied, actor));
+        assert!(decision.is_denied(), "{decision:?}");
+        assert_eq!(decision.reason(), Some(DenyReason::ToolPolicyDenies));
+    }
+
+    /// **A `Deny` tool stays refused even when a looser override is written for it.**
+    ///
+    /// This is the case that forces `requiring` to translate `Ask` into `Deny`: a tool author's
+    /// `Deny` is absolute, so an override can never be the thing that makes it runnable. The override
+    /// here is the *loosest* value an operator could write, and the refusal must survive it.
+    #[test]
+    fn an_override_cannot_make_a_denying_tool_runnable() {
+        let definition = tool(
+            "jarvis.mail.purge",
+            EffectSet::single(ToolEffect::ExternalCommunication),
+            2,
+            ApprovalPolicy::Deny,
+            ScopeSet::single(scope("mail.send")),
+        );
+        let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
+
+        for override_policy in ApprovalPolicy::all() {
+            let workspace =
+                WorkspacePolicy::default().requiring(id("jarvis.mail.purge"), override_policy);
+            let decision = evaluate(&request(&definition, &workspace, actor.clone()));
+            assert!(
+                decision.is_denied(),
+                "override {override_policy} must not make a `Deny` tool runnable: {decision:?}"
+            );
+        }
+    }
+
+    /// **The direction rule holds for every (declared, override) pair, as a property.**
+    ///
+    /// A sweep rather than a case, because the rule is "for all pairs" and a mutation that inverted
+    /// `tighter` would survive any single hand-picked assertion made the wrong way round. The
+    /// property stated is the *refusal* of relaxation: the effective policy is never less strict than
+    /// the tool's own declaration.
+    #[test]
+    fn an_override_never_produces_a_less_strict_policy_for_any_pair() {
+        for declared in ApprovalPolicy::all() {
+            for override_policy in ApprovalPolicy::all() {
+                let definition = tool(
+                    "jarvis.fixture.subject",
+                    EffectSet::single(ToolEffect::ReadOnly),
+                    0,
+                    declared,
+                    ScopeSet::none(),
+                );
+                let workspace = WorkspacePolicy::default()
+                    .requiring(id("jarvis.fixture.subject"), override_policy);
+                let effective = workspace.effective_approval(definition.id(), declared);
+                assert!(
+                    effective.strictness() >= declared.strictness(),
+                    "declared {declared} with override {override_policy} produced {effective}, \
+                     which is less strict than the declaration"
+                );
+            }
+        }
+    }
+
+    /// **An override is a `max`, not a replacement: it can lose to a stricter declaration.**
+    ///
+    /// The control for the sweep above. Without this, `effective_approval` could be implemented as
+    /// "always return the declaration", which satisfies every relaxation assertion and makes the
+    /// whole override feature inert.
+    #[test]
+    fn an_override_that_is_stricter_than_the_declaration_wins() {
+        let declared = ApprovalPolicy::Auto;
+        let workspace =
+            WorkspacePolicy::default().requiring(id("jarvis.fixture.subject"), ApprovalPolicy::Ask);
+        let effective = workspace.effective_approval(&id("jarvis.fixture.subject"), declared);
+        assert_eq!(
+            effective,
+            ApprovalPolicy::Ask,
+            "a stricter override must win, or the override does nothing"
         );
     }
 

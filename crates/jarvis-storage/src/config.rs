@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     io::{self, Read, Write},
@@ -6,7 +7,7 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
-use jarvis_core::LogLevel;
+use jarvis_core::{ApprovalPolicy, LogLevel, Risk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml::Table;
@@ -273,6 +274,78 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The workspace's tool-authorization policy, as an operator writes it.
+///
+/// # Why this is a document section and not a database row
+///
+/// `ADR-0122` decides it: the configuration document is the **seed**, and the daemon's workspace
+/// policy is built from it at startup. A control-plane UI that edits policy at runtime writes a row,
+/// which is a different slice; what this section provides is the declarative form, because it is the
+/// form an operator can review, diff, and keep under version control — and because a policy that only
+/// exists in a database is a security posture nobody can read before the daemon starts.
+///
+/// # Why the risk fields are typed and the tool lists are not
+///
+/// `max_risk` and `approval_threshold` are [`Risk`] values, which is `jarvis-core`'s vocabulary and
+/// therefore reachable from this adapter crate — a bad value is refused by `serde` with the field
+/// named. The tool identifiers stay `String` here and are parsed where the tool registry is, because
+/// `ToolId` belongs to `jarvis-tools` and `docs/architecture/repository-layout.md` forbids an adapter
+/// depending on another adapter. A `ToolId::new` failure therefore surfaces at the composition root
+/// with the identifier named, which is the same place an unknown *tool* is noticed.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// The highest risk the workspace permits at all. Absent means the workspace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_risk: Option<Risk>,
+    /// The risk at which an approval is always required. Absent means the workspace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_threshold: Option<Risk>,
+    /// Tools the workspace refuses outright.
+    ///
+    /// A denial outranks every grant and every approval, so this is the one list whose entries take
+    /// effect before any other setting is consulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny: Vec<String>,
+    /// Per-tool approval overrides, as `id = "policy"` entries.
+    ///
+    /// A table rather than a list of `{tool, approval}` records, because the operator's question is
+    /// "what has been said about this tool" and a table answers it in one lookup. A **map** in TOML
+    /// also cannot contain the same key twice, which is the duplicate-entry defect a list would allow.
+    ///
+    /// The values are [`ApprovalPolicy`], so a typo is refused by `serde` rather than silently
+    /// becoming a default. The overrides can only **tighten**: see
+    /// [`jarvis_tools::WorkspacePolicy::requiring`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    approval: BTreeMap<String, ApprovalPolicy>,
+}
+
+impl PolicyConfig {
+    /// Returns the configured ceiling, when one was written.
+    #[must_use]
+    pub const fn max_risk(&self) -> Option<Risk> {
+        self.max_risk
+    }
+
+    /// Returns the configured approval threshold, when one was written.
+    #[must_use]
+    pub const fn approval_threshold(&self) -> Option<Risk> {
+        self.approval_threshold
+    }
+
+    /// Returns the denied tool identifiers, in stable order.
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    /// Returns the per-tool approval overrides, in stable identifier order.
+    #[must_use]
+    pub const fn approval(&self) -> &BTreeMap<String, ApprovalPolicy> {
+        &self.approval
+    }
+}
+
 /// Effective validated JARVIS configuration schema v1.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -281,6 +354,14 @@ pub struct Config {
     profile: ProfileConfig,
     logging: LoggingConfig,
     daemon: DaemonConfig,
+    /// The workspace tool-authorization policy.
+    ///
+    /// `default` so a document written before this section existed — or one that simply does not
+    /// configure policy — parses and gets the workspace defaults. That direction is the safe one:
+    /// an absent section means "no operator opinion", which leaves every tool's own declaration in
+    /// force and denies nothing, whereas requiring the section would make an upgrade refuse to start.
+    #[serde(default)]
+    policy: PolicyConfig,
 }
 
 impl Config {
@@ -304,6 +385,7 @@ impl Config {
                 shutdown_timeout_seconds,
                 ..DaemonConfig::default()
             },
+            policy: PolicyConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -353,6 +435,7 @@ impl Config {
                             shutdown_timeout_seconds: legacy.shutdown_timeout_seconds,
                             ..DaemonConfig::default()
                         },
+                        policy: PolicyConfig::default(),
                     },
                     Some(ConfigMigration::V0ToV1),
                 )
@@ -397,6 +480,12 @@ impl Config {
     #[must_use]
     pub const fn daemon(&self) -> &DaemonConfig {
         &self.daemon
+    }
+
+    /// Returns the workspace tool-authorization policy.
+    #[must_use]
+    pub const fn policy(&self) -> &PolicyConfig {
+        &self.policy
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -459,6 +548,50 @@ impl Config {
         {
             return Err(ConfigError::RelativeModelApiKeyRef);
         }
+        self.validate_policy()?;
+        Ok(())
+    }
+
+    /// Validates the workspace policy section.
+    ///
+    /// # What is refused, and what deliberately is not
+    ///
+    /// Two things are refused here because they are **self-contradictory documents**, not because the
+    /// values are unsafe:
+    ///
+    /// - a threshold above the ceiling, which would require approval for every risk already refused —
+    ///   the same contradiction [`jarvis_tools::WorkspacePolicy::new`] refuses, checked here as well so
+    ///   an operator gets a configuration error naming the file rather than a daemon that will not start
+    ///   for a reason expressed in another crate's vocabulary;
+    /// - a blank tool identifier, which names nothing and would silently apply to nothing.
+    ///
+    /// A tool identifier that names no **registered** tool is deliberately **not** refused. The registry
+    /// is not reachable from this crate, and more importantly an MCP server's tools are discovered at
+    /// startup: an operator writing a policy for a server that is temporarily down would otherwise be
+    /// unable to start the daemon. An override for a tool that does not exist is inert, and the
+    /// composition root reports the mismatch rather than this layer guessing.
+    fn validate_policy(&self) -> Result<(), ConfigError> {
+        // The two fields are independently optional, so the effective pair is each field's value or its
+        // default. The defaults cannot contradict each other (`High` ceiling, `Moderate` threshold), so
+        // only a written pair can.
+        let max_risk = self.policy.max_risk.unwrap_or(Risk::High);
+        let threshold = self.policy.approval_threshold.unwrap_or(Risk::Moderate);
+        if threshold > max_risk {
+            return Err(ConfigError::ApprovalThresholdAboveCeiling {
+                approval_threshold: threshold,
+                max_risk,
+            });
+        }
+        for identifier in self.policy.approval.keys() {
+            if identifier.trim().is_empty() {
+                return Err(ConfigError::BlankPolicyTool { key: "approval" });
+            }
+        }
+        for identifier in &self.policy.deny {
+            if identifier.trim().is_empty() {
+                return Err(ConfigError::BlankPolicyTool { key: "deny" });
+            }
+        }
         Ok(())
     }
 }
@@ -470,6 +603,7 @@ impl Default for Config {
             profile: ProfileConfig::default(),
             logging: LoggingConfig::default(),
             daemon: DaemonConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -697,6 +831,30 @@ pub enum ConfigError {
     /// started — or none at all.
     #[error("daemon.executor_api_key_ref must be an absolute path")]
     RelativeModelApiKeyRef,
+    /// The policy approval threshold was above the ceiling the same document sets.
+    ///
+    /// A self-contradictory document: every risk that could be approved is already refused, so the
+    /// threshold can never take effect. Refused here as well as in `jarvis-tools` so the error names the
+    /// configuration file an operator edited rather than a crate they have not read.
+    #[error(
+        "policy.approval_threshold ({approval_threshold}) is above policy.max_risk ({max_risk}), \
+         which would require approval for every risk already refused"
+    )]
+    ApprovalThresholdAboveCeiling {
+        /// The threshold the document declared.
+        approval_threshold: Risk,
+        /// The ceiling the document declared.
+        max_risk: Risk,
+    },
+    /// A policy entry named no tool.
+    ///
+    /// Refused rather than skipped: a blank identifier applies to nothing while reading as a configured
+    /// restriction, and the likely cause is a templating mistake an operator needs to see.
+    #[error("policy.{key} contains a blank tool identifier")]
+    BlankPolicyTool {
+        /// Which policy list held the blank entry.
+        key: &'static str,
+    },
     /// A prefixed environment key is not part of the explicit override contract.
     #[error("unknown configuration environment variable: {key}")]
     UnknownEnvironmentKey {
@@ -778,13 +936,19 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
             "shutdown_timeout_seconds",
         ]
     } else {
-        &["schema_version", "profile", "logging", "daemon"]
+        &["schema_version", "profile", "logging", "daemon", "policy"]
     };
     collect_unknown_keys(table, root_keys, "", &mut unknown);
 
     if version == CURRENT_CONFIG_VERSION {
         collect_nested_unknown(table, "profile", &["name"], &mut unknown);
         collect_nested_unknown(table, "logging", &["level"], &mut unknown);
+        collect_nested_unknown(
+            table,
+            "policy",
+            &["max_risk", "approval_threshold", "deny", "approval"],
+            &mut unknown,
+        );
         collect_nested_unknown(
             table,
             "daemon",
@@ -1272,6 +1436,144 @@ executor_api_key_ref = "model.key"
             .err()
             .unwrap_or_else(|| panic!("a relative key path must be refused"));
         assert_eq!(error, ConfigError::RelativeModelApiKeyRef);
+    }
+
+    /// **A policy section is read, and the absent section is the workspace default rather than an error.**
+    ///
+    /// The two halves are one claim: an operator can configure policy, and a document that does not
+    /// still starts. The second half matters because it is what an upgrade looks like — a config
+    /// written before this section existed must not refuse to load.
+    #[test]
+    fn a_policy_section_is_read_and_defaults_when_absent() {
+        let configured = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+
+[policy]
+max_risk = "high"
+approval_threshold = "low"
+deny = ["jarvis.mail.send"]
+
+[policy.approval]
+"jarvis.files.read" = "ask"
+"mcp.github.create_issue" = "deny"
+"#;
+        let loaded = Config::parse_with_environment(configured, Vec::<(String, String)>::new())
+            .unwrap_or_else(|error| panic!("a policy section should load: {error}"));
+        let policy = loaded.config().policy();
+        assert_eq!(policy.max_risk(), Some(Risk::High));
+        assert_eq!(policy.approval_threshold(), Some(Risk::Low));
+        assert_eq!(policy.deny(), ["jarvis.mail.send"]);
+        assert_eq!(
+            policy.approval().get("jarvis.files.read"),
+            Some(&ApprovalPolicy::Ask)
+        );
+        assert_eq!(
+            policy.approval().get("mcp.github.create_issue"),
+            Some(&ApprovalPolicy::Deny)
+        );
+
+        // The absent section is the default, not an error.
+        let bare = Config::parse_with_environment(V1_CONFIG, Vec::<(String, String)>::new())
+            .unwrap_or_else(|error| panic!("a document with no policy section must load: {error}"));
+        assert_eq!(bare.config().policy(), &PolicyConfig::default());
+        assert_eq!(bare.config().policy().max_risk(), None);
+    }
+
+    /// **An unknown approval policy name is refused rather than defaulted.**
+    ///
+    /// The direction that matters: the likely mistake is a misspelled *tightening*, and a default
+    /// would silently leave the tool's own policy in force while the operator believes the opposite.
+    #[test]
+    fn an_unknown_approval_policy_name_is_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+
+[policy.approval]
+"jarvis.files.read" = "always"
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| panic!("an unknown approval policy must be refused"));
+        assert_eq!(error, ConfigError::InvalidDocument);
+    }
+
+    /// **A threshold above the ceiling is refused, because the document contradicts itself.**
+    ///
+    /// Every risk that could be approved is already refused, so the threshold can never take effect.
+    /// Asserted with the two field names in the message, so an operator is told which values clash.
+    #[test]
+    fn a_policy_threshold_above_the_ceiling_is_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+
+[policy]
+max_risk = "low"
+approval_threshold = "high"
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| panic!("a contradictory policy must be refused"));
+        assert_eq!(
+            error,
+            ConfigError::ApprovalThresholdAboveCeiling {
+                approval_threshold: Risk::High,
+                max_risk: Risk::Low,
+            }
+        );
+    }
+
+    /// **A blank tool identifier is refused rather than skipped.**
+    ///
+    /// A blank entry applies to nothing while reading as a configured restriction, and the likely cause
+    /// is a templating mistake the operator needs to see.
+    #[test]
+    fn a_blank_policy_tool_identifier_is_refused() {
+        let document = r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+
+[policy]
+deny = ["  "]
+"#;
+        let error = Config::parse_with_environment(document, Vec::<(String, String)>::new())
+            .err()
+            .unwrap_or_else(|| panic!("a blank tool identifier must be refused"));
+        assert_eq!(error, ConfigError::BlankPolicyTool { key: "deny" });
     }
 
     #[test]

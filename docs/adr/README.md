@@ -139,3 +139,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0119](0119-the-model-may-request-a-tool-and-rust-decides.md) | The model may request a tool; deterministic policy still decides whether it runs | Accepted |
 | [0120](0120-a-decided-approval-continues-the-run.md) | A decided approval continues the run that parked on it | Accepted |
 | [0121](0121-a-providers-credential-is-a-file-path-not-a-value.md) | A provider's credential is a file path, and a partial provider is refused rather than guessed | Accepted |
+| [0122](0122-an-approval-override-can-only-tighten.md) | An operator's approval override can only tighten, and the risk vocabulary moved to core | Accepted |

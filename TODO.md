@@ -2188,6 +2188,78 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       text and the `SCRIPTED_MODEL_NAME` doc comment both told the reader to set `executor_model` "once a
       provider adapter is available", which this slice makes false.
 
+## P3-025: Configurable tool approval policy
+
+- [x] `P3-025` Let an operator configure which tools need approval, and per tool.
+      **THE VOCABULARY EXISTED AND THE SURFACE TO USE IT DID NOT.** The engine already honored a per-tool
+      `ApprovalPolicy::Ask` (`P3-015`), a workspace could deny a tool by identifier, and `WorkspacePolicy::new`
+      refused a threshold above its ceiling — but `WorkspacePolicy::default()` was constructed at the
+      composition site, `denying()` had **no production caller**, and `config.toml` had no policy field at all.
+      So every install decided every tool by the same compiled-in posture, and the "producer with no consumer"
+      shape this repository removes was sitting in the authorization path.
+      **Delivered:** `jarvis-core` gains `Risk` and `ApprovalPolicy`; `jarvis-tools` re-exports both and keeps
+      the effect-floor binding; `WorkspacePolicy` gains `requiring(id, policy)`, `effective_approval`, and
+      `approval_overrides`; `evaluate` applies the effective policy at the tool-policy step; `jarvis-storage`
+      gains a `[policy]` section (`max_risk`, `approval_threshold`, `deny`, `[policy.approval]`); and
+      `compose_workspace_policy` in `jarvisd` translates the document into the policy the pipeline decides
+      with. **`ADR-0122`.**
+      **⭐⭐ A SHARED DOMAIN TYPE NEEDED BY TWO ADAPTER CRATES BELONGS IN CORE, NOT IN EITHER.** `Risk` and
+      `ApprovalPolicy` moved to `jarvis-core` because `repository-layout.md` allows an adapter to depend on
+      core and **not on another adapter** — so `jarvis-storage`, which parses the operator's `max_risk`, could
+      not name `jarvis-tools`'s type. The workaround would have been a second risk vocabulary in storage:
+      **two values that must agree with nothing holding both**, where a drift would compile and an operator's
+      configured ceiling would be silently ignored. Core already held `Sensitivity` for the same reason.
+      Deliberately **not** the `AuthenticationStrength` situation: that type exists twice and the duplication
+      is correct, because the two mean different things (what a channel *can* establish versus what the
+      answering channel *did* establish). **Duplication is right when the meanings differ and wrong when they
+      do not — the test is whether one value could be substituted for the other without changing a claim.**
+      `Risk::declared_for` now takes the floor as a **number** (an `EffectSet` is `jarvis-tools`'s type), and
+      `jarvis-tools::declared_for_effects` is the single binding that supplies `EffectSet::risk_floor()`, so
+      the rule keeps exactly one home.
+      **⭐⭐ AN OVERRIDE IS A `max` APPLIED AT EVALUATION, NEVER AT CONSTRUCTION.** `requiring` stores what the
+      operator wrote; `effective_approval(id, declared)` returns `declared.tighter(override)` inside
+      `evaluate`. Applying the override when the policy is built would make the stored value the effective
+      value, so the override would **replace** the declaration and a looser override would remove a guard —
+      exactly what `ADR-0017` rejects by name. The rule lives with the policy, so a future runtime editor
+      inherits it rather than reimplementing it.
+      **⭐⭐ MY "SAFETY" TRANSLATION WAS ITSELF THE DEFECT.** The first `requiring` rewrote `Ask` into `Deny`,
+      reasoning that an override must be unable to lose to a tool declaring `Deny`. But because the override
+      is a `max`, `tighter(Deny, Ask)` is **already** `Deny` — no translation was needed — and the rewrite
+      broke the common case, turning "hold this tool for approval" into "refuse this call outright". A test
+      named for the *other* direction caught it: *"a stricter override must win, or the override does
+      nothing"*. **A second guard that also changes the meaning is not a guard.**
+      **⭐ A PREDICATE'S DIRECTION IS NOT INFERABLE FROM ITS NAME.** `tighter` reads correct whether it
+      returns the stricter or the looser operand. `ApprovalPolicy::strictness()` (Auto 0 → Policy 1 → Ask 2 →
+      Deny 3) is the mechanism, and the tests state the adversarial case **in their names** (*"a workspace
+      override must not relax a tool that declares Ask"*, *"an override cannot make a denying tool
+      runnable"*) plus a **sweep over every (declared, override) pair**, because a single hand-picked
+      assertion written the wrong way round survives an inverted comparison. Both complements are asserted:
+      the sweep proves nothing relaxes, and *"a stricter override wins"* is the control that stops "always
+      return the declaration" from passing.
+      **⭐ THE DOCUMENT IS A SEED, AND ITS ABSENCE IS THE DEFAULT.** `[policy]` is `#[serde(default)]`, so a
+      document written before the section existed still loads — the safe direction, because an absent section
+      means "no operator opinion" rather than a refusal to start. Two mistakes are refused as
+      self-contradictions: a threshold above the ceiling (every risk that could be approved is already
+      refused) and a blank identifier (applies to nothing while reading as a restriction). An entry naming
+      an **unregistered** tool is deliberately **not** refused: MCP servers are discovered at startup and one
+      may be down, so an inert entry is honest whereas a refusal would make a valid policy unable to start.
+      Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` (adds 8 core
+      vocabulary tests, 6 direction-rule and override tests, 4 config tests, 5 composition tests; 124 daemon
+      tests, `jarvis-tools` at 187), `cargo deny check` ok.
+      **⭐⭐ A COMPOSITION-ORDER DEFECT, FOUND BY ASKING WHERE THE NEW CODE IS REACHED.** `compose_tool_pipeline`
+      returned `Ok(None)` early when no roots and no MCP servers were configured, and the policy was built
+      **after** that return — so a document with an unusable policy was **accepted and silently ignored** by
+      exactly the daemons most likely to have a stale one. Building the policy before the return fixes it, and
+      the test for it was proven to falsify: reintroducing the early return made the test fail. **A new
+      validation on one path is not a validation unless you check which paths reach it.**
+      **Limits, recorded rather than glossed:** the document is read **at startup** and there is **no runtime
+      policy surface** — a CLI or control-plane UI that edits policy while the daemon runs needs a durable
+      workspace row and a reload path, and that is the next slice; the tool-identifier vocabulary is split
+      (`PolicyConfig` holds `String`s and the composition root parses them, because `ToolId` belongs to
+      `jarvis-tools`), so a malformed identifier is a **startup** error rather than a parse error; an override
+      can never relax a tool's declaration by design; and `[policy.approval]` cannot express "ask, whatever
+      the tool declares" for a tool that declares `Deny`, because `Deny` is absolute.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

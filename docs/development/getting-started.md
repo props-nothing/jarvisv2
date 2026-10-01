@@ -300,6 +300,45 @@ shutdown_timeout_seconds = 15
 
 Allowed overrides are `JARVIS_PROFILE_NAME`, `JARVIS_LOG_LEVEL`, and `JARVIS_SHUTDOWN_TIMEOUT_SECONDS`. Unknown TOML keys and unknown `JARVIS_*` variables are errors. Missing files use defaults without writing; schema v0 is migrated in memory and must be saved explicitly. Newer schemas fail closed. Configuration writes validate first, replace atomically, and retain no secret values.
 
+### Configuring tool approval
+
+The `[policy]` section decides which tools need a human, and how much risk the workspace permits at all:
+
+```toml
+[policy]
+max_risk = "high"              # the highest risk permitted at all
+approval_threshold = "moderate" # risk at which approval is always required
+deny = ["jarvis.mail.send"]     # refused outright, whatever the grants say
+
+[policy.approval]               # per-tool, by identifier
+"jarvis.files.read" = "ask"     # a read the workspace would allow now waits for a human
+"mcp.github.create_issue" = "auto"  # ignored: see the direction rule below
+```
+
+The four approval values are `auto` (run when scoped), `policy` (the workspace's threshold decides),
+`ask` (always ask, whatever the threshold says), and `deny` (never run, even with an approval a human
+could give). Risk levels are `minimal`, `low`, `moderate`, and `high`.
+
+**An override can only tighten, never relax.** `[policy.approval]` is applied as a maximum against the
+tool's own declaration, so `"jarvis.mail.send" = "auto"` cannot remove an `ask` the tool's author
+declared — the entry is inert rather than a removed guard. That is deliberate (`ADR-0017`, `ADR-0122`): a
+configuration file that could relax a tool's own approval policy would be a way to disable a security
+control from a text file. To loosen a tool, change the tool's declaration, not the workspace.
+
+**Two mistakes are refused at startup rather than starting a daemon that misbehaves:**
+
+- `approval_threshold` above `max_risk` — every risk that could be approved is already refused, so the
+  threshold can never take effect;
+- a blank identifier in `deny` or `[policy.approval]` — it applies to nothing while reading as a
+  configured restriction.
+
+A policy entry naming a tool that is **not currently registered** is not refused: MCP servers are
+discovered at startup and one may be down, so an inert entry is the honest outcome rather than a daemon
+that will not start.
+
+Omitting `[policy]` entirely gives the workspace defaults, which permit the full risk range and ask for
+approval from `moderate` up.
+
 ## Prototype
 
 The [example](../../example/readme.md) can be run separately to study behavior, subject to its dependencies, terms, and local credential handling. Do not run it automatically during production setup or tests. Do not read or commit its `config/api_keys.json` or `memory/long_term.json`.

@@ -19,10 +19,12 @@ mod timestamp;
 mod transport;
 
 mod approval;
+mod approval_policy;
 mod candidate;
 mod isolation;
 mod memory;
 mod retrieval;
+mod risk;
 mod secretbytes;
 mod tool_outcome;
 
@@ -32,6 +34,7 @@ pub use approval::{
     DecisionNonce, IntentError, InvalidApprovalField, MAX_APPROVAL_LIFETIME_SECONDS,
     MAX_APPROVAL_PREVIEW_CHARS, MAX_CANONICAL_INTENT_CHARS, NonceError,
 };
+pub use approval_policy::{ApprovalPolicy, ApprovalPolicyError};
 pub use candidate::{
     CandidateClassification, CandidateContext, CandidateRefusal, MAX_CANDIDATE_CONTENT_CHARS,
     MAX_CANDIDATE_ENTITIES, MemoryAdmission, MemoryCandidate, MemoryCandidateComparison,
@@ -81,6 +84,7 @@ pub use retrieval::{
     may_be_offered_as_fact, rank, reason_for, recency_signal, reinforcement_signal, score,
     signals_for, source_reliability_signal, temporal_signal,
 };
+pub use risk::{MAX_RISK_LEVEL, Risk, RiskError};
 pub use run::{
     ExpectedRunState, InvalidRunErrorCode, InvalidRunState, MAX_RUN_ERROR_CODE_CHARS, RunErrorCode,
     RunOutcome, RunState, RunTransition, RunTransitionError,

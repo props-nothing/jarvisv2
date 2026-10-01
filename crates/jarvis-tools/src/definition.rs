@@ -32,7 +32,7 @@ use crate::policy::{
     ApprovalPolicy, Availability, Idempotency, MAX_TOOL_TIMEOUT_SECONDS, RetryDeclaration,
     RetryPolicy, ToolSensitivity, ToolSource,
 };
-use crate::risk::{Risk, RiskError};
+use crate::risk::{Risk, RiskError, declared_for_effects};
 use crate::schema::ToolSchema;
 use crate::scope::ScopeSet;
 use crate::{ToolOutcome, ToolOutcomeError, ToolOutcomeRecord};
@@ -147,7 +147,7 @@ impl ToolDefinition {
 
         // The two cross-field checks. Both are delegated to the types that own the rule so the rule
         // has one home; calling them here is what makes this constructor the door.
-        let risk = Risk::declared_for(risk, &effects)?;
+        let risk = declared_for_effects(risk, &effects)?;
         // The retry declaration is *converted* rather than inspected: `RetryDeclaration` is the
         // unvalidated shape a manifest holds, and this is the conversion that makes it a
         // `RetryPolicy` or refuses. It needs the effects and idempotency, which is why the

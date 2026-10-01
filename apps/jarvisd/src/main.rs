@@ -107,6 +107,30 @@ enum DaemonError {
         #[source]
         source: jarvis_tools::RootError,
     },
+    /// The configured workspace policy was self-contradictory.
+    ///
+    /// The pair is refused at parse time too, so this is the belt to that suspenders: the composition
+    /// root states its own requirement rather than trusting a caller the configuration layer already
+    /// filtered.
+    #[error("the configured workspace policy is not usable")]
+    WorkspacePolicy {
+        /// Why the policy was refused, which names the two clashing values.
+        #[source]
+        source: jarvis_tools::PolicyError,
+    },
+    /// A configured tool identifier in the policy section was not a valid identifier.
+    ///
+    /// Carries the identifier, which is **safe** here: a tool identifier is not a secret, it is the
+    /// thing an operator must edit, and an error that did not name it would leave them searching the
+    /// document.
+    #[error("the workspace policy names an invalid tool: {tool}")]
+    WorkspacePolicyTool {
+        /// The identifier as written in the document.
+        tool: String,
+        /// Why the identifier was rejected.
+        #[source]
+        source: jarvis_tools::ToolIdError,
+    },
     #[error("the tool pipeline could not be composed")]
     ToolPipeline {
         /// Why composition failed, which names the rejected definition or root.
@@ -601,6 +625,14 @@ fn compose_tool_pipeline(
     )>,
     paths: &AppPaths,
 ) -> Result<Option<Arc<crate::tool_pipeline::ToolPipeline>>, DaemonError> {
+    // The workspace policy is built **before** the no-pipeline early return, and that ordering is the
+    // point rather than an accident. A malformed policy — a contradictory ceiling, or an identifier that
+    // is not a tool identifier at all — is a configuration fault an operator must fix whether or not a
+    // tool can currently run. Validating it only on the path that builds a pipeline would mean a daemon
+    // with no workspace roots **accepts** a document whose policy is unusable and silently ignores it,
+    // which is the "accepted and silently ignored" shape this repository removes wherever it finds it.
+    let workspace = compose_workspace_policy(config)?;
+
     // **No filesystem roots and no additional adapters means no pipeline**, not an empty one. Registering
     // the filesystem adapter over zero roots would let the daemon advertise a tool that fails every call,
     // which reads to a caller as a broken tool rather than an absent capability. A pipeline is warranted as
@@ -620,7 +652,7 @@ fn compose_tool_pipeline(
     let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
         database,
         roots,
-        jarvis_tools::WorkspacePolicy::default(),
+        workspace,
         additional,
         // The plaintext decision nonce goes to a file only this account can read, never into the durable
         // approval row: `ADR-0018` stores a digest there deliberately, and `SecretStore`'s module
@@ -631,6 +663,75 @@ fn compose_tool_pipeline(
     )
     .map_err(|source| DaemonError::ToolPipeline { source })?;
     Ok(Some(Arc::new(pipeline)))
+}
+
+/// Builds the workspace tool-authorization policy from the configuration document.
+///
+/// # Why this lives here rather than in `jarvis-storage`
+///
+/// The document section is `jarvis-storage`'s, because configuration parsing is its role; the policy is
+/// `jarvis-tools`'s, because authorization is its role; and `docs/architecture/repository-layout.md`
+/// allows an adapter to depend on `jarvis-core` and **not on another adapter**, so neither crate can do
+/// this translation. The composition root is where both vocabularies are in scope, which is exactly the
+/// `ADR-0023` shape: the pipeline is composed in the daemon over the adapter's own definitions.
+///
+/// # The direction rule is enforced across this seam, not here
+///
+/// Every override passes through [`jarvis_tools::WorkspacePolicy::requiring`], which applies it as a
+/// `max` against the tool's own declaration. So the translation cannot relax a guard even though it is
+/// the only place an operator's string becomes a policy — the rule lives with the policy and not with
+/// the parser, which is what keeps it true for a runtime editor as well.
+///
+/// # A tool identifier that names nothing is not refused
+///
+/// The registry is built *after* this runs and an MCP server's tools are discovered at startup, so an
+/// override for a tool that is currently absent would make the daemon refuse to start. An inert entry is
+/// the honest outcome for a policy written before a server came up; `ADR-0122` records the reasoning.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::WorkspacePolicy`] when a configured tool identifier is not a valid identifier,
+/// or when [`jarvis_tools::WorkspacePolicy::new`] refuses the ceiling and threshold pair. Both are
+/// configuration faults, so they stop the daemon at startup rather than at the first tool call.
+fn compose_workspace_policy(
+    config: &jarvis_storage::Config,
+) -> Result<jarvis_tools::WorkspacePolicy, DaemonError> {
+    let configured = config.policy();
+    // Each field falls back to the workspace default independently, so an operator who sets only one of
+    // the two gets a policy that is legal rather than a contradiction with a default they did not write.
+    let defaults = jarvis_tools::WorkspacePolicy::default();
+    let max_risk = configured.max_risk().unwrap_or(defaults.max_risk());
+    let approval_threshold = configured
+        .approval_threshold()
+        .unwrap_or(defaults.approval_threshold());
+
+    let mut policy = jarvis_tools::WorkspacePolicy::new(
+        max_risk,
+        approval_threshold,
+        defaults.requires_approval_for_external_communication(),
+        defaults.requires_strong_authentication_for_high_risk(),
+    )
+    .map_err(|source| DaemonError::WorkspacePolicy { source })?;
+
+    for identifier in configured.deny() {
+        let id = jarvis_tools::ToolId::new(identifier.clone()).map_err(|source| {
+            DaemonError::WorkspacePolicyTool {
+                tool: identifier.clone(),
+                source,
+            }
+        })?;
+        policy = policy.denying(id);
+    }
+    for (identifier, approval) in configured.approval() {
+        let id = jarvis_tools::ToolId::new(identifier.clone()).map_err(|source| {
+            DaemonError::WorkspacePolicyTool {
+                tool: identifier.clone(),
+                source,
+            }
+        })?;
+        policy = policy.requiring(id, *approval);
+    }
+    Ok(policy)
 }
 
 /// Builds and binds the inbound MCP endpoint, when the operator enabled one.
@@ -1086,5 +1187,194 @@ mod tests {
             signal_event(None).map_err(|error| error.kind()),
             Err(io::ErrorKind::BrokenPipe)
         );
+    }
+
+    /// Parses a document with `body` in the policy section, for the composition tests below.
+    fn config_with_policy(section: &str) -> jarvis_storage::Config {
+        let document = format!(
+            r#"
+schema_version = 1
+
+[profile]
+name = "home"
+
+[logging]
+level = "warn"
+
+[daemon]
+shutdown_timeout_seconds = 30
+
+{section}
+"#
+        );
+        jarvis_storage::Config::parse_with_environment(&document, Vec::<(String, String)>::new())
+            .unwrap_or_else(|error| panic!("the fixture document must load: {error}"))
+            .into_config()
+    }
+
+    fn tool_id(value: &str) -> jarvis_tools::ToolId {
+        jarvis_tools::ToolId::new(value).unwrap_or_else(|error| panic!("{value}: {error}"))
+    }
+
+    /// **The workspace policy defaults when the document configures none.**
+    ///
+    /// The control for the tests that follow: without it a composition that ignored the document
+    /// entirely would satisfy every other assertion here.
+    #[test]
+    fn a_document_without_a_policy_section_composes_the_workspace_default() {
+        let policy = compose_workspace_policy(&config_with_policy(""))
+            .unwrap_or_else(|error| panic!("the default policy must compose: {error}"));
+        let defaults = jarvis_tools::WorkspacePolicy::default();
+        assert_eq!(policy.max_risk(), defaults.max_risk());
+        assert_eq!(policy.approval_threshold(), defaults.approval_threshold());
+        assert!(!policy.denies(&tool_id("jarvis.files.read")));
+        assert_eq!(
+            policy.approval_overrides().count(),
+            0,
+            "a document that configures no override must produce none"
+        );
+    }
+
+    /// **A configured ceiling, threshold, denial, and override all reach the composed policy.**
+    ///
+    /// The end-to-end claim of the slice at the composition seam: each value an operator writes is the
+    /// value policy decides with. No call is made — the policy is constructed and read, which is what
+    /// the offline suite can establish.
+    #[test]
+    fn a_configured_policy_reaches_the_composed_workspace_policy() {
+        let config = config_with_policy(
+            r#"[policy]
+max_risk = "high"
+approval_threshold = "low"
+deny = ["jarvis.mail.send"]
+
+[policy.approval]
+"jarvis.files.read" = "ask"
+"#,
+        );
+        let policy = compose_workspace_policy(&config)
+            .unwrap_or_else(|error| panic!("the configured policy must compose: {error}"));
+
+        assert_eq!(policy.max_risk(), jarvis_tools::Risk::High);
+        assert_eq!(policy.approval_threshold(), jarvis_tools::Risk::Low);
+        assert!(
+            policy.denies(&tool_id("jarvis.mail.send")),
+            "a configured denial must reach the policy that decides"
+        );
+        // The override is what `evaluate` consults, so it is asserted through the accessor the engine
+        // itself calls rather than by reading the map: a composition that stored the override where
+        // nothing reads it would pass a map assertion and fail this one.
+        assert_eq!(
+            policy.effective_approval(
+                &tool_id("jarvis.files.read"),
+                jarvis_tools::ApprovalPolicy::Auto
+            ),
+            jarvis_tools::ApprovalPolicy::Ask,
+            "a configured override must tighten the tool's own declaration"
+        );
+    }
+
+    /// **A configured override cannot relax a tool's own declaration across the composition seam.**
+    ///
+    /// The direction rule asserted where the operator's *string* becomes a policy, because this is the
+    /// boundary an implementation is most likely to get wrong: a translation that wrote the configured
+    /// value into the policy as-is, rather than through `requiring`, would satisfy every tightening
+    /// assertion and fail only here.
+    #[test]
+    fn a_configured_override_cannot_relax_a_declaration_at_composition() {
+        let config = config_with_policy(
+            r#"[policy.approval]
+"jarvis.mail.send" = "auto"
+"#,
+        );
+        let policy = compose_workspace_policy(&config)
+            .unwrap_or_else(|error| panic!("the configured policy must compose: {error}"));
+
+        // The tool declares `Ask`; the operator wrote the loosest possible value.
+        assert_eq!(
+            policy.effective_approval(
+                &tool_id("jarvis.mail.send"),
+                jarvis_tools::ApprovalPolicy::Ask
+            ),
+            jarvis_tools::ApprovalPolicy::Ask,
+            "an override must not lower a tool's own `Ask`, wherever it is read from"
+        );
+    }
+
+    /// **An invalid tool identifier in the policy section is refused at startup.**
+    ///
+    /// The identifier is named in the error, because a tool identifier is not a secret and an operator
+    /// needs to know which line to fix.
+    #[test]
+    fn an_invalid_policy_tool_identifier_is_refused() {
+        let config = config_with_policy(
+            r#"[policy]
+deny = ["not a tool id"]
+"#,
+        );
+        let error = compose_workspace_policy(&config)
+            .err()
+            .unwrap_or_else(|| panic!("an invalid tool identifier must be refused"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not a tool id"),
+            "the refused identifier must be named so it can be fixed: {rendered}"
+        );
+    }
+
+    /// **An unusable policy is refused even when no tool can run.**
+    ///
+    /// A daemon with no workspace roots and no MCP server composes **no pipeline**, and the first version
+    /// of `compose_tool_pipeline` returned early before the policy was built — so a document whose policy
+    /// was contradictory or whose identifier was malformed was **accepted and silently ignored**. That is
+    /// the "accepted and silently ignored" shape this repository removes, and it was invisible because the
+    /// only path that validated policy was the one that built a pipeline.
+    ///
+    /// This drives the same composition the daemon drives, with the incoming adapters list empty, and
+    /// asserts the policy is still built. The **ordering** is what is under test: the refusal itself is
+    /// covered above and would pass either way, so this would fail only against a reintroduced early return.
+    #[tokio::test]
+    async fn an_unusable_policy_is_refused_even_with_no_tools_registered() {
+        let config = config_with_policy(
+            r#"[policy]
+deny = ["not a tool id"]
+"#,
+        );
+        // The same temporary-profile shape the executor's tests use, so the fixture is not a second
+        // convention: a real migrated database under the scratch directory the testkit removes.
+        let root = std::env::temp_dir().join(format!(
+            "jarvis-policy-compose-{}-{}",
+            std::process::id(),
+            jarvis_core::RunId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create scratch: {error}"));
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(
+                &root.join(jarvis_storage::DEFAULT_DATABASE_FILENAME),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let paths = jarvis_storage::AppPaths::from_root(&root)
+            .unwrap_or_else(|error| panic!("resolve paths: {error}"));
+
+        let error = compose_tool_pipeline(&config, database, Vec::new(), &paths)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("an unusable policy must be refused even with no tools registered")
+            });
+        assert!(
+            error.to_string().contains("not a tool id"),
+            "the refusal must be the policy's, not the no-pipeline path: {error}"
+        );
+
+        // Cleaned up after the database is dropped, because a profile removed while a pool still holds the
+        // file open is a sharing violation on Windows.
+        drop_error_free(&root);
+    }
+
+    /// Removes a scratch directory, ignoring the failure `remove_scratch_dir` already bounds.
+    fn drop_error_free(path: &std::path::Path) {
+        jarvis_core::remove_scratch_dir(path);
     }
 }

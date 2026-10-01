@@ -97,7 +97,7 @@ pub use registry::{
     DiscoveryReport, MAX_DISCOVERY_TOOLS, MAX_REGISTERED_TOOLS, MAX_SUMMARY_DESCRIPTION_CHARS,
     RegistrationError, RegistryError, ToolInventoryEntry, ToolRegistry, ToolSummary,
 };
-pub use risk::{MAX_RISK_LEVEL, Risk, RiskError};
+pub use risk::{MAX_RISK_LEVEL, Risk, RiskError, declared_for_effects};
 pub use schema::{
     MAX_REPORTED_VIOLATIONS, MAX_TOOL_SCHEMA_BYTES, SchemaError, SchemaViolation,
     TOOL_SCHEMA_DIALECT, ToolSchema, ValidationReport,

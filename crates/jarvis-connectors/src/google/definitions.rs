@@ -44,9 +44,9 @@
 
 use jarvis_core::Sensitivity;
 use jarvis_tools::{
-    ApprovalPolicy, Availability, EffectSet, Idempotency, RetryDeclaration, Risk, SchemaError,
-    Scope, ScopeError, ScopeSet, TOOL_SCHEMA_DIALECT, ToolDefinition, ToolDefinitionError,
-    ToolDefinitionParts, ToolId, ToolIdError, ToolSchema, ToolSensitivity, ToolSource,
+    Availability, EffectSet, Idempotency, RetryDeclaration, Risk, SchemaError, Scope, ScopeError,
+    ScopeSet, TOOL_SCHEMA_DIALECT, ToolDefinition, ToolDefinitionError, ToolDefinitionParts,
+    ToolId, ToolIdError, ToolSchema, ToolSensitivity, ToolSource,
 };
 
 use crate::manifest::{ConnectorManifest, ProviderIdempotency, ValidatedOperation};
@@ -283,7 +283,7 @@ pub fn definition(operation: &ValidatedOperation) -> Result<ToolDefinition, Goog
         // approval field. Risk 0 is `Auto` by the guidance table, and the manifest refuses an operation whose
         // risk is below its effects' floor — so deriving the policy cannot under-approve, and a future write
         // operation cannot be added with `Auto` by accident: it would have to raise its risk first.
-        approval: ApprovalPolicy::for_risk(risk),
+        approval: risk.for_approval(),
         timeout_seconds: TOOL_TIMEOUT_SECONDS,
         retry: retry_declaration(operation.idempotency()),
         idempotency,
