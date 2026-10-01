@@ -445,9 +445,13 @@ fn message_for_channel(channel_id: &str) -> ChannelMessage {
 }
 
 /// A registration for a channel id and an account.
+///
+/// The resource id is the guide's own example value, because it is the provider's that the connector only ever
+/// echoes back — the stop call's second identifier.
 fn registration(channel_id: &str, account: &str) -> ChannelRegistration {
     ChannelRegistration::new(
         channel_id.to_owned(),
+        "ret08u3rv24htgh289g".to_owned(),
         must(
             crate::account::AccountReference::new(account),
             "a valid account reference",
@@ -542,6 +546,7 @@ fn a_registration_redacts_its_token_and_the_route_uses_only_the_id() {
     // token differs still routes, because routing and verification answer different questions.
     let with_token = ChannelRegistration::new(
         "channel-alpha".to_owned(),
+        "o3hgv1538sdjfh".to_owned(),
         must(
             crate::account::AccountReference::new("acct-alpha"),
             "a valid account reference",
@@ -571,6 +576,42 @@ fn a_registration_redacts_its_token_and_the_route_uses_only_the_id() {
     );
     // And a registration with NO token is a recorded choice, surfaced as `None` rather than a sentinel.
     assert_eq!(registration("channel-beta", "acct-beta").token(), None);
+}
+
+#[test]
+fn a_registration_carries_both_identifiers_the_stop_call_needs_and_they_reach_it_in_order() {
+    // **The finding this field exists for.** `parse_channel_watch_response` read the `watch` response's
+    // `resourceId` and there was **nowhere to put it**, so the value the stop call needs was dropped one
+    // function after it was obtained -- while `ADR-0106`'s own note said `resourceId` is *"what the
+    // `channels.stop` call needs"*. A registration is the only place that survives between the `watch` and the
+    // teardown, so it is where the provider's identifier has to live.
+    let registration = registration("channel-alpha", "acct-alpha");
+    assert_eq!(registration.resource_id, "ret08u3rv24htgh289g");
+    // The two identifiers are OPAQUE STRINGS OF SIMILAR SHAPE, so a transposition would be well-formed and
+    // would silently stop the wrong channel -- or none. This asserts they reach the body in the fields the
+    // reference names, with `id` holding the channel and `resourceId` holding the resource.
+    let request = crate::google::request::calendar_channel_stop(
+        &registration.channel_id,
+        registration.resource_id(),
+    )
+    .unwrap_or_else(|error| panic!("a registered channel must be stoppable: {error}"));
+    assert!(
+        request.url().ends_with("/calendar/v3/channels/stop"),
+        "the stop is addressed on the Calendar base, not a per-user path: {}",
+        request.url()
+    );
+    let body = request.rendered_body();
+    assert!(
+        body.contains(r#""id":"channel-alpha""#),
+        "the channel id must be the `id` field: {body}"
+    );
+    assert!(
+        body.contains(r#""resourceId":"ret08u3rv24htgh289g""#),
+        "the watched resource must be the `resourceId` field: {body}"
+    );
+    // And the pair is genuinely required: an empty resource id is refused rather than sent as a blank field,
+    // which would name no resource and leave that channel notifying.
+    assert!(crate::google::request::calendar_channel_stop("channel-alpha", "  ").is_err());
 }
 
 /// Full header set for a delivery naming a channel, in a given state, with an optional token.
@@ -618,6 +659,7 @@ fn ingest(
 fn registration_with_token(channel_id: &str, account: &str, token: &str) -> ChannelRegistration {
     ChannelRegistration::new(
         channel_id.to_owned(),
+        "o3hgv1538sdjfh".to_owned(),
         must(
             crate::account::AccountReference::new(account),
             "a valid account reference",
@@ -852,4 +894,150 @@ fn every_ingest_outcome_acknowledges_because_none_is_repaired_by_retrying() {
         .filter(|outcome| outcome.account_to_sync().is_some())
         .count();
     assert_eq!(syncing, 1, "exactly one of the four outcomes syncs");
+}
+
+/// A representable instant from whole seconds, for the renewal tests.
+fn instant(seconds: i64) -> jarvis_core::UtcTimestamp {
+    must(
+        jarvis_core::UtcTimestamp::from_unix_nanos(i128::from(seconds) * 1_000_000_000),
+        "a representable instant",
+    )
+}
+
+#[test]
+fn the_watch_responses_expiration_is_epoch_millis_and_the_conversion_is_asserted() {
+    // The guide's own `watch` response example, verbatim. Its `expiration` is a **JSON number** of
+    // **milliseconds** (1426325213000), the opposite of the human-readable header AND the opposite of the Gmail
+    // lease's millisecond **string** — three encodings across two mechanisms. `UtcTimestamp` takes nanos, so
+    // the value is scaled by one million; a wrong factor is not an error, it is an instant in the year 1970 or
+    // 47,000, so the conversion is pinned against the guide's number rather than inspected.
+    let body = r#"{
+      "kind": "api#channel",
+      "id": "01234567-89ab-cdef-0123456789ab",
+      "resourceId": "o3hgv1538sdjfh",
+      "resourceUri": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+      "expiration": 1426325213000
+    }"#;
+    let response = must(
+        parse_channel_watch_response(body),
+        "the guide's own watch response must parse",
+    );
+    assert_eq!(response.channel_id, "01234567-89ab-cdef-0123456789ab");
+    assert_eq!(response.resource_id, "o3hgv1538sdjfh");
+    // 1426325213000 ms == 1426325213 s. If the parser used the number as seconds the instant would be
+    // 1426325213000 s, and if it multiplied by 1000 instead of 1_000_000 it would be 1000x too early — so this
+    // exact value is what distinguishes the three scalings.
+    assert_eq!(
+        response.expires_at.unix_nanos(),
+        i128::from(1_426_325_213_i64) * 1_000_000_000,
+        "the value is milliseconds and must be scaled by one million to nanos"
+    );
+}
+
+#[test]
+fn an_unreadable_watch_response_names_the_field_and_the_layer() {
+    // Each refusal is a distinct variant pointing at a distinct defect — the body, the field, the type, or the
+    // range — because "the response is unreadable" would leave a caller guessing which to look at.
+    // Not JSON at all.
+    assert!(matches!(
+        parse_channel_watch_response("not json"),
+        Err(ChannelWatchError::NotJson { .. })
+    ));
+    // A missing field, named.
+    match parse_channel_watch_response(r#"{"id":"c","resourceId":"r"}"#) {
+        Err(ChannelWatchError::Missing { field }) => assert_eq!(field, RESPONSE_EXPIRATION_FIELD),
+        other => panic!("a missing expiration must be refused by name, got {other:?}"),
+    }
+    // A wrong type: the field is documented as a millisecond number, and a string is a different encoding (the
+    // header's, or the Gmail lease's) that this field is not.
+    match parse_channel_watch_response(
+        r#"{"id":"c","resourceId":"r","expiration":"1426325213000"}"#,
+    ) {
+        Err(ChannelWatchError::WrongType { field, .. }) => {
+            assert_eq!(field, RESPONSE_EXPIRATION_FIELD);
+        }
+        other => panic!("a string expiration must be refused as the wrong type, got {other:?}"),
+    }
+    // A value too large for an instant is refused rather than wrapped.
+    assert_eq!(
+        parse_channel_watch_response(
+            r#"{"id":"c","resourceId":"r","expiration":9223372036854775807}"#
+        ),
+        Err(ChannelWatchError::OutOfRange)
+    );
+    // And a `null` is treated as absent rather than as a wrong type — the provider sent no value.
+    assert!(matches!(
+        parse_channel_watch_response(r#"{"id":"c","resourceId":"r","expiration":null}"#),
+        Err(ChannelWatchError::Missing { .. })
+    ));
+}
+
+#[test]
+fn a_channel_lease_reports_direction_and_the_exact_boundary_is_lapsed() {
+    // The boundary is decided in nanoseconds and the **exact expiry instant counts as lapsed**, the same rule
+    // `watch_lapse` uses and for the same reason: treating it as alive keeps a dead channel one interval
+    // longer, which is the silent failure this path removes.
+    let expiry = instant(1_000_000 + 600);
+    assert!(!channel_lease(expiry, instant(1_000_000)).is_lapsed());
+    assert_eq!(
+        channel_lease(expiry, instant(1_000_000)).seconds_from_edge(),
+        600
+    );
+    assert_eq!(
+        channel_lease(expiry, expiry),
+        ChannelLease::Lapsed { for_seconds: 0 },
+        "the expiry instant itself is lapsed, not alive"
+    );
+    assert_eq!(
+        channel_lease(expiry, instant(1_000_000 + 900)),
+        ChannelLease::Lapsed { for_seconds: 300 }
+    );
+}
+
+#[test]
+fn the_renewal_decision_replaces_a_lapsed_channel_a_nearly_lapsed_one_and_leaves_the_rest() {
+    // Three states, because a lapsed channel and a nearly-lapsed one need the same action but mean different
+    // things: one is already **losing** notifications, the other must be replaced **before** it does.
+    let now = instant(1_000_000);
+    // A channel well inside its lease: nothing to do.
+    let comfortable = instant(1_000_000 + CHANNEL_REPLACE_LEAD_SECONDS + 3_600);
+    assert_eq!(
+        renewal_decision(comfortable, now),
+        ChannelRenewal::NotYet {
+            remaining_seconds: CHANNEL_REPLACE_LEAD_SECONDS + 3_600
+        }
+    );
+    assert!(!renewal_decision(comfortable, now).should_replace());
+    // Exactly at the lead time: replace now (the boundary is inclusive on the "soon" side).
+    let at_lead = instant(1_000_000 + CHANNEL_REPLACE_LEAD_SECONDS);
+    assert_eq!(
+        renewal_decision(at_lead, now),
+        ChannelRenewal::ReplaceSoon {
+            remaining_seconds: CHANNEL_REPLACE_LEAD_SECONDS
+        }
+    );
+    assert!(renewal_decision(at_lead, now).should_replace());
+    // Just inside the lead time.
+    assert!(matches!(
+        renewal_decision(instant(1_000_000 + 60), now),
+        ChannelRenewal::ReplaceSoon {
+            remaining_seconds: 60
+        }
+    ));
+    // Lapsed: already losing notifications, and the variant says how long ago it stopped.
+    assert_eq!(
+        renewal_decision(instant(1_000_000 - 120), now),
+        ChannelRenewal::ReplaceNow {
+            lapsed_for_seconds: 120
+        }
+    );
+    // The two "replace" states are distinct, so a caller cannot mistake one for the other.
+    assert_ne!(
+        renewal_decision(at_lead, now),
+        renewal_decision(instant(1_000_000 - 120), now)
+    );
+    assert_eq!(
+        CHANNEL_REPLACE_LEAD_SECONDS, 86_400,
+        "one day, a stated JARVIS figure"
+    );
 }

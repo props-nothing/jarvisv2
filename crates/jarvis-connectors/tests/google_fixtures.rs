@@ -747,6 +747,7 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
     // The change fixture's channel and token, from the file itself.
     let registrations = [ChannelRegistration::new(
         "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        "ret08u3rv24htgh289g".to_owned(),
         reference("acct-example"),
         Some(secret("target=myApp-myCalendarChannelDest")),
     )];
@@ -790,6 +791,7 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
     // A registration whose token differs: the channel routes, and the token control fails.
     let wrong_token = [ChannelRegistration::new(
         "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        "ret08u3rv24htgh289g".to_owned(),
         reference("acct-example"),
         Some(secret("a-different-token")),
     )];
@@ -801,6 +803,7 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
     // the guide's optional-token case rather than a failure.
     let untokened = [ChannelRegistration::new(
         "4ba78bf0-6a47-11e2-bcfd-0800200c9a66".to_owned(),
+        "ret08u3rv24htgh289g".to_owned(),
         reference("acct-example"),
         None,
     )];
@@ -809,6 +812,64 @@ fn a_recorded_delivery_is_ingested_end_to_end_to_one_account_or_a_refusal() {
         ChannelIngest::Changed {
             account: reference("acct-example")
         }
+    );
+}
+
+#[test]
+fn the_watch_response_drives_a_renewal_decision_the_header_cannot() {
+    // **The encoding split, proved end to end against the guide's own values.** The channel's expiry arrives in
+    // two places with two encodings: this `watch` response carries `expiration` as a **number of milliseconds**
+    // (comparable to a clock after one scale factor), while the notification header carries it as a
+    // **human-readable date** (not comparable without a parser the crate does not have). So only the response
+    // can drive a renewal decision, and this fixture is what makes that checkable.
+    use jarvis_connectors::google::channel::{
+        ChannelLease, ChannelRenewal, channel_lease, parse_channel_watch_response, renewal_decision,
+    };
+    use jarvis_core::UtcTimestamp;
+
+    let text = fixture("calendar_channel_watch_response.json");
+    assert_declared_shape(&text);
+    let response = match parse_channel_watch_response(&text) {
+        Ok(response) => response,
+        Err(error) => panic!("the documented watch response must parse: {error}"),
+    };
+    assert_eq!(response.channel_id, "01234567-89ab-cdef-0123456789ab");
+    assert_eq!(response.resource_id, "o3hgv1538sdjfh");
+
+    let at = |seconds: i64| {
+        UtcTimestamp::from_unix_nanos(i128::from(seconds) * 1_000_000_000)
+            .unwrap_or_else(|error| panic!("a representable instant: {error}"))
+    };
+    // The expiry is 1426325213 seconds. A day before it, the channel is inside the replace-lead window, so a
+    // replacement must start -- which is the decision the human-readable header cannot produce.
+    let day_before = at(1_426_325_213 - 86_400);
+    assert_eq!(
+        renewal_decision(response.expires_at, day_before),
+        ChannelRenewal::ReplaceSoon {
+            remaining_seconds: 86_400
+        }
+    );
+    assert!(renewal_decision(response.expires_at, day_before).should_replace());
+    // Well before that, there is nothing to do.
+    let long_before = at(1_426_325_213 - 86_400 - 3_600);
+    assert_eq!(
+        renewal_decision(response.expires_at, long_before),
+        ChannelRenewal::NotYet {
+            remaining_seconds: 86_400 + 3_600
+        }
+    );
+    // After it, the channel is already lapsed and notifications are being lost until it is replaced.
+    let after = at(1_426_325_213 + 120);
+    assert_eq!(
+        renewal_decision(response.expires_at, after),
+        ChannelRenewal::ReplaceNow {
+            lapsed_for_seconds: 120
+        }
+    );
+    assert!(channel_lease(response.expires_at, after).is_lapsed());
+    assert_eq!(
+        channel_lease(response.expires_at, after),
+        ChannelLease::Lapsed { for_seconds: 120 }
     );
 }
 

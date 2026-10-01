@@ -1003,3 +1003,89 @@ fn a_watch_topic_name_goes_through_the_same_bounds_as_every_other_resource_ident
         "a label list over the cap must be refused"
     );
 }
+
+#[test]
+fn a_calendar_channel_stop_names_the_two_identifiers_the_reference_requires() {
+    // The `channels.stop` reference gives a body of exactly `id` and `resourceId` — *"This method requires that
+    // you provide at least the channel's `id` and the `resourceId` properties"* — and the two are opaque
+    // strings of similar shape, so a **transposition would be well-formed and would stop the wrong channel or
+    // none**. Parsed rather than substring-matched, because the substance is which field holds which value.
+    let request = must(
+        calendar_channel_stop("channel-alpha", "o3hgv1538sdjfh"),
+        "a stop with both identifiers must build",
+    );
+    // The address is the single `channels/stop` path on the Calendar base -- not a per-user or per-calendar
+    // path, which is what makes this one call per channel rather than one call per account.
+    assert_eq!(
+        request.url(),
+        "https://www.googleapis.com/calendar/v3/channels/stop"
+    );
+    assert_eq!(request.content_type(), "application/json");
+    let body: serde_json::Value = must(
+        serde_json::from_str(request.rendered_body()),
+        "the body is JSON",
+    );
+    assert_eq!(body["id"], "channel-alpha");
+    assert_eq!(body["resourceId"], "o3hgv1538sdjfh");
+    // Exactly two fields: the reference lists an optional `token`, and sending the channel token back would put
+    // the anti-spoofing control into a body that a diagnostic renders -- for no effect, since the field does not
+    // stop anything.
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(2),
+        "the stop body must carry the two identifiers and nothing else: {body}"
+    );
+    assert_eq!(body.get("token"), None);
+    // And the transposition the parse above rules out is checked once more by value, because `id` and
+    // `resourceId` are both opaque and the assertion above would pass for a body whose fields were swapped only
+    // if the two arguments were swapped with them.
+    assert_ne!(body["id"], body["resourceId"]);
+}
+
+#[test]
+fn both_channel_identifiers_go_through_the_same_identifier_validator() {
+    // The stop body is a second body on a second API, so the risk is that it acquires its own weaker
+    // validation. Each argument is checked against the same `resource_id` rules every other identifier here
+    // follows -- empty, whitespace-only, control-bearing and oversized -- and the **field is named**, so a
+    // caller learns which of the two is unusable rather than being told "the request is invalid".
+    for (channel, resource, field) in [
+        ("", "o3hgv1538sdjfh", "channel_id"),
+        ("channel-alpha", "", "resource_id"),
+        ("   ", "o3hgv1538sdjfh", "channel_id"),
+        ("channel-alpha", "   ", "resource_id"),
+        ("chan\nnel", "o3hgv1538sdjfh", "channel_id"),
+        ("channel-alpha", "res\tource", "resource_id"),
+    ] {
+        assert!(
+            matches!(
+                calendar_channel_stop(channel, resource),
+                Err(RequestError::Argument { field: named, .. }) if named == field
+            ),
+            "`{channel}` / `{resource}` must be refused naming `{field}`"
+        );
+    }
+    let oversized = "a".repeat(MAX_RESOURCE_ID_CHARS + 1);
+    assert!(
+        matches!(
+            calendar_channel_stop(&oversized, "o3hgv1538sdjfh"),
+            Err(RequestError::Argument {
+                field: "channel_id",
+                ..
+            })
+        ),
+        "an oversized channel id must be refused"
+    );
+    assert!(
+        matches!(
+            calendar_channel_stop("channel-alpha", &oversized),
+            Err(RequestError::Argument {
+                field: "resource_id",
+                ..
+            })
+        ),
+        "an oversized resource id must be refused"
+    );
+    // The control: the boundary value itself is accepted, so the refusals above are about being outside the
+    // bound rather than about the bound being unreachable.
+    assert!(calendar_channel_stop("channel-alpha", &"b".repeat(MAX_RESOURCE_ID_CHARS)).is_ok());
+}

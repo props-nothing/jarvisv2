@@ -123,3 +123,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0103](0103-composing-the-push-path-is-what-decides.md) | Composing the push path is what decides, and the seam changed a type | Accepted |
 | [0104](0104-a-cause-is-not-a-marker.md) | A cause is not a marker, and the two pushes do not share a state machine | Accepted |
 | [0105](0105-the-documented-remedy-is-two-steps.md) | The documented remedy is two steps, and only the second was a type | Accepted |
+| [0106](0106-the-same-expiry-in-two-encodings.md) | The same expiry in two encodings, and renewal is a replacement | Accepted |
+| [0107](0107-a-teardown-whose-arity-the-provider-decides.md) | A teardown step whose arity the provider decides, and a value read for a consumer that did not exist | Accepted |

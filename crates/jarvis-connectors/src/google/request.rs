@@ -670,17 +670,26 @@ pub fn gmail_profile() -> HttpRequest {
 
 /// A `POST` whose body is JSON, and authenticated by a bearer header.
 ///
-/// # Why this is the first such type here, and what it is not
+/// # Why this is the shape for every body-bearing call here, and what it is not
 ///
 /// [`HttpRequest`] has **no body** on purpose — every operation it builds is a `GET`, and it documents that a
-/// body field "would be a shape nothing uses". `users.watch` is the operation that disproves the general claim:
-/// the reference gives it as `POST …/users/me/watch` with a JSON request body carrying `topicName` and
-/// optionally `labelIds`/`labelFilterBehavior`. So this crate needed a second request shape, and it is **not**
-/// [`FormRequest`] — that type exists for the token endpoint, whose body carries the `code` and the
-/// `refresh_token`, is `application/x-www-form-urlencoded`, and authenticates by its body's `client_id`. A
-/// watch body carries a topic name and label ids and authenticates by the caller's **bearer header**, so
-/// reusing `FormRequest` would have put a non-credential body into a type whose whole justification is the
-/// credential it holds.
+/// body field "would be a shape nothing uses". Two operations disprove the general claim: `users.watch`
+/// (`POST …/users/me/watch` with a JSON body carrying `topicName` and optionally `labelIds` and
+/// `labelFilterBehavior`) and `channels.stop` (`POST …/calendar/v3/channels/stop` with a JSON body carrying
+/// `id` and `resourceId`). So this crate needed a second request shape, and it is **not** [`FormRequest`] —
+/// that type exists for the token endpoint, whose body carries the `code` and the `refresh_token`, is
+/// `application/x-www-form-urlencoded`, and authenticates by its body's `client_id`. Neither body here carries
+/// a credential, and both authenticate by the caller's **bearer header**, so reusing `FormRequest` would have
+/// put a non-credential body into a type whose whole justification is the credential it holds.
+///
+/// # Why the name is `JsonRequest` rather than `WatchRequest`
+///
+/// It was `WatchRequest` while `users.watch` was its **only** caller. The second caller is not a watch —
+/// `channels.stop` is the call that *ends* a channel that a watch created — so a name derived from its first
+/// user became a claim about the type that is false. The axis that makes this a separate type from
+/// `FormRequest` is the **credential boundary** (`ADR-0093`), not the operation, so the name follows the axis
+/// rather than the caller. Renaming it is safe here precisely because it has no consumers: the builders are the
+/// public surface, and the type is the value they return.
 ///
 /// # What this type deliberately does not hold
 ///
@@ -697,12 +706,12 @@ pub fn gmail_profile() -> HttpRequest {
 /// the body is a string, so the set of fields sent is visible in one place rather than spread across attributes
 /// on a struct — which is what makes the deprecated-field rule below checkable.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WatchRequest {
+pub struct JsonRequest {
     url: String,
     body: String,
 }
 
-impl WatchRequest {
+impl JsonRequest {
     /// Returns the absolute URL. It carries no query parameters: the watch takes its arguments in the body.
     #[must_use]
     pub fn url(&self) -> &str {
@@ -711,12 +720,14 @@ impl WatchRequest {
 
     /// Returns the rendered JSON body.
     ///
-    /// **Not redacted, and that is a decision rather than an oversight.** This body holds a topic name and
+    /// **Not redacted, and that is a decision rather than an oversight.** A watch body holds a topic name and
     /// label ids: the topic name is a resource in the caller's own Cloud project, and the label ids are Gmail's
-    /// own vocabulary (`INBOX`, `UNREAD`) rather than message content. There is no credential here — unlike
-    /// [`FormRequest::rendered_body`], whose type exists to hide one — so rendering it in a diagnostic shows
-    /// what was sent without disclosing anything the caller did not already know. The body is bounded by the
-    /// validators below, so it also cannot become an unbounded log line.
+    /// own vocabulary (`INBOX`, `UNREAD`) rather than message content. A stop body holds a channel id the
+    /// connector generated and a `resourceId` the provider returned — neither is a secret, and neither names a
+    /// person. There is no credential here — unlike [`FormRequest::rendered_body`], whose type exists to hide
+    /// one — so rendering it in a diagnostic shows what was sent without disclosing anything the caller did not
+    /// already know. The body is bounded by the validators below, so it also cannot become an unbounded log
+    /// line.
     #[must_use]
     pub fn rendered_body(&self) -> &str {
         &self.body
@@ -845,7 +856,7 @@ fn watch_json_body(
 ///
 /// # The three traps, and where each is handled
 ///
-/// The **body** is a `POST` with JSON, which is why this returns [`WatchRequest`] rather than the GET-only
+/// The **body** is a `POST` with JSON, which is why this returns [`JsonRequest`] rather than the GET-only
 /// [`HttpRequest`]. The **deprecated `labelFilterAction`** has no parameter, so it is unreachable. And the
 /// **filter-without-a-list** pairing is refused in [`watch_json_body`] rather than sent, because the provider
 /// does not treat it as an error.
@@ -858,14 +869,69 @@ pub fn gmail_watch(
     topic_name: &str,
     label_ids: Option<&[String]>,
     filter: Option<client::LabelFilterBehavior>,
-) -> Result<WatchRequest, RequestError> {
+) -> Result<JsonRequest, RequestError> {
     let body = watch_json_body(topic_name, label_ids, filter)?;
-    Ok(WatchRequest {
+    Ok(JsonRequest {
         // Gmail's own base, and `me` because the connector authenticates as the account it watches. The
         // identifier is a constant here rather than an argument, because a caller that could name another
         // mailbox would be building a request the token does not authorise — a `403` rather than a watch.
         url: format!("{GMAIL_API_BASE}/users/me/watch"),
         body,
+    })
+}
+
+/// Builds the `channels.stop` request that ends **one** Calendar notification channel.
+///
+/// # Why this is a per-channel call, and why there is no Gmail counterpart here
+///
+/// A Calendar channel is stopped by naming a **channel id and a resource id together** — the guide: *"This
+/// method requires that you provide at least the channel's `id` and the `resourceId` properties"* — because the
+/// channel id identifies the channel while the `resourceId` names **which watched resource** it is for, and the
+/// guide says a channel *"is associated both with a particular user and a particular resource (or set of
+/// resources)"*. The pair, not the id alone, is therefore a channel's identity, and this function takes both.
+///
+/// **There is no per-user form and so no single call**, which is the fact that makes a Calendar teardown
+/// different in kind from a Gmail one: *"Note that if the Google Calendar API has several types of resources
+/// that have `watch` methods, there's only one `stop` method"* — reached at `…/channels/stop`, one channel at a
+/// time. An account with three watched calendars needs three calls, and missing one leaves that calendar
+/// notifying until **its own** expiry (`crate::google::teardown`).
+///
+/// `users.stop` is deliberately **not** built beside this: it is a different method on a different collection
+/// whose body is empty, so it would need a third request shape for no gain, and nothing calls it yet.
+///
+/// # The permission rule this cannot check
+///
+/// The guide: *"If the channel was created by a regular user account, only the same user from the same client
+/// (as identified by the OAuth 2.0 client IDs from the auth tokens) who created the channel can stop the
+/// channel. If the channel was created by a service account, any user from the same client can stop the
+/// channel."* This builder cannot enforce that, because the client id is a claim **inside** the credential and
+/// [`crate::google::credential`] deliberately exposes only a rendered header value — so the rule is recorded
+/// as a limit rather than a check, and the provider's `403` is what a violation looks like.
+///
+/// # Errors
+///
+/// Returns [`RequestError::Argument`] for an unusable channel id or resource id, through the same
+/// [`resource_id`] validator every other identifier here uses — so the two bodies are checked identically
+/// rather than each in its own way.
+pub fn calendar_channel_stop(
+    channel_id: &str,
+    watched_resource_id: &str,
+) -> Result<JsonRequest, RequestError> {
+    let id = resource_id("channel_id", channel_id)?;
+    let watched = resource_id("resource_id", watched_resource_id)?;
+    // Built as a map rather than through a struct so the two field names are spelled once each, in the same
+    // place as the values they carry — which is what makes it checkable that `id` holds the channel id and
+    // `resourceId` holds the resource id, since the two are opaque strings of similar shape and could be
+    // transposed without either being malformed.
+    let mut body = serde_json::Map::new();
+    body.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+    body.insert(
+        "resourceId".to_owned(),
+        serde_json::Value::String(watched.to_owned()),
+    );
+    Ok(JsonRequest {
+        url: format!("{CALENDAR_API_BASE}/channels/stop"),
+        body: serde_json::Value::Object(body).to_string(),
     })
 }
 

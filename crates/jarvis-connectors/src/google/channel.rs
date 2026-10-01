@@ -79,6 +79,8 @@
 
 use std::fmt;
 
+use jarvis_core::UtcTimestamp;
+
 use crate::account::AccountReference;
 use crate::auth::SecretValue;
 use crate::webhook::WebhookDelivery;
@@ -515,10 +517,29 @@ pub fn verify_channel_token(
 /// rather than a [`SecretValue`] with a sentinel: [`verify_channel_token`] reads `None` as
 /// [`ChannelTokenCheck::Absent`] (not a refusal), and a caller cannot express "I forgot the token" as distinct
 /// from "there is none".
+///
+/// # The identity of a channel is a **pair**, which is why this holds two identifiers
+///
+/// A registration keeps both [`Self::channel_id`] and [`Self::resource_id`], because the call that **ends** a
+/// channel names both: *"This method requires that you provide at least the channel's `id` and the `resourceId`
+/// properties"*. The channel id says *which channel*, and the resource id says *which watched resource it is
+/// for* — the guide states a channel *"is associated both with a particular user and a particular resource (or
+/// set of resources)"* — so one alone is not enough to stop it.
+///
+/// `resource_id` was previously **read and discarded**: [`parse_channel_watch_response`] parsed the field out
+/// of the `watch` response, and this type had nowhere to put it, so the value the stop call needs was dropped
+/// one function after it was obtained (`ADR-0107`). A registration is therefore assembled from **two**
+/// sources — the provider's response (`channel_id`, `resource_id`) and the connector's own choices (`account`,
+/// `token`) — because two of the four facts are the provider's and two are not.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ChannelRegistration {
     /// The channel id the connector chose for this watch. The value a delivery echoes back.
     pub channel_id: String,
+    /// The provider's opaque, version-stable id for the watched resource. The other half of `channels.stop`.
+    ///
+    /// **Not a secret and not a person's identifier**: it names a collection inside the provider's own
+    /// namespace (`o3hgv1538sdjfh` in the guide's example), so the hand-written `Debug` prints it.
+    resource_id: String,
     /// The account whose credential created the channel.
     pub account: AccountReference,
     /// The token the connector set, when it set one. Redacted by the hand-written `Debug`.
@@ -527,17 +548,33 @@ pub struct ChannelRegistration {
 
 impl ChannelRegistration {
     /// Records a registered channel.
+    ///
+    /// The argument order follows the stop call's body — `id`, then `resourceId` — so the two identifiers a
+    /// caller passes sit in the same order as the fields they will be serialized into, which is what makes a
+    /// transposition visible rather than plausible (`ADR-0107`).
     #[must_use]
     pub const fn new(
         channel_id: String,
+        resource_id: String,
         account: AccountReference,
         token: Option<SecretValue>,
     ) -> Self {
         Self {
             channel_id,
+            resource_id,
             account,
             token,
         }
+    }
+
+    /// Returns the provider's id for the watched resource, which `channels.stop` requires.
+    ///
+    /// Reached through an accessor rather than a public field so that the pair of stop identifiers is read
+    /// from one place: the request builder takes both, and a caller assembling a stop has to have visited this
+    /// value rather than finding a second identifier somewhere else.
+    #[must_use]
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
     }
 
     /// Returns the token the connector set, when it set one.
@@ -554,12 +591,15 @@ impl ChannelRegistration {
 impl fmt::Debug for ChannelRegistration {
     /// Redacts `token`, which is the channel's anti-spoofing control (`ADR-0091`).
     ///
-    /// The channel id and the account are kept, because they name no secret and are what a diagnostic about a
-    /// stray delivery needs to show; a token would be a value an attacker could replay.
+    /// The channel id, the resource id and the account are kept, because they name no secret and are what a
+    /// diagnostic about a stray delivery needs to show; a token would be a value an attacker could replay. A
+    /// `resource_id` is an opaque provider identifier for a **collection**, not for a person, so printing it
+    /// discloses nothing that printing the channel id does not.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ChannelRegistration")
             .field("channel_id", &self.channel_id)
+            .field("resource_id", &self.resource_id)
             .field("account", &self.account)
             .field(
                 "token",
@@ -873,6 +913,283 @@ pub fn ingest_channel_delivery(
         ChannelIngest::Changed {
             account: registration.account.clone(),
         }
+    }
+}
+
+/// Why a `watch` **response** could not be read.
+///
+/// Four variants, and the first three are the same shape [`crate::google::watch`] uses for the Gmail lease — a
+/// body that is not JSON, a field that is absent, a field of the wrong type — while the fourth catches a value
+/// **outside the range this platform represents**, which is where an absurd or wrapped number lands. Each
+/// names the specific defect, because "the response is unreadable" would not tell a caller whether to look at
+/// the body, the field, or the unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ChannelWatchError {
+    /// The body was not JSON of the documented shape.
+    #[error("a channel watch response body must be JSON: {reason}")]
+    NotJson {
+        /// What went wrong.
+        reason: &'static str,
+    },
+    /// The body carried no field this parser needs.
+    #[error("a channel watch response must carry a `{field}` field")]
+    Missing {
+        /// The field that was absent. A `&'static str` so the refusal cannot name a runtime value.
+        field: &'static str,
+    },
+    /// A field was present but not the documented type.
+    #[error(
+        "the `{field}` field is documented as {expected}, but this response carried a different type"
+    )]
+    WrongType {
+        /// The field.
+        field: &'static str,
+        /// What the reference documents.
+        expected: &'static str,
+    },
+    /// The `expiration` was a whole number outside the range of instants this platform represents.
+    #[error("the channel `expiration` is outside the range of instants this platform represents")]
+    OutOfRange,
+}
+
+/// The three JSON field names a channel `watch` response carries, spelled once each.
+const RESPONSE_ID_FIELD: &str = "id";
+const RESPONSE_RESOURCE_ID_FIELD: &str = "resourceId";
+const RESPONSE_EXPIRATION_FIELD: &str = "expiration";
+
+/// A Calendar notification channel, as the `watch` **response** describes it.
+///
+/// # ⚠ The same quantity arrives in two encodings, and this is the one a clock can be compared against
+///
+/// A channel's expiry exists in **two** places, and they do **not** agree on encoding:
+///
+/// - the **notification header** `X-Goog-Channel-Expiration`, which [`ChannelMessage`] reads, is *"in
+///   human-readable format"* — e.g. `Tue, 19 Nov 2013 01:13:52 GMT`;
+/// - the **`watch` response body's** `expiration`, which this type reads, is *"a Unix timestamp (in
+///   milliseconds)"* — **a JSON number**.
+///
+/// So the header is a string a human can read and the response body is a number a clock can be compared
+/// against, and **only this one can drive a renewal decision** without first parsing a date (which needs a
+/// calendar, a locale and a timezone the crate does not have). That is also the opposite of the Gmail watch
+/// lease, whose `expiration` is an epoch-millis **string** — three encodings across the two mechanisms, which
+/// is why they are read by three separate parsers rather than one shared one (`ADR-0106`).
+///
+/// # Why `resource_id` is read and `token` is not
+///
+/// `resourceId` is what the `channels.stop` call needs (the guide's stop example carries exactly `id` and
+/// `resourceId`), so it is a value with a **consumer** once teardown runs — reading it here is what makes that
+/// call constructible. The response also echoes `token`, but the connector already holds the token it set, and
+/// reading it back would be a second source for a value it chose; `kind` and `resourceUri` are informational
+/// and nothing acts on them, so they are deliberately **not** read (`ADR-0092`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelWatchResponse {
+    /// The channel id the connector chose, echoed back.
+    pub channel_id: String,
+    /// An opaque, version-stable id for the watched resource — what `channels.stop` needs.
+    pub resource_id: String,
+    /// When the channel stops, as an instant.
+    ///
+    /// **A hard boundary, and possibly not the one requested**: the guide says the value is *"determined
+    /// either by your request or by any Google Calendar API internal limits or defaults (the more restrictive
+    /// value is used)"*, so a requested far-future expiry can come back shortened.
+    pub expires_at: UtcTimestamp,
+}
+
+/// Reads a `watch` response into the channel facts a renewal and a teardown need.
+///
+/// # Errors
+///
+/// Returns [`ChannelWatchError`] for a body that is not the documented shape: not JSON, a missing `id`,
+/// `resourceId` or `expiration`, a field of the wrong type, or an `expiration` outside the representable
+/// range. Each is a distinct variant because the remedies differ, and a caller should not have to guess which
+/// field to look at.
+pub fn parse_channel_watch_response(body: &str) -> Result<ChannelWatchResponse, ChannelWatchError> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| ChannelWatchError::NotJson {
+            reason: "the body did not parse",
+        })?;
+    let channel_id = string_field(&value, RESPONSE_ID_FIELD)?;
+    let resource_id = string_field(&value, RESPONSE_RESOURCE_ID_FIELD)?;
+    let expiration = value
+        .get(RESPONSE_EXPIRATION_FIELD)
+        .filter(|field| !field.is_null())
+        .ok_or(ChannelWatchError::Missing {
+            field: RESPONSE_EXPIRATION_FIELD,
+        })?;
+    // The response's `expiration` is a **number of milliseconds** (`"expiration": 1426325213000`), unlike the
+    // header's human-readable string and unlike the Gmail lease's string. `UtcTimestamp` takes nanos, so the
+    // value is scaled by one million — a factor a wrong guess does not report as an error, which is why the
+    // unit is pinned by a test against the guide's own example value rather than left to inspection.
+    let millis = expiration.as_i64().ok_or(ChannelWatchError::WrongType {
+        field: RESPONSE_EXPIRATION_FIELD,
+        expected: "a Unix timestamp in milliseconds",
+    })?;
+    let nanos = millis
+        .checked_mul(1_000_000)
+        .ok_or(ChannelWatchError::OutOfRange)?;
+    let expires_at = UtcTimestamp::from_unix_nanos(i128::from(nanos))
+        .map_err(|_| ChannelWatchError::OutOfRange)?;
+    Ok(ChannelWatchResponse {
+        channel_id,
+        resource_id,
+        expires_at,
+    })
+}
+
+/// Reads a required string field, refusing an absent one and a wrong type distinctly.
+fn string_field(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ChannelWatchError> {
+    match value.get(field) {
+        // `null` is treated as absent rather than as a wrong type, because `null` means the provider sent no
+        // value and the remedy is the same as a field that was not there.
+        None | Some(serde_json::Value::Null) => Err(ChannelWatchError::Missing { field }),
+        Some(serde_json::Value::String(text)) => Ok(text.clone()),
+        Some(_) => Err(ChannelWatchError::WrongType {
+            field,
+            expected: "a string",
+        }),
+    }
+}
+
+/// Whether a Calendar channel is still delivering, and how much of its lease remains.
+///
+/// Two variants and not a `bool`, mirroring [`crate::google::watch::WatchLapse`]: a live channel has time left
+/// and a lapsed one has been lapsed for some period, and the second is what tells a caller whether
+/// notifications **just** stopped or have been missing for days. `ADR-0035`'s "a boolean standing for more
+/// than two situations is an enum".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelLease {
+    /// The channel has ended: it is no longer delivering notifications.
+    Lapsed {
+        /// How long ago it ended, in seconds. At least zero.
+        for_seconds: i64,
+    },
+    /// The channel is still running.
+    Alive {
+        /// How long remains, in seconds. At least zero, and zero only at the exact expiry instant.
+        for_seconds: i64,
+    },
+}
+
+impl ChannelLease {
+    /// Returns whether the channel has stopped delivering.
+    #[must_use]
+    pub const fn is_lapsed(self) -> bool {
+        matches!(self, Self::Lapsed { .. })
+    }
+
+    /// Returns the magnitude of the interval, in seconds, whichever state this is.
+    #[must_use]
+    pub const fn seconds_from_edge(self) -> i64 {
+        match self {
+            Self::Lapsed { for_seconds } | Self::Alive { for_seconds } => for_seconds,
+        }
+    }
+}
+
+/// Decides whether a channel whose lease ends at `expires_at` is still delivering, as of `now`.
+///
+/// The comparison is made in **nanoseconds** and the **exact expiry instant counts as lapsed**, for the same
+/// two reasons [`crate::google::watch::watch_lapse`] decides Gmail's lease that way: truncating to seconds
+/// would call a channel with half a second left either alive or lapsed, and treating the boundary as alive
+/// keeps a dead channel one interval longer — the silent failure this whole path exists to remove.
+#[must_use]
+pub fn channel_lease(expires_at: UtcTimestamp, now: UtcTimestamp) -> ChannelLease {
+    let difference = expires_at.unix_nanos() - now.unix_nanos();
+    if difference > 0 {
+        ChannelLease::Alive {
+            for_seconds: nanos_to_seconds(difference),
+        }
+    } else {
+        ChannelLease::Lapsed {
+            for_seconds: nanos_to_seconds(-difference),
+        }
+    }
+}
+
+/// Converts a nanosecond difference to whole seconds, saturating at the `i64` bounds.
+///
+/// Saturating rather than wrapping, and the direction is chosen: a difference that large means the two
+/// instants are centuries apart, so any large value gives the same answer to a caller asking "is this channel
+/// alive" — while a wrap could flip the sign and call a lapsed channel alive.
+fn nanos_to_seconds(nanos: i128) -> i64 {
+    i64::try_from(nanos / 1_000_000_000).unwrap_or(if nanos < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// What to do about a channel, by how much of its lease remains.
+///
+/// **Three variants and not two**, because a lapsed channel and a nearly-lapsed one call for the same action
+/// but carry different operator meaning: one has already stopped delivering (notifications are being **lost**
+/// until it is replaced) while the other must be replaced **before** it does. Collapsing them would hide
+/// whether a gap has already begun — the distinction [`crate::google::watch::RenewalAdvice`] draws for Gmail,
+/// kept here for the same reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRenewal {
+    /// The lease has ended. Notifications have already stopped.
+    ReplaceNow {
+        /// How long ago the channel stopped, in seconds.
+        lapsed_for_seconds: i64,
+    },
+    /// The lease is close enough to its end that the replacement must start now.
+    ///
+    /// "Close" is [`CHANNEL_REPLACE_LEAD_SECONDS`], this crate's own margin rather than a provider figure.
+    ReplaceSoon {
+        /// How long remains before the channel stops, in seconds.
+        remaining_seconds: i64,
+    },
+    /// Plenty of lease remains. Nothing to do.
+    NotYet {
+        /// How long remains, in seconds.
+        remaining_seconds: i64,
+    },
+}
+
+impl ChannelRenewal {
+    /// Returns whether a replacement `watch` should be issued now.
+    #[must_use]
+    pub const fn should_replace(self) -> bool {
+        !matches!(self, Self::NotYet { .. })
+    }
+}
+
+/// How long before a channel's expiry a replacement should be issued, in seconds.
+///
+/// **A JARVIS figure, and it says so:** Google publishes *"there's likely to be an 'overlap' period of time
+/// when the two notification channels for the same resource are active"* but **no number** for how long the
+/// overlap is or how far ahead to start it. One day is deliberately generous relative to a channel whose
+/// lifetime is set in the request, because the cost of starting early is a bounded overlap (the two channels
+/// both deliver, and a duplicate delivery is deduplicated by the at-least-once machinery) while the cost of
+/// starting late is the **silent loss of notifications** this whole path exists to prevent.
+///
+/// It is **not** derived from `WATCH_RENEWAL_RECOMMENDED_SECONDS` (Gmail's daily advice): those are two
+/// different mechanisms with independently documented rules, and reusing one mechanism's figure for the other
+/// would be exactly the cross-mechanism conflation `ADR-0104` records. Same value, stated separately, so each
+/// can move when its own provider text moves.
+pub const CHANNEL_REPLACE_LEAD_SECONDS: i64 = 24 * 60 * 60;
+
+/// Decides what to do about a channel whose lease ends at `expires_at`, as of `now`.
+///
+/// Unlike the Gmail advice this takes the **expiry** rather than a last-renewed instant, because Calendar's
+/// rule has no "renew the same channel" cadence to measure against: renewal is a **replacement**, so the
+/// question a caller asks is when the current channel will end, not how long ago it began. `renewal_decision`
+/// and `watch_lapse` are therefore two different functions on two different inputs, rather than one shared
+/// helper — the same separation the module doc records for the two expirations.
+#[must_use]
+pub fn renewal_decision(expires_at: UtcTimestamp, now: UtcTimestamp) -> ChannelRenewal {
+    match channel_lease(expires_at, now) {
+        ChannelLease::Lapsed { for_seconds } => ChannelRenewal::ReplaceNow {
+            lapsed_for_seconds: for_seconds,
+        },
+        ChannelLease::Alive { for_seconds } if for_seconds <= CHANNEL_REPLACE_LEAD_SECONDS => {
+            ChannelRenewal::ReplaceSoon {
+                remaining_seconds: for_seconds,
+            }
+        }
+        ChannelLease::Alive { for_seconds } => ChannelRenewal::NotYet {
+            remaining_seconds: for_seconds,
+        },
     }
 }
 

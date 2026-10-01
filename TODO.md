@@ -5189,6 +5189,156 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `Rotated`→`RetryCallAndStore` obligation is only **expressed** (a store that could discharge it does not
     exist). `ProviderRefused` is **unreachable from `recover_from_call`** by design — only a caller that knows
     the client itself was refused can produce it, and this function cannot see that.
+- [ ] `P5-005` **(continued — the same expiry in two encodings, and renewal is a replacement)**: new
+  `google::channel` watch-lease half — `parse_channel_watch_response` (`ChannelWatchResponse { channel_id,
+  resource_id, expires_at }`), `ChannelWatchError { NotJson, Missing, WrongType, OutOfRange }`, `ChannelLease
+  { Lapsed, Alive }` + `channel_lease`, `ChannelRenewal { ReplaceNow, ReplaceSoon, NotYet }` +
+  `renewal_decision`, and `CHANNEL_REPLACE_LEAD_SECONDS`. Plus the fixture
+  `calendar_channel_watch_response.json` and a harness test that drives it. **7 new crate tests (so 470 in the
+  crate; 1743 in the workspace).** **`ADR-0106`.** Two guards falsified A-B-A. The half of the channel path
+  that happens *around* a channel rather than on a delivery.
+  - **⭐⭐ THE FINDING: ONE QUANTITY, THREE ENCODINGS, AND THE FORM WE ALREADY HELD WAS THE UNUSABLE ONE.** A
+    Calendar channel's expiry arrives as (a) the notification header `X-Goog-Channel-Expiration`, *"expressed in
+    human-readable format"* (`Tue, 19 Nov 2013 01:13:52 GMT`) — which `ChannelMessage` already parsed and
+    **could not** compare to a clock without a date parser, locale and timezone handling; (b) the `watch`
+    **response body's** `expiration`, *"a Unix timestamp (in milliseconds)"*, typed `long` by the `events.watch`
+    reference — which **was never read**; and (c) Gmail's `watch` response `expiration`, an epoch-millis
+    **string**, per `ADR-0087`. So the connector held the expiry in the one form arithmetic cannot use, and the
+    form it *can* use was the one nothing read. **⭐ Generalisation: when a quantity is available in several
+    encodings, check which one the code already holds and whether it is the one the *decision* needs — "we have
+    this value" is not "we have this value in a usable form".** Three encodings also means **three parsers**:
+    sharing one would force the encoding to become a parameter, and the provider's own words would then live
+    only at the call sites.
+  - **⭐⭐ AND THE GUIDE CONTRADICTS ITS OWN REFERENCE ABOUT THE FIELD'S TYPE — in prose, with a table one click
+    away.** The push guide's request section calls `expiration` *"An `expiration` **property string** set to a
+    Unix timestamp (in milliseconds)"*; the `events.watch` reference the guide links to types it **`expiration |
+    long`**. The reference wins (it is the schema for the method, and the guide uses the same "property string"
+    phrasing for `params.ttl`, which the reference types `string`), so the parser reads a **number** and refuses
+    a string **by name**. A parser that accepted both would have erased which document declares which form —
+    and a *string* here is one of the other two encodings. **Same class as `ADR-0088`'s two-base64-alphabet
+    contradiction, and the same resolution: prefer the specific statement, and make the choice visible.**
+  - **⭐⭐ RENEWAL IS A *REPLACEMENT*, NOT A REFRESH — and reusing Gmail's vocabulary would have hidden it.**
+    Verbatim from the guide: *"Currently, there's no automatic way to renew a notification channel. When a
+    channel is close to its expiration, you must **replace it with a new one** by calling the `watch` method. As
+    always, you must use a **unique value for the `id` property of the new channel**. Note that there's likely
+    to be an **'overlap' period** of time when the two notification channels for the same resource are active."*
+    Four facts, each of which changes a type: the channel is not extended (a *second* one is created), the new
+    id must be unique, the old one **keeps delivering during an overlap** (duplicate deliveries for one resource
+    are expected, not a bug), and **the overlap has no published duration**. `ADR-0087`'s `RenewalAdvice` takes
+    a *last-renewed* instant because Gmail's rule is a **cadence**; Calendar has no cadence, only an **expiry**,
+    so `renewal_decision(expires_at, now)` takes a different input and is a different function — the same split
+    `ADR-0104` records for the two pushes, one layer down.
+  - **⭐ `CHANNEL_REPLACE_LEAD_SECONDS` IS A JARVIS FIGURE AND SAYS SO.** Google publishes the overlap as
+    *"likely"* with **no number**, so the margin for "close to its expiration" cannot be quoted from a page. It
+    happens to equal `WATCH_RENEWAL_RECOMMENDED_SECONDS` and is **stated separately anyway**, because reusing
+    the Gmail constant would tie two independently documented mechanisms together — a change to one provider's
+    text would silently move the other's behaviour. `ADR-0080`: a figure with no source is neither a limit nor
+    a recommendation.
+  - **⭐ THE REFERENCE ALSO PUBLISHES THE SAME 7-DAY FIGURE FROM A SECOND MECHANISM.** *"params.ttl | string |
+    The time-to-live in seconds for the notification channel. **Default is 604800 seconds.**"* Numerically
+    identical to Gmail's `WATCH_RENEWAL_BOUND_SECONDS` (`604_800`), arrived at by a different mechanism and
+    documented on a different page. Recorded because it makes the figure *look* like a shared constant when the
+    two documents are separate — the same trap the two expirations set.
+  - **⭐ `resourceId` IS READ BECAUSE A CONSUMER NEEDS IT; `token` IS NOT, BECAUSE ONE ALREADY EXISTS.**
+    `channels.stop` *"requires that you provide at least the channel's `id` and the `resourceId` properties"*,
+    so `resourceId` is a value with a **consumer** — and the response is the only place it appears *before* a
+    notification arrives (the `sync` message carries it too, but the guide warns it can arrive *before* the
+    `watch` response, so a stop built on `sync` alone has a race the response does not). The echoed `token`, by
+    contrast, would be a second source for a value this connector chose; `kind` and `resourceUri` have no
+    consumer. `ADR-0092`'s rule applied twice in one struct with opposite outcomes.
+  - **⭐ THREE RENEWAL STATES, NOT TWO, BECAUSE ONE IS AN INCIDENT AND ONE IS A TASK.** A **lapsed** channel has
+    already stopped delivering — notifications are being **lost** — while a **nearly-lapsed** one must be
+    replaced *before* it does. Same action, different operator meaning, so collapsing them would hide whether a
+    gap has already begun. The exact expiry instant counts as **lapsed**, in nanoseconds, for the same reasons
+    `watch_lapse` does (`ADR-0035`, `ADR-0087`).
+  - **⭐ TWO GUARDS FALSIFIED A-B-A, both compiling.** (1) `checked_mul(1_000_000)` → `checked_mul(1_000)` (ms
+    read as µs) → **detected** by the test pinning Google's own `1426325213000` to `1426325213` seconds. (2) the
+    renewal boundary `<= CHANNEL_REPLACE_LEAD_SECONDS` → `<` → **detected** by the test asserting a channel
+    exactly one lead away is `ReplaceSoon`. **The scale factor is the one error here that does not announce
+    itself**: `1426325213000` read as micro- or nanoseconds is a valid `UtcTimestamp` in the wrong century, and
+    no type can catch a plausible unit — so the value is pinned to the provider's own example.
+  - **⭐ A DEFECT FIXED IN THE RECORD ITSELF.** Finding 10 said Calendar's channel `expiration` is *"an RFC 3339
+    date-time string"*. **No Calendar page says that** — it is epoch millis, and RFC 3339 is what Google
+    **error** bodies' metadata and Pub/Sub's `publishTime` use. The claim was unquoted, plausible, and survived
+    because nothing read the field. Corrected in place, with the reason: **a comparison drawn from memory reads
+    exactly like one drawn from a page, and only the quoted form can be checked.**
+  - **NEW LIMITS:** **no `watch` call is issued and no live channel has been read** — a hand-built fixture
+    marked `_not_a_capture` stands in. `expiration` may come back **shorter than requested** (*"determined
+    either by your request or by any Google Calendar API internal limits or defaults (the more restrictive value
+    is used)"*), which no offline test can exercise. **The replacement itself is not built** — no second `watch`
+    with a new unique `id`, so the documented overlap is never produced, and no deduplication key for the
+    duplicate deliveries that overlap implies has been decided. Same shape as `ADR-0087`: the *decision* is
+    tested and the *caller that acts* does not exist.
+- [ ] `P5-005` **(continued — a teardown step whose arity the provider decides)**: `google::request` gains
+  `calendar_channel_stop` (a body of exactly `id` + `resourceId`) and `WatchRequest` is **renamed `JsonRequest`**;
+  `ChannelRegistration` gains `resource_id` (read by `ADR-0106` and previously discarded);
+  `TeardownStep::StopCalendarChannel` joins the plan as a **third** step; `notification_exposure` splits into
+  `gmail_exposure` + `calendar_exposure` and `NotificationExposure` gains `AlreadyEnded`. **5 new tests (so 475
+  in the crate; 1748 in the workspace).** **`ADR-0107`.** Two guards falsified A-B-A, one mutation proved a
+  **no-op** and corrected a doc claim. Completes the channel path at its far end.
+  - **⭐⭐ THE FINDING: A VALUE READ FOR A CONSUMER THAT DID NOT EXIST.** `ADR-0106` read `resourceId` out of the
+    `watch` response and said in its own doc that it is *"what the `channels.stop` call needs"* — and
+    `ChannelRegistration` had **nowhere to put it**, so the value was dropped one function after it was obtained.
+    That is `ADR-0092`'s "a response field with no reader" in a **stronger form: a field with a reader and no
+    holder**, where the doc states the consumer and the type cannot carry the value to it. **⭐ A registration is
+    the only value that survives between the `watch` and the teardown, so an identifier missing from it makes
+    the channel unstoppable** — and the omission is discovered at teardown, the worst possible place.
+  - **⭐⭐ AND ONE "THIRD STEP" IS NOT ONE STEP: THE PROVIDER DECIDES THE ARITY.** `teardown.rs` predicted a
+    future third step *"is checked by the same rule"*, and `ADR-0095` asked whether `may_precede` *"generalises or
+    needs a per-API argument"*. **It generalises** — the new step was admitted **unchanged and unedited**, because
+    the rule tests *authority* (`withdraws_access`, `needs_a_live_grant`) rather than the operation. But the
+    prediction missed the step's **shape**: `users.stop` ends **the** mailbox watch (one resource, one call, no
+    arguments), while `channels.stop` ends **a** channel and has *no per-user form* — *"there's only one `stop`
+    method"* — so an account watching three calendars needs **three** calls. One variant would have misreported
+    whichever mechanism it skipped. **⭐ Generalisation: before reusing a step variant, check its ARITY — how many
+    calls it stands for — because a step that is "one call per account" and one that is "one call per instance"
+    are the same effect only until an account has two instances.**
+  - **⭐⭐ AND THE EXPOSURE FIGURE CANNOT BE SHARED, for a reason about the *sources*.** `notification_exposure`
+    returned Gmail's `WATCH_RENEWAL_BOUND_SECONDS` (7 days) — correct for Gmail *because Google publishes a bound
+    for the mechanism*. Google publishes **no equivalent bound for a channel**: its life is *"determined either by
+    your request or by any Google Calendar API internal limits or defaults"*. So the only honest figure is the
+    expiry the channel's own `watch` response reported — **the two mechanisms are documented differently, so one
+    function cannot compute both**, and a flag would drag an `Option<ChannelLease>` that is meaningless in one
+    branch.
+  - **⭐ `AlreadyEnded` REMOVES AN OVERSTATEMENT.** A channel whose lease had **already** lapsed exposes nothing,
+    whether or not a stop was attempted — and it **outranks** the stop's success, because the answer no longer
+    depends on the call. A `bool` function would have reported `UntilTheLeaseLapses { seconds: 0 }`, describing a
+    clean teardown as an open window. Reachable only for Calendar, because Gmail's figure is a constant rather
+    than a lease — a wiring gap the ADR records.
+  - **⭐ THE STOP PERMISSION RULE IS DOCUMENTED AND LOCALLY UNENFORCEABLE, and the reason is worth stating.**
+    *"If the channel was created by a regular user account, only the same user from the same client (as identified
+    by the OAuth 2.0 client IDs from the auth tokens) who created the channel can stop the channel. If the channel
+    was created by a service account, any user from the same client can stop the channel."* **Two rules keyed on
+    how the channel was created**, and the discriminant is the **`client_id` inside the token** — which
+    `credential` exposes only as a rendered header value (`ADR-0061`), and which a JWT access token would carry as
+    the **unverified** `aud`/`azp` claims (`ADR-0064`). Enforcing it locally would mean trusting an unverified
+    claim **to be stricter than the provider**, the failure direction `ADR-0064` warns about. So it is a recorded
+    limit, and a violation is the provider's `403`.
+  - **⭐ `WatchRequest` → `JsonRequest`: A NAME DERIVED FROM ITS FIRST CALLER BECAME FALSE.** `channels.stop` is
+    the call that *ends* a channel a watch created — not a watch. The axis separating this type from
+    `FormRequest` is the **credential boundary** (`ADR-0093`), which both bodies share (neither carries one), so
+    the name follows the axis. `ADR-0093`'s revisit condition asked exactly this and pre-supplied the criterion.
+    It is also the safe moment to rename: the type has **no consumers** — the builders are the public surface.
+  - **⭐ THE TWO IDENTIFIERS ARE OPAQUE AND TRANSPOSABLE, SO THE TEST PARSES RATHER THAN SUBSTRING-MATCHES.** A
+    swapped `id`/`resourceId` pair is well-formed and would stop the wrong channel or none. Asserted by
+    deserializing the body and comparing each field to its expected value, plus an exact field count — so the
+    optional `token` the reference permits is *asserted absent*, because sending it would put the anti-spoofing
+    control into a body a diagnostic renders, for no effect.
+  - **⭐ TWO GUARDS FALSIFIED A-B-A, AND A THIRD MUTATION WAS A NO-OP THAT DISPROVED MY OWN DOC.** (1) Writing the
+    **channel id into both** body fields → **detected** (`left: "channel-alpha"`, `right: "o3hgv1538sdjfh"`).
+    (2) Removing the **`stop_succeeded` guard** from `calendar_exposure`'s live arm → **detected**
+    (`left: SettlingWithinMinutes`, `right: UntilTheLeaseLapses { seconds: 90000 }`). (3) **Reordering the arms
+    so a successful stop matched first changed NOTHING** — `Lapsed` and `Alive` are different variants, so the
+    arms are mutually exclusive and **no order decides anything**. The doc had said *"that is why the arms are
+    ordered lease-first"*, which asserted a fact about the source's **layout** as though it were a fact about the
+    **behaviour** — unfalsifiable, therefore uncheckable. **The claim was corrected rather than kept**, and the
+    load-bearing part is the guard on the arm below.
+  - **NEW LIMITS:** **no request is sent and no teardown executes** — still no caller, as for the push handler and
+    the sync loop. `users.stop` is deliberately **not** built (a different method with an empty body would need a
+    third request shape for no gain). The **channel count is a runtime fact**, so a plan names the effect and the
+    caller performs it per channel; a caller that stops fewer than all of an account's channels gets no refusal
+    from this module, only a plan to read — unchanged from `ADR-0095`. `gmail_exposure` cannot report
+    `AlreadyEnded` even though the caller holds the watch's `expiration`: a wiring gap, not a missing fact.
 - [ ] `P5-006` Research Microsoft identity platform and Microsoft Graph mail/calendar, subscriptions, delta queries, and limits; record findings.
 - [ ] `P5-007` Implement Microsoft connection setup and Outlook/Calendar read tools with recorded wire fixtures.
 - [ ] `P5-008` Research and implement GitHub authentication and read tools.

@@ -1,0 +1,19 @@
+{
+  "_source": "docs/research/integrations/google.md",
+  "_operation": "Calendar events.watch (the watch response that creates a notification channel)",
+  "_shape_documented_at": "https://developers.google.com/workspace/calendar/api/guides/push",
+  "_fixture_kind": "hand_sanitized",
+  "_not_a_capture": true,
+  "_why": "P5-005 requires recorded wire fixtures. This is NOT a recorded provider response. It reproduces the `watch` response the Calendar push guide publishes for a successfully created notification channel.",
+  "_the_point_of_this_fixture": "THE SAME QUANTITY IS ENCODED TWO DIFFERENT WAYS, AND ONLY ONE IS COMPARABLE TO A CLOCK. On a notification, the channel's expiry arrives in the `X-Goog-Channel-Expiration` HEADER as a human-readable date (`Tue, 19 Nov 2013 01:13:52 GMT`). In this `watch` RESPONSE it arrives as `expiration`, a JSON NUMBER of milliseconds (`1426325213000`). The header needs a calendar, a locale and a timezone to interpret; the number needs only a scale factor. A renewal decision can only be driven by the number, and the guide's own value is used here so the millisecond-to-nanosecond scaling is pinned against it rather than inspected. (The Gmail watch lease is a THIRD encoding: an epoch-millis STRING.)",
+  "_why_the_type_is_a_number": "The push guide's request section calls `expiration` an \"`expiration` property string set to a Unix timestamp (in milliseconds)\", but the `events.watch` REFERENCE the guide links to types the response field `expiration | long` and describes it as \"Date and time of notification channel expiration, expressed as a Unix timestamp, in milliseconds.\" The reference wins -- it is the schema for the method, and the guide uses the same \"property string\" phrasing for `params.ttl`, which the reference types `string`. So this parser reads a NUMBER and refuses a string BY NAME: a string here is one of the other two encodings, and accepting both would erase which document declares which form.",
+  "_resource_id_is_read": "`resourceId` is what the `channels.stop` call needs -- the guide's stop example carries exactly `id` and `resourceId` -- so it is read here: that is what makes the stop call constructible.",
+  "_token_not_read": "The response also echoes `token`, but the connector already holds the token it set, so reading it back would be a second source for a value it chose. `kind` and `resourceUri` are informational and nothing acts on them.",
+  "_sanitized": "No real channel id, resource id, calendar id or token appears here; the values are the guide's own examples.",
+  "kind": "api#channel",
+  "id": "01234567-89ab-cdef-0123456789ab",
+  "resourceId": "o3hgv1538sdjfh",
+  "resourceUri": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+  "token": "target=myApp-myCalendarChannelDest",
+  "expiration": 1426325213000
+}

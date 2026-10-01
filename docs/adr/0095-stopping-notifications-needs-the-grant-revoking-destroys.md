@@ -125,8 +125,14 @@ authority, and the damage is a silent privacy exposure that no later call can re
 
 - A teardown executor is written, at which point the ordering is enforced on a code path rather than only
   representable, and the "nothing calls this plan" limit is removed.
-- Calendar push is added, bringing `channels.stop` — a third step, and the first real test of whether
-  `may_precede` generalises or needs a per-API argument.
+- **Calendar push is added, bringing `channels.stop` — a third step, and the first real test of whether
+  `may_precede` generalises or needs a per-API argument.** **Answered by `ADR-0107`: it generalises.** The step
+  was admitted by the rule **unchanged**, and the reason is that the rule tests *authority* (`withdraws_access`,
+  `needs_a_live_grant`) rather than the operation — which no stop carries and revocation does. What the
+  prediction did **not** anticipate is the step's **arity**: `users.stop` ends one mailbox watch while
+  `channels.stop` ends *a* channel and has no per-user form, so one variant would have misreported whichever
+  mechanism it skipped. A second prediction also failed to hold: the exposure figure could not be shared, because
+  a Calendar channel has no stated bound and Gmail's is a constant.
 - Google publishes a numeric bound for how quickly `stop` takes effect, which would turn
   `NotificationExposure::SettlingWithinMinutes` from a qualitative state into a stated figure.
 - A connector-level teardown appears (deleting the topic or subscription), which shares one subscription across
