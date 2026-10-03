@@ -45,10 +45,11 @@ use axum::{
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
 use jarvis_protocol::{
-    ApprovalDecisionBody, ConfirmMemoryRequest, CorrectMemoryRequest, CreateSkillRequest,
-    ForgetMemoryRequest, ForgetSkillRequest, MAX_STREAM_PAGE, MemorySearchRequest,
-    PromoteSkillRequest, RememberRequest, RunEventPageReply, SkillTransitionRequest,
-    StartRunRequest, SummarizeSessionRequest, rest_error, safe,
+    AddAliasRequest, ApprovalDecisionBody, ConfirmMemoryRequest, CorrectMemoryRequest,
+    CreateEntityRequest, CreateSkillRequest, ForgetMemoryRequest, ForgetSkillRequest,
+    MAX_STREAM_PAGE, MemorySearchRequest, MergeEntityRequest, PromoteSkillRequest, RememberRequest,
+    RunEventPageReply, SkillTransitionRequest, StartRunRequest, SummarizeSessionRequest,
+    rest_error, safe,
 };
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,18 @@ impl GatewayState {
     pub fn skills(&self) -> crate::skill_service::SkillService {
         crate::skill_service::SkillService::new(Arc::clone(&self.database), self.tools.as_ref())
     }
+
+    /// Returns the entity surface.
+    ///
+    /// Built on demand like the others, and over the same database. This is the surface that removes the limit
+    /// three slices recorded — `P4-008`'s "no entity-creation surface exists, so a remember is still unreachable
+    /// by a user of the shipped product" — so it is deliberately a sibling of [`Self::memories`] rather than a
+    /// part of it: an entity is not a memory, and making it a sub-resource would put entity creation behind a
+    /// memory write that needs an entity.
+    #[must_use]
+    pub fn entities(&self) -> crate::entity_service::EntityService {
+        crate::entity_service::EntityService::new(Arc::clone(&self.database))
+    }
 }
 
 /// Builds the authenticated router.
@@ -182,6 +195,11 @@ pub fn router(state: GatewayState) -> Router {
             "/sessions/{id}/summaries/retire",
             post(retire_session_summaries),
         )
+        .route("/entities", get(list_entities).post(create_entity))
+        .route("/entities/lookup", get(lookup_entity))
+        .route("/entities/{id}", get(read_entity))
+        .route("/entities/{id}/aliases", post(add_entity_alias))
+        .route("/entities/{id}/merge", post(merge_entity))
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/export", get(export_skills))
         .route("/skills/{id}", get(read_skill).delete(forget_skill))
@@ -1199,7 +1217,7 @@ async fn list_session_summaries(
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let limit = match parse_summary_limit(raw.as_deref()) {
+    let limit = match parse_limit(raw.as_deref(), jarvis_storage::MAX_SUMMARY_PAGE) {
         Ok(limit) => limit,
         Err(message) => {
             return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
@@ -1269,20 +1287,23 @@ pub struct MemoryPageQuery {
     offset: Option<u32>,
 }
 
-/// Parses the summary listing's `limit` parameter.
+/// Parses a listing's `limit` parameter against a bound the caller names.
 ///
-/// # Why this is a parser rather than `parse_memory_page`,
-/// despite reading the same parameter
+/// # Why this takes the default rather than reading one global bound
 ///
-/// The two bounds differ — `MAX_MEMORY_PAGE` is 200 and `MAX_SUMMARY_PAGE` is 128 — so sharing the parser would
-/// mean one of the two routes accepting a page the other refuses, and the *bound* is what a page parameter is
-/// for. The rule is stated once per bound rather than a shared maximum that is wrong for at least one of them.
+/// The listing bounds differ — `MAX_MEMORY_PAGE` is 200, `MAX_SUMMARY_PAGE` is 128, and the entity-match bound
+/// is 50 — because they count different things. A shared parser with one hardcoded maximum would make one route
+/// accept a page another refuses, and the *bound* is what a page parameter is for. Taking the default as a
+/// parameter keeps one parser and three honest limits, which supersedes the two-parser version that existed
+/// when there were only two bounds to reconcile.
+///
+/// The bound itself is **not** enforced here: each service checks its own, so the rule lives beside the read it
+/// bounds and a route cannot be the only thing enforcing it.
 ///
 /// # Errors
 ///
 /// Returns a message naming the parameter that could not be read.
-fn parse_summary_limit(raw: Option<&str>) -> Result<u32, &'static str> {
-    let default = jarvis_storage::MAX_SUMMARY_PAGE;
+fn parse_limit(raw: Option<&str>, default: u32) -> Result<u32, &'static str> {
     let Some(raw) = raw else {
         return Ok(default);
     };
@@ -1298,6 +1319,185 @@ fn parse_summary_limit(raw: Option<&str>) -> Result<u32, &'static str> {
         }
     }
     Ok(default)
+}
+
+/// `POST /api/v1/entities`
+///
+/// Creates the entity a memory will be **about**. This is the route three slices recorded as missing: without
+/// it a remember could be asked for and never performed, because every claim must name a subject and there was
+/// no way to obtain one.
+async fn create_entity(
+    State(state): State<GatewayState>,
+    Json(request): Json<CreateEntityRequest>,
+) -> Response {
+    match state.entities().create(&request).await {
+        // `201`, matching every other create on this surface: the entity did not exist before and its
+        // identifier is in the reply.
+        Ok(reply) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Err(error) => entity_error(&error),
+    }
+}
+
+/// `GET /api/v1/entities`
+async fn list_entities(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let limit = match parse_limit(raw.as_deref(), crate::memory_service::MAX_MEMORY_PAGE) {
+        Ok(limit) => limit,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    match state.entities().list(limit).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => entity_error(&error),
+    }
+}
+
+/// `GET /api/v1/entities/{id}`
+async fn read_entity(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
+    match state.entities().read(&id).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => entity_error(&error),
+    }
+}
+
+/// `GET /api/v1/entities/lookup?label=…` or `?alias_kind=…&alias_value=…`
+///
+/// # Why one route rather than two
+///
+/// Both are "which entity does this name denote", and the answer type is the same. A single route whose query
+/// selects the **kind of name** is what keeps the two lookups' replies identical by construction: two routes
+/// returning the same shape are two places for one of them to start returning a single row, which is exactly the
+/// `resolve_alias` rule this surface must not break.
+async fn lookup_entity(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let query = match parse_entity_lookup(raw.as_deref()) {
+        Ok(query) => query,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    match &query {
+        EntityLookupQuery::Label { label, limit } => {
+            match state.entities().lookup_by_label(label, *limit).await {
+                Ok(reply) => Json(reply).into_response(),
+                Err(error) => entity_error(&error),
+            }
+        }
+        EntityLookupQuery::Alias {
+            alias_kind,
+            alias_value,
+            limit,
+        } => match state
+            .entities()
+            .lookup_by_alias(alias_kind, alias_value, *limit)
+            .await
+        {
+            Ok(reply) => Json(reply).into_response(),
+            Err(error) => entity_error(&error),
+        },
+    }
+}
+
+/// `POST /api/v1/entities/{id}/aliases`
+async fn add_entity_alias(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<AddAliasRequest>,
+) -> Response {
+    match state.entities().add_alias(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => entity_error(&error),
+    }
+}
+
+/// `POST /api/v1/entities/{id}/merge`
+///
+/// The path names the entity being merged **away** and the body names the one merged **into**, which is the
+/// direction an operator is most likely to reverse. The reply is the winner, so a caller that reversed it can
+/// see from the reply which entity is now referenced.
+async fn merge_entity(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<MergeEntityRequest>,
+) -> Response {
+    match state.entities().merge(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => entity_error(&error),
+    }
+}
+
+/// Which name a lookup was asked about.
+#[derive(Debug)]
+enum EntityLookupQuery {
+    /// A lookup by the entity's own label.
+    Label {
+        /// The label to match.
+        label: String,
+        /// How many matches to return at most.
+        limit: u32,
+    },
+    /// A lookup by an alias.
+    Alias {
+        /// The alias kind.
+        alias_kind: String,
+        /// The alias value.
+        alias_value: String,
+        /// How many matches to return at most.
+        limit: u32,
+    },
+}
+
+/// Parses the entity lookup's query parameters.
+///
+/// # Errors
+///
+/// Returns a message when neither a `label` nor both alias parameters are present, which is a request the daemon
+/// cannot answer rather than one it can answer with nothing: an empty query would otherwise return every entity
+/// in the workspace, which is `GET /entities`.
+fn parse_entity_lookup(raw: Option<&str>) -> Result<EntityLookupQuery, &'static str> {
+    let mut label = None;
+    let mut alias_kind = None;
+    let mut alias_value = None;
+    let mut limit = None;
+    let Some(raw) = raw else {
+        return Err("a lookup requires either a label, or an alias kind and value");
+    };
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        // Percent-decoding is deliberately absent: this build's query parsing is the same hand-written form the
+        // memory pager uses, and introducing decoding here would make one route's parameter handling differ
+        // from every other's. A value needing an escape is sent in a body (`POST /entities` for a write) or
+        // arrives through a client that encodes it itself.
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "label" => label = Some(value.to_owned()),
+            "alias_kind" => alias_kind = Some(value.to_owned()),
+            "alias_value" => alias_value = Some(value.to_owned()),
+            "limit" => {
+                limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "the limit parameter is not a positive integer")?,
+                );
+            }
+            // An unrecognized parameter is ignored rather than refused, matching the rule the memory pager and
+            // the event route follow: a request the daemon does not own tolerates an additive field.
+            _ => {}
+        }
+    }
+    let limit = limit.unwrap_or(crate::entity_service::MAX_ENTITY_MATCHES);
+    match (label, alias_kind, alias_value) {
+        (Some(label), _, _) => Ok(EntityLookupQuery::Label { label, limit }),
+        (None, Some(alias_kind), Some(alias_value)) => Ok(EntityLookupQuery::Alias {
+            alias_kind,
+            alias_value,
+            limit,
+        }),
+        // Half an alias is not a lookup. Refused rather than defaulted, because the two plausible defaults are
+        // opposite: an empty kind searches every kind, and an empty value matches nothing.
+        (None, _, _) => Err("a lookup requires either a label, or an alias kind and value"),
+    }
 }
 
 /// Parses the memory listing's query parameters.
@@ -1380,6 +1580,39 @@ fn memory_error(error: &crate::memory_service::MemoryServiceError) -> Response {
         }
         // Storage is matched last and deliberately without the detail.
         Memory::Storage(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal,
+            "the local database is not available",
+        ),
+    }
+}
+
+/// Maps an entity failure onto the shared error vocabulary.
+///
+/// The same three-way split the memory surface makes, and the same reasoning: a caller error is `422` with the
+/// remedy the service wrote, a missing row is `404`, and infrastructure is `503` with no detail. `NotFound` is
+/// worth stating separately here because an entity lookup's most likely failure is a caller holding an
+/// identifier for an entity that was merged away — and "not found" is the answer that stops it looking for a row
+/// that is still present.
+fn entity_error(error: &crate::entity_service::EntityServiceError) -> Response {
+    use crate::entity_service::EntityServiceError as Entity;
+    match error {
+        Entity::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no entity exists for the requested identifier in this workspace",
+        ),
+        Entity::UnknownValue { .. } | Entity::PageTooLarge { .. } | Entity::Refused { .. } => {
+            // Passed through `SafeMessage`, which bounds the length and refuses a control character, so a
+            // refusal cannot forge a log line or a second header. Every detail this service produces is
+            // written by the service and never contains stored content.
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::Validation,
+                safe(&error.detail()).as_str(),
+            )
+        }
+        Entity::Storage(_) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal,
             "the local database is not available",
@@ -4723,5 +4956,344 @@ mod tests {
             exported_body.contains("Retired later."),
             "the export must still hold the retired text: {exported_body}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Entities (`P4-016`)
+    // ---------------------------------------------------------------------------------------------
+
+    /// Creates an entity over HTTP, returning its identifier.
+    async fn create_entity_via(app: &Router, presented: &str, label: &str, kind: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/entities",
+                presented,
+                &format!(r#"{{"label":"{label}","kind":"{kind}","confidence":"confirmed"}}"#),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            body_text(response).await
+        );
+        let body = body_text(response).await;
+        let reply: jarvis_protocol::EntityDetailReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        reply.entity.entity_id
+    }
+
+    /// **An entity can be created over HTTP, and the identifier it returns is the subject a memory can name.**
+    ///
+    /// This is the reachability proof for the gap three slices recorded. The assertion that matters is not
+    /// "the create returned `201`" but that **a remember naming that entity succeeds** — because the recorded
+    /// limit was precisely that a remember could not be performed for want of an identifier. Both halves are
+    /// asserted, so a create that returned an unusable identifier fails here rather than at the next verb.
+    #[tokio::test]
+    async fn an_entity_can_be_created_and_then_used_as_a_subject() {
+        let (app, presented, _profile) = test_router().await;
+        let entity_id = create_entity_via(&app, &presented, "Ada Lovelace", "person").await;
+        assert_eq!(entity_id.len(), 36, "a usable identifier: {entity_id}");
+
+        // The whole point: the identifier is accepted as a subject by the memory surface, which is what was
+        // impossible before this slice.
+        let remembered = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &format!(
+                    r#"{{"content":"Prefers morning meetings.","memory_type":"preference",
+                        "source_kind":"user_statement","entity_ids":["{entity_id}"]}}"#
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            remembered.status(),
+            StatusCode::CREATED,
+            "a remember naming this entity must succeed: {}",
+            body_text(remembered).await
+        );
+
+        // And the entity's own read reports the link, so the count an operator merges by is real.
+        let read = app
+            .oneshot(get_request(
+                &format!("/api/v1/entities/{entity_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = body_text(read).await;
+        let reply: jarvis_protocol::EntityDetailReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.entity.label, "Ada Lovelace");
+        assert_eq!(reply.entity.kind, "person");
+        assert_eq!(
+            reply.entity.linked_memories, 1,
+            "the claim linked to it must be counted: {body}"
+        );
+    }
+
+    /// **A lookup returns every candidate and marks whether each is verified, never one row.**
+    ///
+    /// The architecture's rule is that "ambiguous aliases remain separate candidates", so this is where a route
+    /// could silently break it: a reply with one match would turn a guess into an identity. The ambiguous case
+    /// is the one asserted, and `verified` is checked in **both** directions — a probabilistic candidate is not
+    /// verified, a user-stated one is.
+    #[tokio::test]
+    async fn an_alias_lookup_returns_candidates_and_their_verification() {
+        let (app, presented, _profile) = test_router().await;
+        let first = create_entity_via(&app, &presented, "Ada Lovelace", "person").await;
+        let second = create_entity_via(&app, &presented, "A. Lovelace", "person").await;
+
+        // Two entities, one **probabilistic** alias each for the same email. The source is a user statement
+        // rather than an inference because `record_alias` resolves the entity and returns it, so the entity
+        // must be one the caller is allowed to see; an inference source is refused there — which is a **later**
+        // slice's rule, not this one's, and using it here would make this test fail for a reason it is not
+        // about. What matters below is that two entities can hold one unverified alias and both come back.
+        for (entity, confidence) in [(&first, "likely"), (&second, "uncertain")] {
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    &format!("/api/v1/entities/{entity}/aliases"),
+                    &presented,
+                    &format!(
+                        r#"{{"alias_kind":"email","alias_value":"ada@example.com",
+                            "verification":"probabilistic","source_kind":"user_statement",
+                            "confidence":"{confidence}"}}"#
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a probabilistic alias is a candidate, not a contradiction: {}",
+                body_text(response).await
+            );
+        }
+
+        let lookup = app
+            .clone()
+            .oneshot(get_request(
+                "/api/v1/entities/lookup?alias_kind=email&alias_value=ada@example.com",
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(lookup.status(), StatusCode::OK);
+        let body = body_text(lookup).await;
+        let reply: jarvis_protocol::EntityLookupReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(
+            reply.returned, 2,
+            "both candidate entities must be returned: {body}"
+        );
+        assert!(
+            reply.matches.iter().all(|entry| !entry.verified),
+            "a probabilistic alias is not an identity: {body}"
+        );
+
+        // The control: a **user-stated** confirmed alias for a third entity is verified, so `verified` is not
+        // simply always false.
+        let third = create_entity_via(&app, &presented, "Ada Byron", "person").await;
+        let confirmed = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{third}/aliases"),
+                &presented,
+                r#"{"alias_kind":"email","alias_value":"ada.byron@example.com",
+                    "verification":"confirmed","source_kind":"user_statement","confidence":"confirmed"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            confirmed.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(confirmed).await
+        );
+
+        let verified = app
+            .oneshot(get_request(
+                "/api/v1/entities/lookup?alias_kind=email&alias_value=ada.byron@example.com",
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(verified).await;
+        let reply: jarvis_protocol::EntityLookupReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.returned, 1);
+        assert!(
+            reply.matches[0].verified,
+            "a user statement verifies: {body}"
+        );
+    }
+
+    /// **A verified alias cannot be established by a source that cannot verify one.**
+    ///
+    /// `0009`'s `CHECK` refuses a `confirmed` alias from anything but a user statement or correction, and this
+    /// asserts the refusal over the wire as a `422` naming the rule rather than a constraint failure. It is the
+    /// rule that made `MemorySourceKind::is_user_stated` necessary: the nearest domain predicate —
+    /// `permitted_trust() == Authoritative` — **admits `provider_record`**, which the schema refuses, so a guard
+    /// written as that comparison would have passed here and failed at the database.
+    #[tokio::test]
+    async fn a_confirmed_alias_from_a_provider_record_is_refused() {
+        let (app, presented, _profile) = test_router().await;
+        let entity = create_entity_via(&app, &presented, "Ada Lovelace", "person").await;
+
+        // `provider_record` is `Authoritative` trust and **cannot** confirm an identity.
+        let refused = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{entity}/aliases"),
+                &presented,
+                r#"{"alias_kind":"email","alias_value":"ada@example.com",
+                    "verification":"confirmed","source_kind":"provider_record","confidence":"confirmed"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(refused).await;
+        assert!(
+            body.contains("user statement"),
+            "the refusal must name the remedy: {body}"
+        );
+
+        // The control: the same alias from a **user statement** is accepted, so the guard is about the source
+        // kind and not about confirmed aliases.
+        let accepted = app
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{entity}/aliases"),
+                &presented,
+                r#"{"alias_kind":"email","alias_value":"ada@example.com",
+                    "verification":"confirmed","source_kind":"user_statement","confidence":"confirmed"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(accepted).await
+        );
+    }
+
+    /// **A merge keeps the winner and marks the loser as merged, and the reply is the winner.**
+    ///
+    /// The direction is the whole risk, so it is asserted in the reply: merging `a` into `b` returns `b`, and a
+    /// later read of `a` reports `merged` pointing at `b`. A reply that returned the source would hand a caller
+    /// a name whose claims now belong to another.
+    #[tokio::test]
+    async fn merging_one_entity_into_another_answers_with_the_winner() {
+        let (app, presented, _profile) = test_router().await;
+        let source = create_entity_via(&app, &presented, "Ada L", "person").await;
+        let target = create_entity_via(&app, &presented, "Ada Lovelace", "person").await;
+
+        let merged = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{source}/merge"),
+                &presented,
+                &format!(r#"{{"target_id":"{target}"}}"#),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            merged.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(merged).await
+        );
+        let body = body_text(merged).await;
+        let reply: jarvis_protocol::EntityDetailReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(
+            reply.entity.entity_id, target,
+            "the reply must be the entity kept, not the one merged away"
+        );
+        assert_eq!(reply.entity.status, "active");
+
+        // The loser is retained and points at the winner — a merge is reversible rather than a deletion.
+        let read = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/entities/{source}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(read).await;
+        let reply: jarvis_protocol::EntityDetailReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.entity.status, "merged");
+        assert_eq!(reply.entity.merged_into.as_deref(), Some(target.as_str()));
+
+        // And a self-merge is refused rather than silently succeeding.
+        let itself = app
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{target}/merge"),
+                &presented,
+                &format!(r#"{{"target_id":"{target}"}}"#),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(itself.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(itself).await;
+        assert!(
+            body.contains("itself"),
+            "the refusal must name the reason: {body}"
+        );
+    }
+
+    /// **A lookup with no selector is refused rather than answered with the whole workspace.**
+    ///
+    /// The default matters: an empty query could reasonably mean "everything", which is `GET /entities`, or
+    /// "nothing", which is useless. Refused, so the client says which it meant — and a half-supplied alias is
+    /// refused for the same reason, since an empty kind searches every kind and an empty value matches nothing.
+    #[tokio::test]
+    async fn a_lookup_without_a_selector_is_refused() {
+        let (app, presented, _profile) = test_router().await;
+        for query in [
+            "/api/v1/entities/lookup",
+            "/api/v1/entities/lookup?alias_kind=email",
+            "/api/v1/entities/lookup?alias_value=ada@example.com",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get_request(query, Some(&presented)))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{query} must be refused rather than answered"
+            );
+        }
+
+        // The control: a label **is** a selector and the lookup actually finds the entity — asserted on the
+        // returned count, not only on the status. The first version of this control used a label containing a
+        // space (`?label=Ada+Lovelace`), and since this build does no percent-decoding the `+` stayed literal,
+        // matched nothing, and still returned `200`: a control that could not fail. A one-word label removes
+        // the encoding question and leaves the assertion doing its job.
+        let entity = create_entity_via(&app, &presented, "Aardvark", "person").await;
+        let response = app
+            .oneshot(get_request(
+                "/api/v1/entities/lookup?label=Aardvark",
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let reply: jarvis_protocol::EntityLookupReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.returned, 1, "the label lookup must find it: {body}");
+        assert_eq!(reply.matches[0].entity.entity_id, entity);
     }
 }

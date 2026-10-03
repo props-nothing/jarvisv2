@@ -1,6 +1,7 @@
 //! Versioned wire contracts and conversions for JARVIS clients and runtimes.
 
 mod approval;
+mod entity_api;
 mod frame;
 mod memory_api;
 mod rest;
@@ -11,6 +12,11 @@ mod tool_api;
 mod version;
 mod wire;
 pub use approval::{ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalReply};
+pub use entity_api::{
+    AddAliasRequest, AliasVerificationName, CreateEntityRequest, EntityAliasReply,
+    EntityDetailReply, EntityKindName, EntityListReply, EntityLookupReply, EntityMatchReply,
+    EntityReply, EntityStatusName, MergeEntityRequest,
+};
 pub use frame::{FrameError, MAX_FRAME_BYTES, decode_frame, encode_frame, read_frame, write_frame};
 pub use memory_api::{
     ClaimBody, ConfirmMemoryRequest, CorrectMemoryRequest, DeletionReceipt, ExportedMemory,

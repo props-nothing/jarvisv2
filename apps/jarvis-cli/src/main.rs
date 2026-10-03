@@ -12,6 +12,7 @@
 mod api_client;
 mod chat;
 mod connector;
+mod entity;
 mod memory;
 mod output;
 mod skills;
@@ -50,6 +51,10 @@ async fn main() -> ExitCode {
         Some("chat") => chat(&arguments).await,
         Some("logs") => logs(&arguments),
         Some("memory") => memory_command(&arguments).await,
+        // `entity` is the `P4-016` surface: the subject a memory is about. Before it, every claim needed an
+        // entity identifier and nothing could produce one — which is what `P4-008` recorded as "a remember is
+        // still unreachable by a user of the shipped product".
+        Some("entity") => entity_command(&arguments).await,
         Some("tools") => tools_command(&arguments).await,
         // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
         // stored procedure, which before this verb group was reachable only from a test.
@@ -90,6 +95,25 @@ async fn memory_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     memory::run(&client, arguments).await
+}
+
+/// Runs one `jarvis entity` verb over the daemon's HTTP API.
+///
+/// Shares `run_client` with `memory_command` and `tools_command`, for the reason that function's own comment
+/// gives: the entity surface lives on the same API and needs the same four facts, and a second client builder
+/// would be a second place a configured port is read — which is how two commands come to target different
+/// ports.
+async fn entity_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    entity::run(&client, arguments).await
 }
 
 /// Runs one `jarvis tools` verb over the daemon's HTTP API.

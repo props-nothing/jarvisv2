@@ -653,6 +653,25 @@ impl MemorySourceKind {
     pub const fn is_model_produced(self) -> bool {
         matches!(self, Self::ModelInference)
     }
+
+    /// Returns whether the **user** stated this, as opposed to a process observing it.
+    ///
+    /// # Why this is not `permitted_trust() == Authoritative`
+    ///
+    /// The two answer different questions and the difference is load-bearing. Trust asks "may this content
+    /// instruct", and a `ProviderRecord` is authoritative for it. Identity asks "who established this", and a
+    /// provider record does **not** establish an identity by itself — `0009`'s `CHECK` on `entity_aliases`
+    /// permits a `confirmed` alias only from `user_statement` or `user_correction`. So a predicate written as
+    /// the trust comparison would accept `provider_record` where the schema refuses it, producing a constraint
+    /// failure for a rule the domain appeared to have allowed.
+    ///
+    /// This exists because that divergence was found while building the entity surface: the schema's rule and
+    /// the nearest domain predicate were **different sets**, and they were one line apart from being treated as
+    /// one. Stating the rule here makes the schema's `CHECK` and the domain agree by construction.
+    #[must_use]
+    pub const fn is_user_stated(self) -> bool {
+        matches!(self, Self::UserStatement | Self::UserCorrection)
+    }
 }
 
 impl fmt::Display for MemorySourceKind {

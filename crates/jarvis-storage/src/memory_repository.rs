@@ -1413,6 +1413,90 @@ pub async fn record_entity(
     Ok(entity.id)
 }
 
+/// Reads a workspace's entities, newest first.
+///
+/// # Why this exists rather than callers using `find_entity` in a loop
+///
+/// An entity surface needs "what do I know about" as a **page**, and the alternative — reading identifiers from
+/// somewhere and then one row each — is an N+1 that also has no bound. It is also what makes the surface
+/// usable: a client must be able to obtain an entity identifier before it can remember or summarize anything
+/// about one, and `P4-008`'s recorded gap is precisely that nothing could.
+///
+/// Archived and merged rows are **excluded**, because a client listing entities is choosing a subject and
+/// `StoredEntity::is_usable` is the rule for whether a subject may be named: a merged entity's claims belong
+/// to its winner and an archived one's to nobody. A caller wanting the full history reads a row by identifier.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded, and
+/// [`DatabaseError::InvalidMemoryRequest`] when `limit` is zero.
+pub async fn read_workspace_entities(
+    database: &SqliteDatabase,
+    workspace_id: WorkspaceId,
+    limit: u32,
+) -> Result<Vec<StoredEntity>, DatabaseError> {
+    if limit == 0 {
+        return Err(DatabaseError::InvalidMemoryRequest { field: "limit" });
+    }
+    let rows = sqlx::query(
+        "SELECT id, workspace_id, kind, label, attributes, confidence, status, merged_into, created_at, \
+                updated_at, version \
+         FROM entities WHERE workspace_id = ?1 AND status = 'active' \
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
+    )
+    .bind(workspace_id.to_string())
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read a workspace's entities",
+        source,
+    })?;
+
+    rows.iter().map(decode_entity).collect()
+}
+
+/// Reads one entity by label, exactly as stored.
+///
+/// # Why an exact label and not a text search
+///
+/// Resolution by a **fuzzy** match would turn a guess into an identity, which is the same rule
+/// [`resolve_alias`] follows for aliases: a caller that wants candidates gets a list it can disambiguate, and a
+/// caller that wants one entity gets either the one or a refusal. A case-insensitive *lookup* is still exact:
+/// `label` is stored trimmed and the comparison folds case, but several rows may match and the caller decides.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded.
+pub async fn read_entities_by_label(
+    database: &SqliteDatabase,
+    workspace_id: WorkspaceId,
+    label: &str,
+    limit: u32,
+) -> Result<Vec<StoredEntity>, DatabaseError> {
+    let label = label.trim();
+    if label.is_empty() || limit == 0 {
+        return Err(DatabaseError::InvalidMemoryRequest { field: "label" });
+    }
+    let rows = sqlx::query(
+        "SELECT id, workspace_id, kind, label, attributes, confidence, status, merged_into, created_at, \
+                updated_at, version \
+         FROM entities WHERE workspace_id = ?1 AND status = 'active' AND label = ?2 COLLATE NOCASE \
+         ORDER BY id ASC LIMIT ?3",
+    )
+    .bind(workspace_id.to_string())
+    .bind(label)
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read entities by label",
+        source,
+    })?;
+
+    rows.iter().map(decode_entity).collect()
+}
+
 /// Reads one entity.
 ///
 /// # Errors
@@ -1508,6 +1592,73 @@ pub async fn merge_entities(
         });
     }
     find_entity(database, &source_id.to_string()).await
+}
+
+/// Counts the memories linked to one entity.
+///
+/// The **entity-side** counterpart of [`count_memory_entity_links`], and the difference is the question: that
+/// one answers "what is this claim about" and this one "how many claims are about this". An operator merging
+/// duplicates needs the second — a merge moves no links, so merging the wrong direction leaves every claim
+/// attached to an entity whose status is `merged`, and the count is the only evidence for which side is used.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the read fails.
+pub async fn count_entity_memory_links(
+    database: &SqliteDatabase,
+    entity_id: EntityId,
+) -> Result<u32, DatabaseError> {
+    let row = sqlx::query("SELECT COUNT(*) AS total FROM memory_entities WHERE entity_id = ?1")
+        .bind(entity_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "count an entity's linked memories",
+            source,
+        })?;
+    let total = row
+        .try_get::<i64, _>("total")
+        .map_err(|_| DatabaseError::StoredMemoryInvalid { field: "total" })?;
+    Ok(u32::try_from(total).unwrap_or(u32::MAX))
+}
+
+/// Reads every alias belonging to one entity, oldest first.///
+/// # Why this is not `read_alias_candidates`
+///
+/// `read_alias_candidates` answers "which entities are guessed from this **value**", which is a lookup. This
+/// answers "what names does this **entity** have", which is a detail read. They share a table and nothing else:
+/// the candidate read is keyed by normalized value and the kind, and this one by the entity.
+///
+/// It lives here rather than in the daemon because returning rows means decoding them, and a second decode of
+/// one table is a second place for the four `CHECK`ed vocabularies to be parsed differently — the same reason
+/// `decode_entity` is shared by the two entity reads above.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded, and
+/// [`DatabaseError::InvalidMemoryRequest`] when `limit` is zero.
+pub async fn read_entity_aliases(
+    database: &SqliteDatabase,
+    entity_id: EntityId,
+    limit: u32,
+) -> Result<Vec<StoredAlias>, DatabaseError> {
+    if limit == 0 {
+        return Err(DatabaseError::InvalidMemoryRequest { field: "limit" });
+    }
+    let rows = sqlx::query(
+        "SELECT id, entity_id, alias_kind, alias_value, normalized, verification, confidence \
+         FROM entity_aliases WHERE entity_id = ?1 ORDER BY id ASC LIMIT ?2",
+    )
+    .bind(entity_id.to_string())
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read an entity's aliases",
+        source,
+    })?;
+
+    rows.iter().map(decode_alias).collect()
 }
 
 /// Records a verified alias for an entity.

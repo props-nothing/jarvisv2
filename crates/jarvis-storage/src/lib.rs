@@ -43,12 +43,13 @@ pub use identity_repository::{
 pub use inspect::{DaemonInstanceRow, DatabaseInspection, DatabaseState, inspect_database};
 pub use memory_repository::{
     EntityKind, EntityStatus, MemoryTransition, NewEntity, StoredAlias, StoredEntity, StoredMemory,
-    StoredRelation, TASK_LIKE_PREDICATES, apply_memory_transition, count_memory_entity_links,
-    find_entity, find_memory, find_memory_including_deleted, is_tombstoned, link_memory_entity,
-    merge_entities, purge_memory, read_alias_candidates, read_all_memories, read_entity_memories,
-    read_retrievable_memories, read_subject_relations, read_workspace_memories, record_alias,
-    record_entity, record_memory, record_relation, record_tombstone, reinforce_memory,
-    resolve_alias,
+    StoredRelation, TASK_LIKE_PREDICATES, apply_memory_transition, count_entity_memory_links,
+    count_memory_entity_links, find_entity, find_memory, find_memory_including_deleted,
+    is_tombstoned, link_memory_entity, merge_entities, purge_memory, read_alias_candidates,
+    read_all_memories, read_entities_by_label, read_entity_aliases, read_entity_memories,
+    read_retrievable_memories, read_subject_relations, read_workspace_entities,
+    read_workspace_memories, record_alias, record_entity, record_memory, record_relation,
+    record_tombstone, reinforce_memory, resolve_alias,
 };
 pub use message_repository::{
     MAX_MESSAGE_PAGE, StoredMessage, append_message, count_messages, find_message, read_messages,

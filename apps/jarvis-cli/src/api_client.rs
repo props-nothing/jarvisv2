@@ -42,14 +42,15 @@ use jarvis_core::LoopbackHost;
 // be a new direct dependency for a name.
 
 use jarvis_protocol::{
-    ConfirmMemoryRequest, CorrectMemoryRequest, CreateSkillRequest, DeletionReceipt,
+    AddAliasRequest, ConfirmMemoryRequest, CorrectMemoryRequest, CreateEntityRequest,
+    CreateSkillRequest, DeletionReceipt, EntityDetailReply, EntityListReply, EntityLookupReply,
     ForgetMemoryRequest, ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply,
     MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest,
-    PromoteSkillRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
-    SSE_ACCEPT, SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply,
-    SkillReply, SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply,
-    ToolPreviewRequest, WireError, dotted_path_segment, path_segment, run_path, run_stream_path,
-    runs_path,
+    MergeEntityRequest, PromoteSkillRequest, RememberRequest, RunPathError, RunReply,
+    RunStreamDecoder, RunStreamFrame, SSE_ACCEPT, SkillDeletionReceipt, SkillDetailReply,
+    SkillExportReply, SkillListReply, SkillReply, SkillTransitionRequest, StartRunRequest,
+    ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError, dotted_path_segment,
+    path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -91,6 +92,17 @@ fn tool_preview_path(tool: &str) -> Result<String, ApiError> {
 /// Returns [`RunPathError`] when the identifier contains a character that would change the request target.
 fn memory_path(memory_id: &str) -> Result<String, RunPathError> {
     Ok(format!("/api/v1/memories/{}", path_segment(memory_id)?))
+}
+
+/// The base path of the entity surface (`P4-016`).
+const ENTITIES_PATH: &str = "/api/v1/entities";
+
+/// Builds the path for one entity, validating the identifier first.
+///
+/// [`jarvis_protocol::path_segment`], the same segment rule the run and memory paths use: two validators over
+/// the same class of untrusted value are two places for the traversal case to be handled differently.
+fn entity_path(entity_id: &str) -> Result<String, RunPathError> {
+    Ok(format!("/api/v1/entities/{}", path_segment(entity_id)?))
 }
 
 /// The skill collection's path.
@@ -421,6 +433,137 @@ impl ApiClient {
         if status.is_success() {
             return response
                 .json::<MemoryReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Creates an entity, which is what a memory will be *about*.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the daemon refuses the kind, the confidence, or the attributes.
+    pub async fn create_entity(
+        &self,
+        request: &CreateEntityRequest,
+    ) -> Result<EntityDetailReply, ApiError> {
+        let response = self
+            .bounded_request(reqwest::Method::POST, ENTITIES_PATH)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<EntityDetailReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Lists the workspace's entities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the page is refused or the transport fails.
+    pub async fn list_entities(&self, limit: Option<u32>) -> Result<EntityListReply, ApiError> {
+        let path = match limit {
+            Some(limit) => format!("{ENTITIES_PATH}?limit={limit}"),
+            None => ENTITIES_PATH.to_owned(),
+        };
+        self.get_json(&path).await
+    }
+
+    /// Reads one entity with its aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when no entity has that identifier.
+    pub async fn read_entity(&self, entity_id: &str) -> Result<EntityDetailReply, ApiError> {
+        self.get_json(&entity_path(entity_id)?).await
+    }
+
+    /// Looks an entity up by its label, returning every match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the label is blank or the transport fails.
+    pub async fn lookup_entity_by_label(&self, label: &str) -> Result<EntityLookupReply, ApiError> {
+        // The label goes in a query parameter rather than the path. A **path** segment would need the label to
+        // satisfy a route grammar, and a label is user text — a person called "A/B" would be unroutable, and
+        // percent-encoding it here would be a second parsing path for a value the daemon re-reads.
+        self.get_json(&format!("{ENTITIES_PATH}/lookup?label={label}"))
+            .await
+    }
+
+    /// Resolves an alias, returning every candidate and whether each is verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when a parameter is blank or the transport fails.
+    pub async fn lookup_entity_by_alias(
+        &self,
+        alias_kind: &str,
+        alias_value: &str,
+    ) -> Result<EntityLookupReply, ApiError> {
+        self.get_json(&format!(
+            "{ENTITIES_PATH}/lookup?alias_kind={alias_kind}&alias_value={alias_value}"
+        ))
+        .await
+    }
+
+    /// Attaches an alias to an entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the schema's rules refuse the pair of verification and source kind, or
+    /// when another entity already holds the alias as verified.
+    pub async fn add_entity_alias(
+        &self,
+        entity_id: &str,
+        request: &AddAliasRequest,
+    ) -> Result<EntityDetailReply, ApiError> {
+        let path = format!("{}/aliases", entity_path(entity_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<EntityDetailReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Merges one entity into another, returning the winner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] for a self-merge, a cross-workspace merge, or a target that is not active.
+    pub async fn merge_entity(
+        &self,
+        source_id: &str,
+        request: &MergeEntityRequest,
+    ) -> Result<EntityDetailReply, ApiError> {
+        let path = format!("{}/merge", entity_path(source_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<EntityDetailReply>()
                 .await
                 .map_err(|_| ApiError::Decode);
         }

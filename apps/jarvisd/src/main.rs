@@ -3,6 +3,7 @@
 mod build_info;
 mod control;
 mod dispatch;
+mod entity_service;
 mod executor;
 mod gateway;
 mod health;

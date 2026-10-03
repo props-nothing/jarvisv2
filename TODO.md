@@ -3557,6 +3557,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         component. The summary route is HTTP-only — no CLI verb, matching `P4-014`'s tool, because both need an
         entity identifier the CLI has no way to obtain.
 
+- [ ] `P4-016` Add the entity surface: an operator can create, list, and look up the entities a memory is
+      `about`, and attach an alias to one so a later lookup resolves by name rather than by identifier.
+      **The gap three slices recorded.** `P4-008`'s note is that "**No entity-creation surface exists**, so a
+      remember is still unreachable by a user of the shipped product"; `P4-014` and `P4-015` each record the
+      same limit from a different direction. The measurement behind this slice: seven entity-repository
+      functions had **no production caller at all** — `merge_entities`, `record_alias`, `resolve_alias`,
+      `read_alias_candidates`, `read_entity_memories`, `record_relation`, `read_subject_relations` — and
+      `resolve_alias`/`read_alias_candidates` are exactly the "entity resolution" that note names as missing.
+
 ## P5: Connectors
 
 - [x] `P5-001` Define connector manifest, account, auth flow, health, sync cursor, webhook, rate-limit, scope, and diagnostics contracts.
