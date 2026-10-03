@@ -40,7 +40,8 @@ use jarvis_core::{
     ContextBudget, ContextItem, ContextPriority, ContextSource, ContextSourceKind, ContextTrust,
     CorrelationId, EventSummary, InclusionReason, MemoryType, NewMessage, RetrievedMemory,
     RunErrorCode, RunEventKind, RunEventPayload, RunState, RunTransition, Sensitivity,
-    SessionChannel, SystemClock, UtcTimestamp, assemble_context,
+    SessionChannel, SkillQuery, SystemClock, UtcTimestamp, WorkspaceId, assemble_context,
+    select_skills, skill_context_item,
 };
 use jarvis_models::{
     ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, StreamEvent,
@@ -99,6 +100,14 @@ const MAX_HISTORY_TURNS: u32 = 12;
 /// constrains the request, which is the property that makes `P4-004`'s ranking meaningful when it arrives
 /// in front of this read.
 const MAX_MEMORIES_LOADED: u32 = 24;
+
+/// Stored skill revisions read as selection candidates for one model call.
+///
+/// The same reasoning as [`MAX_MEMORIES_LOADED`]: a candidate window, so assembling one request costs a
+/// constant. It is deliberately **larger than the offered count** ([`MAX_SELECTED_SKILLS`]) because the
+/// selection rule — not the read — is what decides which candidates are usable, and a read bounded at the
+/// offered count would make that rule unreachable for the rows it exists to filter.
+const MAX_SKILLS_LOADED: u32 = 32;
 
 /// The memory types a model answer may be given.
 ///
@@ -393,23 +402,45 @@ pub async fn execute_run(
     execute_run_with_tools(database, model, &model_id, None, run_id).await
 }
 
+/// The daemon-owned singletons a run's loop reads for its whole duration.
+///
+/// # Why these travel together rather than as separate parameters
+///
+/// They are the same values at every entry point and every step — one profile, one model, one configured
+/// tool surface, one correlation — and each was added as an argument until a function crossed the argument
+/// limit. Adding a field here is what a new singleton costs; adding an argument is what it costs every
+/// signature between the route and the step that needs it.
+///
+/// Grouping them also puts each value next to the one it could be confused with. `model` and `model_id` are
+/// a provider and the identifier sent to it (deliberately independent — `executor_model` selects a
+/// transport while `executor_model_name` is what the provider is asked for), and a transposed pair would
+/// type-check as a wrong model name rather than as an error.
+#[derive(Clone, Copy)]
+struct RunDeps<'a> {
+    /// The profile database.
+    database: &'a Arc<SqliteDatabase>,
+    /// The model adapter the run drives.
+    model: &'a dyn ModelGateway,
+    /// The identifier sent to the provider, which is the model's own id rather than the daemon's name.
+    model_id: &'a ModelId,
+    /// The composed tool path, absent when this profile has no registry and no adapters.
+    tools: Option<&'a Arc<ToolPipeline>>,
+}
+
 /// Enforces the model-call budget and performs one model call.
 ///
 /// Extracted from the loop so the `Executing` arm is one call and the budget check reads beside the call
 /// it bounds. The counter is incremented **before** the check, so the budget is the number of calls the run
 /// may make and not one fewer — the off-by-one a post-increment would introduce.
 async fn generate_step(
-    database: &Arc<SqliteDatabase>,
-    model: &dyn ModelGateway,
-    tools: Option<&Arc<ToolPipeline>>,
+    deps: RunDeps<'_>,
     run: &StoredRun,
-    model_id: &ModelId,
     state: &mut RunLoopState,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
     if state.over_model_budget() {
         return fail(
-            database,
+            deps.database,
             run,
             RunErrorCode::new("too_many_model_calls").map_err(|_| {
                 DatabaseError::InvalidRunRequest {
@@ -421,7 +452,7 @@ async fn generate_step(
         )
         .await;
     }
-    generate(database, model, tools, run, model_id, state, correlation_id).await
+    generate(deps, run, state, correlation_id).await
 }
 
 /// The transcript and tool budget a run loop carries between iterations.
@@ -507,15 +538,13 @@ pub async fn execute_run_with_tools(
     tools: Option<&Arc<ToolPipeline>>,
     run_id: &str,
 ) -> Result<StoredRun, DatabaseError> {
-    drive_run(
+    let deps = RunDeps {
         database,
         model,
         model_id,
         tools,
-        run_id,
-        RunLoopState::default(),
-    )
-    .await
+    };
+    drive_run(deps, run_id, RunLoopState::default()).await
 }
 
 /// Continues a run whose held tool call has just been decided and executed.
@@ -551,7 +580,13 @@ pub async fn resume_run_with_tools(
         }),
         ..RunLoopState::default()
     };
-    drive_run(database, model, model_id, tools, run_id, state).await
+    let deps = RunDeps {
+        database,
+        model,
+        model_id,
+        tools,
+    };
+    drive_run(deps, run_id, state).await
 }
 
 /// Drives one run to a terminal state, starting from the state the caller supplies.
@@ -560,13 +595,11 @@ pub async fn resume_run_with_tools(
 /// [`resume_run_with_tools`] (a run a decided approval released). The only difference between the two
 /// is the [`RunLoopState`] they begin with.
 async fn drive_run(
-    database: &Arc<SqliteDatabase>,
-    model: &dyn ModelGateway,
-    model_id: &ModelId,
-    tools: Option<&Arc<ToolPipeline>>,
+    deps: RunDeps<'_>,
     run_id: &str,
     mut state: RunLoopState,
 ) -> Result<StoredRun, DatabaseError> {
+    let database = deps.database;
     let run = find_run(database, run_id).await?;
 
     // A run that already settled is returned as-is rather than restarted. Re-executing it would
@@ -602,23 +635,12 @@ async fn drive_run(
             RunState::ContextBuilding => {
                 // The assembled request is held across the loop rather than rebuilt in `generate`,
                 // because the manifest is the record of what was selected for **this** call.
-                state.messages =
-                    assemble_context_messages(database, model, &current, model_id, correlation_id)
-                        .await?;
+                state.messages = assemble_context_messages(deps, &current, correlation_id).await?;
                 enter_planning(database, &current, correlation_id).await?
             }
             RunState::Planning => enter_execution(database, &current, correlation_id).await?,
             RunState::Executing => {
-                generate_step(
-                    database,
-                    model,
-                    tools,
-                    &current,
-                    model_id,
-                    &mut state,
-                    correlation_id,
-                )
-                .await?
+                generate_step(deps, &current, &mut state, correlation_id).await?
             }
             RunState::Observing => {
                 // A final answer is being produced; a tool round trip re-enters planning instead, and
@@ -639,16 +661,7 @@ async fn drive_run(
                 let Some(pending) = state.pending.take() else {
                     return Ok(current);
                 };
-                resume_held_call(
-                    database,
-                    model,
-                    model_id,
-                    &current,
-                    &pending,
-                    &mut state,
-                    correlation_id,
-                )
-                .await?
+                resume_held_call(deps, &current, &pending, &mut state, correlation_id).await?
             }
             RunState::Responding => {
                 return complete(database, &current, correlation_id).await;
@@ -757,12 +770,13 @@ async fn check_cancellation(
 /// Returns [`DatabaseError`] when the history or memory read fails, or when a manifest entry cannot be
 /// resolved back to the turn or record it names.
 async fn assemble_context_messages(
-    database: &Arc<SqliteDatabase>,
-    model: &dyn ModelGateway,
+    deps: RunDeps<'_>,
     run: &StoredRun,
-    model_id: &ModelId,
     correlation_id: CorrelationId,
 ) -> Result<Vec<ChatMessage>, DatabaseError> {
+    let database = deps.database;
+    let model = deps.model;
+    let model_id = deps.model_id;
     let budget = ContextBudget::new(
         TOTAL_CONTEXT_TOKENS,
         RESERVED_POLICY_TOKENS,
@@ -828,6 +842,20 @@ async fn assemble_context_messages(
         );
     }
 
+    let workspace_id: WorkspaceId =
+        run.workspace_id()
+            .parse()
+            .map_err(|_| DatabaseError::InvalidRunRequest {
+                field: "workspace_id",
+            })?;
+
+    // The destination ceiling is computed from the **model** rather than assumed, because it is a
+    // privacy input: a local model never leaves the machine and may receive anything, while a remote or
+    // unprobed model may not receive Confidential content. It is needed **before** the skills are selected,
+    // because selection refuses a procedure above the ceiling, so this one value is computed once and
+    // reused by the assembler below.
+    let ceiling = destination_ceiling(model, model_id).await;
+
     // Retrieved memory, isolated and offered through the same assembler. A claim whose type the use case
     // does not allow, or which is not current truth, is **refused by conversion** and never offered — that
     // is the eligibility half of `P4-004`, applied to the item that is actually built.
@@ -836,10 +864,14 @@ async fn assemble_context_messages(
         offered.push(memory.item().clone());
     }
 
-    // The destination ceiling is the model's **placement**, which is a privacy input rather than a
-    // label, read from the adapter instead of assumed. A local model never leaves the machine, so
-    // it may receive anything; a remote or unprobed model may not receive Confidential content.
-    let ceiling = destination_ceiling(model, model_id).await;
+    // Retrieved skills, selected by relevance to the objective and offered as **fenced derived content**.
+    // A skill is a procedure rather than a claim, so it cannot be required policy and cannot carry an
+    // authority (`ADR-0117`): the step instructions reach the model as data it may follow, and every step
+    // they name is re-evaluated by policy when it runs, never at load.
+    let skills = load_skills(database, run, workspace_id, ceiling, deps.tools).await?;
+    for skill in &skills {
+        offered.push(skill.item.clone());
+    }
 
     let manifest = assemble_context(offered, budget, ceiling)
         .map_err(|_| DatabaseError::InvalidRunRequest { field: "context" })?;
@@ -849,7 +881,7 @@ async fn assemble_context_messages(
         run,
         RunEventKind::ActivityUpdated,
         Some("context assembled"),
-        &context_summary(&manifest, &history, &memories),
+        &context_summary(&manifest, &history, &memories, &skills),
         correlation_id,
     )
     .await?;
@@ -858,7 +890,123 @@ async fn assemble_context_messages(
     // "what the audit record says was included" and "what the model was sent" the same set: a turn
     // the assembler excluded for budget must not appear in the request, or the manifest is a record
     // of a decision that was not honoured.
-    messages_from_manifest(&manifest, &history, &memories, run.objective())
+    messages_from_manifest(&manifest, &history, &memories, &skills, run.objective())
+}
+
+/// One selected skill, already isolated and rendered as the item assembly will offer.
+///
+/// # Why the reference, the isolated text, and the item are carried together
+///
+/// The item is what assembly offers and what the manifest records, and the reference is the string the
+/// message builder has to match against the manifest's entry. Deriving the reference from a **copy** of the
+/// identifier would be the `P3-006a` shape — two values that must agree with nothing holding both — so it is
+/// read from the item itself, which is where `skill_context_item` put it and where the manifest will read it
+/// again.
+///
+/// The **isolated** text is carried rather than produced at render time for the same reason
+/// [`RetrievedMemory`] carries it: isolation is a transform, and applying it twice is two chances for the
+/// item's estimate and the sent text to describe different bytes.
+struct RetrievedSkill {
+    /// The context item, built by `skill_context_item` so the trust class and the fence flag are decided in
+    /// one place rather than here.
+    item: ContextItem,
+    /// The source reference the manifest records, read from the item rather than recomputed.
+    reference: String,
+    /// The procedure rendered and fenced, which is what would be sent.
+    isolated: jarvis_core::IsolatedText,
+}
+
+/// Loads the workspace's usable skill revisions and selects the ones this objective may use.
+///
+/// # Why the read is `read_usable_skill_revisions` rather than every revision
+///
+/// A proposal and an archived revision are not choices, so they are absent from the read rather than
+/// filtered here — the same rule [`jarvis_tools::ToolRegistry::discover`] applies to an unavailable tool.
+/// An operator who wants the whole picture reads `read_workspace_skill_revisions`, which is what `P4-013`'s
+/// inspection surface will use.
+///
+/// # Why the query's text is the objective and the destination is the model's ceiling
+///
+/// The two inputs of [`SkillQuery`] are precisely the two facts selection needs and this function cannot
+/// invent. The **text** is the run's objective, because the question a skill answers is "does this procedure
+/// apply to what I was asked to do" — and an empty objective selects nothing rather than everything, which
+/// is the direction that fails safe. The **destination** is the model's placement ceiling, so a procedure
+/// classified above what the model may receive is refused by `is_eligible` and by `assemble_context` a
+/// second time.
+///
+/// # Why the tool validator is passed in rather than assumed
+///
+/// A revision names tools, and a decode **re-applies** the identifier rule. That rule lives in
+/// `jarvis-tools`, which `jarvis-storage` may not depend on (an adapter may depend on `jarvis-core` and not
+/// on another adapter), so it arrives as a predicate. Supplying the real registry's membership check rather
+/// than a permissive `|_| true` means a row naming a tool this deployment does not have is **refused on
+/// read** instead of being offered as a procedure that cannot run.
+async fn load_skills(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    workspace_id: WorkspaceId,
+    ceiling: Sensitivity,
+    tools: Option<&Arc<ToolPipeline>>,
+) -> Result<Vec<RetrievedSkill>, DatabaseError> {
+    // The validator is `None` when no tool surface is composed, and a permissive predicate then accepts
+    // every name. That is deliberate: with no tools there is no registry to check against, and refusing
+    // every skill because nothing can run would conflate "this deployment has no tools" with "this
+    // procedure names a bad tool". A skill's steps are re-checked at execution either way, which is the
+    // only place the check can be sound (`ADR-0117` §6).
+    let validate_tool: &(dyn Fn(&str) -> bool + Send + Sync) = &|name: &str| {
+        tools.is_none_or(|pipeline| {
+            jarvis_tools::ToolId::new(name).is_ok_and(|id| pipeline.registry().get(&id).is_ok())
+        })
+    };
+
+    let stored = jarvis_storage::read_usable_skill_revisions(
+        database,
+        workspace_id.to_string().as_str(),
+        MAX_SKILLS_LOADED,
+        validate_tool,
+    )
+    .await?;
+
+    let mut query = SkillQuery::new(workspace_id, ceiling);
+    let objective = run.objective().trim();
+    if !objective.is_empty() {
+        query = query.with_text(objective);
+    }
+    let selection = select_skills(&stored, &query);
+
+    tracing::debug!(
+        eligible = selection.eligible_total,
+        offered = selection.offered.len(),
+        excluded = selection.excluded.len(),
+        dropped = selection.dropped.len(),
+        "skills selected for this run"
+    );
+
+    let mut offered = Vec::with_capacity(selection.offered.len());
+    for selected in &selection.offered {
+        // Optional priority, because a procedure is retrieved content: a skill that does not fit the budget
+        // must be dropped rather than failing the run, exactly as a conversation turn is. `Required` here
+        // would make an oversized procedure an error, and "your procedure library is long" is not a reason
+        // to refuse a question.
+        let item = skill_context_item(&selected.revision, ContextPriority::Optional)
+            .map_err(|_| DatabaseError::InvalidRunRequest { field: "skill" })?;
+        // The procedure's **rendered** text: its prose and then its steps in position order, which is the
+        // order `SkillRevision::build` already sorted them into. Rendered here so that the isolation, the
+        // item's estimate, and the text that is sent are all derived from one string.
+        let mut procedure = selected.revision.description().to_owned();
+        for step in selected.revision.steps() {
+            procedure.push_str("\n- ");
+            procedure.push_str(step.instruction());
+        }
+        let isolated = jarvis_core::IsolatedText::new(&procedure)
+            .map_err(|_| DatabaseError::InvalidRunRequest { field: "skill" })?;
+        offered.push(RetrievedSkill {
+            reference: item.source().reference().to_owned(),
+            item,
+            isolated,
+        });
+    }
+    Ok(offered)
 }
 
 /// Builds the model-facing tool specifications from the daemon's registered tools.
@@ -914,6 +1062,7 @@ fn context_summary(
     manifest: &jarvis_core::ContextManifest,
     history: &[HistoryTurn],
     memories: &[RetrievedMemory],
+    skills: &[RetrievedSkill],
 ) -> String {
     let included = |memory: &RetrievedMemory| {
         manifest
@@ -927,8 +1076,23 @@ fn context_summary(
         .filter(|memory| memory.isolated().was_altered())
         .count();
 
+    // A skill is counted the same way a memory is — offered versus included — so "why was this procedure
+    // not used" is answerable from the run record without storing the procedure. A skill has no isolated
+    // payload to have been altered, so there is deliberately no `skills_altered`: a count that is always
+    // zero is a field a reader learns to skip, which is the reasoning the `MissingScopes` diagnostic
+    // records for a finding that is always present.
+    let skills_included = skills
+        .iter()
+        .filter(|skill| {
+            manifest
+                .included()
+                .iter()
+                .any(|item| item.source().reference() == skill.reference)
+        })
+        .count();
+
     format!(
-        r#"{{"included":{},"excluded":{},"used_tokens":{},"instruction_tokens":{},"untrusted_tokens":{},"history_offered":{},"memories_offered":{},"memories_included":{},"memories_altered":{}}}"#,
+        r#"{{"included":{},"excluded":{},"used_tokens":{},"instruction_tokens":{},"untrusted_tokens":{},"history_offered":{},"memories_offered":{},"memories_included":{},"memories_altered":{},"skills_offered":{},"skills_included":{}}}"#,
         manifest.included().len(),
         manifest.excluded().len(),
         manifest.used_tokens(),
@@ -938,6 +1102,8 @@ fn context_summary(
         memories.len(),
         memories_included,
         memories_altered,
+        skills.len(),
+        skills_included,
     )
 }
 
@@ -1127,6 +1293,7 @@ fn messages_from_manifest(
     manifest: &jarvis_core::ContextManifest,
     history: &[HistoryTurn],
     memories: &[RetrievedMemory],
+    skills: &[RetrievedSkill],
     objective: &str,
 ) -> Result<Vec<ChatMessage>, DatabaseError> {
     let included = |kind: ContextSourceKind| {
@@ -1182,13 +1349,45 @@ fn messages_from_manifest(
         };
         included_memories.push(memory);
     }
-    if !included_memories.is_empty() {
-        let mut text = jarvis_core::memory_context_introduction(included_memories.len());
+
+    // Retrieved skills, found by the same rule: the reference the manifest recorded, with a miss an error
+    // rather than a skip. A skill is looked up here rather than while walking the manifest above so the
+    // memory lookup keeps its own shape, and both share the one fenced message below.
+    let mut included_skills: Vec<&RetrievedSkill> = Vec::new();
+    for item in manifest.included() {
+        if item.source().kind() != ContextSourceKind::Skill {
+            continue;
+        }
+        let Some(skill) = skills
+            .iter()
+            .find(|skill| skill.reference == item.source().reference())
+        else {
+            return Err(DatabaseError::InvalidRunRequest {
+                field: "context_manifest",
+            });
+        };
+        included_skills.push(skill);
+    }
+    if !included_memories.is_empty() || !included_skills.is_empty() {
+        // One message, one introduction, one fenced region — because a skill is retrieved content for the
+        // same reason a memory is (`ADR-0117` §3) and the introduction's promise, *"the policy and the
+        // request win"*, is exactly the promise a procedure needs. A second message would need a second
+        // introduction making a second claim about the same kind of fence, which is the duplication that
+        // lets one of them drift.
+        //
+        // The count is the total, because the introduction describes what follows it and two counts would
+        // make one of them false. Each payload is separated by a blank line, so a payload cannot run into
+        // the next one's opening marker and read as part of it.
+        let mut text = jarvis_core::memory_context_introduction(
+            included_memories.len() + included_skills.len(),
+        );
         for memory in &included_memories {
-            // A blank line between fences, so a payload cannot run into the next record's opening
-            // marker and read as part of it.
             text.push_str("\n\n");
             text.push_str(&memory.isolated().render());
+        }
+        for skill in &included_skills {
+            text.push_str("\n\n");
+            text.push_str(&skill.isolated.render());
         }
         messages.push(ChatMessage::user(text));
     }
@@ -1320,18 +1519,21 @@ async fn consume_stream(
 /// Not only on the last one, because an agent loop makes several billable calls and a run that recorded
 /// only the final usage would understate its cost by every round trip but one.
 async fn generate(
-    database: &Arc<SqliteDatabase>,
-    model: &dyn ModelGateway,
-    tools: Option<&Arc<ToolPipeline>>,
+    deps: RunDeps<'_>,
     run: &StoredRun,
-    model_id: &ModelId,
     state: &mut RunLoopState,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
+    let database = deps.database;
+    let model = deps.model;
     // The tool surface is re-derived from the registry on every call rather than carried in the
     // transcript, so the offered set is always the current one and there is one statement of it.
-    let specs = tools.map_or_else(Vec::new, tool_specs);
-    let mut request = ChatRequest::new(model_id.clone(), state.messages.clone(), correlation_id);
+    let specs = deps.tools.map_or_else(Vec::new, tool_specs);
+    let mut request = ChatRequest::new(
+        deps.model_id.clone(),
+        state.messages.clone(),
+        correlation_id,
+    );
     if !specs.is_empty() {
         request = request.with_tools(specs);
     }
@@ -1405,12 +1607,11 @@ async fn generate(
     }
 
     // A turn that requested tools is not the answer. The invocations are executed and their results fed
-    // back, and the run is observed and then planned again — `run_tool_round` owns that whole path so
+    // back, and the run is observed and then planned again � `run_tool_round` owns that whole path so
     // this function stays about one model call.
     if !summary.tool_calls().is_empty() {
         return run_tool_round(
-            database,
-            tools,
+            deps,
             run,
             state,
             summary.tool_calls(),
@@ -1420,10 +1621,26 @@ async fn generate(
         .await;
     }
 
-    // No tool calls: this is the final answer. It is recorded as `OutputCompleted` **before** the run
-    // advances, because `complete` reads the answer back from this event rather than holding a second copy
-    // in memory — so the stored transcript and the event stream cannot disagree about what was said. A
-    // tool round trip does **not** reach here: it has no answer yet and re-plans instead.
+    record_final_answer(database, run, &text, correlation_id).await
+}
+
+/// Records the final answer and advances the run to `Observing`.
+///
+/// # Why the answer is recorded **before** the run advances
+///
+/// [`complete`] reads the answer back from this event rather than holding a second copy in memory, so the
+/// stored transcript and the event stream cannot disagree about what was said. A tool round trip does not
+/// reach here � it has no answer yet and re-plans � which is the other half of the same rule.
+///
+/// Extracted from [`generate`] when the skill path pushed that function over the line-count limit. The
+/// extraction is the right shape rather than a workaround: "one model call" and "what a final answer writes"
+/// are two jobs, and the function above is now about the first.
+async fn record_final_answer(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    text: &str,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
     append(
         database,
         run,
@@ -1431,7 +1648,7 @@ async fn generate(
         None,
         &format!(
             r#"{{"text":{},"chars":{}}}"#,
-            json_string(&text),
+            json_string(text),
             text.chars().count()
         ),
         correlation_id,
@@ -1463,15 +1680,15 @@ async fn generate(
 /// rejected fixed literal is an authoring error, so the run fails rather than the model being told a
 /// tool is unavailable when the real fault is the daemon's own scope constant.
 async fn run_tool_round(
-    database: &Arc<SqliteDatabase>,
-    tools: Option<&Arc<ToolPipeline>>,
+    deps: RunDeps<'_>,
     run: &StoredRun,
     state: &mut RunLoopState,
     requested: &[jarvis_models::ToolCall],
     text: &str,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
-    let Some(tools) = tools else {
+    let database = deps.database;
+    let Some(tools) = deps.tools else {
         // A model asked for a tool no pipeline is composed for. This is a configuration fault reported
         // as a run failure rather than silently answering without the tool, because an answer that
         // claims to have used a tool nothing ran is the failure the system prompt warns against.
@@ -1657,14 +1874,13 @@ async fn run_tool_call(
 /// output belongs: content that originates outside JARVIS, treated as data to reason about. That is a
 /// recorded limit, not an oversight — see `ADR-0120`.
 async fn resume_held_call(
-    database: &Arc<SqliteDatabase>,
-    model: &dyn ModelGateway,
-    model_id: &ModelId,
+    deps: RunDeps<'_>,
     run: &StoredRun,
     pending: &PendingCall,
     state: &mut RunLoopState,
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
+    let database = deps.database;
     // The stored call is the row the resume route wrote, so this reads the effect rather than re-running
     // it. A lookup failure or a non-terminal outcome is reported to the model as the observation: the
     // run's job is to answer, and a missing result is a fact about the request rather than a reason to
@@ -1699,8 +1915,7 @@ async fn resume_held_call(
     // observation — no policy, no objective, and no history — and the model would answer a message about a
     // tool with no idea what was asked. `generate` runs once from the `Responding` handling, which reads
     // the message list this function fills.
-    state.messages =
-        assemble_context_messages(database, model, run, model_id, correlation_id).await?;
+    state.messages = assemble_context_messages(deps, run, correlation_id).await?;
     state
         .messages
         .push(ChatMessage::user(truncate_tool_result(&observation)));
@@ -3313,6 +3528,133 @@ mod tests {
         );
     }
 
+    /// Records a user-authored, active skill revision naming `jarvis.files.read`.
+    ///
+    /// A **user-authored** revision so it is active from the outset, which is the shape that needs no
+    /// promotion — and `new` refuses a model-authored revision recorded active, so a fixture that took that
+    /// shortcut would fail at construction rather than at the assertion.
+    async fn record_skill(database: &Arc<SqliteDatabase>, workspace_id: &str, description: &str) {
+        let parts = jarvis_core::SkillRevisionParts {
+            skill_id: jarvis_core::SkillId::new(),
+            workspace_id: workspace_id
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture workspace: {error}")),
+            revision_id: jarvis_core::SkillId::new(),
+            version: "1".to_owned(),
+            description: description.to_owned(),
+            steps: vec![
+                jarvis_core::SkillStep::new(
+                    1,
+                    "jarvis.files.read",
+                    "1.0.0",
+                    "Read the notes file and list its open items.",
+                    |identifier: &str| {
+                        identifier
+                            .split_once('.')
+                            .is_some_and(|(ns, name)| !ns.is_empty() && !name.is_empty())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("fixture step: {error}")),
+            ],
+            source: jarvis_core::MemorySource::of_kind(
+                jarvis_core::MemorySourceKind::UserStatement,
+                "session-1",
+            )
+            .unwrap_or_else(|error| panic!("fixture source: {error}")),
+            sensitivity: jarvis_core::Sensitivity::Internal,
+            state: jarvis_core::SkillState::Active,
+            supersedes: None,
+            dropped_fields: Vec::new(),
+            run_id: None,
+            created_by_actor_id: LOCAL_USER_ID.to_owned(),
+            correlation_id: CorrelationId::new(),
+            created_at: UtcTimestamp::now(&SystemClock),
+        };
+        let revision = jarvis_core::SkillRevision::new(parts)
+            .unwrap_or_else(|error| panic!("fixture revision: {error}"));
+        jarvis_storage::record_skill_revision(database, &revision)
+            .await
+            .unwrap_or_else(|error| panic!("record skill: {error}"));
+    }
+
+    /// **⭐ A stored skill is selected for a relevant objective and reaches the prompt as FENCED data.**
+    ///
+    /// This is the end-to-end evidence for the wiring: the revision is written through the repository, the
+    /// read returns it, `select_skills` keeps it because the objective's words appear in its text, the item
+    /// enters the manifest, and the message builder renders its **prose and its step instructions** inside
+    /// the fence. Every earlier slice tested one of those links; none tested that they are joined.
+    ///
+    /// Two assertions matter more than the others. The fence proves it arrived as *data* rather than as
+    /// instruction, which is `ADR-0117` §3 — a procedure that reached a prompt unfenced would be read as the
+    /// model's own plan. And the step text proves the **procedure body** travelled, not merely its title: an
+    /// implementation that sent the description alone would look correct against a single containment check.
+    ///
+    /// The pipeline is `None`, so no tool surface is composed and the tool validator accepts every name. A
+    /// skill's steps are re-checked at execution (`ADR-0117` §6), which is why offering one to a model in a
+    /// deployment that has no tools is not the defect; refusing to offer it would be a different one.
+    ///
+    /// # The objective is phrased to satisfy the conjunctive rule, which is the point of the sibling test
+    ///
+    /// `matches_text` requires **every** word of the query to appear in the procedure's text, and the query
+    /// here is the run's objective. So an objective carrying one word the procedure does not contain offers
+    /// nothing — "my notes" against a procedure that says "the user's notes" was the first version of this
+    /// test, and it failed for exactly that reason. That is the rule working as designed rather than a defect,
+    /// and its consequence is asserted in `an_objective_with_an_unmatched_word_offers_no_skill`.
+    #[tokio::test]
+    async fn a_stored_skill_reaches_the_prompt_as_fenced_data() {
+        let (_profile, database) = database().await;
+        let identity = jarvis_storage::load_local_identity(&database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must have a seeded identity: {error}"));
+
+        // Every word of this objective appears in the procedure's prose or its step instruction, which is
+        // what the conjunctive rule requires.
+        let run = start(&database, "summarize the open items in the notes").await;
+        record_skill(
+            &database,
+            identity.workspace_id(),
+            "Summarize the open items in the user's notes.",
+        )
+        .await;
+
+        let model = model(vec![Turn::answer("Done.")]);
+        let settled =
+            execute_run_with_tools(&database, &model, &fixture_model_id(), None, run.id())
+                .await
+                .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+
+        let request = model
+            .seen_messages()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the model must have been called once"));
+        let retrieved = request
+            .iter()
+            .find(|message| message.text().contains(jarvis_core::FENCE_OPEN))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the procedure must reach the prompt inside a fence, or it reads as an instruction: \
+                     {request:?}"
+                )
+            });
+        assert!(
+            retrieved.text().contains("open items"),
+            "the procedure's prose must be sent: {}",
+            retrieved.text()
+        );
+        assert!(
+            retrieved
+                .text()
+                .contains("Read the notes file and list its open items."),
+            "the step instruction is the procedure's body and must be sent too: {}",
+            retrieved.text()
+        );
+    }
+
     /// A pipeline whose only tool **declares** an approval, with an adapter that counts its calls.
     ///
     /// The declaration (risk 0, `ApprovalPolicy::Ask`) is the fixture's own contract, so the hold comes
@@ -3340,6 +3682,56 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("compose the approval pipeline: {error}"));
         (Arc::new(pipeline), adapter)
+    }
+
+    /// **⚠ An objective carrying a word the procedure lacks offers NO skill — the conjunctive rule's cost.**
+    ///
+    /// The sibling of the test above, and the reason it is a separate test rather than an extra assertion:
+    /// `matches_text` requires **every** query word, so relevance is brittle by construction. A user asking
+    /// about "my notes" is not offered a procedure that says "the user's notes", which is a real and
+    /// deliberately accepted cost — the alternative is offering a procedure on a partial overlap, and a
+    /// procedure that matches loosely is one whose *steps* a model may follow when they do not apply.
+    ///
+    /// Asserted because the consequence is otherwise invisible: the run **succeeds** either way, the answer is
+    /// plausible either way, and the difference is only that a procedure the user wrote was not used. A
+    /// retrieval rule whose failure mode is silence needs a test that names the silence.
+    ///
+    /// This is the behaviour `P4-012`'s own limits record, and it is where a future ranked retrieval would
+    /// change the outcome — a claim is matched against **floors** rather than a conjunction, which is why a
+    /// memory is ranked and a skill is filtered.
+    #[tokio::test]
+    async fn an_objective_with_an_unmatched_word_offers_no_skill() {
+        let (_profile, database) = database().await;
+        let identity = jarvis_storage::load_local_identity(&database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must have a seeded identity: {error}"));
+
+        // "my" appears in neither the procedure's prose nor its step instruction.
+        let run = start(&database, "summarize the open items in my notes").await;
+        record_skill(
+            &database,
+            identity.workspace_id(),
+            "Summarize the open items in the user's notes.",
+        )
+        .await;
+
+        let model = model(vec![Turn::answer("Done.")]);
+        execute_run_with_tools(&database, &model, &fixture_model_id(), None, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+
+        let request = model
+            .seen_messages()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the model must have been called once"));
+        assert!(
+            !request
+                .iter()
+                .any(|message| message.text().contains(jarvis_core::FENCE_OPEN)),
+            "one unmatched word must suppress the procedure, which is the conjunctive rule's deliberate \
+             cost: {request:?}"
+        );
     }
 
     /// Decides a held call's approval and resumes it through the pipeline, as the two routes do.

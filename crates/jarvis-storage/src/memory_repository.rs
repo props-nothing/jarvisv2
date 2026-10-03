@@ -558,6 +558,17 @@ pub async fn find_memory(
 /// the bound forces the caller to state what it needs. `P4-004` will pass a candidate window rather than
 /// everything, and this signature makes that the only shape available.
 ///
+/// # ⭐ Why the order is `unixepoch(created_at)` and not `created_at`
+///
+/// A retrieval read is **windowed**, and these timestamps are RFC 3339 text with the fraction **omitted when
+/// it is zero**, so `'…:20Z'` sorts *after* `'…:20.5Z'` in byte order (`.` is 0x2E, `Z` is 0x5A). A windowed
+/// `ORDER BY created_at DESC` therefore does not return the newest rows: the read that prompted this fix
+/// returned the oldest and newest of three and **dropped the middle one**. This is the `ADR-0034` trap, and
+/// this module already refuses `valid_until` comparisons in SQL for exactly this reason — the ordering needed
+/// the same treatment. `unixepoch()` parses the string into seconds, and `id` breaks a tie so the order is
+/// total. Sub-second ordering is not recovered (`unixepoch` resolves to seconds; `julianday` only to
+/// milliseconds), which is a recorded limit owned by `ADR-0034` rather than something a read can fix.
+///
 /// # Errors
 ///
 /// Returns [`DatabaseError::StoredMemoryInvalid`] when a stored row cannot be decoded, so one corrupt row is
@@ -575,7 +586,7 @@ pub async fn read_workspace_memories(
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
                 retrieval_count, version \
          FROM memories WHERE workspace_id = ?1 AND status <> 'deleted' \
-         ORDER BY created_at DESC, id ASC LIMIT ?2",
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
         workspace_id,
         None,
         limit,
@@ -663,7 +674,7 @@ pub async fn read_retrievable_memories(
            AND source_kind <> 'model_inference' \
            AND (claim_predicate IS NULL OR lower(claim_predicate) NOT IN ( \
                  'objective', 'current_objective', 'pending_call', 'planned_step', 'plan', 'next_action')) \
-         ORDER BY created_at DESC, id ASC LIMIT ?2",
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
         workspace_id,
         None,
         limit,
@@ -695,7 +706,7 @@ pub async fn read_entity_memories(
                 m.version \
          FROM memories m JOIN memory_entities me ON me.memory_id = m.id \
          WHERE m.workspace_id = ?1 AND me.entity_id = ?2 AND m.status <> 'deleted' \
-         ORDER BY m.created_at DESC, m.id ASC LIMIT ?3",
+         ORDER BY unixepoch(m.created_at) DESC, m.id DESC LIMIT ?3",
         workspace_id,
         Some(entity_id),
         limit,
@@ -736,6 +747,13 @@ pub async fn read_all_memories(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<StoredMemory>, DatabaseError> {
+    // **`unixepoch`, and it matters here as much as anywhere.** These timestamps are RFC 3339 text with the
+    // fraction **omitted when it is zero**, so `'…:20Z'` sorts *after* `'…:20.5Z'` in byte order: an export
+    // ordered by `created_at` lists a user's memories in a sequence that is not time order. `id ASC` makes the
+    // text order total, so the pages still **tile** — this is not a row-skipping defect, and claiming one would
+    // overstate it — but the sequence a portability read produces is wrong, which is the same `ADR-0034` trap
+    // the other reads in this file were corrected for. Sub-second order is not recovered: `unixepoch` resolves
+    // to seconds, so two memories written in one second order by `id`, which is arbitrary but stable.
     let rows = sqlx::query(
         "SELECT id, workspace_id, memory_type, content, claim_subject, claim_predicate, claim_object, source_kind, source_locator, \
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
@@ -743,7 +761,7 @@ pub async fn read_all_memories(
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
                 retrieval_count, version \
          FROM memories WHERE workspace_id = ?1 \
-         ORDER BY created_at DESC, id ASC LIMIT ?2 OFFSET ?3",
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2 OFFSET ?3",
     )
     .bind(workspace_id.to_string())
     .bind(i64::from(limit))

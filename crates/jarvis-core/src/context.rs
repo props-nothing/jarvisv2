@@ -167,6 +167,15 @@ pub enum ContextSourceKind {
     RecentConversation,
     /// A stored memory record.
     Memory,
+    /// A stored skill revision: a procedure naming already-granted tools.
+    ///
+    /// Its own kind rather than [`Self::Memory`], because the trust rule differs and that rule is what
+    /// this kind exists to enforce: a skill the **model** authored is `Derived` at best (`ADR-0117` §3),
+    /// while a memory can carry [`ContextTrust::User`] when the person said it. Labelling a self-authored
+    /// procedure `User` would present it as the person's own instruction, which is the self-feeding loop
+    /// the inference boundary exists to prevent — and it would be unrepresentable if a skill reused the
+    /// memory kind, since that kind permits `User`.
+    Skill,
     /// A stored document or chunk.
     Document,
     /// An admitted event.
@@ -190,6 +199,7 @@ impl ContextSourceKind {
             Self::ToolContract => "tool_contract",
             Self::RecentConversation => "recent_conversation",
             Self::Memory => "memory",
+            Self::Skill => "skill",
             Self::Document => "document",
             Self::Event => "event",
             Self::ToolObservation => "tool_observation",
@@ -224,10 +234,20 @@ impl ContextSourceKind {
                 ContextTrust::Derived,
                 ContextTrust::Untrusted,
             ],
-            // A tool observation is untrusted even when the tool is JARVIS's own, because
-            // the content it reports originates outside JARVIS. It is never `User`, because
-            // no user authored it.
-            Self::ToolObservation => &[ContextTrust::Derived, ContextTrust::Untrusted],
+            // **A skill and a tool observation are `Derived` or `Untrusted`, never the user's voice.**
+            //
+            // `ADR-0117` §3 for the skill: a procedure the model authored is `Derived` at best and one an
+            // external document supplied is `Untrusted`, so neither `User` nor policy is possible — a
+            // procedure re-entering a prompt as though the person had asked for it is the self-feeding loop
+            // the inference boundary prevents. This is why `Skill` is its own kind rather than reusing
+            // `Memory`, which permits `User`: a memory can be the person speaking, while a skill is a
+            // *stored procedure*, derived content even when the person wrote it.
+            //
+            // A tool observation is untrusted even when the tool is JARVIS's own, because the content it
+            // reports originates outside JARVIS. It is never `User`, because no user authored it.
+            Self::Skill | Self::ToolObservation => {
+                &[ContextTrust::Derived, ContextTrust::Untrusted]
+            }
             // External content is untrusted by definition; it has no trusted form.
             Self::ExternalContent => &[ContextTrust::Untrusted],
         }
@@ -249,6 +269,7 @@ impl ContextSourceKind {
             self,
             Self::RecentConversation
                 | Self::Memory
+                | Self::Skill
                 | Self::Document
                 | Self::Event
                 | Self::ToolObservation
@@ -276,6 +297,7 @@ impl FromStr for ContextSourceKind {
             "tool_contract" => Ok(Self::ToolContract),
             "recent_conversation" => Ok(Self::RecentConversation),
             "memory" => Ok(Self::Memory),
+            "skill" => Ok(Self::Skill),
             "document" => Ok(Self::Document),
             "event" => Ok(Self::Event),
             "tool_observation" => Ok(Self::ToolObservation),
@@ -1863,6 +1885,77 @@ mod tests {
         assert!(ContextSourceKind::ExternalContent.is_always_untrusted());
         assert!(ContextSourceKind::Memory.is_retrieved());
         assert!(!ContextSourceKind::IdentityPolicy.is_retrieved());
+    }
+
+    /// **⭐⭐ A skill can never be placed as the user's own instruction, whatever its provenance.**
+    ///
+    /// `ADR-0117` §3, and this is the test that makes the kind worth having. A procedure the model authored
+    /// is `Derived` at best; one an external document supplied is `Untrusted`. **Neither `User` nor
+    /// `Authoritative` is in the set**, so a self-authored procedure cannot re-enter a prompt as though the
+    /// person had asked for it — the self-feeding loop the inference boundary exists to prevent.
+    ///
+    /// The distinction from `Memory` is asserted too, and it is the reason a separate kind was added rather
+    /// than reusing the memory one: a memory **does** permit `User`, because the person saying something is
+    /// the user speaking. A skill is a *stored procedure*, which is derived content even when the person
+    /// wrote it — so reusing the memory kind would have made the rule unrepresentable.
+    #[test]
+    fn a_skill_can_never_be_the_users_own_instruction() {
+        let allowed = ContextSourceKind::Skill.allowed_trusts();
+        assert!(
+            !allowed.contains(&ContextTrust::User),
+            "a skill must never be placed as the user speaking: {allowed:?}"
+        );
+        assert!(
+            !allowed.contains(&ContextTrust::Authoritative),
+            "a skill must never be authoritative policy: {allowed:?}"
+        );
+        assert_eq!(
+            allowed,
+            &[ContextTrust::Derived, ContextTrust::Untrusted],
+            "a skill is derived or untrusted, and nothing else"
+        );
+
+        // The control: `Memory` permits `User`, so the two kinds genuinely differ and the assertion above is
+        // not vacuous.
+        assert!(
+            ContextSourceKind::Memory
+                .allowed_trusts()
+                .contains(&ContextTrust::User),
+            "a memory may be the user's own words, which is what makes the skill rule a real restriction"
+        );
+
+        // And the rule is enforced at construction rather than merely tabulated.
+        assert_eq!(
+            ContextItem::new(
+                source(ContextSourceKind::Skill, "skill:1"),
+                ContextTrust::User,
+                Sensitivity::Internal,
+                ContextPriority::Optional,
+                1,
+                InclusionReason::RetrievedMatch,
+                true,
+            )
+            .err(),
+            Some(ContextError::TrustNotAllowedForSource {
+                kind: "skill",
+                trust: "user",
+            }),
+            "constructing a skill item as the user's own instruction must be refused"
+        );
+    }
+
+    /// A skill is a retrieved kind, so it reaches assembly through selection rather than being reserved.
+    #[test]
+    fn a_skill_is_a_retrieved_kind() {
+        assert!(
+            ContextSourceKind::Skill.is_retrieved(),
+            "a skill is selected by relevance, so it must be a retrieved kind"
+        );
+        assert_eq!(ContextSourceKind::Skill.as_str(), "skill");
+        assert_eq!(
+            "skill".parse::<ContextSourceKind>(),
+            Ok(ContextSourceKind::Skill)
+        );
     }
 
     #[test]

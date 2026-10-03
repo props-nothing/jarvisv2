@@ -11,6 +11,7 @@ mod mcp_serve;
 mod memory_service;
 mod run_service;
 mod singleton;
+mod skill_service;
 mod sse;
 mod tool_actor;
 mod tool_pipeline;

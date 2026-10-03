@@ -14,6 +14,7 @@ mod chat;
 mod connector;
 mod memory;
 mod output;
+mod skills;
 mod tools;
 
 use std::{io, path::PathBuf, process::ExitCode};
@@ -50,6 +51,9 @@ async fn main() -> ExitCode {
         Some("logs") => logs(&arguments),
         Some("memory") => memory_command(&arguments).await,
         Some("tools") => tools_command(&arguments).await,
+        // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
+        // stored procedure, which before this verb group was reachable only from a test.
+        Some("skills") => skills_command(&arguments).await,
         Some("connector") => connector::run(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
@@ -67,7 +71,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|tools|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis connector <new|check|items> [...]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|tools|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
@@ -105,6 +109,25 @@ async fn tools_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     tools::run(&client, arguments).await
+}
+
+/// Runs one `jarvis skills` verb over the daemon's HTTP API.
+///
+/// Shares `run_client` with `memory_command` and `tools_command`, for the reason that function's own comment
+/// gives: the skill surface lives on the same API and needs the same four facts, and a second client builder
+/// would be a second place a configured port is read — which is how two commands come to target different
+/// ports.
+async fn skills_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    skills::run(&client, arguments).await
 }
 
 fn json_requested(arguments: &[String]) -> bool {
@@ -486,11 +509,18 @@ fn run_client(root: &[String]) -> Result<api_client::ApiClient, ExitStatus> {
         // Reported rather than worked around: the HTTP transport is off by default because a
         // listening port is a larger surface than an OS-protected pipe, and turning it on is the
         // operator's decision. The message names the exact keys so the fix is one edit.
+        //
+        // ⭐ The environment form spells out `true` because the daemon parses **`bool`**, not a
+        // truthiness rule — so `JARVIS_HTTP_ENABLED=1`, which a reader reasonably tries first, is a
+        // startup failure whose message ("invalid value for configuration environment variable") does
+        // not say what would be valid. A hint that names a value the daemon refuses sends the operator
+        // to the configuration file to look for a problem that is in the hint.
         eprintln!(
             "jarvis: the daemon HTTP API is not enabled for this profile, so runs are unreachable"
         );
         eprintln!(
-            "jarvis: set daemon.http_enabled = true in config.toml (or JARVIS_HTTP_ENABLED=1) and restart jarvisd"
+            "jarvis: set daemon.http_enabled = true in config.toml (or JARVIS_HTTP_ENABLED=true, \
+             which parses as a strict boolean) and restart jarvisd"
         );
         return Err(ExitStatus::Unavailable);
     }

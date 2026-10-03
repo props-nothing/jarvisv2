@@ -100,9 +100,11 @@ pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};
 pub use session::{InvalidSessionField, MAX_SESSION_TITLE_CHARS, SessionChannel, SessionStatus};
 pub use skill::{
-    DropReason, InvalidSkill, MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_DROPPED_FIELD_NAME_CHARS,
-    MAX_SKILL_DROPPED_FIELDS, MAX_SKILL_STEP_CHARS, MAX_SKILL_STEPS, MAX_SKILL_VERSION_CHARS,
-    SkillDroppedField, SkillRevision, SkillRevisionParts, SkillState, SkillStep,
+    DropReason, ExcludedSkill, InvalidSkill, MAX_SELECTED_SKILLS, MAX_SKILL_DESCRIPTION_CHARS,
+    MAX_SKILL_DROPPED_FIELD_NAME_CHARS, MAX_SKILL_DROPPED_FIELDS, MAX_SKILL_STEP_CHARS,
+    MAX_SKILL_STEPS, MAX_SKILL_VERSION_CHARS, SelectedSkill, SkillDroppedField, SkillIneligibility,
+    SkillQuery, SkillRevision, SkillRevisionParts, SkillSelection, SkillSelectionReason,
+    SkillState, SkillStep, estimate_skill_tokens, matches_text, select_skills, skill_context_item,
 };
 pub use testkit::{
     MAX_SCRATCH_REMOVAL_ATTEMPTS, SCRATCH_REMOVAL_INTERVAL, remove_scratch_dir, scratch_tag,

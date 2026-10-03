@@ -584,6 +584,15 @@ pub enum DatabaseError {
         /// Why the transition was refused.
         reason: &'static str,
     },
+    /// A skill write was refused because the counter the caller presented is stale.
+    ///
+    /// Distinct from [`Self::SkillRevisionNotFound`] because the remedy is different and the fact is
+    /// different: a stale counter means the row **exists and changed**, so the caller should re-read and
+    /// retry — while a missing row means the caller named something that is not there. Reporting the first as
+    /// the second sends an operator looking for a deletion that never happened, which is the same
+    /// distinction-with-a-different-remedy rule [`Self::SkillPromotionRefused`] follows.
+    #[error("the skill revision changed since it was read; re-read it and retry")]
+    SkillConflict,
 }
 
 /// An initialized local SQLite database owned by JARVIS.

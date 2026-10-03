@@ -61,6 +61,21 @@ An agent that authors a skill produces a **proposal**, not an active procedure �
 attributable decision that names its approver (`ADR-0043`). An agent that could author a procedure *and*
 promote it would have authored its own effect, which is precisely the boundary `AGENTS.md` draws.
 
+**The second half of that rule — that the approver must not *be* the author — took three slices to
+enforce, and nothing about the gap was visible in the code.** The construction rule refuses a model-authored
+revision recorded `Active`, and the `skill_revisions` schema refuses to store one without a named promoter:
+both were in place, and the author of a proposal could reach `Active` simply by calling `promote` with its own
+identifier as the approver, which satisfied the schema's own `CHECK`. So this paragraph's sentence was quoted
+in the migration, in the constructor, and in `promote`'s doc comment — three descriptions of a boundary and no
+check of it. `SkillRevision::promote` now refuses `approver == created_by_actor_id`, compared after trimming,
+with its own error variant separate from an unattributed promotion because the two remedies differ (name
+somebody, versus have somebody *else* decide). It is deliberately the same rule, at the same scope,
+`ApprovalRequest` applies to a tool call: the approval's rule is unconditional, so a user may not approve a
+request it made either. The two shapes the guard separates are a **run promoting a proposal it authored**
+(refused — this paragraph's boundary) and a **user promoting a proposal a run produced** (the ordinary path,
+and the control its test asserts). **A decision that states a rule as reasoning has described it, not
+enforced it; the enforcement is a `Result`, and this one did not exist.**
+
 **5. A skill is versioned and provenance-carrying, and correction is declared.**
 
 A stored procedure carries its source, its version, and the tools it names at that version. Replacing one is

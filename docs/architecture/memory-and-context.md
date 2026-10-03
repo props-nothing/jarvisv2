@@ -159,6 +159,23 @@ on every call site reading them correctly:
 - **Untrusted content must be marked quoted, and required content must be trusted.** The
   reserved budget is what protects policy from being crowded out, so admitting untrusted
   content to it would be the injection path. It is closed when the item is built.
+  **Recorded limit:** the rule refuses `ContextTrust::is_external()`, which is `Untrusted`
+  alone — **not** every non-authoritative class. So a hand-built item with `Derived` trust
+  and `InclusionReason::ReservedPolicy` (which names no required source kind, since assembly
+  selects policy from configuration rather than from a source) **is** constructible and can
+  draw on the reserved budget. The production routes are unaffected, because a retrieved
+  item is always paired with `RetrievedMatch`, whose implied `Optional` priority refuses it
+  first; the gap is reachable only by constructing an item directly. Stated here rather than
+  left latent, and asserted by a test whose name says it is a limit.
+
+**A skill is its own source kind, and it can never be the user's own voice.** `Skill`
+declares `[Derived, Untrusted]`, with `User` and `Authoritative` deliberately absent — see
+[ADR-0117](../adr/0117-a-skill-is-a-procedure-not-a-permission.md) §3 and the note on
+`Procedural` above. `Memory` permits `User`, because a memory may be the person speaking;
+a skill is a *stored procedure*, derived content even when the person wrote it. Reusing the
+memory kind would have made the restriction unexpressible, since a kind that allows `User`
+cannot refuse it. `SkillRevision`'s own source class still decides which of the two it is: a
+model-authored proposal is `Derived` and one an external document supplied is `Untrusted`.
 
 `assemble_context` returns a manifest that accounts for every offered item as either
 included or excluded-with-reason. An absent item and an item dropped for budget are

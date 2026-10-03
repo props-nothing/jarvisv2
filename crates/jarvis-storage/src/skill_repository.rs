@@ -30,8 +30,9 @@
 //! second.
 
 use jarvis_core::{
-    DropReason, InvalidSkill, MemorySource, MemorySourceKind, MemoryTrust, SkillDroppedField,
-    SkillId, SkillRevision, SkillRevisionParts, SkillState, SkillStep, UtcTimestamp, WorkspaceId,
+    DropReason, InvalidSkill, MemorySource, MemorySourceKind, MemoryTrust, Sensitivity,
+    SkillDroppedField, SkillId, SkillRevision, SkillRevisionParts, SkillState, SkillStep,
+    UtcTimestamp, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -43,7 +44,14 @@ use crate::database::{DatabaseError, SqliteDatabase};
 /// A `dyn Fn` rather than a generic parameter so the public signatures stay readable: nearly every function
 /// here needs it, and a generic would appear in each. The callers are the daemon (which passes
 /// `jarvis_tools::ToolId::new`) and this crate's tests (which pass a function mirroring the same rule).
-pub type ToolValidator<'a> = &'a dyn Fn(&str) -> bool;
+///
+/// # Why it is also `Send + Sync`
+///
+/// These functions are `async` and the daemon calls them from a **spawned task**, so the validator is held
+/// across an `await` and must therefore be shareable across threads. A bare `dyn Fn` is not, and the
+/// omission is invisible until a caller spawns — which is why the bound belongs in the alias rather than
+/// being discovered as a call-site error.
+pub type ToolValidator<'a> = &'a (dyn Fn(&str) -> bool + Send + Sync);
 
 /// A step as it is stored.
 ///
@@ -112,17 +120,18 @@ pub async fn record_skill_revision(
 
     sqlx::query(
         "INSERT INTO skill_revisions (\
-            id, skill_id, workspace_id, version, description, steps, source_kind, source_locator, \
-            source_trust, source_excerpt_hash, state, dropped_fields, promoted_by_actor_id, \
-            promoted_at, supersedes_revision_id, superseded_by_revision_id, run_id, \
-            created_by_actor_id, correlation_id, created_at, updated_at, version_counter\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-            ?19, ?20, ?21, 1)",
+            id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
+            source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
+            promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
+            run_id, created_by_actor_id, correlation_id, created_at, updated_at, version_counter\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+            ?18, ?19, ?20, ?21, ?22, 1)",
     )
     .bind(revision.revision_id().to_string())
     .bind(revision.skill_id().to_string())
     .bind(revision.workspace_id().to_string())
     .bind(revision.version())
+    .bind(revision.sensitivity().as_str())
     .bind(revision.description())
     .bind(steps)
     .bind(revision.source().kind().as_str())
@@ -149,6 +158,50 @@ pub async fn record_skill_revision(
     Ok(())
 }
 
+/// A revision together with the optimistic-locking counter the row holds.
+///
+/// # Why this is a separate type rather than a field on [`SkillRevision`]
+///
+/// `version_counter` is not part of the **procedure** — it is the platform's guard against a lost update, and
+/// it changes for reasons the procedure's content has nothing to do with (a promotion, an archive, a
+/// supersession link). Putting it on the domain value would make it a field a caller could set, and the
+/// control path's whole requirement is that the counter a write presents is one the **store** issued and the
+/// caller merely observed.
+///
+/// # Why the retrieval reads do not return it
+///
+/// `P4-012`'s selection and the executor's context assembly read revisions to **offer** them, and a counter has
+/// no meaning there — the selection is a pure function of the revision set. Widening those reads would put a
+/// value with no reader on a hot path, which is the shape `ADR-0092` records. So the counter arrives through
+/// this type, used by the control surface where the guard is actually presented.
+#[derive(Clone, Debug)]
+pub struct StoredSkillRevision {
+    /// The decoded revision.
+    revision: SkillRevision,
+    /// The counter a control verb must present.
+    version_counter: i64,
+}
+
+impl StoredSkillRevision {
+    /// Returns the decoded revision.
+    #[must_use]
+    pub const fn revision(&self) -> &SkillRevision {
+        &self.revision
+    }
+
+    /// Returns the counter a control verb must present.
+    #[must_use]
+    pub const fn version_counter(&self) -> i64 {
+        self.version_counter
+    }
+
+    /// Consumes the wrapper and returns the revision.
+    #[must_use]
+    pub fn into_revision(self) -> SkillRevision {
+        self.revision
+    }
+}
+
 /// Reads one revision by its own identifier.
 ///
 /// `validate_tool` is the rule a step's tool identifier is checked against — see the module documentation
@@ -163,11 +216,33 @@ pub async fn find_skill_revision(
     revision_id: &str,
     validate_tool: ToolValidator<'_>,
 ) -> Result<SkillRevision, DatabaseError> {
+    Ok(
+        find_skill_revision_state(database, revision_id, validate_tool)
+            .await?
+            .into_revision(),
+    )
+}
+
+/// Reads one revision **with its optimistic-locking counter**, for the control surface.
+///
+/// The read every control verb begins from: a promotion, an archive, or a deletion must present the counter
+/// the caller observed, and this is where it comes from. A missing counter would leave a client no way to
+/// obtain the value it must send, which is the lost update the guard exists to prevent.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::SkillRevisionNotFound`] when no revision has that identifier, and
+/// [`DatabaseError::StoredSkillInvalid`] when a row cannot be decoded.
+pub async fn find_skill_revision_state(
+    database: &SqliteDatabase,
+    revision_id: &str,
+    validate_tool: ToolValidator<'_>,
+) -> Result<StoredSkillRevision, DatabaseError> {
     let row = sqlx::query(
-        "SELECT id, skill_id, workspace_id, version, description, steps, source_kind, \
+        "SELECT id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
                 source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
                 promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
-                run_id, created_by_actor_id, correlation_id, created_at, updated_at \
+                run_id, created_by_actor_id, correlation_id, created_at, updated_at, version_counter \
          FROM skill_revisions WHERE id = ?1",
     )
     .bind(revision_id)
@@ -178,10 +253,85 @@ pub async fn find_skill_revision(
         source,
     })?;
     let row = row.ok_or(DatabaseError::SkillRevisionNotFound)?;
-    decode_revision(&row, validate_tool)
+    let version_counter = row.try_get::<i64, _>("version_counter").map_err(|_| {
+        DatabaseError::StoredSkillInvalid {
+            field: "version_counter",
+        }
+    })?;
+    Ok(StoredSkillRevision {
+        revision: decode_revision(&row, validate_tool)?,
+        version_counter,
+    })
+}
+
+/// Reads a workspace's revisions **with their counters**, newest first, bounded by `limit`.
+///
+/// The listing and export read of the control surface. Ordered by `unixepoch(created_at) DESC, id DESC` for
+/// the reason [`read_usable_skill_revisions`] records in full: the stored form is RFC 3339 text whose
+/// fraction is omitted at a whole second, so byte order and time order disagree, and a tie-break must share
+/// the primary key's direction or it inverts every tie.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredSkillInvalid`] when any row cannot be decoded.
+pub async fn read_workspace_skill_revision_states(
+    database: &SqliteDatabase,
+    workspace_id: &str,
+    limit: u32,
+    validate_tool: ToolValidator<'_>,
+) -> Result<Vec<StoredSkillRevision>, DatabaseError> {
+    read_skill_states(
+        database,
+        "SELECT id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
+                source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
+                promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
+                run_id, created_by_actor_id, correlation_id, created_at, updated_at, version_counter \
+         FROM skill_revisions WHERE workspace_id = ?1 \
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
+        workspace_id,
+        limit,
+        validate_tool,
+    )
+    .await
+}
+
+/// The runner the counter-carrying reads share, so one statement's parameter positions stay in one place.
+async fn read_skill_states(
+    database: &SqliteDatabase,
+    statement: &'static str,
+    workspace_id: &str,
+    limit: u32,
+    validate_tool: ToolValidator<'_>,
+) -> Result<Vec<StoredSkillRevision>, DatabaseError> {
+    let rows = sqlx::query(statement)
+        .bind(workspace_id)
+        .bind(i64::from(limit))
+        .fetch_all(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "read skill revisions with their counters",
+            source,
+        })?;
+    rows.iter()
+        .map(|row| {
+            let version_counter = row.try_get::<i64, _>("version_counter").map_err(|_| {
+                DatabaseError::StoredSkillInvalid {
+                    field: "version_counter",
+                }
+            })?;
+            Ok(StoredSkillRevision {
+                revision: decode_revision(row, validate_tool)?,
+                version_counter,
+            })
+        })
+        .collect()
 }
 
 /// Reads the revisions of one skill, newest first.
+///
+/// The order is `unixepoch(created_at)`, not `created_at`, for the reason [`read_usable_skill_revisions`]
+/// records: the stored form is RFC 3339 text whose fraction is **omitted when zero**, so byte order and time
+/// order disagree within a second.
 ///
 /// # Errors
 ///
@@ -194,11 +344,12 @@ pub async fn read_skill_revisions(
     validate_tool: ToolValidator<'_>,
 ) -> Result<Vec<SkillRevision>, DatabaseError> {
     let rows = sqlx::query(
-        "SELECT id, skill_id, workspace_id, version, description, steps, source_kind, \
+        "SELECT id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
                 source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
                 promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
                 run_id, created_by_actor_id, correlation_id, created_at, updated_at \
-         FROM skill_revisions WHERE workspace_id = ?1 AND skill_id = ?2 ORDER BY created_at DESC",
+         FROM skill_revisions WHERE workspace_id = ?1 AND skill_id = ?2 \
+         ORDER BY unixepoch(created_at) DESC, id DESC",
     )
     .bind(workspace_id)
     .bind(skill_id)
@@ -220,23 +371,63 @@ pub async fn read_skill_revisions(
 /// caller cannot use is not a choice, and listing it invites a use that policy would refuse. An operator who
 /// wants the whole picture reads [`read_workspace_skill_revisions`].
 ///
+/// # Why `limit` is a parameter rather than the newest rows being read unbounded
+///
+/// A caller assembling a prompt runs this on **every model call**, so an unbounded read grows with the
+/// user's procedure library and makes the cost of one request a function of their history. The bound is what
+/// makes that cost a constant, and it is a **candidate window** rather than a result set: the selection rule
+/// — not this read — decides which candidates are usable, so the window is deliberately larger than the
+/// number of skills that may be offered.
+///
+/// # ⭐ Why the order is `unixepoch(created_at) DESC, id DESC` and not `created_at DESC`
+///
+/// Two defects, and the second was invisible until the first was fixed.
+///
+/// **1. Byte order and time order disagree.** `created_at` is RFC 3339 text and [`UtcTimestamp`] **omits the
+/// fraction at a whole second**, so in byte order `'…:20Z'` sorts *after* `'…:20.5Z'` (`'Z'` is 0x5A, `'.'`
+/// is 0x2E). A windowed `ORDER BY created_at DESC` therefore does **not** return the newest rows: this read's
+/// own test saw it return the oldest and the newest of three and **drop the middle one**. This is the
+/// lexicographic trap `ADR-0034` records, whose conclusion is that these timestamps must not be compared as
+/// text in SQL. `unixepoch()` parses the string into seconds, so ties are compared as instants.
+///
+/// **2. ⭐ A DESC primary with an ASC tie-break orders a tie OLDEST-first.** `unixepoch` resolves to whole
+/// seconds, so rows inside one second tie, and `id ASC` then put the **earliest** of them first — the exact
+/// opposite of what a newest-first read is for. Adding the tie-break to make the order *total* introduced a
+/// second ordering defect, and only a fixture with two rows in one second could see it. The tie-break
+/// descends because **it is part of the same ordering**, not a separate concern: an ordering has one
+/// direction, and mixing directions within one key inverts every tie.
+///
+/// # The sub-second limit, recorded rather than hidden
+///
+/// `unixepoch()` resolves to **whole seconds**, so two revisions created within one second tie on this key and
+/// the `id` tie-break decides. These identifiers are `UUIDv7`, whose first 48 bits are a millisecond
+/// timestamp, so `id DESC` orders two same-second rows by their creation **millisecond** — and a real write
+/// gives the identifier and `created_at` the same instant, so the tie-break agrees with the row rather than
+/// overriding it. Two revisions differing by less than a millisecond would be ordered by the id's random tail,
+/// which is arbitrary; that is the residual imprecision, and genuine nanosecond ordering needs an **integer
+/// nanoseconds column** — a migration across every timestamp column, which is `ADR-0034`'s decision rather
+/// than something to slip into this read. What matters for a candidate window is that it keeps the newest rows
+/// and drops the oldest; it does that.
+///
 /// # Errors
 ///
 /// Returns [`DatabaseError::StoredSkillInvalid`] when any row cannot be decoded.
 pub async fn read_usable_skill_revisions(
     database: &SqliteDatabase,
     workspace_id: &str,
+    limit: u32,
     validate_tool: ToolValidator<'_>,
 ) -> Result<Vec<SkillRevision>, DatabaseError> {
     let rows = sqlx::query(
-        "SELECT id, skill_id, workspace_id, version, description, steps, source_kind, \
+        "SELECT id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
                 source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
                 promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
                 run_id, created_by_actor_id, correlation_id, created_at, updated_at \
          FROM skill_revisions WHERE workspace_id = ?1 AND state = 'active' \
-         ORDER BY created_at DESC",
+         ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
     )
     .bind(workspace_id)
+    .bind(i64::from(limit))
     .fetch_all(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -262,11 +453,11 @@ pub async fn read_workspace_skill_revisions(
     validate_tool: ToolValidator<'_>,
 ) -> Result<Vec<SkillRevision>, DatabaseError> {
     let rows = sqlx::query(
-        "SELECT id, skill_id, workspace_id, version, description, steps, source_kind, \
+        "SELECT id, skill_id, workspace_id, version, sensitivity, description, steps, source_kind, \
                 source_locator, source_trust, source_excerpt_hash, state, dropped_fields, \
                 promoted_by_actor_id, promoted_at, supersedes_revision_id, superseded_by_revision_id, \
                 run_id, created_by_actor_id, correlation_id, created_at, updated_at \
-         FROM skill_revisions WHERE workspace_id = ?1 ORDER BY created_at DESC",
+         FROM skill_revisions WHERE workspace_id = ?1 ORDER BY unixepoch(created_at) DESC, id DESC",
     )
     .bind(workspace_id)
     .fetch_all(database.pool())
@@ -295,14 +486,23 @@ pub async fn read_workspace_skill_revisions(
 /// refused. Calling it before the write means the domain is the enforcer and the SQL guard is defence in
 /// depth against concurrency, rather than a second copy of a rule that could disagree.
 ///
+/// # Why `expected_version` is required
+///
+/// A promotion is an **attributable decision** (`ADR-0117` §4, `ADR-0043`), and a decision taken against a
+/// revision the approver has not read is not one — the approver would be approving text that has since
+/// changed. The counter is what makes that expressible, and it is required rather than optional because a
+/// caller that has not read the revision has nothing to decide about.
+///
 /// # Errors
 ///
 /// Returns [`DatabaseError::SkillRevisionNotFound`] when no revision has that identifier,
-/// [`DatabaseError::SkillPromotionRefused`] when the revision is not a proposal (already active, archived, or
-/// promoted by a concurrent writer), and [`DatabaseError::StoredSkillInvalid`] when the approver is unusable.
+/// [`DatabaseError::SkillConflict`] when the counter does not match (a concurrent writer changed the row),
+/// [`DatabaseError::SkillPromotionRefused`] when the revision is not a proposal, and
+/// [`DatabaseError::StoredSkillInvalid`] when the approver is unusable.
 pub async fn promote_skill_revision(
     database: &SqliteDatabase,
     revision_id: &str,
+    expected_version: i64,
     approver_actor_id: &str,
     at: UtcTimestamp,
     validate_tool: ToolValidator<'_>,
@@ -312,8 +512,32 @@ pub async fn promote_skill_revision(
         current
             .promote(approver_actor_id, at)
             .map_err(|error: InvalidSkill| match error {
-                InvalidSkill::SelfReference => DatabaseError::SkillPromotionRefused {
-                    reason: "the approver was empty",
+                // **The two promotion refusals keep their own reasons**, because the remedies differ: an
+                // unattributed promotion needs an approver named, while a self-approval needs a *different*
+                // actor to decide. Collapsing them into one message would send an operator looking for a
+                // missing field that is not missing.
+                InvalidSkill::PromotionUnattributed => DatabaseError::SkillPromotionRefused {
+                    reason: "no approver was named",
+                },
+                InvalidSkill::PromotionSelfApproval => DatabaseError::SkillPromotionRefused {
+                    reason: "the approver is the revision's own author",
+                },
+                InvalidSkill::ApproverTooLong => DatabaseError::StoredSkillInvalid {
+                    field: "approver_actor_id",
+                },
+                // ⭐ The state guard keeps its **own reason**, because the remedy is a transition rather than a
+                // field: an `Active` revision needs no decision, and an `Archived` one returns through
+                // `restore`. Reporting `StoredSkillInvalid` here would send an operator to inspect a row that
+                // is perfectly well formed.
+                InvalidSkill::WrongState { state, .. } => DatabaseError::SkillPromotionRefused {
+                    reason: match state {
+                        SkillState::Active => "the revision is already active",
+                        SkillState::Archived => "the revision is archived; restore it instead",
+                        // Unreachable: `promote` refuses everything that is not `Proposed`, so the state
+                        // carried here is never a proposal. Spelled out rather than wildcarded so adding a
+                        // state forces this arm to be reconsidered.
+                        SkillState::Proposed => "the revision is not a proposal",
+                    },
                 },
                 other => DatabaseError::StoredSkillInvalid {
                     field: match other {
@@ -326,11 +550,12 @@ pub async fn promote_skill_revision(
     let updated = sqlx::query(
         "UPDATE skill_revisions SET state = 'active', promoted_by_actor_id = ?1, promoted_at = ?2, \
             updated_at = ?2, version_counter = version_counter + 1 \
-         WHERE id = ?3 AND state = 'proposed'",
+         WHERE id = ?3 AND state = 'proposed' AND version_counter = ?4",
     )
     .bind(promoted.promoted_by_actor_id())
     .bind(at.to_string())
     .bind(revision_id)
+    .bind(expected_version)
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -338,26 +563,52 @@ pub async fn promote_skill_revision(
         source,
     })?;
 
-    // Zero rows means the guard refused it: the row is no longer a proposal, which is either a second
-    // promotion or a concurrent writer that got there first. Both are reported rather than treated as
-    // success, because the caller asked for a transition that did not happen.
+    // Zero rows has two causes, and the caller has to be told which: a stale counter is a re-read and a
+    // retry, while a revision that is no longer a proposal is not. Resolved by a read rather than by
+    // guessing, which is the rule the run repository's guarded writes follow.
     if updated.rows_affected() == 0 {
-        return Err(DatabaseError::SkillPromotionRefused {
-            reason: "the revision is not a proposal, so it was not promoted",
-        });
+        return Err(classify_skill_write_failure(database, revision_id, expected_version).await);
     }
     Ok(promoted)
+}
+
+/// Resolves why a guarded skill write affected no rows.
+///
+/// The two causes have different remedies, so collapsing them into one error sends an operator to the wrong
+/// place: `SkillConflict` means the row **exists and changed**, so the answer is to re-read it, while
+/// `SkillRevisionNotFound` means the caller named something that is not there. `SkillTransitionRefused`
+/// covers the third case — the row is present, unchanged, and in a state that does not accept the transition
+/// — which is a fact about the revision rather than about a race.
+async fn classify_skill_write_failure(
+    database: &SqliteDatabase,
+    revision_id: &str,
+    expected_version: i64,
+) -> DatabaseError {
+    // The validator is permissive here on purpose: this function asks about a **counter**, and a row whose
+    // steps fail to decode still answers that question. A stricter validator would report every such write as
+    // a conflict rather than as the decoding problem it is, which is the defect this avoids.
+    match find_skill_revision_state(database, revision_id, &|_| true).await {
+        Ok(stored) if stored.version_counter() != expected_version => DatabaseError::SkillConflict,
+        // Present, unchanged, and refusing the transition: the state guard is the reason, and the caller's
+        // own verb reports which transition it wanted.
+        Ok(_) => DatabaseError::SkillTransitionRefused {
+            reason: "the revision is not in the state this transition requires",
+        },
+        Err(error) => error,
+    }
 }
 
 /// Sets a revision aside, retaining it for audit.
 ///
 /// # Errors
 ///
-/// Returns [`DatabaseError::SkillRevisionNotFound`], or [`DatabaseError::SkillTransitionRefused`] when the
-/// revision is already archived — a redundant transition is refused rather than reported as success.
+/// Returns [`DatabaseError::SkillRevisionNotFound`], [`DatabaseError::SkillConflict`] when the counter does
+/// not match, or [`DatabaseError::SkillTransitionRefused`] when the revision is already archived — a redundant
+/// transition is refused rather than reported as success.
 pub async fn archive_skill_revision(
     database: &SqliteDatabase,
     revision_id: &str,
+    expected_version: i64,
     at: UtcTimestamp,
     validate_tool: ToolValidator<'_>,
 ) -> Result<SkillRevision, DatabaseError> {
@@ -367,7 +618,7 @@ pub async fn archive_skill_revision(
         .map_err(|_| DatabaseError::SkillTransitionRefused {
             reason: "the revision is already archived",
         })?;
-    write_state(database, revision_id, "archived", at).await?;
+    write_state(database, revision_id, "archived", expected_version, at).await?;
     Ok(archived)
 }
 
@@ -375,11 +626,12 @@ pub async fn archive_skill_revision(
 ///
 /// # Errors
 ///
-/// Returns [`DatabaseError::SkillRevisionNotFound`], or [`DatabaseError::SkillTransitionRefused`] when the
-/// revision is not archived.
+/// Returns [`DatabaseError::SkillRevisionNotFound`], [`DatabaseError::SkillConflict`] when the counter does
+/// not match, or [`DatabaseError::SkillTransitionRefused`] when the revision is not archived.
 pub async fn restore_skill_revision(
     database: &SqliteDatabase,
     revision_id: &str,
+    expected_version: i64,
     at: UtcTimestamp,
     validate_tool: ToolValidator<'_>,
 ) -> Result<SkillRevision, DatabaseError> {
@@ -389,28 +641,38 @@ pub async fn restore_skill_revision(
         .map_err(|_| DatabaseError::SkillTransitionRefused {
             reason: "the revision is not archived",
         })?;
-    write_state(database, revision_id, restored.state().as_str(), at).await?;
+    write_state(
+        database,
+        revision_id,
+        restored.state().as_str(),
+        expected_version,
+        at,
+    )
+    .await?;
     Ok(restored)
 }
 
 /// Writes one revision's state and the counter, guarded by the state it must be leaving.
 ///
-/// Shared by archive and restore, which differ only in the target state and the guard. The guard is passed
-/// as the state the transition starts from, so the `WHERE` refuses the same races `promote_skill_revision`'s
-/// does.
+/// Shared by archive and restore, which differ only in the target state. The guard is the same one
+/// `promote_skill_revision` uses: the **state** the transition starts from, so a concurrent writer that got
+/// there first is refused, plus the **counter** the caller observed, so a writer that changed something else
+/// about the row is refused too. Both are in the `WHERE`, so the decision and the write cannot disagree.
 async fn write_state(
     database: &SqliteDatabase,
     revision_id: &str,
     state: &str,
+    expected_version: i64,
     at: UtcTimestamp,
 ) -> Result<(), DatabaseError> {
     let updated = sqlx::query(
         "UPDATE skill_revisions SET state = ?1, updated_at = ?2, version_counter = version_counter + 1 \
-         WHERE id = ?3",
+         WHERE id = ?3 AND version_counter = ?4",
     )
     .bind(state)
     .bind(at.to_string())
     .bind(revision_id)
+    .bind(expected_version)
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -418,7 +680,7 @@ async fn write_state(
         source,
     })?;
     if updated.rows_affected() == 0 {
-        return Err(DatabaseError::SkillRevisionNotFound);
+        return Err(classify_skill_write_failure(database, revision_id, expected_version).await);
     }
     Ok(())
 }
@@ -429,11 +691,25 @@ async fn write_state(
 /// it replaced through its `supersedes` at insert time; this writes the forward direction so a read of the
 /// predecessor finds its replacement without scanning every later revision.
 ///
+/// # ⭐ Both ends must belong to the SAME skill, and this is the only layer that can say so
+///
+/// A supersession is a statement about **one procedure's history**, so a chain that leaves its own procedure
+/// is not a longer chain — it is a wrong answer to "what replaced this". The rule needs **both rows**, which is
+/// why it cannot live in [`SkillRevision`]: the domain holds one revision and has no way to ask whether a
+/// given `SkillId` names a revision of the same procedure. Its own test records that limit explicitly
+/// (`the_domain_cannot_vouch_for_a_predecessor_and_says_so`).
+///
+/// The existing successor check is what made this the **missing** half rather than an absent one:
+/// `acknowledge_skill_revision` confirms the successor **exists**, and nothing confirmed it was **related**.
+/// A dangling pointer is refused; a pointer to another procedure is accepted and looks identical from
+/// either end.
+///
 /// # Errors
 ///
 /// Returns [`DatabaseError::SkillRevisionNotFound`] when either revision is missing — **both** are checked,
 /// because a dangling `superseded_by` would make the chain unwalkable and the failure would only surface
-/// when something tried to follow it.
+/// when something tried to follow it — and [`DatabaseError::SkillTransitionRefused`] when the two revisions
+/// belong to different skills, or when they are the same revision.
 pub async fn supersede_skill_revision(
     database: &SqliteDatabase,
     replaced_revision_id: &str,
@@ -447,6 +723,39 @@ pub async fn supersede_skill_revision(
     // The successor is checked first, so a missing successor does not leave the predecessor already
     // pointing at a row that does not exist.
     acknowledge_skill_revision(database, successor_revision_id).await?;
+
+    // **The relationship, read as one statement.** Both rows must share a `skill_id`, and this is a single
+    // query rather than a read of each and a comparison in Rust: the rule is a property of the **pair**, so
+    // expressing it as two round trips would leave a window in which either row could be written, and the
+    // comparison would decide something the database no longer agrees with.
+    //
+    // The count is **2** — both rows, not one. The predicate selects the rows whose skill is the
+    // *predecessor's*, so a successor from another procedure is simply absent from that count. Comparing
+    // against 1 would accept exactly the cross-procedure pair this exists to refuse: the predecessor always
+    // matches its own skill, so a count of at least 1 is guaranteed and decides nothing.
+    let related = sqlx::query(
+        "SELECT COUNT(*) AS matching FROM skill_revisions \
+         WHERE id IN (?1, ?2) AND skill_id = (SELECT skill_id FROM skill_revisions WHERE id = ?1)",
+    )
+    .bind(replaced_revision_id)
+    .bind(successor_revision_id)
+    .fetch_one(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "check a skill supersession relates one procedure",
+        source,
+    })?;
+    let matching: i64 = related
+        .try_get("matching")
+        .map_err(|_| DatabaseError::Sqlite {
+            operation: "check a skill supersession relates one procedure",
+            source: sqlx::Error::RowNotFound,
+        })?;
+    if matching != 2 {
+        return Err(DatabaseError::SkillTransitionRefused {
+            reason: "the two revisions belong to different procedures, so the chain would leave its skill",
+        });
+    }
 
     let updated = sqlx::query(
         "UPDATE skill_revisions SET superseded_by_revision_id = ?1, version_counter = version_counter + 1 \
@@ -485,6 +794,87 @@ async fn acknowledge_skill_revision(
     row.ok_or(DatabaseError::SkillRevisionNotFound).map(|_| ())
 }
 
+/// Deletes one revision outright, guarded by the counter the caller observed.
+///
+/// # Why a skill's deletion is final, unlike a memory's
+///
+/// A memory's deletion writes a **tombstone** so a later automatic ingest cannot resurrect the claim. A skill
+/// has no ingest: it is written by an explicit request, so there is no process the user did not run that could
+/// bring it back. A tombstone here would be a row nothing consults — the "value with a producer and no reader"
+/// shape this repository removes wherever it finds it — so the row is deleted and the receipt says so.
+///
+/// # Why the guard is on the counter rather than on a state
+///
+/// `archive` is the reversible verb and `forget` is the final one, so a deletion is allowed from **any** state:
+/// a proposal nobody wants, an active procedure being removed, and an archived revision being discarded are
+/// all legitimate. What is not legitimate is deleting a revision the caller has not read, which is what the
+/// counter guards — the same rule a correction follows, and the reason it is required rather than optional.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::SkillRevisionNotFound`] when no revision has that identifier,
+/// [`DatabaseError::SkillConflict`] when the counter does not match, and
+/// [`DatabaseError::SkillTransitionRefused`] when the revision cannot be removed without breaking a chain it
+/// is part of.
+pub async fn delete_skill_revision(
+    database: &SqliteDatabase,
+    revision_id: &str,
+    expected_version: i64,
+) -> Result<(), DatabaseError> {
+    // ⭐ **A revision another revision points at cannot simply vanish.** Both supersession columns are
+    // `REFERENCES ... ON DELETE SET NULL`, so the foreign keys would let the delete succeed and quietly blank
+    // the surviving row's link — leaving a successor that declares nothing about what it replaced, or a
+    // predecessor with no way to find its replacement. `ADR-0117` §5's rule is that replacement is
+    // **declared**, so erasing one leg of a declaration is worse than refusing the deletion: the caller gets a
+    // reason and can delete the pair deliberately.
+    //
+    // Read in the same statement as the guard so the decision and the delete cannot disagree about what
+    // existed.
+    let blocked = sqlx::query(
+        "SELECT COUNT(*) AS linked FROM skill_revisions \
+         WHERE (supersedes_revision_id = ?1 OR superseded_by_revision_id = ?1) AND id <> ?1",
+    )
+    .bind(revision_id)
+    .fetch_one(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "check a skill revision's supersession links",
+        source,
+    })?;
+    let linked: i64 = blocked
+        .try_get("linked")
+        .map_err(|_| DatabaseError::StoredSkillInvalid {
+            field: "supersession_links",
+        })?;
+    if linked > 0 {
+        return Err(DatabaseError::SkillTransitionRefused {
+            reason: "another revision declares a supersession with this one, so deleting it would erase one leg of that declaration",
+        });
+    }
+
+    let deleted = sqlx::query("DELETE FROM skill_revisions WHERE id = ?1 AND version_counter = ?2")
+        .bind(revision_id)
+        .bind(expected_version)
+        .execute(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "delete a skill revision",
+            source,
+        })?;
+
+    if deleted.rows_affected() == 1 {
+        return Ok(());
+    }
+    // Zero rows has two causes and the caller must be told which: a stale counter is a retry, while a missing
+    // row is not. Resolved by a read rather than by guessing, which is the rule the run repository's guarded
+    // writes follow — a caller that lost a race must re-read rather than conclude deletion.
+    match find_skill_revision_state(database, revision_id, &|_| true).await {
+        Ok(_) => Err(DatabaseError::SkillConflict),
+        Err(DatabaseError::SkillRevisionNotFound) => Err(DatabaseError::SkillRevisionNotFound),
+        Err(other) => Err(other),
+    }
+}
+
 /// Decodes one stored row, **re-applying every rule the domain can state**.
 ///
 /// The `CHECK` constraints are the first enforcer and this is the second, so a row that arrived some other
@@ -507,6 +897,13 @@ fn decode_revision(
 
     let source = decode_source(row)?;
 
+    let sensitivity: Sensitivity =
+        text("sensitivity")?
+            .parse()
+            .map_err(|_| DatabaseError::StoredSkillInvalid {
+                field: "sensitivity",
+            })?;
+
     let state: SkillState = text("state")?
         .parse()
         .map_err(|_| DatabaseError::StoredSkillInvalid { field: "state" })?;
@@ -521,6 +918,7 @@ fn decode_revision(
         description: text("description")?,
         steps,
         source,
+        sensitivity,
         state,
         supersedes: row
             .try_get::<Option<String>, _>("supersedes_revision_id")

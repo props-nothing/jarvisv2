@@ -3092,14 +3092,224 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       drop vocabulary is the seam a format would plug into. Also: there is **no creation surface** (no route
       and no tool writes a skill, so a skill is reachable only from a test), which `P4-013` owns; `steps` and
       `dropped_fields` are JSON columns with `json_valid` bounds rather than child tables, recorded in the
-      migration with the reasoning; and no `P4-012` retrieval selection exists, so nothing selects a skill by
-      relevance to a task.
+      migration with the reasoning; and no `P4-012` retrieval selection existed at the time of this slice —
+      selection and envelope inclusion were delivered later (see `P4-012`), and **the execution path still does
+      not**, so nothing has run a skill's steps and nothing in the daemon calls `select_skills`.
 - [ ] `P4-012` Retrieve and use a skill: selection by relevance to the task, inclusion in the context envelope
       as derived content, and an execution path in which **every step is an ordinary tool request** through
       the full gateway. There is deliberately **no "skill execution" path**, so a step whose grant was revoked
       between load and run must refuse at execution — the check can only be an execution-time one.
-- [ ] `P4-013` Add skill inspection and control: list, inspect (what it is, what it names, its source), correct,
+      **SELECTION AND ENVELOPE INCLUSION ARE DELIVERED; THE EXECUTION PATH IS NOT, AND THE REMAINDER IS NAMED
+      AT THE END RATHER THAN FOLDED INTO A CHECKMARK.**
+      **Delivered:** `jarvis-core::skill` gains `SkillQuery`, `SkillIneligibility`, `ExcludedSkill`,
+      `SelectedSkill`, `SkillSelection`, `SkillSelectionReason`, `select_skills`, `matches_text`,
+      `estimate_skill_tokens`, and `skill_context_item`; `SkillRevision` gains a **`sensitivity`** (with the
+      migration column, repository threading, decode rule, and a `CHECK`); and `ContextSourceKind` gains
+      **`Skill`** so a procedure's trust rule is representable.
+      **⭐⭐ THE `Skill` SOURCE KIND EXISTS BECAUSE THE RULE IS OTHERWISE UNREPRESENTABLE.** Its allowed trusts
+      are `[Derived, Untrusted]` — **`User` and `Authoritative` are deliberately absent** — because
+      `ADR-0117` §3 says a self-authored procedure must not re-enter a prompt as the person's own
+      instruction. **`Memory` does permit `User`**, since a memory can be the person speaking, so reusing the
+      memory kind would have made the skill rule unexpressible: a table that allows `User` cannot refuse it.
+      The rule is enforced at construction (a test builds a skill item with `User` trust and asserts
+      `TrustNotAllowedForSource`), and falsified — widening the arm to include `User` fails the test.
+      **⭐ A SKILL IS NEVER POLICY, EVEN WHEN THE PERSON WROTE IT.** `skill_context_item` maps
+      `MemoryTrust::Authoritative` **down** to `ContextTrust::Derived`, which is the one place a skill's rule
+      is *stricter* than a memory's: a procedure the person wrote is their earlier writing rather than the
+      person speaking now. Both directions are asserted, so an implementation that mapped everything to
+      `Untrusted` fails too — the distinction between "trusted enough to be derived" and "untrusted" is real.
+      **⭐⭐ MY FIRST RANKING DESIGN WAS INCOHERENT, AND THE TEST THAT REPLACED IT RECORDS WHY.** The first
+      `select_skills` ranked by **how many query words a revision matched**. That cannot work: eligibility
+      already requires **every** query word to appear, so every offered skill matches the whole query and every
+      score is identical. **A conjunctive filter cannot also be graded.** The design only appeared to function
+      because the test exercising it used a query a *candidate* did not fully match — which the eligibility
+      rule refuses outright, so the case could never arise through the function at all. The ordering now
+      answers the question a caller actually has when two procedures both apply: **which is current**. So
+      revisions order by **creation instant, newest first**, with the identifier as a tie-break so the order is
+      total and stable across runs. A memory is still ranked by nine weighted signals and that remains right
+      *there*: a claim's eligibility is a set of **floors** rather than a conjunction, so "which claim is most
+      relevant" is genuinely graded. **The two retrievals differ because their questions differ.**
+      **⭐ THE CLASSIFICATION IS WHAT MAKES THE DISCLOSURE RULE ENFORCEABLE.** `is_eligible` refuses a revision
+      above the destination's ceiling and names **both** values in the reason, and the projection feeds the
+      same field into `ContextItem`, so `assemble_context` applies it a second time. The schema column is
+      `NOT NULL` with **no default**, deliberately: a default would be a value nobody chose applied to every
+      pre-existing row, and the only safe default — the most restrictive — would silently refuse to offer every
+      skill written before the column existed. A round-trip test asserts each of the four levels survives,
+      because a column that silently defaulted would make the rule refuse nothing.
+      **⭐⭐ THREE GUARDS AND A PRE-EXISTING LIMIT, FOUND BY ASKING WHERE THE RULE WAS REACHED.** Writing
+      `a_skill_cannot_be_required_context` I expected `RequiredMustBeTrusted`, and the test reported, in order:
+      `PriorityReasonMismatch` (a retrieved reason implies `Optional`), then `ReasonSourceMismatch` (three of
+      the four required-implying reasons name their own source kind), then — for `ReservedPolicy`, which names
+      no kind — **`None`, meaning the item is constructible**. The cause is that `RequiredMustBeTrusted` fires
+      on `ContextTrust::is_external()`, so it refuses **`Untrusted` rather than every non-authoritative
+      class**. A hand-built `Derived`-trust `ReservedPolicy` item on a skill source therefore **can** reserve
+      policy budget for a procedure. **That is a pre-existing limit in `context.rs`, not one this slice
+      introduced** — the identical construction works with a `Memory` source — and it is now an **asserted
+      finding** rather than a latent surprise, with the production route recorded as unaffected
+      (`skill_context_item` always supplies `RetrievedMatch`). **Asserting the behaviour found beats asserting
+      the behaviour assumed**, and the assumed version would have left the code looking stricter than it is.
+      Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` (adds 16 selection and
+      projection tests in `jarvis-core`, 2 repository tests, and 2 context-kind tests; `jarvis-core` at 278,
+      `jarvis-storage` at 217), `cargo deny check` ok.
+      **⚠ A STALE BINARY MADE THE PHASE-1 GATE FAIL WITH A MIGRATION ERROR.** Editing migration `0010` after a
+      previous `cargo build` left `jarvisd` embedding the **old checksum**, so SQLx's checksum guard refused to
+      re-migrate the database the stale daemon had written (`open database: failed to migrate the SQLite
+      database`). `cargo build --workspace` resolved it, and the gate went green with no code change.
+      **SQLx checksums embedded migrations, so editing an applied one without rebuilding every binary that
+      embeds it produces a failure that reads like a schema bug** — the recorded trap, met again.
+      **⭐⭐⭐ A PROMOTION BY THE REVISION'S OWN AUTHOR IS REFUSED, AND THAT RULE HAD NO ENFORCEMENT AT ALL
+      UNTIL IT WAS WRITTEN.** `ADR-0117` §4 states the boundary in words — *"an agent that could author a
+      procedure and promote it would have authored its own effect"* — and the schema states half of it as a
+      `CHECK` (a model-authored **active** row must record who promoted it). **Neither was enforcement of the
+      second half.** The construction check refuses a model-authored revision *recorded* `Active`, but its own
+      author could simply call `promote` to put it there, and the `CHECK` was satisfied because the row now
+      named an approver — the author. `SkillRevision::promote` now refuses `approver == created_by_actor_id`
+      with `InvalidSkill::PromotionSelfApproval`, and refuses a blank approver with
+      `InvalidSkill::PromotionUnattributed` — **separate variants on purpose**, because the remedies differ: one
+      needs an approver *named*, the other needs a *different* actor to decide, and collapsing them sends an
+      operator looking for a missing field that is not missing. The comparison happens **after trimming**, and a
+      test asserts a whitespace-padded self-promotion is still refused, because the guard exists to be bypassed
+      and a padded string is the first bypass an author would reach for.
+      **This is deliberately the same rule `jarvis_core::ApprovalRequest` applies to a tool call**
+      (`InvalidApprovalField::SelfApproval`), including its scope: there the rule is **unconditional**, so a
+      *user* cannot answer an approval they requested either — checked against `approval.rs` rather than
+      assumed before mirroring it, because a guard copied at the wrong scope is a guard that refuses the
+      legitimate case. `promoted_by_actor_id` is also bounded by `MAX_APPROVER_ID_CHARS` — **the `decided_by`
+      column's own bound**, imported rather than restated — because a promotion *is* an approval and one
+      identity must not have two lengths; a domain that accepted any length would report a revision as valid
+      and then fail on write. The bound test asserts **at** the limit is accepted and **one past** it is not, so
+      an implementation that refused every approver fails the first half rather than passing on the second.
+      **⭐ EVERY TRANSITION REACHES THE DOMAIN, WHICH IS WHY THE GUARD CANNOT BE BYPASSED FROM STORAGE.**
+      `promote_skill_revision`, `archive_skill_revision`, `restore_skill_revision`, and
+      `supersede_skill_revision` each `find` the row, call the domain transition, and only then write — so no
+      repository function can move a revision to `Active` without constructing the value that holds the rule.
+      The `UPDATE`'s own `WHERE state = 'proposed'` is **defence in depth against a concurrent writer**, not a
+      second copy of the rule, which is the shape this repository prefers: the domain decides, the schema and
+      the predicate catch a race.
+      **⚠ THE LESSON IS THE `ADR-0035` SHAPE, MET AGAIN: a decision that names a rule in prose is not
+      enforcement.** §4's words were quoted in the migration, in the constructor, and in `promote`'s own
+      doc comment — three places that *described* the boundary — while nothing anywhere *checked* it. **Read
+      each boundary a decision states as reasoning and ask which check owns it**; a sentence explaining why
+      something is forbidden is evidence that it was considered, never evidence that it is refused.
+      **⭐⭐ `select_skills` IS NOW CALLED BY THE DAEMON, AND A STORED PROCEDURE REACHES A REAL PROMPT
+      FENCED.** `apps/jarvisd`'s `assemble_context_messages` reads the run's own workspace's **active**
+      revisions through `read_usable_skill_revisions`, builds a `SkillQuery` whose **text is the objective**
+      and whose **destination is the model's placement ceiling**, selects, and offers each as an item from
+      `skill_context_item` at **`Optional`** priority — a procedure that does not fit must be dropped rather
+      than failing the run, exactly as a conversation turn is. The message builder renders each included
+      skill's **prose and every step instruction** inside the same fence the memories use, under the same
+      introduction, because a procedure is retrieved content for the same reason a claim is (`ADR-0117` §3);
+      the introduction's own promise — *"the policy and the request win"* — is exactly what a procedure
+      needs. The run event's summary gained `skills_offered`/`skills_included`, so "why was this procedure not
+      used" is answerable from the record without storing the procedure. Deliberately **no `skills_altered`**:
+      a count that is always zero is a field a reader learns to skip.
+      **⭐⭐⭐ THREE DEFECTS FOUND BY WIRING IT, AND THE THIRD WAS INTRODUCED BY FIXING THE FIRST.** (1)
+      **`ORDER BY created_at` is wrong for these timestamps** — they are RFC 3339 text and a whole second
+      **omits its fraction**, so `'…:20Z'` sorts *after* `'…:20.5Z'` (`.` is 0x2E, `Z` is 0x5A). With a window
+      applied the read dropped a **middle** row and kept the oldest. (2) **`julianday` does not fix it** — it
+      resolves to milliseconds, so the boundary case still ties or mis-orders. (3) **⭐⭐ THE TIE-BREAK'S
+      DIRECTION WAS WRONG, AND IT ONLY APPEARS ONCE (1) IS FIXED.** `ORDER BY unixepoch(created_at) DESC, id
+      ASC` orders a **tie** — two rows inside one second — **oldest-first**, which is the exact opposite of
+      what a newest-first read is for. It was introduced by adding the tie-break to make the order total, and
+      no fixture of evenly-spaced whole seconds can see it: **the tie-break is part of the same ordering, not
+      a separate concern, and an ordering has ONE direction.** Every newest-first statement in `jarvis-storage`
+      is now `unixepoch(<col>) DESC, <tie-break> DESC`: three in `skill_repository` and four in
+      `memory_repository`, the latter including the **paginating** `read_all_memories` export.
+      **⭐ THE ASSERTION THAT FOUND ALL THREE WAS "WHICH ROW IS ABSENT", NOT "HOW MANY CAME BACK".** Two of
+      the three defects returned the **right count with the wrong set**, so a count-only assertion is satisfied
+      by every one of them. `the_usable_read_returns_at_most_the_limit_newest_active_revisions` and
+      `the_retrieval_window_returns_the_newest_memories` both assert identity, and the skill one was **proven
+      to falsify** against the original ordering. Its fixture is deliberately awkward: three instants **inside
+      one second** with the **oldest carrying a whole-second timestamp**, and identifiers whose milliseconds
+      match their instants (as `Uuid::now_v7` writes them) so the tie-break agrees with the row.
+      **⚠ The sub-second limit is recorded rather than hidden.** `unixepoch` resolves to whole seconds and
+      `julianday` only to milliseconds, so genuine nanosecond ordering needs an **integer-nanoseconds column**
+      — a migration across every timestamp column, which is `ADR-0034`'s decision and is still **open**;
+      `jarvis-core/src/timestamp.rs` already pins the underlying trap with
+      `the_stored_form_is_not_lexicographically_sortable`.
+      (2) **A conjunctive match is brittle by construction, and the run looks successful either way.** A user
+      asking about *"my notes"* is not offered a procedure that says *"the user's notes"*, because
+      `matches_text` requires **every** word. Both behaviours are asserted — the positive case (the procedure
+      arrives fenced, prose **and** step text) and the negative (`an_objective_with_an_unmatched_word_offers_no_skill`),
+      because the failure mode of this rule is **silence**. The fence assertion was falsified by sending the
+      item's reference instead of the rendered procedure; the test failed, then passed after restoring.
+      `ToolValidator` also gained `Send + Sync`, because these reads are `async` and the daemon calls them from
+      a **spawned task** — the bound belongs in the alias, or it surfaces as a call-site error.
+      **Limits, recorded rather than glossed:** **the execution path is not built**, which is the half of this
+      slice's own acceptance that says every step must re-enter the ordinary gateway — no "skill execution"
+      path exists, so nothing runs a skill's steps at all, and no model-facing surface tells the model what to
+      call first; there is still **no creation surface** and no `P4-013` inspection verbs, so a skill remains
+      reachable only from a test; text matching is whole-word containment over the prose and step
+      instructions, deliberately **not** the nine-signal ranking a memory gets, for the reason recorded above.
+- [x] `P4-013` Add skill inspection and control: list, inspect (what it is, what it names, its source), correct,
       forget, export, and disable — the `FR-MEM-005` lifecycle surface, applied to a stored procedure.
+      **Delivered:** `jarvis-protocol::skill_api` (14 DTOs), `apps/jarvisd/src/skill_service.rs`,
+      **8 routes** (`GET`/`POST /skills`, `GET /skills/export`, `GET`/`DELETE /skills/{id}`,
+      `POST /skills/{id}/{promote,disable,enable}`), `apps/jarvis-cli/src/skills.rs` (8 verbs), and the storage
+      operations they need (`find_skill_revision_state`, `read_workspace_skill_revision_states`,
+      `delete_skill_revision`, and an optimistic-locking guard on all four transitions). **The creation surface
+      `P4-012` recorded as missing is now the `POST /skills` route**, so a skill is no longer reachable only
+      from a test — which is what the retrieval path needed to have a producer at all.
+      **⭐⭐⭐ THE CREATION SURFACE IMMEDIATELY FOUND A DEFECT THAT MADE `enable` DESTROY A USER'S PROCEDURE.**
+      `SkillRevision::restore` derived the restored state from the **promotion record alone**, so a
+      user-authored revision archived and re-enabled came back `Proposed` — and **no actor could ever fix it**,
+      because promotion refuses an approver equal to the revision's author and that author *is* the user. A
+      disable/enable pair permanently destroyed a procedure the person wrote, and nothing in the domain, the
+      storage layer, or the earlier tests could see it: the shape was only reachable once a route could create a
+      user-authored revision. The derivation now uses the same three facts construction does (a model-produced
+      revision is usable only if promoted; a user-authored one needs no promotion), tested both ways so a fix
+      that returned everything to `Active` fails.
+      **⭐⭐ A SUPERSESSION CHAIN COULD LEAVE ITS OWN PROCEDURE.** `supersede_skill_revision` confirmed the
+      successor **exists** (`acknowledge_skill_revision`) and never confirmed it was **related** — so
+      `superseded_by` could point from one procedure to a revision of a **different** one, and "what replaced
+      this" would answer with another skill's revision. The `ON DELETE SET NULL` columns made the deletion case
+      equally wrong: deleting either end quietly **blanks the other's link**, erasing one leg of the declaration
+      `ADR-0117` §5 exists to make readable. The transition now requires both ends to share a `skill_id`, checked
+      in **one statement** rather than a read plus a comparison (a property of the *pair*, so two round trips
+      leave a window), and `delete_skill_revision` refuses a revision any other revision links to. Both refused
+      **before** any write, asserted on the row so a check that reports an error and writes anyway fails.
+      **⭐⭐ `promote` HAD TWO STATE DEFECTS AND ONE `SelfReference` REUSE.** It reported
+      `ModelAuthoredTrust` — the *provenance* error — for an already-active revision, sending an operator to
+      inspect a procedure's provenance for a state problem; and it **accepted an archived revision**, making
+      `promote` a second undocumented route to `Active` that bypassed `restore`. Meanwhile `archive`/`restore`
+      reused `InvalidSkill::SelfReference` ("a value referring to itself") to mean "wrong state". All three are
+      now one vocabulary: `InvalidSkill::WrongState { transition, state }`, with the verb as a field because the
+      verb differs and the fact does not. The storage mapping keeps a **per-verb reason** (`already active`,
+      `archived; restore it instead`) because each remedy is a different action.
+      **⭐⭐ A `version_counter` WITH NO READER, AND THE GUARD IT WAS FOR.** The column was written by
+      `record_skill_revision` and incremented by every transition, and **no read returned it** — so the
+      optimistic guard a control surface needs had no way to obtain the value it must present. Added
+      `StoredSkillRevision`, a narrow wrapper (`revision` + `version_counter`) used by the **control** reads
+      only: the retrieval path deliberately does not return it, because a counter has no meaning to a selection
+      that is a pure function of the revision set, and widening a hot read would put a value with no reader on
+      it (`ADR-0092`). All four transitions now guard on `version_counter` **and** the state they start from.
+      **⭐ ZERO ROWS HAS TWO CAUSES AND THE REMEDIES ARE OPPOSITE.** A guarded `UPDATE` affecting nothing is
+      either a **stale counter** (the row exists and changed — re-read and retry) or a **missing row** (stop),
+      so `classify_skill_write_failure` resolves which by reading, and both are asserted separately; an
+      implementation reporting one for both fails one of them.
+      **⭐ THE LISTING CARRIES NO PROCEDURE TEXT, AND THE FENCE DISCIPLINE FROM `P4-012` IS WHY.** A skill's
+      prose and step instructions both reach a prompt, so a reference that leaked them would be a second, less
+      careful path into a model's context than retrieval's. The test asserts the prose is **absent from the
+      listing and present on the detail read**. `detail_of` also reports usability from the **domain's own**
+      `is_eligible` rather than from `state` + `superseded_by` — the first version re-derived it and **disagreed
+      with retrieval** on a revision that is both archived and superseded.
+      **Verified live, not only in tests:** `jarvis skills create/list/show/disable/enable/forget` were run
+      against a real `jarvisd`, and the `enable` output (`returned to active from its promotion record`) is the
+      user-authored stranding defect observed as **fixed** on a real profile. A stale `--version` returned the
+      `409` conflict with the re-read remedy, an already-active `promote` returned the state refusal rather than
+      a provenance one, and the two CLI step-pairing refusals named the actual problem.
+      **⚠ A HINT THE DAEMON REFUSES.** The client's own message said *"set `JARVIS_HTTP_ENABLED=1`"*, and the
+      daemon parses that variable as a **strict `bool`** — so following the hint produced
+      "invalid value for configuration environment variable" with no indication of what would be valid. The hint
+      now spells out `true`. **A hint that names a value the daemon rejects sends an operator to look for a
+      problem that is in the hint.**
+      **Limits, recorded rather than glossed:** **the execution path is still not built**, so nothing runs a
+      skill's steps and the lifecycle ends at "this is available"; `correct` is expressed as a creation with
+      `--supersedes` + `--skill` rather than a dedicated route, and a correction's `skill_id` must be **stated**
+      by the caller because the domain compares the predecessor against the skill and neither is derivable
+      without the store; the export takes no offset; `sensitivity` is fixed at `internal` on creation (no flag
+      to classify a procedure, so a `public` one cannot be authored here yet); and the tool-membership check
+      needs a composed pipeline, so with no tool surface only the structural identifier rule applies.
 - [ ] `P4-014` Add agent-proposed memory admission: the model may submit memory candidates, a candidate that
       deterministic code supports becomes a `Proposed` record, and admission is a decision that names its
       approver. The inference boundary is unchanged (`P4-001`, `ADR-0049` §6): a model inference is never

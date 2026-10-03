@@ -119,6 +119,22 @@ fn record_of(
     confidence: MemoryConfidence,
     subject: EntityId,
 ) -> MemoryRecord {
+    record_at(memory_type, content, source, confidence, subject, at(0))
+}
+
+/// The same fixture with an explicit instant, for the tests that order by one.
+///
+/// A parameter rather than a field the caller mutates, because `MemoryRecord` has no `parts` accessor: a
+/// test needing a chosen instant has to build one, and doing that by hand would be a second copy of the
+/// fixture body that could drift from this one.
+fn record_at(
+    memory_type: MemoryType,
+    content: &str,
+    source: MemorySource,
+    confidence: MemoryConfidence,
+    subject: EntityId,
+    created_at: UtcTimestamp,
+) -> MemoryRecord {
     must(MemoryRecord::new(MemoryRecordParts {
         id: MemoryId::new(),
         workspace_id: workspace(),
@@ -136,7 +152,7 @@ fn record_of(
         run_id: None,
         created_by_actor_id: LOCAL_USER_ID.to_owned(),
         correlation_id: CorrelationId::new(),
-        created_at: at(0),
+        created_at,
     }))
 }
 
@@ -533,6 +549,70 @@ async fn deletion_removes_text_and_blocks_a_re_ingest() {
     );
     let different_key = key_for(&different);
     must(record_memory(&database, &different, &different_key).await);
+}
+
+/// **⭐⭐ The retrieval window returns the NEWEST rows, ordered by time rather than by timestamp text.**
+///
+/// The window is what `P4-004`'s selection draws candidates from, so a window that does not return the newest
+/// rows silently removes recent claims from what the model may be told. The assertion is on **which** row is
+/// absent rather than how many came back: a count-only assertion is satisfied by any wrong set of the right
+/// size, and this test's own first version passed its count while dropping the wrong row.
+///
+/// # ⚠ The rows are a whole second apart, and that is a limitation rather than a convenience
+///
+/// These timestamps are RFC 3339 text with the fraction **omitted when it is zero** (`.`, 0x2E, sorts before
+/// `Z`, 0x5A), so ordering by the raw text is wrong **within one second** — the `ADR-0034` trap. The read now
+/// orders by `unixepoch(created_at)`, which parses the string into seconds. **That fixes the second boundary
+/// and cannot fix anything finer**, because `unixepoch` resolves to whole seconds: two memories written in one
+/// second tie, and `id ASC` decides arbitrarily. So this fixture uses distinct seconds, and **there is no test
+/// here for the sub-second case because the platform cannot currently express one** — genuine nanosecond
+/// ordering needs an integer-nanoseconds column, which is a migration across every timestamp column and
+/// therefore `ADR-0034`'s decision rather than a drive-by. The defect within a second is thus **recorded as
+/// open, not silently claimed fixed**.
+#[tokio::test]
+async fn the_retrieval_window_returns_the_newest_memories() {
+    const BASE: i128 = 1_774_000_000_000_000_000;
+
+    let (_directory, database) = seeded_database().await;
+    let subject = a_subject(&database).await;
+
+    let instants = [BASE, BASE + 1_000_000_000, BASE + 2_000_000_000]
+        .map(|nanos| must(UtcTimestamp::from_unix_nanos(nanos)));
+
+    let mut oldest = MemoryId::new();
+    for (offset, created_at) in instants.into_iter().enumerate() {
+        // The content varies because the **search key** deduplicates: three identical claims collide on the
+        // unique index (`MemoryDuplicate`), which is the deduplication rule doing its job rather than a
+        // fixture problem — the first version of this test used one text and could not store its own rows.
+        let content = format!("Prefers dark roast coffee, variant {offset}");
+        let record = record_at(
+            MemoryType::Preference,
+            &content,
+            user_source(),
+            MemoryConfidence::Confirmed,
+            subject,
+            created_at,
+        );
+        let key = key_for(&record);
+        must(record_memory(&database, &record, &key).await);
+        if offset == 0 {
+            oldest = record.id();
+        }
+    }
+
+    // Every row is returned when the window is at least the row count, so a read that returned nothing
+    // cannot pass the next assertion.
+    assert_eq!(
+        must(read_retrievable_memories(&database, workspace(), 3).await).len(),
+        3
+    );
+
+    let windowed = must(read_retrievable_memories(&database, workspace(), 2).await);
+    assert_eq!(windowed.len(), 2, "the window must bound the read");
+    assert!(
+        !windowed.iter().any(|memory| memory.record().id() == oldest),
+        "the oldest row must be the one the window drops; if it survives, the read is not ordering by time"
+    );
 }
 
 /// **A deleted memory is not returned by the workspace read.**

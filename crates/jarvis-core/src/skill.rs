@@ -43,8 +43,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::approval::MAX_APPROVER_ID_CHARS;
 use crate::id::{SkillId, WorkspaceId};
 use crate::memory::MemorySource;
+use crate::sensitivity::Sensitivity;
 use crate::timestamp::UtcTimestamp;
 
 /// The longest prose a skill may carry as its description.
@@ -135,6 +137,44 @@ pub enum InvalidSkill {
         "a model-authored skill must carry derived or untrusted provenance, never authoritative"
     )]
     ModelAuthoredTrust,
+    /// A promotion named no approver.
+    ///
+    /// `ADR-0043` requires a decision to be attributable, so an empty approver is refused rather than stored.
+    /// Its own variant, separate from self-approval, because the remedies differ: this one needs an approver
+    /// *named*, while the other needs a *different* actor to decide.
+    #[error("a skill promotion must name its approver")]
+    PromotionUnattributed,
+    /// A promotion named the revision's own author as its approver.
+    ///
+    /// **The boundary `ADR-0117` §4 states in words**: *"an agent that could author a procedure and promote
+    /// it would have authored its own effect."* The same rule a tool approval applies to a call, where an
+    /// approver equal to the requester is not an approval at all.
+    #[error("a skill revision's own author cannot promote it")]
+    PromotionSelfApproval,
+    /// The approver identity was longer than [`MAX_APPROVER_ID_CHARS`], so it cannot be stored.
+    ///
+    /// The same bound the `approvals` table's `decided_by` column carries, and the same reason: a promotion is
+    /// an approval, so its approver is an approval's approver and one identity must not have two lengths. A
+    /// value accepted here and refused by the column would be a write that fails after the domain said the
+    /// record was valid.
+    #[error("a skill approver identity must be at most {MAX_APPROVER_ID_CHARS} characters")]
+    ApproverTooLong,
+    /// The revision's state does not accept the transition that was requested.
+    ///
+    /// # Why one variant rather than one per verb
+    ///
+    /// The fact is always the same — "this state is not the one this transition starts from" — and only the
+    /// verb differs, so the verb is a **field**. Three variants would be three names for one condition, and
+    /// [`Self::SelfReference`] was doing this job for `archive` and `restore` before: a variant that means "a
+    /// value referring to itself" was reporting a *state* problem, so a caller matching on it would read a
+    /// message about identity for a revision that is simply already archived.
+    #[error("a skill revision cannot {transition} while it is {state}")]
+    WrongState {
+        /// The transition that was requested, by its verb.
+        transition: &'static str,
+        /// The state it was requested from.
+        state: SkillState,
+    },
     /// The dropped-field record was longer than [`MAX_SKILL_DROPPED_FIELDS`], or a name was blank or
     /// oversized.
     #[error(
@@ -483,6 +523,18 @@ pub struct SkillRevisionParts {
     pub steps: Vec<SkillStep>,
     /// Where this revision came from. **Required**: a procedure with no provenance is not a skill.
     pub source: MemorySource,
+    /// How widely this procedure may be disclosed.
+    ///
+    /// # Why a procedure needs a classification
+    ///
+    /// The same reason a claim does, and selection makes it load-bearing: a skill's prose and step
+    /// instructions reach a model, so a procedure describing how to handle a confidential workflow must not
+    /// be sent to a third-party model. [`crate::SkillQuery`] refuses a revision above the destination's
+    /// ceiling, and [`crate::assemble_context`] applies the same rule through a [`crate::ContextItem`].
+    ///
+    /// Supplied rather than derived, because nothing in the record implies it: the author decides whether
+    /// the procedure's *content* is sensitive, the same way a memory's classifier decides for a claim.
+    pub sensitivity: Sensitivity,
     /// What state the revision starts in.
     ///
     /// Supplied rather than derived, because the derivation depends on the **author** and not on anything
@@ -521,6 +573,7 @@ pub struct SkillRevision {
     description: String,
     steps: Vec<SkillStep>,
     source: MemorySource,
+    sensitivity: Sensitivity,
     state: SkillState,
     supersedes: Option<SkillId>,
     superseded_by: Option<SkillId>,
@@ -583,6 +636,7 @@ impl SkillRevision {
             description,
             steps,
             source,
+            sensitivity,
             state,
             supersedes,
             dropped_fields,
@@ -647,6 +701,7 @@ impl SkillRevision {
             description,
             steps,
             source,
+            sensitivity,
             state,
             supersedes,
             superseded_by: None,
@@ -733,6 +788,21 @@ impl SkillRevision {
         &self.source
     }
 
+    /// Returns how widely this procedure may be disclosed.
+    #[must_use]
+    pub const fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+
+    /// Returns whether this revision is visible in a workspace.
+    ///
+    /// The retrieval boundary, stated once here so selection and any future reader share one rule rather
+    /// than comparing identifiers at each call site — the same shape [`crate::MemoryRecord`] uses.
+    #[must_use]
+    pub fn is_visible_in(&self, workspace_id: WorkspaceId) -> bool {
+        self.workspace_id == workspace_id
+    }
+
     /// Returns the state.
     #[must_use]
     pub const fn state(&self) -> SkillState {
@@ -799,24 +869,91 @@ impl SkillRevision {
     /// "Promotion is a named act" is the property under test. A repository that accepted an arbitrary new
     /// state would make it possible to reach `Active` without a promotion, which is the boundary the state
     /// exists to hold.
+    ///
+    /// # ⭐⭐ The author of a proposal may not promote it, because that is the boundary `ADR-0117` §4 draws
+    ///
+    /// The decision's own reasoning is explicit: *"An agent that could author a procedure and promote it
+    /// would have authored its own effect."* **The first version of this function did not check that**, so
+    /// the rule §4 names had no enforcement anywhere — the construction check refuses a model-authored
+    /// revision recorded `Active`, but an author could simply call `promote` to put it there. The rule was
+    /// documented and unenforced, which is the `ADR-0035` shape this repository removes.
+    ///
+    /// The check is a **self-approval** refusal, and it is deliberately the same rule
+    /// `jarvis_core::ApprovalRequest` applies to a tool approval: an approver equal to the requester is not
+    /// an approval. Comparing the strings is the whole check because both are actor identifiers from one
+    /// namespace — the platform's actors are users and runs, and a run never has a user's identifier.
+    ///
+    /// An **empty** approver is refused for the same family of reason, and the two are separate errors so a
+    /// caller can tell "you named nobody" from "you named yourself".
+    ///
+    /// # Why a user promoting its own proposal is unaffected by this guard
+    ///
+    /// The guard is unconditional, which raises the question of whether it strands a person. The shapes it
+    /// separates are: a **run promoting a proposal it authored** — refused, which is the boundary §4 draws —
+    /// and a **user promoting a proposal a run produced** — the ordinary path, and the control in this
+    /// function's tests. That pairing is what the guard's scope is chosen for.
+    ///
+    /// It is **not** a claim that a user-authored revision can never be `Proposed`: `Self::build` requires
+    /// promotion only of a *model-produced* revision, so a user-authored `Proposed` revision is
+    /// **representable** and its own author could promote it. Rather than assume the creation path never
+    /// produces that shape, the rule is enforced where it can be: an active model-authored revision must name
+    /// a promoter (the schema's `CHECK`), and that promoter must not be the author (this function). A
+    /// user-authored procedure needs no promotion to be usable, so a `Proposed` one is an unused shape rather
+    /// than an unsafe one — and `promote` refusing an already-`Active` revision means the common case never
+    /// reaches this code at all.
+    /// ⭐⭐ **A promotion acts on a PROPOSAL, and the first version of this function got that wrong twice.**
+    ///
+    /// It refused `Active` with [`InvalidSkill::ModelAuthoredTrust`] — the provenance error, about a
+    /// *model-authored* revision being recorded active — which is a different rule with a different remedy,
+    /// so an operator promoting an already-active revision was told their procedure's provenance was wrong.
+    /// And it did **not** refuse `Archived` at all, so an archived revision could be promoted straight back to
+    /// `Active`, bypassing [`Self::restore`] — which is the transition that exists for exactly that, and whose
+    /// result depends on the promotion record precisely so the two cannot disagree.
+    ///
+    /// The guard is now on the **source state**, which is the fact the transition is about: only a `Proposed`
+    /// revision can be promoted. `StateNotPromotable` names that, and the two former behaviours are both gone
+    /// rather than special-cased.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidSkill::WrongState`] when the revision is not a proposal.
+    /// - [`InvalidSkill::PromotionUnattributed`] when the promotion names no approver.
+    /// - [`InvalidSkill::ApproverTooLong`] when the approver cannot be stored.
+    /// - [`InvalidSkill::PromotionSelfApproval`] when the approver is the revision's own author.
     pub fn promote(
         &self,
         approver_actor_id: impl Into<String>,
         at: UtcTimestamp,
     ) -> Result<Self, InvalidSkill> {
-        if self.state == SkillState::Active {
-            return Err(InvalidSkill::ModelAuthoredTrust);
+        if self.state != SkillState::Proposed {
+            return Err(InvalidSkill::WrongState {
+                transition: "be promoted",
+                state: self.state,
+            });
         }
         let approver = approver_actor_id.into();
-        if approver.trim().is_empty() {
-            // An empty approver is refused here rather than stored, because a promotion without a name is
-            // exactly the unattributable decision `ADR-0043` forbids. Reusing `ModelAuthoredTrust` would be
-            // a misleading variant, so the caller gets `SelfReference`: the decision names itself.
-            return Err(InvalidSkill::SelfReference);
+        let approver = approver.trim();
+        if approver.is_empty() {
+            // A promotion without a name is exactly the unattributable decision `ADR-0043` forbids, so it is
+            // refused rather than stored.
+            return Err(InvalidSkill::PromotionUnattributed);
+        }
+        // Length is checked because the approver is stored in a bounded column. The domain must refuse a
+        // value the schema would reject, or a promotion the domain called valid would fail on write — the
+        // "two lengths for one identity" defect the approvals module removed for `decided_by`.
+        if approver.chars().count() > MAX_APPROVER_ID_CHARS {
+            return Err(InvalidSkill::ApproverTooLong);
+        }
+        // **The self-approval guard.** Its own variant rather than a reused one, because the two refusals
+        // have different remedies: an unattributed promotion needs an approver named, while this one needs a
+        // *different* actor to decide — and an operator told "the approver was empty" when they approved
+        // their own proposal would look for a missing field that is not missing.
+        if approver == self.created_by_actor_id {
+            return Err(InvalidSkill::PromotionSelfApproval);
         }
         let mut promoted = self.clone();
         promoted.state = SkillState::Active;
-        promoted.promoted_by_actor_id = Some(approver.trim().to_owned());
+        promoted.promoted_by_actor_id = Some(approver.to_owned());
         promoted.promoted_at = Some(at);
         promoted.updated_at = at;
         Ok(promoted)
@@ -834,7 +971,10 @@ impl SkillRevision {
     /// is reported rather than silently accepted — the rule `P3-006c` applied to a redundant transition.
     pub fn archive(&self, at: UtcTimestamp) -> Result<Self, InvalidSkill> {
         if self.state == SkillState::Archived {
-            return Err(InvalidSkill::SelfReference);
+            return Err(InvalidSkill::WrongState {
+                transition: "be archived",
+                state: self.state,
+            });
         }
         let mut archived = self.clone();
         archived.state = SkillState::Archived;
@@ -842,29 +982,44 @@ impl SkillRevision {
         Ok(archived)
     }
 
-    /// Restores an archived skill to the state it held before.
+    /// Restores an archived revision to the state it held before.
     ///
-    /// # Why a restored revision is `Proposed` when it was never promoted
+    /// # ⭐⭐ The derivation has THREE inputs, and the first version used one — which stranded a user's own
+    /// procedure
     ///
-    /// The state a restore returns to is the one the revision had **before archiving**, which for a
-    /// never-promoted proposal is `Proposed`. Deriving it from the promotion record rather than from a
-    /// stored "previous state" is the point: a field holding the pre-archive state and the promotion record
-    /// would be two statements of one fact, and the record is the one a reviewer reads.
+    /// The state a restore returns to is the one the revision held **before** archiving. Deriving it from the
+    /// promotion record rather than from a stored "previous state" field is right: a stored pre-archive state
+    /// and the promotion record would be two statements of one fact.
+    ///
+    /// **But the promotion record alone does not determine it.** It answers "was this approved", and a
+    /// revision is usable without ever having been approved when the **person authored it** — so a
+    /// user-authored revision archived and restored came back as `Proposed` in the first version. That is not
+    /// merely wrong: it is **unfixable through the API**, because promotion compares the approver against the
+    /// author and the author is that same user, so no actor could promote it back. A disable/enable pair would
+    /// have permanently destroyed a procedure the user wrote.
+    ///
+    /// So the state is derived from the same three facts that decide it at construction: a model-produced
+    /// revision is usable only if it was promoted, and a user-authored one is usable without a promotion. The
+    /// two questions are separate, which is why one of them alone cannot answer.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidSkill::SelfReference`] when the revision is not archived, because restoring
-    /// something that was never set aside would silently be a no-op that reports success.
+    /// Returns [`InvalidSkill::WrongState`] when the revision is not archived, because restoring something
+    /// that was never set aside would silently be a no-op that reports success.
     pub fn restore(&self, at: UtcTimestamp) -> Result<Self, InvalidSkill> {
         if self.state != SkillState::Archived {
-            return Err(InvalidSkill::SelfReference);
+            return Err(InvalidSkill::WrongState {
+                transition: "be restored",
+                state: self.state,
+            });
         }
         let mut restored = self.clone();
-        restored.state = if self.promoted_by_actor_id.is_some() {
-            SkillState::Active
-        } else {
-            SkillState::Proposed
-        };
+        restored.state =
+            if self.promoted_by_actor_id.is_some() || !self.source.kind().is_model_produced() {
+                SkillState::Active
+            } else {
+                SkillState::Proposed
+            };
         restored.updated_at = at;
         Ok(restored)
     }
@@ -950,6 +1105,488 @@ impl SkillRevision {
         self.updated_at = updated_at;
         self
     }
+}
+
+/// The most skills one selection may offer.
+///
+/// A bound, and a deliberately small one. A skill is a **procedure injected into the prompt beside the
+/// tool list**, so offering many is not merely expensive: each one is text a model may follow, and a
+/// prompt carrying twenty procedures is one where the model has to choose which instructions apply — the
+/// ambiguity `ADR-0117` §2 avoids by making a step an ordinary tool request rather than by trusting the
+/// prose. The number matches the scale `MAX_DISCOVERY_TOOLS` uses for the tool surface, because the two
+/// lists are read together.
+pub const MAX_SELECTED_SKILLS: usize = 8;
+
+/// Explains why one skill was not offered.
+///
+/// # Why a reason rather than a silent drop
+///
+/// The same rule [`crate::Ineligibility`] follows for a memory: "why was this not used" must have an
+/// answer, and an ineligible skill that simply vanished leaves it unanswerable. A skill is a *procedure*,
+/// so the question is more pointed than for a claim — an operator who wrote a skill and never sees it
+/// offered needs to know whether the workspace, the destination, the state, or its own text excluded it.
+///
+/// Ordered roughly by severity, so a caller reporting the **first** refusal reports the most specific one:
+/// a foreign skill is not a ranking question at all, a disclosure is the most severe outcome, and the
+/// caller's own stated requirements come last.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillIneligibility {
+    /// The revision belongs to another workspace, which is the boundary no read may cross.
+    ForeignWorkspace,
+    /// The revision's content is above the destination's ceiling.
+    AboveDestination {
+        /// The revision's classification.
+        sensitivity: Sensitivity,
+        /// The destination's ceiling.
+        destination: Sensitivity,
+    },
+    /// The revision is not `Active`, so it is not a procedure anything may use.
+    ///
+    /// A proposal awaiting promotion, or an archived revision. `ADR-0117` §4 makes promotion the gate, so
+    /// this is the rule that gives the state machine its consequence — without it, `state` would be a field
+    /// nothing reads.
+    NotUsable {
+        /// The state it holds.
+        state: SkillState,
+    },
+    /// The revision has been replaced by a declared correction.
+    ///
+    /// Distinct from [`Self::NotUsable`] because the remedy differs and the fact is different: an operator
+    /// looking at a superseded revision should read its successor, while a proposal needs a promotion.
+    Superseded,
+    /// It matched none of the query's text.
+    ///
+    /// Reported rather than omitted so a caller asking "was my skill considered" gets an answer. A skill
+    /// selection is small and inspectable, so naming the misses is cheap here in a way it would not be for
+    /// a memory scan.
+    NoTextMatch,
+}
+
+impl SkillIneligibility {
+    /// Returns the stable snake-case code, for a log or a wire reply.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ForeignWorkspace => "foreign_workspace",
+            Self::AboveDestination { .. } => "above_destination",
+            Self::NotUsable { .. } => "not_usable",
+            Self::Superseded => "superseded",
+            Self::NoTextMatch => "no_text_match",
+        }
+    }
+}
+
+impl fmt::Display for SkillIneligibility {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+/// One skill that was considered and not offered, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExcludedSkill {
+    /// The revision's identifier.
+    pub revision_id: SkillId,
+    /// The rule that excluded it.
+    pub reason: SkillIneligibility,
+}
+
+/// What a skill selection is a function of.
+///
+/// # Why the defaults are deliberately empty rather than permissive
+///
+/// Unlike [`crate::MemoryQuery`], this query has **no default destination and no default trust floor**,
+/// because a skill has no trust field to floor: its provenance constrains what may be *stored* (`ADR-0117`
+/// §3) rather than what may be selected. The destination is required because a skill's text reaches a
+/// model, and a default destination would mean a caller who did not think about it disclosed every skill
+/// to whatever the default named. So the destination is stated at construction and there is no
+/// `Default`.
+#[derive(Clone, Debug)]
+pub struct SkillQuery {
+    /// The workspace to search, which is also the retrieval boundary.
+    pub workspace_id: WorkspaceId,
+    /// The destination's sensitivity ceiling.
+    pub destination: Sensitivity,
+    /// The free text to match against a revision's prose and step instructions.
+    ///
+    /// Empty means "no text requirement", which selects every usable revision in the workspace — the
+    /// behaviour an inspection surface wants and a *prompt* must not have, which is why the caller that
+    /// assembles a prompt supplies text.
+    pub text: String,
+}
+
+impl SkillQuery {
+    /// Builds a query for one workspace and destination.
+    ///
+    /// # Why the destination has no default
+    ///
+    /// See the type's documentation: the permissive default for a retrieval is a disclosure, and a skill's
+    /// prose and instructions go into a prompt. Making the caller state it is the same choice
+    /// [`crate::MemoryQuery`] makes for its *ceiling*, taken one step further because a skill has no trust
+    /// field a floor could narrow.
+    #[must_use]
+    pub fn new(workspace_id: WorkspaceId, destination: Sensitivity) -> Self {
+        Self {
+            workspace_id,
+            destination,
+            text: String::new(),
+        }
+    }
+
+    /// Sets the free text to match.
+    #[must_use]
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    /// Applies the eligibility rules, reporting the first that refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SkillIneligibility`] naming the rule that excluded the revision. The order is chosen
+    /// so the reported reason is the most specific, and it is the same order and reasoning
+    /// [`crate::MemoryQuery::is_eligible`] uses: workspace first (a foreign revision is not a ranking
+    /// question), then the destination (a disclosure is the most severe outcome), then the two state rules,
+    /// then the caller's own text requirement.
+    ///
+    /// # Why the workspace check is stated as one rule
+    ///
+    /// `docs/architecture/identity-and-workspaces.md` splits "actor authorization" from "workspace and
+    /// sharing policy", and this platform's actor authorization *is* workspace membership — every read in
+    /// this codebase binds `workspace_id` as its scope, so a second rule with nothing to distinguish it
+    /// would be a rule that always passes. Recorded rather than silently merged, because a reader looking
+    /// for the document's two rules should find out why there is one.
+    pub fn is_eligible(&self, revision: &SkillRevision) -> Result<(), SkillIneligibility> {
+        if !revision.is_visible_in(self.workspace_id) {
+            return Err(SkillIneligibility::ForeignWorkspace);
+        }
+        if !revision.sensitivity().can_flow_to(self.destination) {
+            return Err(SkillIneligibility::AboveDestination {
+                sensitivity: revision.sensitivity(),
+                destination: self.destination,
+            });
+        }
+        // The state rule, which is what gives `SkillState` its consequence: a proposal is a candidate rather
+        // than a procedure, and an archived revision was set aside.
+        if !revision.is_usable() {
+            return Err(SkillIneligibility::NotUsable {
+                state: revision.state(),
+            });
+        }
+        // A replaced revision is refused, and refused *separately* from being unusable: it is active, so the
+        // state rule passes, and an operator reading "not usable" would look for a promotion that is not the
+        // remedy. `ADR-0117` §5: the replacement is declared, so this is a fact rather than an inference.
+        if revision.superseded_by().is_some() {
+            return Err(SkillIneligibility::Superseded);
+        }
+        if !self.text.is_empty() && !matches_text(revision, &self.text) {
+            return Err(SkillIneligibility::NoTextMatch);
+        }
+        Ok(())
+    }
+}
+
+/// Returns whether a revision's text mentions every word of the query.
+///
+/// # Why whole-word containment and not a ranking signal
+///
+/// A skill selection is a **prompt-injection decision**, so the question is not "which of these is most
+/// relevant" but "did this procedure actually match what was asked for". A fuzzy or weighted match would
+/// offer a procedure on a partial overlap, and a procedure that matches loosely is one whose *steps* the
+/// model may follow when they do not apply — the failure `ADR-0117` is most concerned with. So the rule is
+/// conjunctive and literal: every word of the query must appear, which is what [`crate::MemorySearchKey`]
+/// does for a claim's deduplication key and for the same reason.
+///
+/// Case-insensitive because a procedure's prose is natural language, and word-boundary aware so `read` does
+/// not match `already` — a substring match would offer a skill for a word that merely contains a query term.
+///
+/// **The step instructions are searched as well as the prose**, because a procedure's *actions* are where
+/// the tool names and the operational words live: a query naming a tool would otherwise miss a skill whose
+/// description never mentions it.
+#[must_use]
+pub fn matches_text(revision: &SkillRevision, text: &str) -> bool {
+    let haystack = skill_haystack(revision);
+    text.split_whitespace()
+        .all(|word| matches_word(&haystack, word))
+}
+
+/// The combined text a query matches against: the prose, then each step's instruction.
+///
+/// Lowercased once here so a caller does not repeat it, and joined with a space so a word cannot be formed
+/// across the boundary between the prose and a step.
+fn skill_haystack(revision: &SkillRevision) -> String {
+    let mut haystack = revision.description().to_lowercase();
+    for step in revision.steps() {
+        haystack.push(' ');
+        haystack.push_str(&step.instruction().to_lowercase());
+    }
+    haystack
+}
+
+/// Returns whether one **query word** is present in the haystack.
+///
+/// # Why a query word is itself split
+///
+/// A query word may carry separators, and the case that matters most does: `jarvis.files.read` is **one**
+/// whitespace-delimited word, and comparing it whole against the haystack's tokens would never match — the
+/// haystack holds `jarvis`, `files`, and `read`. So a query word's own segments are what must all appear,
+/// which is what makes a query naming a tool find a procedure that calls it. This is not laxness: every
+/// segment still has to be present on a word boundary, so the conjunction is preserved one level down.
+fn matches_word(haystack: &str, word: &str) -> bool {
+    let segments = segments_of(word);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| contains_token(haystack, segment))
+}
+
+/// Splits a query word into its lowercased alphanumeric segments.
+fn segments_of(word: &str) -> Vec<String> {
+    word.split(|character: char| !character.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Returns whether the haystack contains a token exactly equal to `needle`.
+///
+/// The haystack is split on any character that is not alphanumeric, so `jarvis.files.read` in a step's
+/// instruction contributes the three tokens `jarvis`, `files`, and `read`.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    haystack
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|token| token == needle)
+}
+
+/// One skill offered for use, and why it was selected.
+///
+/// Carries the **revision** rather than a copy of its text, so a caller that must fence the content
+/// (`ADR-0117` §3) does it once at the point of assembly rather than receiving a string that looks like
+/// prose. The `reason` is a stored value rather than a generated explanation, for the same reason
+/// [`crate::SelectionReason`] is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedSkill {
+    /// The offered revision.
+    pub revision: SkillRevision,
+    /// Why it was offered.
+    pub reason: SkillSelectionReason,
+}
+
+/// Why a skill was offered.
+///
+/// Closed, and stored, for the reason every vocabulary here is: a free-form explanation would be a place
+/// for content to enter an audit record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillSelectionReason {
+    /// Every word of the query appears in the revision's text.
+    FullTextMatch,
+    /// The query was empty, so the revision was offered without a text requirement.
+    ///
+    /// The inspection case. Reported separately because "nothing was asked for" and "everything was found"
+    /// are different facts, and a caller displaying a list to an operator needs to know which it has.
+    NoTextRequirement,
+}
+
+impl SkillSelectionReason {
+    /// Returns the stable snake-case code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FullTextMatch => "full_text_match",
+            Self::NoTextRequirement => "no_text_requirement",
+        }
+    }
+}
+
+impl fmt::Display for SkillSelectionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+/// The result of selecting skills: what was offered, what was refused, and what did not fit.
+///
+/// The same three-part shape [`crate::MemorySelection`] uses, so a caller has one vocabulary for "why is
+/// this here", "why is this not", and "why did the list stop".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillSelection {
+    /// The offered revisions, most recent first.
+    pub offered: Vec<SelectedSkill>,
+    /// Every revision considered and refused, with the rule that refused it.
+    pub excluded: Vec<ExcludedSkill>,
+    /// The revisions that were eligible but did not fit the bound, so a truncation is visible rather than
+    /// looking like the end of the list.
+    pub dropped: Vec<SkillId>,
+    /// How many eligible revisions there were, whether or not they fit.
+    pub eligible_total: usize,
+}
+
+impl SkillSelection {
+    /// Returns whether the list was cut short.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        !self.dropped.is_empty()
+    }
+}
+
+/// Selects the skills a query may offer, most recent first, dropping the ineligible.
+///
+/// # Why there is no graded relevance score, and what replaced it
+///
+/// The first version of this function ranked by **how many query words a revision matched**, and the design
+/// was incoherent: eligibility already requires **every** query word to appear ([`matches_text`]), so every
+/// offered skill matches the whole query and every score is identical. A ranking whose input is constant
+/// cannot order anything, and the only reason it looked like a ranking was that the test exercising it used
+/// a query a *candidate* did not fully match — which the eligibility rule refuses outright, so the case
+/// could not arise through this function at all. **A filter that is conjunctive cannot also be graded.**
+///
+/// What the ordering answers instead is the question a caller actually has when two procedures both apply:
+/// *which one is current*. So revisions are ordered by **creation instant, newest first**, with the
+/// identifier as a tie-break so the order is total and stable across runs — without which two revisions
+/// created in the same instant would order by the candidate set's arrival, which for a database-backed read
+/// is a query plan away from changing between builds.
+///
+/// A memory is ranked by nine weighted signals, and that remains right there: a claim's eligibility is a
+/// set of *floors* rather than a conjunction, so "which claim is most relevant" is a genuinely graded
+/// question. The two retrievals differ because their questions differ.
+#[must_use]
+pub fn select_skills(revisions: &[SkillRevision], query: &SkillQuery) -> SkillSelection {
+    let mut excluded = Vec::new();
+    let mut eligible = Vec::new();
+    for revision in revisions {
+        match query.is_eligible(revision) {
+            Ok(()) => {
+                let reason = if query.text.is_empty() {
+                    SkillSelectionReason::NoTextRequirement
+                } else {
+                    SkillSelectionReason::FullTextMatch
+                };
+                eligible.push(SelectedSkill {
+                    revision: revision.clone(),
+                    reason,
+                });
+            }
+            Err(reason) => excluded.push(ExcludedSkill {
+                revision_id: revision.revision_id(),
+                reason,
+            }),
+        }
+    }
+
+    let eligible_total = eligible.len();
+    // Newest first, then by identifier ascending, so the order is total and stable.
+    eligible.sort_by(|left, right| {
+        right
+            .revision
+            .created_at()
+            .unix_nanos()
+            .cmp(&left.revision.created_at().unix_nanos())
+            .then_with(|| {
+                left.revision
+                    .revision_id()
+                    .cmp(&right.revision.revision_id())
+            })
+    });
+
+    // Truncation is recorded rather than silent, so a caller can tell "there are no more" from "there were
+    // more and they did not fit" — the same distinction `DiscoveryReport` reports by count.
+    let dropped: Vec<SkillId> = eligible
+        .iter()
+        .skip(MAX_SELECTED_SKILLS)
+        .map(|selected| selected.revision.revision_id())
+        .collect();
+    eligible.truncate(MAX_SELECTED_SKILLS);
+
+    SkillSelection {
+        offered: eligible,
+        excluded,
+        dropped,
+        eligible_total,
+    }
+}
+
+/// The estimated token cost of offering one skill, for a context budget.
+///
+/// # Why an estimate from length rather than a real tokenizer
+///
+/// The platform has no tokenizer in the domain, and adding one would make this crate depend on a model's
+/// vocabulary — which inverts the boundary `ADR-0004` draws. So the estimate is a **character count divided
+/// by a divisor**, and the divisor is at the low end of what natural-language tokenizers achieve
+/// (roughly four characters per token for English), so the estimate **over-counts** rather than
+/// under-counts. Over-counting evicts a skill that might have fit; under-counting overflows the budget,
+/// which is the direction that produces a prompt the model cannot receive.
+///
+/// The count includes the prose and every step's instruction, because those are what would be rendered.
+#[must_use]
+pub fn estimate_skill_tokens(revision: &SkillRevision) -> u32 {
+    /// Characters per token, at the **low** end of the usual range so the estimate over-counts.
+    const CHARACTERS_PER_TOKEN: usize = 3;
+
+    let characters = skill_haystack(revision).chars().count();
+    // At least one token, because `ContextItem` refuses a zero estimate and a non-empty revision always
+    // costs something to render.
+    u32::try_from(characters.div_ceil(CHARACTERS_PER_TOKEN))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// Renders one selected skill as a context item, **fenced as derived data**.
+///
+/// # Why this function exists rather than the caller building an item
+///
+/// `ADR-0117` §3 requires a skill to reach a prompt as fenced content marked as data, and the two ways to
+/// get that wrong are both encoding decisions a caller would have to repeat:
+///
+/// 1. **The trust class.** A skill is [`ContextTrust::Derived`] or [`ContextTrust::Untrusted`] depending on
+///    its **provenance**, and never `User`. Deriving it here from the source kind means a caller cannot
+///    label a model-authored procedure as the person's own instruction, and
+///    [`ContextSourceKind::Skill`]'s own trust set refuses it if they try.
+/// 2. **The step text.** The instructions are what a model would follow, so they are carried in the item's
+///    reference rather than left for a caller to concatenate — and the reference is what a fenced renderer
+///    uses to place the content.
+///
+/// # Why `quoted` is always true
+///
+/// A skill is never instruction-bearing: it is a procedure retrieved from memory, so it is `Derived` or
+/// `Untrusted`, and [`ContextItem::new`] requires untrusted content to be marked quoted. Setting it here
+/// rather than letting a caller decide is the same reasoning — the flag records that the content is data,
+/// and a caller who could clear it would be marking a procedure as the model's own instruction.
+///
+/// # Errors
+///
+/// Returns [`crate::context::ContextError`] when the reference or the estimate is unusable. A revision's
+/// identifier and a non-zero token estimate both satisfy the item's own rules, so a failure here is an
+/// internal inconsistency rather than a caller mistake — and it is reported rather than unwrapped so a
+/// repository that somehow produced a zero-length revision fails loudly.
+pub fn skill_context_item(
+    revision: &SkillRevision,
+    priority: crate::ContextPriority,
+) -> Result<crate::context::ContextItem, crate::context::ContextError> {
+    // The provenance decides the trust class: a model-authored procedure is `Derived`, and one an external
+    // document supplied is `Untrusted`. `MemorySourceKind::permitted_trust` is already the table for this, and
+    // **`Authoritative` is mapped down to `Derived`** because a skill may never be policy — the one place a
+    // skill's rule is *stricter* than a memory's, and the reason this is a projection rather than a
+    // re-export of the source's own trust.
+    let trust = match revision.source().kind().permitted_trust() {
+        crate::MemoryTrust::Authoritative | crate::MemoryTrust::Derived => {
+            crate::ContextTrust::Derived
+        }
+        crate::MemoryTrust::Untrusted => crate::ContextTrust::Untrusted,
+    };
+    crate::context::ContextItem::new(
+        crate::ContextSource::new(
+            crate::ContextSourceKind::Skill,
+            format!("skill:{}", revision.revision_id()),
+        )?,
+        trust,
+        revision.sensitivity(),
+        priority,
+        estimate_skill_tokens(revision),
+        crate::InclusionReason::RetrievedMatch,
+        // Always quoted: a procedure is retrieved content, so it is data rather than instruction.
+        true,
+    )
 }
 
 #[cfg(test)]

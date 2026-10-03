@@ -42,11 +42,13 @@ use jarvis_core::LoopbackHost;
 // be a new direct dependency for a name.
 
 use jarvis_protocol::{
-    CorrectMemoryRequest, DeletionReceipt, ForgetMemoryRequest, JSON_BODY_CONTENT_TYPE,
-    MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply,
-    MemorySearchRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
-    SSE_ACCEPT, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError,
-    path_segment, run_path, run_stream_path, runs_path,
+    CorrectMemoryRequest, CreateSkillRequest, DeletionReceipt, ForgetMemoryRequest,
+    ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply,
+    MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest, PromoteSkillRequest,
+    RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT,
+    SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply, SkillReply,
+    SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest,
+    WireError, path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -82,6 +84,23 @@ fn tool_preview_path(tool: &str) -> Result<String, ApiError> {
 /// Returns [`RunPathError`] when the identifier contains a character that would change the request target.
 fn memory_path(memory_id: &str) -> Result<String, RunPathError> {
     Ok(format!("/api/v1/memories/{}", path_segment(memory_id)?))
+}
+
+/// The skill collection's path.
+const SKILLS_PATH: &str = "/api/v1/skills";
+
+/// Builds the path for one skill revision, validating the identifier first.
+///
+/// Validation is [`jarvis_protocol::path_segment`], the same segment rule the run and memory paths use, for
+/// the reason that function's callers record: two validators over the same class of untrusted value are two
+/// chances for one of them to miss a character, and a revision identifier is no more trustworthy than a run
+/// identifier.
+///
+/// # Errors
+///
+/// Returns [`RunPathError`] when the identifier contains a character that would change the request target.
+fn skill_path(revision_id: &str) -> Result<String, RunPathError> {
+    Ok(format!("{SKILLS_PATH}/{}", path_segment(revision_id)?))
 }
 
 /// Time allowed to establish a connection to a loopback daemon.
@@ -495,6 +514,134 @@ impl ApiClient {
             return response.json::<T>().await.map_err(|_| ApiError::Decode);
         }
         Err(self.refusal(response).await)
+    }
+
+    /// Performs an authenticated request carrying a JSON body and decodes the reply.
+    ///
+    /// The shared body of every **write** on this surface, so a verb added later cannot quietly omit the
+    /// credential, the timeout, or the refusal decoding. The skill verbs are four calls that differ only in
+    /// method and path, which is exactly the shape that grows a divergent copy when written out.
+    async fn send_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let response = self
+            .bounded_request(method, path)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json::<T>().await.map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Lists the workspace's skill revisions, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the page size is refused or the transport fails.
+    pub async fn list_skills(&self, limit: Option<u32>) -> Result<SkillListReply, ApiError> {
+        let path = match limit {
+            Some(limit) => format!("{SKILLS_PATH}?limit={limit}"),
+            None => SKILLS_PATH.to_owned(),
+        };
+        self.get_json(&path).await
+    }
+
+    /// Reads one skill revision, with the procedure's text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when the revision is not in this workspace.
+    pub async fn read_skill(&self, revision_id: &str) -> Result<SkillDetailReply, ApiError> {
+        self.get_json(&skill_path(revision_id)?).await
+    }
+
+    /// Records a new skill revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` when a step names a tool this deployment cannot run, or when
+    /// the revision is refused by a rule — a refusal is an ordinary outcome here, so it is decoded rather than
+    /// thrown away.
+    pub async fn create_skill(&self, request: &CreateSkillRequest) -> Result<SkillReply, ApiError> {
+        self.send_json(reqwest::Method::POST, SKILLS_PATH, request)
+            .await
+    }
+
+    /// Promotes a proposal, naming the approver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` for a stale counter and a `422` for a self-approval.
+    pub async fn promote_skill(
+        &self,
+        revision_id: &str,
+        request: &PromoteSkillRequest,
+    ) -> Result<SkillReply, ApiError> {
+        let path = format!("{}/promote", skill_path(revision_id)?);
+        self.send_json(reqwest::Method::POST, &path, request).await
+    }
+
+    /// Disables a revision by archiving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` for a stale counter.
+    pub async fn disable_skill(
+        &self,
+        revision_id: &str,
+        request: &SkillTransitionRequest,
+    ) -> Result<SkillReply, ApiError> {
+        let path = format!("{}/disable", skill_path(revision_id)?);
+        self.send_json(reqwest::Method::POST, &path, request).await
+    }
+
+    /// Enables a disabled revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` for a stale counter.
+    pub async fn enable_skill(
+        &self,
+        revision_id: &str,
+        request: &SkillTransitionRequest,
+    ) -> Result<SkillReply, ApiError> {
+        let path = format!("{}/enable", skill_path(revision_id)?);
+        self.send_json(reqwest::Method::POST, &path, request).await
+    }
+
+    /// Deletes a revision, returning the receipt of what was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` for a stale counter and a `422` when another revision
+    /// declares a supersession with this one.
+    pub async fn forget_skill(
+        &self,
+        revision_id: &str,
+        request: &ForgetSkillRequest,
+    ) -> Result<SkillDeletionReceipt, ApiError> {
+        self.send_json(reqwest::Method::DELETE, &skill_path(revision_id)?, request)
+            .await
+    }
+
+    /// Exports every revision the workspace holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the page size is refused or the transport fails.
+    pub async fn export_skills(&self, limit: Option<u32>) -> Result<SkillExportReply, ApiError> {
+        let path = match limit {
+            Some(limit) => format!("{SKILLS_PATH}/export?limit={limit}"),
+            None => format!("{SKILLS_PATH}/export"),
+        };
+        self.get_json(&path).await
     }
 
     /// Opens a run's event stream.

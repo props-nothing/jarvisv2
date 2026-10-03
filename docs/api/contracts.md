@@ -295,6 +295,45 @@ pub trait MemoryRepository: Send + Sync {
 
 `MemoryQuery` includes workspace, eligible types/sensitivity, temporal/entity constraints, ranking budget, and caller purpose. Repositories enforce workspace eligibility; they do not accept a globally unscoped search.
 
+## Skill Control Plane (`P4-013` — implemented)
+
+The `FR-MEM-005` lifecycle applied to a **stored procedure**: list, inspect, create, promote, disable, enable,
+forget, and export. `ADR-0117` fixes the trust boundary, and three of its rules shape the contract.
+
+| Route | Verb | What it answers |
+| --- | --- | --- |
+| `/api/v1/skills` | `GET` | the workspace's revisions as **references** — no procedure text |
+| `/api/v1/skills` | `POST` | records a new revision, or a declared correction |
+| `/api/v1/skills/export` | `GET` | every revision **with** text, plus what the export excludes |
+| `/api/v1/skills/{id}` | `GET` | one revision, with its prose and steps |
+| `/api/v1/skills/{id}` | `DELETE` | removes it, returning a `SkillDeletionReceipt` |
+| `/api/v1/skills/{id}/promote` | `POST` | the approval that makes a proposal usable |
+| `/api/v1/skills/{id}/disable` | `POST` | archives it: retained for inspection, not offered |
+| `/api/v1/skills/{id}/enable` | `POST` | returns it to the state its promotion record implies |
+
+**No request carries a workspace, a granted tool, a scope, or a pre-approval.** `deny_unknown_fields` makes an
+attempt a `422` rather than an ignored value, and there is no field for authority to arrive in — so creating a
+skill cannot be privilege escalation.
+
+**Every control verb requires `expected_version`**, the counter the caller observed. A listing and a detail
+read both return it (`version_counter`), because a guard value a client cannot obtain is one it cannot send.
+The counter is the platform's optimistic-locking value and is **not** the author's `author_version` string,
+which is content and is not unique across workspaces.
+
+**`promote` is the one verb that names an actor** (`approver_actor_id`), because `ADR-0117` §4 makes promotion
+an approval and `ADR-0043` requires it to be attributable. The daemon refuses an approver equal to the
+revision's author; the author comes from the authenticated session and cannot be supplied, which is what makes
+that refusal meaningful.
+
+**A creation records a `user_statement` source and an `active` state** — a person stating how something is
+done needs no approval. A model-authored revision reaches the store as `proposed` and needs a promotion. A
+client cannot choose which path it is on, so the promotion rule is not a flag.
+
+**Status codes:** `201` for a creation and `200` for a correction (a correction is not a creation); `409` for a
+stale counter, because the remedy is a re-read; `422` for an unknown tool, a malformed step, a mismatch between
+a correction and the skill it names, a self-approval, or a refused transition; `404` for an absent revision —
+including one in another workspace, because "not yours" would confirm that something exists.
+
 ## Events
 
 ```rust

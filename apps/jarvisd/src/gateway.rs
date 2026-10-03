@@ -45,8 +45,9 @@ use axum::{
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
 use jarvis_protocol::{
-    ApprovalDecisionBody, CorrectMemoryRequest, ForgetMemoryRequest, MAX_STREAM_PAGE,
-    MemorySearchRequest, RememberRequest, RunEventPageReply, StartRunRequest, rest_error, safe,
+    ApprovalDecisionBody, CorrectMemoryRequest, CreateSkillRequest, ForgetMemoryRequest,
+    ForgetSkillRequest, MAX_STREAM_PAGE, MemorySearchRequest, PromoteSkillRequest, RememberRequest,
+    RunEventPageReply, SkillTransitionRequest, StartRunRequest, rest_error, safe,
 };
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,18 @@ impl GatewayState {
     pub fn memories(&self) -> crate::memory_service::MemoryService {
         crate::memory_service::MemoryService::new(Arc::clone(&self.database))
     }
+
+    /// Returns the skill surface.
+    ///
+    /// Built on demand like the memory surface, but it also reads the **tool pipeline** — because creating a
+    /// skill validates each step's tool against the registry. Passing `self.tools` rather than a separately
+    /// configured predicate is what keeps the tools this surface accepts and the tools the executor can run the
+    /// same set: two sources of that fact could disagree, and the disagreement would be a stored procedure that
+    /// cannot execute.
+    #[must_use]
+    pub fn skills(&self) -> crate::skill_service::SkillService {
+        crate::skill_service::SkillService::new(Arc::clone(&self.database), self.tools.as_ref())
+    }
 }
 
 /// Builds the authenticated router.
@@ -158,7 +171,13 @@ pub fn router(state: GatewayState) -> Router {
         .route("/memories/export", get(export_memories))
         .route("/memories/{id}", get(read_memory))
         .route("/memories/{id}/correct", post(correct_memory))
-        .route("/memories/{id}/forget", post(forget_memory));
+        .route("/memories/{id}/forget", post(forget_memory))
+        .route("/skills", get(list_skills).post(create_skill))
+        .route("/skills/export", get(export_skills))
+        .route("/skills/{id}", get(read_skill).delete(forget_skill))
+        .route("/skills/{id}/promote", post(promote_skill))
+        .route("/skills/{id}/disable", post(disable_skill))
+        .route("/skills/{id}/enable", post(enable_skill));
 
     Router::new()
         .route("/health/live", get(health_live))
@@ -1204,6 +1223,164 @@ fn memory_error(error: &crate::memory_service::MemoryServiceError) -> Response {
         }
         // Storage is matched last and deliberately without the detail.
         Memory::Storage(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal,
+            "the local database is not available",
+        ),
+    }
+}
+
+/// `GET /api/v1/skills`
+///
+/// A listing of the workspace's procedures as **references** rather than content: a skill's prose and step
+/// instructions both reach a prompt, so a listing that returned them would be a second, less careful path into
+/// a model's context. `GET /skills/{id}` is where the text belongs — one procedure, deliberately requested.
+async fn list_skills(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let limit = match match parse_memory_page(raw.as_deref()) {
+        Ok(page) => Ok(page.limit.unwrap_or(crate::skill_service::MAX_SKILL_PAGE)),
+        Err(message) => Err(message),
+    } {
+        Ok(limit) => limit,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    match state.skills().list(limit).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `POST /api/v1/skills`
+///
+/// The creation surface. `201` for a new procedure and `200` for a declared correction, because a correction is
+/// not a creation — and reporting it as one would make a corrected procedure look like an unrelated new one.
+async fn create_skill(
+    State(state): State<GatewayState>,
+    Json(request): Json<CreateSkillRequest>,
+) -> Response {
+    match state.skills().create(&request).await {
+        Ok(reply) => {
+            let status = if reply.outcome == "created" {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(reply)).into_response()
+        }
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `GET /api/v1/skills/{id}`
+async fn read_skill(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
+    match state.skills().read(&id).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `POST /api/v1/skills/{id}/promote`
+async fn promote_skill(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<PromoteSkillRequest>,
+) -> Response {
+    match state.skills().promote(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `POST /api/v1/skills/{id}/disable`
+async fn disable_skill(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<SkillTransitionRequest>,
+) -> Response {
+    match state.skills().disable(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `POST /api/v1/skills/{id}/enable`
+async fn enable_skill(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<SkillTransitionRequest>,
+) -> Response {
+    match state.skills().enable(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `DELETE /api/v1/skills/{id}`
+///
+/// The verb is `DELETE` rather than a `/forget` sub-resource, because a deletion is what it is: a procedure has
+/// no automatic ingest that could resurrect it, so there is no tombstone to describe and no `allow_relearn` to
+/// choose. The body still carries the counter, because `DELETE` with a body is what the guard needs and a
+/// query parameter would put a guard value in a place a proxy may rewrite.
+async fn forget_skill(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<ForgetSkillRequest>,
+) -> Response {
+    match state.skills().forget(&id, &request).await {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// `GET /api/v1/skills/export`
+async fn export_skills(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
+    let limit = match parse_memory_page(raw.as_deref()) {
+        Ok(page) => page.limit.unwrap_or(crate::skill_service::MAX_SKILL_PAGE),
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    match state.skills().export(limit).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => skill_error(&error),
+    }
+}
+
+/// Maps a skill failure onto the shared error envelope.
+///
+/// # Why `ForeignWorkspace` renders exactly as `NotFound`
+///
+/// The service keeps the two apart because the isolation rule is otherwise untestable, but a caller must not be
+/// able to learn that another workspace holds a revision with a given identifier — which is precisely what a
+/// distinct message would disclose. So the wire has one answer for both, and the distinction stays inside.
+///
+/// The detail string is carried for the caller-actionable variants and **not** for storage, because a
+/// `DatabaseError`'s text can name a path or a SQL statement.
+fn skill_error(error: &crate::skill_service::SkillServiceError) -> Response {
+    use crate::skill_service::SkillServiceError as Skill;
+    match error {
+        // Both absences render identically — see the note above.
+        Skill::NotFound | Skill::ForeignWorkspace => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no skill revision exists for the requested identifier in this workspace",
+        ),
+        Skill::Conflict => error_response(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the skill revision was changed by another writer; re-read it and retry",
+        ),
+        Skill::UnknownValue { .. } | Skill::PageTooLarge { .. } | Skill::Refused { .. } => {
+            // Through `SafeMessage`, which bounds the length and refuses a control character, so a refusal
+            // cannot forge a log line or a second header.
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::Validation,
+                safe(&error.detail()).as_str(),
+            )
+        }
+        Skill::Storage(_) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal,
             "the local database is not available",
@@ -2873,6 +3050,444 @@ mod tests {
         assert!(
             !export.exclusions.is_empty(),
             "an export that looks complete and is not is worse than one that says what it left out"
+        );
+    }
+
+    /// Creates a skill over HTTP, returning its revision identifier.
+    ///
+    /// A helper because almost every skill test needs a revision that exists, and building the body each time
+    /// would be five copies of one request that could drift.
+    async fn create_skill_via_http(app: &Router, presented: &str, description: &str) -> String {
+        let body = serde_json::json!({
+            "description": description,
+            "author_version": "1",
+            "steps": [{
+                "position": 1,
+                "tool": "jarvis.files.read",
+                "tool_version": "1.0.0",
+                "instruction": "Read the notes file.",
+            }],
+        })
+        .to_string();
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/skills", presented, &body))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "a creation must be a creation: {}",
+            body_text(response).await
+        );
+        let text = body_text(response).await;
+        let reply: jarvis_protocol::SkillReply =
+            serde_json::from_str(&text).unwrap_or_else(|error| panic!("decode {text}: {error}"));
+        reply.reference.revision_id
+    }
+
+    /// **⭐⭐⭐ A skill can be created, listed, read, disabled, enabled, and deleted over HTTP.**
+    ///
+    /// The whole `P4-013` lifecycle in one test, and every assertion is made against a **subsequent request**
+    /// rather than against the reply that caused it — so a handler that returned the right shape and wrote
+    /// nothing would fail. That is the same rule the memory round trip follows, and it matters more here,
+    /// because `P4-012` recorded that a skill could previously be *created only from a test*.
+    ///
+    /// # What the assertions are chosen to catch
+    ///
+    /// - **The listing carries no text.** A reference that leaked the description would be a second, less
+    ///   careful path into a prompt than the retrieval path — so `description` must be absent from the listing
+    ///   and present on the detail read.
+    /// - **The counter advances.** Every transition increments `version_counter`, and a verb applied with a
+    ///   stale one is refused; so the test reads the current value before each verb, exactly as a client does.
+    /// - **Disable is not deletion.** The disabled revision is still listed, which is what makes "why is this
+    ///   not being used" answerable.
+    //
+    // The length is the lifecycle's rather than the test's: create, list, read, disable, enable, and delete,
+    // each asserted against a **subsequent** request. Splitting it would put the six verbs in six tests that
+    // share no state, so the property this test actually establishes — that a *sequence* of verbs works, each
+    // one accepting the counter the previous returned — would be unasserted. That sequence is the thing an
+    // optimistic guard can break, which is why it stays one test.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn the_skill_routes_create_list_read_disable_enable_and_delete() {
+        let (app, presented, _profile) = test_router().await;
+        let revision_id =
+            create_skill_via_http(&app, &presented, "Summarize the open items.").await;
+
+        // The listing is a **reference**, so it must not carry the procedure's text.
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/skills?limit=10", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = body_text(listed).await;
+        let listing: jarvis_protocol::SkillListReply = serde_json::from_str(&listed_body)
+            .unwrap_or_else(|error| panic!("decode {listed_body}: {error}"));
+        assert_eq!(listing.returned, 1, "the creation must be listed");
+        assert!(
+            !listed_body.contains("Summarize the open items"),
+            "a listing must not carry the procedure's prose, or it is a second path into a prompt: \
+             {listed_body}"
+        );
+        assert_eq!(
+            listing.skills[0].tool_ids,
+            vec!["jarvis.files.read".to_owned()],
+            "the tools a procedure names are metadata and are what an operator recognises it by"
+        );
+
+        // The detail read is the one place the text belongs.
+        let detail = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/skills/{revision_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body = body_text(detail).await;
+        let detail: jarvis_protocol::SkillDetailReply = serde_json::from_str(&detail_body)
+            .unwrap_or_else(|error| panic!("decode {detail_body}: {error}"));
+        assert_eq!(detail.description, "Summarize the open items.");
+        assert_eq!(detail.steps.len(), 1);
+        assert!(
+            detail.is_usable,
+            "a user-authored procedure is usable from the outset, because nothing proposed it for approval"
+        );
+
+        // Disable: the revision stays listed, which is what makes the inspection surface answer "why not".
+        let disabled = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/skills/{revision_id}/disable"),
+                &presented,
+                &serde_json::json!({ "expected_version": detail.reference.version_counter })
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            disabled.status(),
+            StatusCode::OK,
+            "disabling must be accepted: {}",
+            body_text(disabled).await
+        );
+        let disabled_body = body_text(disabled).await;
+        let disabled: jarvis_protocol::SkillReply = serde_json::from_str(&disabled_body)
+            .unwrap_or_else(|error| panic!("decode {disabled_body}: {error}"));
+        assert_eq!(disabled.reference.state, "archived");
+        assert!(
+            disabled.reference.version_counter > detail.reference.version_counter,
+            "a transition must advance the counter, or a second verb would present a value the store rejects"
+        );
+
+        let after_disable = serde_json::from_str::<jarvis_protocol::SkillListReply>(
+            &body_text(
+                app.clone()
+                    .oneshot(get_request("/api/v1/skills", Some(&presented)))
+                    .await
+                    .unwrap_or_else(|error| panic!("router call: {error}")),
+            )
+            .await,
+        )
+        .unwrap_or_else(|error| panic!("decode listing: {error}"));
+        assert_eq!(
+            after_disable.returned, 1,
+            "a disabled revision is retained, because 'why is this not being used' is the question this view \
+             exists to answer"
+        );
+
+        // Enable: back to the state its promotion record implies, which for a user-authored revision is active.
+        let enabled = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/skills/{revision_id}/enable"),
+                &presented,
+                &serde_json::json!({ "expected_version": disabled.reference.version_counter })
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let enabled_body = body_text(enabled).await;
+        let enabled: jarvis_protocol::SkillReply = serde_json::from_str(&enabled_body)
+            .unwrap_or_else(|error| panic!("decode {enabled_body}: {error}"));
+        assert_eq!(enabled.reference.state, "active");
+
+        // Delete: the verb is `DELETE` and the receipt counts what went.
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/skills/{revision_id}"))
+                    .method("DELETE")
+                    .header(header::AUTHORIZATION, format!("Bearer {presented}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "expected_version": enabled.reference.version_counter })
+                            .to_string(),
+                    ))
+                    .unwrap_or_else(|error| panic!("fixture request: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            deleted.status(),
+            StatusCode::OK,
+            "deleting must be accepted: {}",
+            body_text(deleted).await
+        );
+        let deleted_body = body_text(deleted).await;
+        let receipt: jarvis_protocol::SkillDeletionReceipt = serde_json::from_str(&deleted_body)
+            .unwrap_or_else(|error| panic!("decode {deleted_body}: {error}"));
+        assert_eq!(receipt.removed_steps, 1);
+        assert!(
+            !receipt.unreachable.is_empty(),
+            "a receipt that reads as total is worse than one that names what it could not reach"
+        );
+
+        // And it is gone, asserted by a read rather than by the delete's own reply.
+        let gone = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/skills/{revision_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// **⭐⭐ A skill's creation refuses a tool this deployment cannot run, and a stale counter is a `409`.**
+    ///
+    /// Two rules that only the service can state, both asserted over the wire because a rule the route does not
+    /// report is not one a client can act on.
+    ///
+    /// The unknown-tool refusal is the **membership** half: the identifier is structurally valid, so the
+    /// domain and the schema would accept it, and the step would be stored as a procedure that cannot execute.
+    /// The router here composes **no** tool pipeline, so the membership check does not fire — and that is the
+    /// deliberate case the service's `None` arm covers, where with no registry there is nothing to compare
+    /// against and refusing every step would conflate "no tools" with "a bad tool name".
+    #[tokio::test]
+    async fn the_skill_routes_refuse_a_stale_counter_and_a_malformed_step() {
+        let (app, presented, _profile) = test_router().await;
+        let revision_id = create_skill_via_http(&app, &presented, "A procedure.").await;
+        let read: jarvis_protocol::SkillDetailReply = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(get_request(
+                        &format!("/api/v1/skills/{revision_id}"),
+                        Some(&presented),
+                    ))
+                    .await
+                    .unwrap_or_else(|error| panic!("router call: {error}")),
+            )
+            .await,
+        )
+        .unwrap_or_else(|error| panic!("decode detail: {error}"));
+
+        // A stale counter is a `409`, because the remedy is a re-read rather than a different request.
+        let stale = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/skills/{revision_id}/disable"),
+                &presented,
+                &serde_json::json!({ "expected_version": read.reference.version_counter + 7 })
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            stale.status(),
+            StatusCode::CONFLICT,
+            "a stale counter must be a conflict: {}",
+            body_text(stale).await
+        );
+
+        // A **malformed** tool identifier is a `422` about the caller's input, not a `409` or a `500` — the
+        // step cannot be built at all, and the reason names the field.
+        let malformed = serde_json::json!({
+            "description": "A procedure with a bad step.",
+            "author_version": "1",
+            "steps": [{
+                "position": 1,
+                "tool": "notadottedidentifier",
+                "tool_version": "1.0.0",
+                "instruction": "Do something.",
+            }],
+        })
+        .to_string();
+        let refused = app
+            .clone()
+            .oneshot(post_json("/api/v1/skills", &presented, &malformed))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a step naming a malformed tool must be refused as a value problem: {}",
+            body_text(refused).await
+        );
+
+        // Nothing was written by either refusal, asserted by the listing rather than by the replies.
+        let listing: jarvis_protocol::SkillListReply = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(get_request("/api/v1/skills", Some(&presented)))
+                    .await
+                    .unwrap_or_else(|error| panic!("router call: {error}")),
+            )
+            .await,
+        )
+        .unwrap_or_else(|error| panic!("decode listing: {error}"));
+        assert_eq!(
+            listing.returned, 1,
+            "a refused write must not have stored anything, and the counter refusal must not have disabled it"
+        );
+        assert_eq!(
+            listing.skills[0].state, "active",
+            "the stale-counter refusal must not have archived the revision"
+        );
+    }
+
+    /// **⭐⭐ A promotion is the one route that names its approver, and a self-approval is refused.**
+    ///
+    /// `ADR-0117` §4's boundary over the wire. The revision is created **as an agent proposal** directly
+    /// through storage, because the HTTP creation surface deliberately records a *user-authored* revision — a
+    /// client cannot choose which path it is on, which is what keeps the promotion rule from being a flag. So
+    /// this test writes the proposal the way the agent path would and then drives the decision over HTTP.
+    ///
+    /// The refusal is asserted **before** the legitimate promotion, so an implementation that refused every
+    /// promotion fails the second half rather than passing on the first.
+    //
+    // Long because it is one rule in three parts: the proposal a promotion acts on, the refusal, and the
+    // control. The control is what makes the refusal meaningful, so separating them would leave the assertion
+    // satisfied by an implementation that refused every promotion.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_self_approved_promotion_is_refused_over_http() {
+        let (app, presented, _profile, database) = memory_router().await;
+
+        // An agent-authored proposal: `Proposed`, so a promotion is the only route to usable.
+        let identity = jarvis_storage::load_local_identity(&database)
+            .await
+            .unwrap_or_else(|error| panic!("load identity: {error}"));
+        let proposed = jarvis_core::SkillRevision::new(jarvis_core::SkillRevisionParts {
+            skill_id: jarvis_core::SkillId::new(),
+            workspace_id: identity
+                .workspace_id()
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture workspace: {error}")),
+            revision_id: jarvis_core::SkillId::new(),
+            version: "1".to_owned(),
+            description: "A procedure the model suggested.".to_owned(),
+            steps: vec![
+                jarvis_core::SkillStep::new(
+                    1,
+                    "jarvis.files.read",
+                    "1.0.0",
+                    "Read the notes.",
+                    |identifier: &str| identifier.contains('.'),
+                )
+                .unwrap_or_else(|error| panic!("fixture step: {error}")),
+            ],
+            source: jarvis_core::MemorySource::of_kind(
+                jarvis_core::MemorySourceKind::ModelInference,
+                "run-9",
+            )
+            .unwrap_or_else(|error| panic!("fixture source: {error}")),
+            sensitivity: jarvis_core::Sensitivity::Internal,
+            state: jarvis_core::SkillState::Proposed,
+            supersedes: None,
+            dropped_fields: Vec::new(),
+            run_id: None,
+            // The author is the **run**, which is the actor the self-approval guard compares against.
+            created_by_actor_id: "run-9".to_owned(),
+            correlation_id: jarvis_core::CorrelationId::new(),
+            created_at: jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+        })
+        .unwrap_or_else(|error| panic!("fixture proposal: {error}"));
+        jarvis_storage::record_skill_revision(&database, &proposed)
+            .await
+            .unwrap_or_else(|error| panic!("record proposal: {error}"));
+        let revision_id = proposed.revision_id().to_string();
+
+        let read: jarvis_protocol::SkillDetailReply = serde_json::from_str(
+            &body_text(
+                app.clone()
+                    .oneshot(get_request(
+                        &format!("/api/v1/skills/{revision_id}"),
+                        Some(&presented),
+                    ))
+                    .await
+                    .unwrap_or_else(|error| panic!("router call: {error}")),
+            )
+            .await,
+        )
+        .unwrap_or_else(|error| panic!("decode detail: {error}"));
+        assert!(
+            !read.is_usable,
+            "a model-authored proposal must not be usable before a decision"
+        );
+        assert_eq!(read.unusable_reason.as_deref(), Some("not_usable"));
+
+        // The self-approval: the run that authored it names itself as the approver.
+        let self_approved = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/skills/{revision_id}/promote"),
+                &presented,
+                &serde_json::json!({
+                    "expected_version": read.reference.version_counter,
+                    "approver_actor_id": "run-9",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            self_approved.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an author must not be able to approve its own procedure: {}",
+            body_text(self_approved).await
+        );
+        let refusal_body = body_text(self_approved).await;
+        assert!(
+            refusal_body.contains("own author"),
+            "the refusal must name the actual problem, not report a missing field: {refusal_body}"
+        );
+
+        // **The control:** a different actor promotes the same proposal, so the refusal above is the
+        // self-approval rule rather than a promotion that never works.
+        let promoted = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/skills/{revision_id}/promote"),
+                &presented,
+                &serde_json::json!({
+                    "expected_version": read.reference.version_counter,
+                    "approver_actor_id": "user-1",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            promoted.status(),
+            StatusCode::OK,
+            "a different actor must be able to promote it: {}",
+            body_text(promoted).await
+        );
+        let promoted_body = body_text(promoted).await;
+        let promoted: jarvis_protocol::SkillReply = serde_json::from_str(&promoted_body)
+            .unwrap_or_else(|error| panic!("decode {promoted_body}: {error}"));
+        assert_eq!(promoted.reference.state, "active");
+        assert_eq!(
+            promoted.reference.promoted_by_actor_id.as_deref(),
+            Some("user-1"),
+            "the approver a decision named must survive to the read"
         );
     }
 

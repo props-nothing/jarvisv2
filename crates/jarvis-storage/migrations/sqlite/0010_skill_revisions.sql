@@ -39,6 +39,21 @@ CREATE TABLE skill_revisions (
     -- The author's version string. Content, not identity, and bounded like a tool version so a step's
     -- `tool_version` and this cannot disagree about what a version looks like.
     version TEXT NOT NULL CHECK (length(version) BETWEEN 1 AND 64),
+    -- **How widely this procedure may be disclosed.**
+    --
+    -- Same vocabulary and same reason as a memory's: a skill's prose and step instructions reach a model, so
+    -- a procedure describing a confidential workflow must not be sent to a third-party model.
+    -- `SkillQuery::is_eligible` and `ContextItem` both refuse a revision above the destination's ceiling, so
+    -- this column is what makes that rule enforceable rather than merely intended.
+    --
+    -- `NOT NULL` with **no default**, deliberately. A default here would be a value nobody chose applied to
+    -- every row written before this column existed — and the only safe default is the most restrictive,
+    -- which would silently refuse to offer every pre-existing skill. Requiring it means the writer states it,
+    -- and a decode of a row that somehow lacks one fails rather than guessing (`P3-006c`'s rule: a field
+    -- accepted-then-ignored is worse than one never accepted).
+    sensitivity TEXT NOT NULL CHECK (
+        sensitivity IN ('public', 'internal', 'confidential', 'restricted')
+    ),
     -- The procedure's prose, which reaches a model and is therefore fenced by the caller rather than here.
     -- Bounded because an unbounded description is a single record that can consume a whole context budget.
     description TEXT NOT NULL CHECK (length(description) BETWEEN 1 AND 8192),
