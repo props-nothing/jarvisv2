@@ -81,3 +81,47 @@ pub struct ApprovalReply {
     /// When it lapses.
     pub expires_at: UtcTimestamp,
 }
+/// One pending approval, with what a person needs to decide it.
+///
+/// Returned by `GET /api/v1/approvals`. It carries the **arguments** the call was made with, which is the
+/// reason this type exists beside [`ApprovalReply`]: a decision reply reports that a decision happened, while
+/// this lets a person see **what they are about to approve**. It never carries the nonce — that travels through
+/// the profile-private file (`ADR-0042`), not through a route a requester could also reach.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingApprovalReply {
+    /// The approval's identifier, which a decision names.
+    pub approval_id: String,
+    /// The run that is waiting on it.
+    pub run_id: String,
+    /// The held call, which is what a resume names.
+    pub call_id: String,
+    /// The tool the call would run.
+    pub tool: String,
+    /// The tool version the intent is bound to.
+    pub tool_version: String,
+    /// The risk level the call was held at.
+    pub risk_level: u8,
+    /// The authentication strength a decision must be made with.
+    pub required_strength: String,
+    /// A short description of the action.
+    pub preview: String,
+    /// The arguments the call was made with, absent when they were too large to hold.
+    ///
+    /// When absent the approval is **not decidable from a client that must show what it approves**, which
+    /// is the fail-closed direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
+    /// When the request was created.
+    pub created_at: UtcTimestamp,
+    /// When it lapses.
+    pub expires_at: UtcTimestamp,
+}
+
+/// Response body for `GET /api/v1/approvals`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalListReply {
+    /// How many approvals are pending.
+    pub total: usize,
+    /// The pending approvals, newest first.
+    pub approvals: Vec<PendingApprovalReply>,
+}

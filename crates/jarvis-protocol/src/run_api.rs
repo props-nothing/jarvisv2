@@ -402,6 +402,11 @@ pub enum StreamReading {
     /// received. That is not hypothetical: it is what the first end-to-end run of this stream did,
     /// and the two kinds carried the same classification until the duplication was seen on screen.
     OutputCompleted,
+    /// The run is waiting for a person to decide a held action.
+    ///
+    /// Not terminal — the run is parked, not settled — but a client that keeps waiting for it to finish
+    /// would wait for a human it never told. The event's payload names the approval.
+    AwaitingApproval,
     /// Anything else worth showing as an operational line.
     Activity,
 }
@@ -417,6 +422,7 @@ impl StreamReading {
             RunEventKind::StateChanged => Self::StateChanged,
             RunEventKind::OutputDelta => Self::OutputDelta,
             RunEventKind::OutputCompleted => Self::OutputCompleted,
+            RunEventKind::ApprovalRequested => Self::AwaitingApproval,
             _ => Self::Activity,
         }
     }

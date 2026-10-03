@@ -506,6 +506,11 @@ impl RunLoopState {
 struct PendingCall {
     /// The admitted call the decision released.
     call_id: String,
+    /// Whether the decision **refused** the call rather than released it.
+    ///
+    /// A refused call never ran, so there is no stored outcome to read; the run instead tells the model that
+    /// the person declined, so it answers the user instead of staying parked on a decision already made.
+    declined: bool,
 }
 
 /// Drives one run to a terminal state, running model-requested tools through the policy pipeline.
@@ -577,6 +582,41 @@ pub async fn resume_run_with_tools(
     let state = RunLoopState {
         pending: Some(PendingCall {
             call_id: call_id.to_owned(),
+            declined: false,
+        }),
+        ..RunLoopState::default()
+    };
+    let deps = RunDeps {
+        database,
+        model,
+        model_id,
+        tools,
+    };
+    drive_run(deps, run_id, state).await
+}
+
+/// Continues a run whose held tool call a person **declined**.
+///
+/// Without this a denial settled the approval and left the run parked at `AwaitingApproval` forever: the
+/// person had answered and the conversation never learned it. The model is told the action was refused and
+/// not run, and it answers the user from there. The call itself is not executed — there is no effect to
+/// report — so this takes the identifier only, for the transcript.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] under the same conditions as [`execute_run_with_tools`].
+pub async fn resume_run_declined(
+    database: &Arc<SqliteDatabase>,
+    model: &dyn ModelGateway,
+    model_id: &ModelId,
+    tools: Option<&Arc<ToolPipeline>>,
+    run_id: &str,
+    call_id: &str,
+) -> Result<StoredRun, DatabaseError> {
+    let state = RunLoopState {
+        pending: Some(PendingCall {
+            call_id: call_id.to_owned(),
+            declined: true,
         }),
         ..RunLoopState::default()
     };
@@ -1892,6 +1932,17 @@ async fn resume_held_call(
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
     let database = deps.database;
+    if pending.declined {
+        // A refusal is this platform's own statement, not retrieved content, so it is not fenced. It says what
+        // the person decided and what that means for the model: nothing ran, and asking again is not wanted.
+        state.messages = assemble_context_messages(deps, run, correlation_id).await?;
+        state.messages.push(ChatMessage::user(format!(
+            "The person declined to approve tool call {}. It was not run and nothing happened. Do not \
+             request it again; tell the user plainly that you did not do it and offer another way to help.",
+            pending.call_id
+        )));
+        return enter_execution(database, run, correlation_id).await;
+    }
     // The stored call is the row the resume route wrote, so this reads the effect rather than re-running
     // it. A lookup failure or a non-terminal outcome is reported to the model as the observation: the
     // run's job is to answer, and a missing result is a fact about the request rather than a reason to
@@ -3933,6 +3984,81 @@ mod tests {
         assert!(
             matches!(executed, ToolPipelineOutcome::Executed(_)),
             "the resumed call must run: {executed:?}"
+        );
+    }
+
+    /// **A run whose held call was declined answers the user instead of staying parked.**
+    ///
+    /// Found live: denying an approval settled the approval and left the run at `AwaitingApproval` forever, so
+    /// the person had answered and the conversation never learned it. The effect count is asserted on the
+    /// adapter because the one thing a decline must never do is run the tool, and the model's request is
+    /// asserted because the point of continuing the run is that the model is **told** — and told not to ask
+    /// again.
+    #[tokio::test]
+    async fn a_run_whose_held_call_was_declined_answers_without_running_it() {
+        let (profile, database) = database().await;
+        let (tools, adapter) = approval_pipeline(&profile, &database);
+        let run = start(&database, "perform the approved action").await;
+        let tool_model = model(vec![Turn::tool_call(
+            "call_1",
+            crate::approval_fixture::APPROVAL_TOOL,
+            r#"{"path":"notes.txt"}"#,
+        )]);
+        let parked = execute_run_with_tools(
+            &database,
+            &tool_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(parked.state(), RunState::AwaitingApproval);
+
+        let held = jarvis_storage::read_run_tool_calls(&database, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("read the run's calls: {error}"));
+        let call = held
+            .first()
+            .unwrap_or_else(|| panic!("the hold must have written a call row"));
+
+        let answer_model = model(vec![Turn::answer("I did not do that, as you declined.")]);
+        let resumed = resume_run_declined(
+            &database,
+            &answer_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+            call.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("continue the declined run: {error}"));
+
+        assert_eq!(
+            resumed.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded),
+            "a declined run must answer rather than stay parked"
+        );
+        assert_eq!(
+            adapter.calls(),
+            0,
+            "a declined call must never reach the adapter"
+        );
+
+        let requests = answer_model.seen_messages();
+        assert_eq!(requests.len(), 1, "one model call after the decline");
+        let texts: Vec<String> = requests[0].iter().map(ChatMessage::text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("declined") && text.contains("Do not request it again")),
+            "the model must be told the person declined: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("perform the approved action")),
+            "the request must still carry the objective: {texts:?}"
         );
     }
 

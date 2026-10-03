@@ -22,7 +22,9 @@ mod tool_call_repository;
 mod workspace_repository;
 
 pub use approval_repository::{
-    create_approval, find_approval, read_pending_approvals, read_run_approvals, record_decision,
+    MAX_APPROVAL_ARGUMENTS_BYTES, attach_approval_arguments, create_approval, find_approval,
+    read_approval_arguments, read_pending_approvals, read_run_approvals,
+    read_workspace_pending_approvals, record_decision,
 };
 pub use config::{
     CURRENT_CONFIG_VERSION, Config, ConfigError, ConfigMigration, ConfigStore, DaemonConfig,

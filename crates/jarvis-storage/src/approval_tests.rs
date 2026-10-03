@@ -756,3 +756,92 @@ async fn a_row_whose_decision_attribution_is_missing_is_reported() {
         "an empty approver must be reported, got {decoded:?}"
     );
 }
+/// **A pending approval holds the arguments a person needs to see, and a decision removes them.**
+///
+/// The hash binds a decision to an action; it cannot show anyone what the action is. So the payload is held
+/// while the approval is pending and the guarded decision `UPDATE` clears it — a decided approval keeps no
+/// tool payload in a durable record, which is what `0006` was protecting.
+#[tokio::test]
+async fn a_pending_approval_holds_its_arguments_until_it_is_decided() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    let arguments = serde_json::json!({"url": "https://example.com"});
+    let request = approval_for("jarvis.web.fetch", &arguments);
+    let id = request.id().to_string();
+    must(create_approval(&database, &request).await);
+
+    assert_eq!(must(read_approval_arguments(&database, &id).await), None);
+    assert!(must(
+        attach_approval_arguments(&database, &id, &arguments.to_string()).await
+    ));
+    assert_eq!(
+        must(read_approval_arguments(&database, &id).await),
+        Some(arguments.to_string())
+    );
+
+    must(record_decision(&database, &id, request.nonce_for_storage(), &approve(1)).await);
+    assert_eq!(
+        must(read_approval_arguments(&database, &id).await),
+        None,
+        "a decided approval must hold no tool payload"
+    );
+    assert!(
+        !must(attach_approval_arguments(&database, &id, &arguments.to_string()).await),
+        "a payload can never be attached to an approval that was already decided"
+    );
+}
+
+/// A payload too large to hold is not held, and that is not an error: the approval stands, and is simply not
+/// decidable from a client that must show what it approves.
+#[tokio::test]
+async fn arguments_too_large_to_show_are_not_held() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    let request = approval_for("jarvis.web.fetch", &serde_json::json!({}));
+    let id = request.id().to_string();
+    must(create_approval(&database, &request).await);
+
+    let huge = format!(
+        "{{\"text\":\"{}\"}}",
+        "x".repeat(MAX_APPROVAL_ARGUMENTS_BYTES)
+    );
+    assert!(!must(
+        attach_approval_arguments(&database, &id, &huge).await
+    ));
+    assert_eq!(must(read_approval_arguments(&database, &id).await), None);
+}
+
+/// The workspace's pending list contains undecided, unexpired approvals and nothing else.
+#[tokio::test]
+async fn the_workspace_pending_list_excludes_decided_and_lapsed_approvals() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    let pending = approval_expiring_at("jarvis.a.pending", &serde_json::json!({"n": 1}), 10);
+    let decided = approval_expiring_at("jarvis.b.decided", &serde_json::json!({"n": 2}), 10);
+    let lapsed = approval_expiring_at("jarvis.c.lapsed", &serde_json::json!({"n": 3}), 1);
+    for request in [&pending, &decided, &lapsed] {
+        must(create_approval(&database, request).await);
+    }
+    must(
+        record_decision(
+            &database,
+            &decided.id().to_string(),
+            decided.nonce_for_storage(),
+            &approve(1),
+        )
+        .await,
+    );
+
+    let listed = must(read_workspace_pending_approvals(&database, LOCAL_WORKSPACE_ID, at(5)).await);
+    let tools: Vec<&str> = listed.iter().map(ApprovalRequest::tool).collect();
+    assert_eq!(tools, vec!["jarvis.a.pending"], "got {tools:?}");
+
+    let elsewhere = must(
+        read_workspace_pending_approvals(&database, "0198f000-0000-7000-8000-00000000ffff", at(5))
+            .await,
+    );
+    assert!(
+        elsewhere.is_empty(),
+        "another workspace's approvals must never be listed"
+    );
+}

@@ -215,8 +215,29 @@ async fn start_and_render(
     TurnOutcome {
         session_id: Some(reply.session_id.clone()),
         session_rejected: false,
-        status: consume_turn(client, &reply, &mut stream).await,
+        status: consume_turn(client, &reply, &mut stream, None).await,
     }
+}
+
+/// Follows a run that was parked on an approval and has since been released, rendering it to its end.
+///
+/// The stream replays from the start, so it passes through the approval the person **just decided**. That
+/// event is skipped by identifier — treating it as "the run is waiting" would end the command at the very
+/// approval it exists to follow past — while a *later* approval, from a second held action, still stops it.
+pub(crate) async fn follow_run(
+    client: &ApiClient,
+    run_id: &str,
+    decided_approval: &str,
+) -> ExitStatus {
+    let reply = match client.read_run(run_id).await {
+        Ok(reply) => reply,
+        Err(error) => return report_error(&error),
+    };
+    let mut stream = match client.open_stream(run_id).await {
+        Ok(stream) => stream,
+        Err(error) => return report_error(&error),
+    };
+    consume_turn(client, &reply, &mut stream, Some(decided_approval)).await
 }
 
 /// Renders a run's stream until it settles, and reports the exit status for the turn.
@@ -228,6 +249,7 @@ async fn consume_turn(
     client: &ApiClient,
     reply: &RunReply,
     stream: &mut crate::api_client::RunEventStream,
+    skip_approval: Option<&str>,
 ) -> ExitStatus {
     // A run's stream begins with the state it was already in, so the first `state_changed` event is
     // the objective's acceptance, not progress. Rendering it would print the same state twice.
@@ -316,6 +338,26 @@ async fn consume_turn(
             StreamReading::Activity => {
                 if let Some(summary) = &event.summary {
                     eprintln!("jarvis: {summary}");
+                }
+            }
+            // Only the event that **names** an approval ends the turn. The run records a second, state-only
+            // event when it parks, which carries no identifier a person could act on.
+            StreamReading::AwaitingApproval => {
+                let approval = event
+                    .payload
+                    .get("approval_id")
+                    .and_then(serde_json::Value::as_str);
+                if let Some(approval) = approval
+                    && skip_approval != Some(approval)
+                {
+                    eprintln!(
+                        "jarvis: run {} is waiting for your approval ({approval})",
+                        reply.run_id
+                    );
+                    eprintln!(
+                        "jarvis: see what it wants with `jarvis approvals list`, then `jarvis approvals approve` or `deny`"
+                    );
+                    return ExitStatus::AwaitingApproval;
                 }
             }
             reading @ (StreamReading::Completed

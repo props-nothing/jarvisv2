@@ -34,6 +34,11 @@ pub(crate) enum ExitStatus {
     /// Distinct from [`Self::Rejected`], which means the daemon refused the *request*. This means
     /// the request was accepted and the work failed, which is a different thing to retry.
     RunFailed,
+    /// The run is parked on an action that needs a person's decision.
+    ///
+    /// Distinct from [`Self::Unavailable`], which a script reads as "try again later": nothing is wrong, the
+    /// run is waiting for `jarvis approvals`, and retrying would only start a second run.
+    AwaitingApproval,
     /// An unexpected internal failure occurred.
     Internal,
 }
@@ -71,6 +76,7 @@ impl From<ExitStatus> for ExitCode {
             ExitStatus::RepairFailed => Self::from(8),
             ExitStatus::Cancelled => Self::from(9),
             ExitStatus::RunFailed => Self::from(10),
+            ExitStatus::AwaitingApproval => Self::from(11),
             ExitStatus::Internal => Self::from(1),
         }
     }
@@ -155,6 +161,10 @@ mod tests {
         assert_eq!(ExitCode::from(ExitStatus::RepairFailed), ExitCode::from(8));
         assert_eq!(ExitCode::from(ExitStatus::Cancelled), ExitCode::from(9));
         assert_eq!(ExitCode::from(ExitStatus::RunFailed), ExitCode::from(10));
+        assert_eq!(
+            ExitCode::from(ExitStatus::AwaitingApproval),
+            ExitCode::from(11)
+        );
         assert_eq!(ExitCode::from(ExitStatus::Internal), ExitCode::from(1));
     }
 

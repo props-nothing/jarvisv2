@@ -11,7 +11,10 @@ mod skill_api;
 mod tool_api;
 mod version;
 mod wire;
-pub use approval::{ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalReply};
+pub use approval::{
+    ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalListReply, ApprovalReply,
+    PendingApprovalReply,
+};
 pub use entity_api::{
     AddAliasRequest, AliasVerificationName, CreateEntityRequest, EntityAliasReply,
     EntityDetailReply, EntityKindName, EntityListReply, EntityLookupReply, EntityMatchReply,

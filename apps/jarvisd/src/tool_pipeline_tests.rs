@@ -1481,7 +1481,7 @@ async fn web_pipeline(
 /// fetch would run unattended and nothing about the tool's own tests would notice.
 #[tokio::test]
 async fn a_web_fetch_is_held_for_approval_by_default() {
-    let (_root, _database, pipeline, actor) = web_pipeline(WorkspacePolicy::default()).await;
+    let (_root, database, pipeline, actor) = web_pipeline(WorkspacePolicy::default()).await;
     let outcome = must(
         pipeline
             .call_tool(
@@ -1492,10 +1492,21 @@ async fn a_web_fetch_is_held_for_approval_by_default() {
             )
             .await,
     );
-    let ToolPipelineOutcome::AwaitingApproval { reason_code, .. } = outcome else {
+    let ToolPipelineOutcome::AwaitingApproval {
+        reason_code,
+        approval_id,
+        ..
+    } = outcome
+    else {
         panic!("a web fetch must be held under the default policy, got {outcome:?}");
     };
     assert_eq!(reason_code, "approval_required");
+
+    // The held approval carries the URL, so the person deciding can see what they are approving (`ADR-0130`).
+    let held = must(jarvis_storage::read_approval_arguments(&database, &approval_id).await);
+    let held: serde_json::Value = serde_json::from_str(&held.unwrap_or_default())
+        .unwrap_or_else(|error| panic!("the held arguments must be JSON: {error}"));
+    assert_eq!(held, json!({ "url": "https://example.com/" }));
 }
 
 /// **With the operator's opt-in the call reaches the adapter, and the adapter's guard still refuses.**

@@ -42,15 +42,15 @@ use jarvis_core::LoopbackHost;
 // be a new direct dependency for a name.
 
 use jarvis_protocol::{
-    AddAliasRequest, ConfirmMemoryRequest, CorrectMemoryRequest, CreateEntityRequest,
-    CreateSkillRequest, DeletionReceipt, EntityDetailReply, EntityListReply, EntityLookupReply,
-    ForgetMemoryRequest, ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply,
-    MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest,
-    MergeEntityRequest, PromoteSkillRequest, RememberRequest, RunPathError, RunReply,
-    RunStreamDecoder, RunStreamFrame, SSE_ACCEPT, SkillDeletionReceipt, SkillDetailReply,
-    SkillExportReply, SkillListReply, SkillReply, SkillTransitionRequest, StartRunRequest,
-    ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError, dotted_path_segment,
-    path_segment, run_path, run_stream_path, runs_path,
+    AddAliasRequest, ApprovalDecisionBody, ApprovalListReply, ApprovalReply, ConfirmMemoryRequest,
+    CorrectMemoryRequest, CreateEntityRequest, CreateSkillRequest, DeletionReceipt,
+    EntityDetailReply, EntityListReply, EntityLookupReply, ForgetMemoryRequest, ForgetSkillRequest,
+    JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply,
+    MemorySearchReply, MemorySearchRequest, MergeEntityRequest, PromoteSkillRequest,
+    RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT,
+    SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply, SkillReply,
+    SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest,
+    WireError, dotted_path_segment, path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -120,6 +120,24 @@ const SKILLS_PATH: &str = "/api/v1/skills";
 /// Returns [`RunPathError`] when the identifier contains a character that would change the request target.
 fn skill_path(revision_id: &str) -> Result<String, RunPathError> {
     Ok(format!("{SKILLS_PATH}/{}", path_segment(revision_id)?))
+}
+
+/// The approval collection's path.
+const APPROVALS_PATH: &str = "/api/v1/approvals";
+
+/// Builds the decision path for one approval, validating the identifier first.
+///
+/// The same segment rule the run and memory paths use, for the reason `memory_path` gives.
+fn approval_decision_path(approval_id: &str) -> Result<String, RunPathError> {
+    Ok(format!(
+        "{APPROVALS_PATH}/{}/decision",
+        path_segment(approval_id)?
+    ))
+}
+
+/// Builds the resume path for one held call, validating the identifier first.
+fn call_resume_path(call_id: &str) -> Result<String, RunPathError> {
+    Ok(format!("/api/v1/calls/{}/resume", path_segment(call_id)?))
 }
 
 /// Time allowed to establish a connection to a loopback daemon.
@@ -335,6 +353,51 @@ impl ApiClient {
             None => MEMORIES_PATH.to_owned(),
         };
         self.get_json(&path).await
+    }
+
+    /// Lists the workspace's pending approvals, with the arguments each is waiting on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the transport fails or the daemon refuses.
+    pub async fn list_approvals(&self) -> Result<ApprovalListReply, ApiError> {
+        self.get_json(APPROVALS_PATH).await
+    }
+
+    /// Records a decision on a pending approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the approval is unknown, already decided, lapsed, or the nonce does
+    /// not match.
+    pub async fn decide_approval(
+        &self,
+        approval_id: &str,
+        body: &ApprovalDecisionBody,
+    ) -> Result<ApprovalReply, ApiError> {
+        let path = approval_decision_path(approval_id)?;
+        self.send_json(reqwest::Method::POST, &path, body).await
+    }
+
+    /// Resumes a held call after its approval was decided, supplying the arguments the approval bound.
+    ///
+    /// The daemon recomputes the intent from these arguments, so a wrong payload is refused rather than run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the call is unknown, was not approved, or the arguments differ.
+    pub async fn resume_call(
+        &self,
+        call_id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        let path = call_resume_path(call_id)?;
+        self.send_json(
+            reqwest::Method::POST,
+            &path,
+            &serde_json::json!({ "arguments": arguments }),
+        )
+        .await
     }
 
     /// Lists every registered tool with the authorization posture in force for it.

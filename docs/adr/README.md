@@ -142,3 +142,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0122](0122-an-approval-override-can-only-tighten.md) | An operator's approval override can only tighten, and the risk vocabulary moved to core | Accepted |
 | [0123](0123-the-control-plane-reads-the-policy-in-force.md) | The control plane reads the policy in force, and a preview is a decision not a prediction | Accepted |
 | [0129](0129-a-fetch-is-checked-on-the-address-it-connects-to.md) | A fetch is checked on the address it connects to, and a model-chosen URL is held for a person by default | Accepted |
+| [0130](0130-a-pending-approval-holds-what-it-is-waiting-on.md) | A pending approval holds what it is waiting on, so a person can decide it (amends 0013) | Accepted |

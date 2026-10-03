@@ -378,6 +378,33 @@ async fn a_complete_stream_yields_ordered_events_and_a_terminal_reason() {
 }
 
 #[tokio::test]
+async fn several_events_in_one_network_chunk_are_all_delivered() {
+    // A fast provider (a local Ollama proxying a cloud model was the one that exposed this) writes many events
+    // into one TCP read. The decoder hands back one event per call, so the adapter must keep draining it before
+    // it waits for the next chunk; otherwise the finish reason and the done sentinel sit unread and a complete
+    // answer is reported as `Incomplete`. Every fixture above delivers one event per chunk and could not see it.
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n\
+          data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n\
+          data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+          data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n\
+          data: [DONE]\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+
+    let mut stream = provider.stream(request()).await.expect("stream starts");
+    let mut validator = StreamValidator::new();
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+        let envelope = item.expect("a complete answer in one chunk is not an error");
+        validator.accept(envelope).expect("events are ordered");
+    }
+
+    let summary = validator.finish().expect("the stream completed");
+    assert_eq!(summary.text(), "hello world");
+    assert_eq!(summary.finish_reason(), Some(FinishReason::Stop));
+}
+
+#[tokio::test]
 async fn a_non_streaming_response_maps_model_usage_and_finish_reason() {
     let transport = ScriptedTransport::new(vec![Reply::Body(
         r#"{"model":"served-alias-2","choices":[{"message":{"content":"hi"},"finish_reason":"length"}],

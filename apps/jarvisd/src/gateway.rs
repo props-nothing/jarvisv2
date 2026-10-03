@@ -179,6 +179,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/tools/{tool}/calls", post(call_tool))
         .route("/tools/{tool}/preview", post(preview_tool))
         .route("/calls/{id}/resume", post(resume_call))
+        .route("/approvals", get(list_approvals))
         .route("/approvals/{id}/decision", post(decide_approval))
         .route("/memories", get(list_memories).post(remember))
         .route("/memories/search", post(search_memories))
@@ -697,9 +698,129 @@ async fn decide_approval(
     Json(body): Json<ApprovalDecisionBody>,
 ) -> Response {
     match state.runs.decide(&id, &body).await {
-        Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
+        Ok(reply) => {
+            // A refusal is a decision the run has to hear about. An **approval** is continued by the resume
+            // route, because releasing the call needs the arguments; a refusal needs nothing but to tell the
+            // model, so it is continued here, where the decision is made.
+            if body.decision != jarvis_protocol::ApprovalDecisionRequest::Approve {
+                continue_declined_run(&state, &reply.run_id, &id).await;
+            }
+            (StatusCode::OK, Json(reply)).into_response()
+        }
         Err(error) => error.into_response(),
     }
+}
+
+/// Continues a run that parked on a call whose approval was just refused or withdrawn.
+///
+/// The twin of [`continue_parked_run`], for the case where there is no effect to wait for. A run that is not
+/// parked is left alone, for the same reason: a client may decide an approval whose run was cancelled since.
+async fn continue_declined_run(state: &GatewayState, run_id: &str, approval_id: &str) {
+    let Some(executor) = &state.executor else {
+        return;
+    };
+    let parked = match state.runs.read(run_id).await {
+        Ok(reply) => reply.state == jarvis_core::RunState::AwaitingApproval,
+        Err(_) => false,
+    };
+    if !parked {
+        return;
+    }
+    // The held call's identifier is the approval's own correlation identity — the pipeline names a call by it.
+    let Ok(approval) = jarvis_storage::find_approval(state.database(), approval_id).await else {
+        return;
+    };
+    let call_id = approval.correlation_id().to_string();
+
+    let database = Arc::clone(&state.database);
+    let executor = Arc::clone(executor);
+    let tools = state.tools.clone();
+    let run_id = run_id.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = crate::executor::resume_run_declined(
+            &database,
+            executor.model(),
+            executor.model_id(),
+            tools.as_ref(),
+            &run_id,
+            &call_id,
+        )
+        .await
+        {
+            tracing::error!(
+                run_id,
+                error = %error,
+                "a run whose approval was refused could not be driven to a terminal state"
+            );
+        }
+    });
+}
+
+/// `GET /api/v1/approvals`
+///
+/// Lists the workspace's pending approvals with the arguments each is waiting on, so a person can see **what
+/// they would be approving** before they decide (`ADR-0130`). The workspace is the profile's own, read from the
+/// seeded identity rather than from a request, for the reason the decision route gives: a client-supplied
+/// workspace is a claim, not proof of access.
+///
+/// The nonce is **not** here and never will be: it reaches a human through the profile-private file, and a
+/// route that returned it would hand it to whatever can call this route.
+async fn list_approvals(State(state): State<GatewayState>) -> Response {
+    let now = jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock);
+    let Ok(identity) = jarvis_storage::load_local_identity(state.database()).await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal,
+            "the local database is not available",
+        );
+    };
+    let pending = match jarvis_storage::read_workspace_pending_approvals(
+        state.database(),
+        identity.workspace_id(),
+        now,
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "the pending approvals could not be read");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Internal,
+                "the local database is not available",
+            );
+        }
+    };
+
+    let mut approvals = Vec::with_capacity(pending.len());
+    for request in &pending {
+        let id = request.id().to_string();
+        // A stored payload that is not JSON is treated as absent rather than failing the list: one bad row
+        // must not hide every other pending approval, and an approval with no payload is not decidable from a
+        // client that must show it, which is the safe direction.
+        let arguments = match jarvis_storage::read_approval_arguments(state.database(), &id).await {
+            Ok(Some(text)) => serde_json::from_str(&text).ok(),
+            _ => None,
+        };
+        approvals.push(jarvis_protocol::PendingApprovalReply {
+            approval_id: id,
+            run_id: request.run_id().to_string(),
+            call_id: request.correlation_id().to_string(),
+            tool: request.tool().to_owned(),
+            tool_version: request.tool_version().to_owned(),
+            risk_level: request.risk_level(),
+            required_strength: request.required_strength().as_str().to_owned(),
+            preview: request.preview().as_str().to_owned(),
+            arguments,
+            created_at: request.created_at(),
+            expires_at: request.expires_at(),
+        });
+    }
+    let reply = jarvis_protocol::ApprovalListReply {
+        total: approvals.len(),
+        approvals,
+    };
+    (StatusCode::OK, Json(reply)).into_response()
 }
 
 /// Renders an executed call's result as JSON.
@@ -2840,6 +2961,75 @@ mod tests {
             presented,
             &body.to_string(),
         )
+    }
+
+    /// **A person can list what is waiting, and sees the arguments — never the nonce.**
+    ///
+    /// `GET /approvals` is how a client learns what a held call would do. The assertions are the three ways it
+    /// could be wrong: the arguments the call was made with are shown (so the person knows what they approve),
+    /// the nonce appears nowhere in the reply (it must reach a human only through the private file), and a
+    /// decided approval leaves the list.
+    #[tokio::test]
+    async fn a_pending_approval_is_listed_with_its_arguments_and_never_its_nonce() {
+        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
+
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/approvals", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(listed.status(), StatusCode::OK);
+        let text = body_text(listed).await;
+        assert!(
+            !text.contains(nonce.trim()),
+            "the nonce must never travel in a reply: {text}"
+        );
+        let reply: jarvis_protocol::ApprovalListReply = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("decode the list: {error}: {text}"));
+        assert_eq!(reply.total, 1);
+        let approval = &reply.approvals[0];
+        assert_eq!(approval.approval_id, approval_id);
+        assert_eq!(approval.tool, crate::approval_fixture::APPROVAL_TOOL);
+        assert_eq!(
+            approval.arguments,
+            Some(serde_json::json!({ "path": "notes.txt" })),
+            "the person deciding must see what they are approving"
+        );
+        assert!(
+            !approval.call_id.is_empty(),
+            "a client needs the call identifier to resume it"
+        );
+
+        let decided = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "deny", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(decided.status(), StatusCode::OK);
+
+        let after = app
+            .oneshot(get_request("/api/v1/approvals", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let after: jarvis_protocol::ApprovalListReply =
+            serde_json::from_str(&body_text(after).await)
+                .unwrap_or_else(|error| panic!("decode the list: {error}"));
+        assert_eq!(after.total, 0, "a decided approval is no longer pending");
+    }
+
+    /// The approvals list needs the profile credential like every other route.
+    #[tokio::test]
+    async fn the_approvals_list_refuses_an_unauthenticated_request() {
+        let (app, _presented, _profile, _approval_id, _nonce, _database) = approval_router().await;
+        let refused = app
+            .oneshot(get_request("/api/v1/approvals", None))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// **The route that makes a delivered nonce usable: an operator decides a held approval.**

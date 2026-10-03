@@ -2461,6 +2461,33 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     per-tool result budget and an `offset` argument); non-UTF-8 charsets are decoded lossily; no live-internet test;
     `jarvis tools list` and the CLI were not exercised against a running daemon with this tool.
 
+## P3-028: Approve from the CLI, and the defects that flow exposed
+
+- [x] `P3-028` Let a person see, decide and finish a held action from the shipped product. Found by driving a real
+  model (Ollama `glm-5.3:cloud` through a local Ollama) and the real network through `jarvisd` and the CLI.
+  - **Live result:** "fetch https://example.com" → model requests `jarvis.web.fetch` → run parks (CLI exit 11) →
+    `jarvis approvals approve` → the page is really fetched → the model answers "Example Domain". Also verified live:
+    deny, a refused loopback URL, and kill-and-restart of the daemon while an approval was pending.
+  - **Four defects found by that walk, each fixed with a test that failed first or asserts the fix:**
+    1. `jarvis-models`: **a stream whose events arrive in one network chunk was reported `incomplete`.** The SSE
+       decoder returns one event per call and the adapter never drained it before awaiting the next chunk, so the
+       finish reason and `[DONE]` sat unread. Every fixture sent one event per chunk. Test:
+       `several_events_in_one_network_chunk_are_all_delivered`. *Every live run against Ollama failed before this.*
+    2. **A denied approval left its run parked forever.** Now the executor tells the model it was declined and the
+       run answers (`resume_run_declined`; test asserts the tool ran zero times).
+    3. **A daemon with a parked run would not start** (recovery tried `awaiting_approval → failed`, which the state
+       table forbids). Recovery now leaves a parked run alone. Amends `ADR-0013`.
+    4. **A person could not see what they were approving, or release a held call without a client-side copy of its
+       arguments.** A pending approval now holds its arguments until decided ([ADR-0130](docs/adr/0130-a-pending-approval-holds-what-it-is-waiting-on.md),
+       migration `0013`, schema version 13).
+  - Delivered: `GET /api/v1/approvals`; `jarvis approvals list|approve|deny`; `jarvis ask` exits 11 with the approval
+    id instead of "stalled"; docs (`getting-started.md` was also stale about what exists).
+  - **Limits:** an expired pending approval keeps its payload until a retention sweep exists; a declined call's
+    `tool_calls` row stays `requested`; `approve` resumes the call from the arguments the CLI was shown, so a daemon
+    restart *between* the decision and the resume leaves the call approved but not run (re-run `approve` is refused
+    because it is decided — a `resume`-only verb is the follow-up); SQLite only (no Postgres `approvals` migration
+    exists yet).
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

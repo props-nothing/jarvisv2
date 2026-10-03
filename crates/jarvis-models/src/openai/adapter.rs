@@ -559,27 +559,33 @@ impl StreamState {
                 return Ok(None);
             }
 
-            let chunk = self.body.next_chunk().await;
-
-            let step = match chunk {
-                Ok(Some(chunk)) => self.decoder.push(&chunk),
-                Ok(None) => {
-                    // The connection ended. Without a terminal event this is a
-                    // truncated answer, not a finished one.
-                    self.exhausted = true;
-                    if self.validator.is_finished() || self.terminal {
-                        return Ok(None);
+            // The decoder returns one event per call, so anything it already buffered is drained **before**
+            // another chunk is awaited. Awaiting first loses the tail of a chunk that held several events: the
+            // finish reason and the done sentinel stay buffered, the connection ends, and a complete answer is
+            // reported as incomplete.
+            let mut step = self.decoder.push(&[]);
+            if matches!(step, SseStep::Incomplete) {
+                let chunk = self.body.next_chunk().await;
+                step = match chunk {
+                    Ok(Some(chunk)) => self.decoder.push(&chunk),
+                    Ok(None) => {
+                        // The connection ended. Without a terminal event this is a
+                        // truncated answer, not a finished one.
+                        self.exhausted = true;
+                        if self.validator.is_finished() || self.terminal {
+                            return Ok(None);
+                        }
+                        return Err(ModelError::new(
+                            ModelErrorKind::Incomplete,
+                            safe_message_for(ModelErrorKind::Incomplete),
+                        ));
                     }
-                    return Err(ModelError::new(
-                        ModelErrorKind::Incomplete,
-                        safe_message_for(ModelErrorKind::Incomplete),
-                    ));
-                }
-                Err(error) => {
-                    self.exhausted = true;
-                    return Err(map_transport_error(error));
-                }
-            };
+                    Err(error) => {
+                        self.exhausted = true;
+                        return Err(map_transport_error(error));
+                    }
+                };
+            }
 
             match step {
                 SseStep::Data(text) => self.decode_chunk(&text)?,

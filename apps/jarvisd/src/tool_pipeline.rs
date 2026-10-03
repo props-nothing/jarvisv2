@@ -465,6 +465,9 @@ struct PreparedHold {
     required_strength: AuthenticationStrength,
     /// A human-readable preview of what is being authorized.
     preview: String,
+    /// The arguments the intent was computed over, held on the approval **while it is pending** so the person
+    /// deciding can see what they are approving (`ADR-0130`). The intent, not this value, is the binding.
+    arguments: serde_json::Value,
     /// The correlation identity shared with the originating request.
     correlation_id: CorrelationId,
     /// When the call was admitted.
@@ -1482,6 +1485,7 @@ impl ToolPipeline {
                     .required_strength()
                     .unwrap_or(AuthenticationStrength::Present),
                 preview: format!("{tool} {}", definition.version()),
+                arguments: arguments.clone(),
                 correlation_id,
                 issued_at: now,
             };
@@ -1566,6 +1570,28 @@ impl ToolPipeline {
         // repoint it at a different approval.
         link_tool_call_approval(&self.database, &hold.call_id, &request.id().to_string()).await?;
 
+        // The arguments are held on the approval so the person deciding can see them, and so the call can be
+        // resumed by a client that never had them (`ADR-0130`). They are not part of the binding — the intent is —
+        // and a payload that does not fit is simply not held, which leaves the approval undecidable from a client
+        // that must show what it is approving: the fail-closed direction.
+        let arguments_text = serde_json::to_string(&hold.arguments).ok();
+        let stored_arguments = match arguments_text {
+            Some(text) => {
+                jarvis_storage::attach_approval_arguments(
+                    &self.database,
+                    &request.id().to_string(),
+                    &text,
+                )
+                .await?
+            }
+            None => false,
+        };
+        if !stored_arguments {
+            tracing::warn!(
+                approval_id = %request.id(),
+                "a held call's arguments are too large to show a person, so the approval cannot be decided from a client that must display them"
+            );
+        }
         // The stream records that a human is now the thing holding this run up, which is the one fact a
         // client cannot infer from the tool events around it.
         append_event(

@@ -20,8 +20,8 @@ Phase 1 (`P1-001` through `P1-012`) has delivered a runnable local foundation:
 - per-user service planning and drift detection (no service is installed yet)
 - an automated process-level acceptance gate in `tests/e2e`, run on Windows, macOS, and Linux CI
 
-Not implemented yet: service installation, log rotation, live model provider adapters, tools, memory,
-workflows, and voice.
+Not implemented yet: service installation, log rotation, workflows, voice, and the desktop client. Models, tools,
+memory, MCP, and a first connector contract exist; see [TODO.md](../../TODO.md) for exactly which slices are done.
 
 The next implementation task is the first unchecked item in [TODO.md](../../TODO.md).
 
@@ -122,6 +122,34 @@ refused; it must be absolute. `ADR-0121` records the reasoning.
 The executor lives in `apps/jarvisd` rather than `jarvis-application`, because
 `docs/architecture/repository-layout.md` allows the application layer to depend only on `jarvis-core`
 and has no arrow from it into an adapter crate.
+
+**Trying it with Ollama cloud models (no API key in this repository).** A local Ollama that is signed in
+proxies its `:cloud` models, so the OpenAI-compatible endpoint above needs no real key:
+
+```powershell
+$env:JARVIS_HTTP_ENABLED = "true"
+$env:JARVIS_EXECUTOR_MODEL = "openai-compatible"
+$env:JARVIS_EXECUTOR_BASE_URL = "http://localhost:11434/v1"
+$env:JARVIS_EXECUTOR_MODEL_NAME = "glm-5.3:cloud"
+$env:JARVIS_EXECUTOR_API_KEY_REF = "C:/path/to/a/file/containing/the/word/ollama"
+jarvisd --root C:/path/to/a/scratch/profile
+```
+
+### Tools and approvals
+
+The model is offered the daemon's tools: file read/list inside `daemon.tool_workspace_roots`, memory proposals,
+any configured MCP servers, and `jarvis.web.fetch` (a guarded read of a public web page). A tool the default policy
+holds — `jarvis.web.fetch` is one — **parks the run** until you decide it:
+
+```powershell
+jarvis ask "Fetch https://example.com and tell me the page heading."   # exits 11: waiting for approval
+jarvis approvals list                                                   # shows the tool and its exact arguments
+jarvis approvals approve                                                # confirms, runs it once, prints the answer
+jarvis approvals deny                                                   # the run answers that you declined
+```
+
+`approve` shows the arguments and asks; without a terminal it needs `--yes`. A held action survives a daemon
+restart. See `ADR-0130`.
 
 ### Chatting (multi-turn)
 

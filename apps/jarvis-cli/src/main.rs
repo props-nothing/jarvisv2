@@ -10,6 +10,7 @@
 //! generating a value.
 
 mod api_client;
+mod approvals;
 mod chat;
 mod connector;
 mod entity;
@@ -56,6 +57,9 @@ async fn main() -> ExitCode {
         // still unreachable by a user of the shipped product".
         Some("entity") => entity_command(&arguments).await,
         Some("tools") => tools_command(&arguments).await,
+        // `approvals` is how a person releases or refuses an action a tool call was held on: without it a held
+        // call parked its run and nothing in the shipped product could finish the conversation.
+        Some("approvals") => approvals_command(&arguments).await,
         // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
         // stored procedure, which before this verb group was reachable only from a test.
         Some("skills") => skills_command(&arguments).await,
@@ -76,7 +80,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|tools|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|tools|approvals|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny> [...]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
@@ -133,6 +137,27 @@ async fn tools_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     tools::run(&client, arguments).await
+}
+
+/// Runs one `jarvis approvals` verb over the daemon's HTTP API.
+///
+/// Needs the profile's paths as well as a client: the decision nonce is delivered to a file under the profile's
+/// state directory, and reading it is the one thing here that cannot go through the daemon.
+async fn approvals_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let paths = match resolve_paths(&root) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    approvals::run(&client, &paths, arguments).await
 }
 
 /// Runs one `jarvis skills` verb over the daemon's HTTP API.

@@ -281,10 +281,17 @@ pub async fn recover_interrupted_runs(
 ) -> Result<Vec<String>, DatabaseError> {
     // Non-terminal states are exactly the ones a `NOT IN` list describes, and the index
     // `agent_runs_active_idx` covers that predicate, so this scan does not walk the table.
+    //
+    // A run at `awaiting_approval` is **not** in flight: no process holds it, and none needs to — the approval
+    // row and its nonce file are durable and the person can still decide after a restart. It is also not
+    // failable (`RunState::can_transition_to`), so settling it would refuse and, because recovery runs at
+    // startup, take the daemon down with it. It is recovered only when cancellation was already requested,
+    // which is a legal edge and the operator's stated intent.
     let rows = sqlx::query(
         "SELECT id, session_id, state, version, cancellation_requested_at \
          FROM agent_runs \
-         WHERE state NOT IN ('completed', 'cancelled', 'failed')",
+         WHERE state NOT IN ('completed', 'cancelled', 'failed') \
+           AND NOT (state = 'awaiting_approval' AND cancellation_requested_at IS NULL)",
     )
     .fetch_all(database.pool())
     .await
@@ -1938,6 +1945,54 @@ mod tests {
             None,
             "a cancellation is not a failure"
         );
+        database.close().await;
+    }
+
+    /// **A run waiting on a person is not in flight, and a restart must not settle it — or fail to start.**
+    ///
+    /// Found live: a daemon with a run parked at `awaiting_approval` refused to start at all ("the agent run
+    /// transition was refused"), because recovery tried to settle every non-terminal run as `failed` and the
+    /// state table deliberately forbids that edge (no machine work is in progress, so nothing can have
+    /// failed). The approval row and its nonce file are durable, so the person can still decide after the
+    /// restart; the right recovery is to leave the run exactly where it is.
+    #[tokio::test]
+    async fn a_run_waiting_on_approval_survives_a_restart() {
+        let (_directory, database) = seeded_database().await;
+        let run = one_run(&database, RUN_A).await;
+        let context = advance(&database, run, RunState::ContextBuilding).await;
+        let planning = advance(&database, context, RunState::Planning).await;
+        let waiting = advance(&database, planning, RunState::AwaitingApproval).await;
+
+        let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+        assert!(
+            recovered.is_empty(),
+            "a run waiting on a person must not be settled: {recovered:?}"
+        );
+        let after = must(find_run(&database, waiting.id()).await);
+        assert_eq!(after.state(), RunState::AwaitingApproval);
+        assert_eq!(
+            after.version(),
+            waiting.version(),
+            "and it must not be written"
+        );
+        database.close().await;
+    }
+
+    /// A parked run whose cancellation was already requested is the one parked case recovery does settle: the
+    /// operator's intent was that it stop, and `awaiting_approval → cancelled` is a legal edge.
+    #[tokio::test]
+    async fn a_waiting_run_that_was_cancelled_settles_as_cancelled_on_restart() {
+        let (_directory, database) = seeded_database().await;
+        let run = one_run(&database, RUN_A).await;
+        let context = advance(&database, run, RunState::ContextBuilding).await;
+        let planning = advance(&database, context, RunState::Planning).await;
+        let waiting = advance(&database, planning, RunState::AwaitingApproval).await;
+        must(request_run_cancellation(&database, waiting.id(), at(2)).await);
+
+        let recovered = must(recover_interrupted_runs(&database, at(3)).await);
+        assert_eq!(recovered, vec![waiting.id().to_owned()]);
+        let settled = must(find_run(&database, waiting.id()).await);
+        assert_eq!(settled.state(), RunState::Cancelled);
         database.close().await;
     }
 

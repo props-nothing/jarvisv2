@@ -217,7 +217,7 @@ pub async fn record_decision(
     let result = sqlx::query(
         "UPDATE approvals SET \
             state = ?2, decision_channel = ?3, decision_strength = ?4, decided_by = ?5, \
-            occurred_at = ?6, nonce_hash = ?7 \
+            occurred_at = ?6, nonce_hash = ?7, arguments_json = NULL \
          WHERE id = ?1 AND state = 'pending'",
     )
     .bind(id)
@@ -287,6 +287,105 @@ pub async fn read_run_approvals(
     })?;
 
     rows.iter().map(decode_approval).collect()
+}
+
+/// The most bytes of arguments a pending approval will hold.
+///
+/// Matches the migration's `CHECK`, so the limit is stated once in Rust and enforced once in SQL rather than
+/// being a number a caller could exceed and learn about from a constraint failure.
+pub const MAX_APPROVAL_ARGUMENTS_BYTES: usize = 8192;
+
+/// Stores the arguments a pending approval is waiting on, so the person deciding can see them.
+///
+/// Returns `Ok(false)` — and stores nothing — when the arguments are too large to hold. That is not an error:
+/// the approval exists and is valid, it is just not decidable from a client that must show what it is
+/// approving, which is the fail-closed direction.
+///
+/// The write is guarded on `state = 'pending'`, so a payload can never be attached to an approval that has
+/// already been decided: a decided approval holds none (`record_decision` clears it).
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the write fails.
+pub async fn attach_approval_arguments(
+    database: &SqliteDatabase,
+    id: &str,
+    arguments_json: &str,
+) -> Result<bool, DatabaseError> {
+    if arguments_json.len() > MAX_APPROVAL_ARGUMENTS_BYTES {
+        return Ok(false);
+    }
+    let result =
+        sqlx::query("UPDATE approvals SET arguments_json = ?2 WHERE id = ?1 AND state = 'pending'")
+            .bind(id)
+            .bind(arguments_json)
+            .execute(database.pool())
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "attach an approval's arguments",
+                source,
+            })?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Reads the arguments a pending approval holds, if it holds any.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::ApprovalNotFound`] for an unknown approval and [`DatabaseError::Sqlite`] when the
+/// read fails.
+pub async fn read_approval_arguments(
+    database: &SqliteDatabase,
+    id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let row = sqlx::query("SELECT arguments_json FROM approvals WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "read an approval's arguments",
+            source,
+        })?
+        .ok_or(DatabaseError::ApprovalNotFound)?;
+    row.try_get::<Option<String>, _>("arguments_json")
+        .map_err(|_| DatabaseError::StoredApprovalInvalid {
+            field: "arguments_json",
+        })
+}
+
+/// Reads the pending approvals of a workspace, newest first, evaluated against a clock.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredApprovalInvalid`] when a stored row cannot be decoded.
+pub async fn read_workspace_pending_approvals(
+    database: &SqliteDatabase,
+    workspace_id: &str,
+    now: UtcTimestamp,
+) -> Result<Vec<ApprovalRequest>, DatabaseError> {
+    let rows = sqlx::query(
+        "SELECT id, workspace_id, run_id, actor_id, tool, tool_version, intent_hash, preview, \
+                risk_level, required_strength, nonce_hash, state, decision_channel, \
+                decision_strength, decided_by, correlation_id, created_at, expires_at, occurred_at \
+         FROM approvals WHERE workspace_id = ?1 AND state = 'pending' \
+         ORDER BY created_at DESC, id ASC",
+    )
+    .bind(workspace_id)
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read a workspace's pending approvals",
+        source,
+    })?;
+
+    // The expiry is decided in Rust, from the instant, for the reason this module's header gives.
+    Ok(rows
+        .iter()
+        .map(decode_approval)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|request| request.state_at(now) == ApprovalState::Pending)
+        .collect())
 }
 
 /// Reads the pending approvals for a run, evaluated against a clock.

@@ -76,10 +76,14 @@ reviewable. A run that was interrupted is reported as interrupted.
 
 - **Resumption.** When a provider adapter can report whether a call was accepted, a resume is a new
   decision with new evidence, and it needs its own record.
-- **`awaiting_approval`.** No run reaches that state until `P3` provides approvals. It is non-terminal,
-  so recovery would settle it `failed`, which is correct today (nothing can resume it) and will need
-  revisiting when a durable approval request can outlive a restart. `A13` owns the workflow version of
-  the same problem.
+- **`awaiting_approval`.** *Amended 2026-10-03 (`P3-028`).* This line said recovery would settle a parked run
+  `failed` and "will need revisiting when a durable approval request can outlive a restart". It did, and the
+  revisit was overdue: the state table forbids `awaiting_approval → failed` (no machine work is in progress, so
+  nothing can have failed), so the settlement was **refused** — and because recovery runs at startup, a daemon
+  holding one parked run **would not start**. Found by restarting a daemon with a live model and a held fetch.
+  Recovery now leaves a parked run alone, since its approval row and nonce file are durable and the person can
+  still decide; it settles one only when cancellation was already requested (`awaiting_approval → cancelled`
+  is legal and is the operator's stated intent). `A13` still owns the workflow version of the same problem.
 - **Partial answers.** The `output_delta` events of an interrupted run remain in its stream and are
   neither replayed to a client as a finished answer nor deleted. They are what was observed, and
   deleting history to tidy an outcome is worse than reporting the outcome.
