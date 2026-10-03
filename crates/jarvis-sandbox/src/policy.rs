@@ -86,6 +86,20 @@ impl std::fmt::Display for Guarantee {
 pub struct SandboxRequest {
     /// The executable to launch.
     pub program: PathBuf,
+    /// The container image to run, for a request a container backend will serve.
+    ///
+    /// # Why this is optional, and why it is not derived from `program`
+    ///
+    /// A container cannot run without an image and a host process cannot be started *from* one, so the two are
+    /// alternatives rather than one field with a fallback. The field is optional because the requirement belongs
+    /// to **one backend**: a request for the cgroup or unconfined backend has no image and must not be forced to
+    /// invent one, while a container launch that omits it is refused by name.
+    ///
+    /// Deriving it from `program` was rejected. A host path (`/usr/bin/python3`) and an image reference
+    /// (`python:3.13-slim`) are different kinds of name, and a backend that accepted either would make them
+    /// interchangeable — so a caller who meant "run this binary" on a host with a container could silently get a
+    /// *different* binary from an image, or the reverse.
+    pub image: Option<String>,
     /// Its arguments, passed as a vector rather than a shell string.
     ///
     /// **There is no shell.** `docs/architecture/security.md` lists command injection as a threat with
@@ -289,6 +303,7 @@ mod tests {
     fn request(required: Vec<Guarantee>) -> SandboxRequest {
         SandboxRequest {
             program: PathBuf::from("/nonexistent/program"),
+            image: None,
             arguments: Vec::new(),
             working_directory: None,
             environment: BTreeMap::new(),

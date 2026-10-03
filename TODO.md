@@ -1154,7 +1154,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       **never reconnects or pools**, so a server that dies stays unavailable until the daemon restarts.
       `seen_before` is always empty, so an identity drift across a restart is **invisible** — `P3-009`'s
       persistence problem, unchanged. The **`NamingStrategy` is hardcoded to `Prefixed`** and the file cannot
-      set it, so `Bare` is unreachable from configuration. A **collision refuses the MCP host and its tools are
+      set it, so `Bare` is unreachable from configuration — **CLOSED by `P3-008k` below.** A
+      **collision refuses the MCP host and its tools are
       simply absent** — the correct outcome, but the caller is not told which servers were dropped, only a log
       line. And the daemon is proven to **compose** a host from a document, not to have serviced an MCP call
       through a **run**: the routing test drives the pipeline directly rather than over HTTP.
@@ -1184,6 +1185,53 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       consecutive passes" are not evidence about a *concurrency* defect: the window only opens under load, so
       isolated repetition samples the wrong thing. `P2-009a`'s finding 3 ("writes now re-read first") was
       necessary but not sufficient, and it was recorded as if it were the fix.
+- [x] `P3-008k` Make the naming strategy the document's, so an operator can choose it and a collision is
+      reachable from configuration.
+      **Closes the limit `P3-008j` recorded** — "the `NamingStrategy` is hardcoded to `Prefixed` and the file
+      cannot set it, so `Bare` is unreachable from configuration" — and with it three defects rather than one
+      gap: an operator could not express the choice, **a caller could pass a strategy the document disagreed
+      with**, and `HostError::Collision` was **unreachable through the daemon's own path** because `Prefixed`
+      cannot collide. New: `NamingDocument`, `StrategyName` and the `naming_strategy()` accessor in
+      `crates/jarvis-mcp-transport/src/host_config.rs`; `connect` lost its `strategy` parameter and eight call
+      sites were updated. `ADR-0127`.
+      - **`connect` takes no strategy, so the disagreement is unrepresentable rather than refused.** That is the
+        shape of the fix: `McpHostConfig` owns the value and reads its own field, so two builders of one
+        configuration cannot produce two tool sets — the property `dispatch.rs` refuses for adapters and the
+        catalog refuses for duplicate names.
+      - **An absent section means `Prefixed`, and the default is stated on `StrategyName` rather than derived
+        onto `NamingStrategy`.** `NamingStrategy` already derives `Deserialize`, so reusing it was shorter — but
+        a `#[serde(default)]` on the domain enum would be **that type choosing a security-relevant default for
+        one consumer**. The default belongs where the consequence is, and the consequence is which tools a model
+        is offered. `StrategyName` is also written out rather than derived, for the reason every vocabulary here
+        is: the domain's `as_str` is its wire form, and a rename there must not silently change what a document
+        means.
+      - **The daemon's test changed from asserting a constant to asserting a read.** The old
+        `the_daemons_naming_strategy_is_the_one_that_avoids_collisions` passed a document and checked that two
+        unreachable servers composed — which **a daemon that ignored the section would also pass**. The new pair
+        is `the_daemon_reads_the_configured_naming_strategy` (the parse, asserted directly, because an
+        unreachable server cannot collide so the collision path cannot distinguish the strategies) and
+        `a_configured_bare_strategy_can_collide_and_is_then_refused`. **A test that asserts a hardcoding is a
+        test of a constant.**
+      - **The collision test now writes the strategy into its document**, and asserts both halves: `bare` with
+        two servers offering one name is a **refusal**, and the same two servers under the default **compose**.
+        A test of the refusal alone would pass if every document composed.
+      - **Both directions falsified, in both layers.** Replacing the parsed strategy with `Prefixed` in `parse`
+        fails the transport's collision test *and* the daemon's read test (`left: Prefixed, right: Bare`);
+        making `Bare` the default fails `a_configured_stdio_server_becomes_a_callable_tool` — the identifiers
+        lose the prefix (`["mcp.fetch", "mcp.search"]` where `["mcp.local.fetch", "mcp.local.search"]` is
+        required) — and the absent-section assertion in the collision test.
+      - **⭐⭐ The same over-correction mistake as `P4-016`, made again, and caught by the compiler this time.**
+        Restoring mutation 1 with a **global** replace rewrote *both* `naming:` initializers, so `none()` — which
+        has no document — tried to read `parsed`. `P4-016` recorded this exact lesson ("a mutation restore must
+        be scoped to its occurrence") and it recurred, because the anchor was a line that legitimately appears
+        twice. The compiler caught it here; in `P4-016` a silent narrowing of three queries did not. **The rule
+        that works: when the anchor appears more than once, count the occurrences first and refuse to replace
+        unless the count is the one you expect.**
+      - **Limits:** `Hashed` is expressible but **not exercised against a real server**, because no fixture
+        reports a name that cannot be represented. The strategy is **per host, not per server**, so a setup
+        where one server's names need hashing has to hash both or be split across two profiles — the section
+        shape is where a per-server override would go.
+      - Gates: fmt, clippy `-D warnings` over the workspace, the workspace suite, `cargo deny check` ok.
 - [ ] `P3-009` Implement authenticated, scoped JARVIS MCP server exposure with per-client allowlists and rate limits.
       **Split into three recorded parts, because this reverses a platform decision and adds an auth surface.**
       `P3-009a` (done below) is the policy value; `P3-009d` (done below) is the served surface, recorded under
@@ -2039,11 +2087,70 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         the adapter's own call **count**, which both the route test and the pipeline test now assert.
         Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero skips**,
         all three phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok.
-- [ ] `P3-020` Add a restricted-execution sandbox backend behind the `P3-011` contracts (a container or an
+- [x] `P3-020` Add a restricted-execution sandbox backend behind the `P3-011` contracts (a container or an
       equivalent isolated worker), naming the guarantees the backend can actually enforce per `ADR-0041`.
       No new capability surface: the existing code-execution tool gains a backend, and a guarantee the
       backend cannot enforce is refused rather than declared. The `P3-011` backend stays available so a
       deployment without a container runtime degrades to it rather than to nothing.
+  - **Shape.** `crates/jarvis-sandbox/src/container.rs` (`ContainerBackend`, `container_arguments`,
+    `container_guarantees`), `Support::Container`, `SandboxRequest::image`, and a `wait` method added to
+    `LaunchedProcess`. `backend_for_host()` now prefers a **probed** container where the host-process backend
+    has nothing. `docs/adr/0128` records the decisions and `docs/research/integrations/container-sandboxing.md`
+    the evidence, written before the code.
+  - **Three of five guarantees, and the two refusals differ in kind.** `TreeTermination`,
+    `ProcessCountCeiling` (`--pids-limit`, container-scoped), and `MemoryCeiling` (`--memory`). `CpuTimeCeiling`
+    is refused because the only flag (`--ulimit cpu`) is `RLIMIT_CPU`, **per process**, so a tree of N
+    processes gets N budgets — the same argument `ADR-0041` used to reject `RLIMIT_NPROC`. `CpuRateCeiling` is
+    refused because the `--cpus` translation is **not written**, which is a fact about this file rather than
+    about the facility, and is recorded as such.
+  - **A memory ceiling has a floor, and zero is refused separately.** `--memory` below 6 MiB is rejected **by
+    the daemon** (exit 125), so it is refused by value rather than passed on as an opaque launch failure; and
+    `--memory=0` is *accepted* and read as **unlimited**, the inverse of the field's meaning. Found by probing
+    the boundary. A mutation that deleted the explicit zero test **survived**, because zero is arithmetically
+    below the floor — so the distinction now lives in the refusal's explanation and is asserted on its own.
+  - **The environment boundary is `env -i`, and the first design for it was a no-op.** `-e` **adds** to an
+    image's environment (`PATH` and `HOME` survive; probed), while `SandboxRequest::environment` is documented
+    as the complete one. A `/bin/sh -c 'export -n -p; …'` wrapper was written and believed correct; probed,
+    BusyBox `ash` ignores `export -n` and `-p` only *prints*, so the image's environment survived — and in
+    `dash` it would have worked, making confinement a property of the image. The same argv also dropped the
+    program, because `shift` skipped a marker `"$@"` had already excluded.
+  - **The kill path removes the container, not the CLI.** `Child::kill` on the `docker` CLI leaves the container
+    running in the daemon, so `kill` runs `docker rm -f <name>` and then reaps the client. The generated name is
+    therefore a **handle**.
+  - **Two defects the acceptance test found that the unit tests could not.** (1) The launcher started
+    `request.program` — an **in-image** path — instead of the runtime, failing with a bare `entity not found`.
+    (2) Because of that, the container argv was built **twice**, so the name generator ran twice and the
+    container was launched under one name while `kill` removed another; the leftover sat in state `Created`
+    while the kill reported success. Both are why the injected launcher is now `stdio_launcher(piped)` — a
+    closure that only decides whether to capture the streams — and the backend builds the command. The ordering
+    property is unchanged: the command is built *after* the confinement exists, so `refusing_launcher` still
+    proves no process was created.
+  - **`LaunchedProcess` gained `wait`.** It had `pid()` and `kill()` and no way to observe a child, so no live
+    property of **any** backend was assertable — a handle that could be destroyed but never read. Consuming, for
+    the `'static` future; the limitation that a consuming wait cannot be cancelled is recorded on the trait.
+  - **The live tests are serialised.** A container runtime keeps one container list for the whole host, so
+    parallel tests saw each other's containers and read an absence as a removal. A `tokio::sync::Mutex` is held
+    across each live test, and `wait_for_owned_containers` polls because a container is created by the daemon
+    *after* `spawn` returns. Both were observed failures, not precautions.
+  - **Limits recorded, not closed.** A daemon that ignores `--pids-limit` is undetectable from here (it depends
+    on the daemon's cgroup driver and kernel support); `--network none` and `--read-only` are enforced but are
+    **not** `Guarantee`s, so a caller cannot require them and `doctor` does not report them — which means a
+    container is confined *more* than the guarantee list says; `--security-opt no-new-privileges` is deliberately
+    not passed, because unmodelled hardening enforces something a caller cannot see. A request with an `image`
+    sent to a host-process backend is refused **by name** rather than served, because confining the `docker` CLI
+    would apply `pids.max` to a client while the container's processes ran unbounded — silently, with `doctor`
+    reporting four guarantees.
+  - **Verification.** Live on this host: `doctor --json` reports `sandbox.available` with
+    `facility: container` and `guarantees: tree_termination,process_count_ceiling,memory_ceiling`, where the
+    same host previously reported `unconfined`/`none`. Eight tests launch real containers (read-only refusal
+    observed as `Read-only file system`, `exit 7` propagating as **7**, kill leaving nothing in `docker ps -a`,
+    the image's `PATH`/`HOME` cleared, empty-environment control, both refusals before a container starts,
+    argument boundaries intact), and they skip **loudly** when no runtime or image is present. Mutations proved
+    caught: `--read-only` removed; the removal skipped (leaves the container, named in the failure); the
+    environment boundary skipped; the memory floor disabled; the zero explanation removed.
+  - Gates: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --all-features --locked --
+    -D warnings` clean; `cargo test --workspace --all-features --locked` **1992 passed / 51 suites**; `cargo
+    deny check` ok (advisories, bans, licenses, sources).
 - [ ] `P3-021` Add a remote or disposable sandbox backend (a hosted or short-lived worker) behind the same
       contracts, and prove resource limits, crash isolation, output bounding, and cleanup on the adapter
       boundary. The `P3-011` port is unchanged, so this is an adapter slice and not a protocol change.

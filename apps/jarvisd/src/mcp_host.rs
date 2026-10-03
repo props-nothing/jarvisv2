@@ -174,16 +174,18 @@ pub async fn compose_host(
         return Ok(None);
     }
 
-    // `Prefixed` is the daemon's strategy, and it is the safe one: it names each tool after its server, so
-    // two servers offering `search` produce two distinct identifiers rather than a collision. `Bare` exists
-    // for an operator who wants short names and accepts that two servers cannot both offer one, which is a
-    // choice a configuration file would state — and does not yet, so the safe value is the only one used.
+    // **The naming strategy is the document's, not the daemon's.** It used to be hardcoded here as
+    // `Prefixed` — the safe value — and this comment said `Bare` "is a choice a configuration file would state
+    // and does not yet". It does now: `[naming] strategy = "bare"` is read by `McpHostConfig::parse`, so an
+    // operator who has established their servers cannot collide can say so, and a caller cannot pass a strategy
+    // the document disagrees with. `Prefixed` remains what an absent section means, because a collision is the
+    // failure the namespacing prevents and a default must fail towards serving.
     //
     // No `seen_before` observation is passed: persistence of a server's self-report across restarts is not
     // built, so every build is a first build and a drift is invisible across a restart. That limit is
     // recorded in `TODO.md` rather than implied here.
     let host = config
-        .connect(jarvis_mcp_transport::NamingStrategy::Prefixed, &[])
+        .connect(&[])
         .await
         .map_err(HostComposeError::Connect)?;
 
@@ -297,23 +299,71 @@ mod tests {
     /// A host whose servers **collide** is refused, and that refusal is what keeps the daemon from registering
     /// a tool set whose contents depend on configuration order.
     ///
-    /// This cannot be reached through [`compose_host`] as written, because the daemon hardcodes
-    /// `NamingStrategy::Prefixed` — which namespaces each tool by its server, so two servers offering one name
-    /// produce two identifiers rather than a collision. The collision path therefore belongs to
-    /// `McpHostConfig::connect` and is exercised there, over `Bare`, in `jarvis-mcp-transport`'s own tests.
-    /// Asserted here rather than assumed, so that a future change to the daemon's strategy is a decision
-    /// rather than an accident: this test fails if `Prefixed` stops being collision-free.
+    /// This was unreachable through [`compose_host`] while the daemon hardcoded `NamingStrategy::Prefixed` —
+    /// a namespacing strategy cannot collide — and the test below asserted that hardcoding instead of reaching
+    /// the refusal. Now that the strategy is the **document's**, the daemon's own path can produce a collision:
+    /// the document asks for `bare` and the refusal arrives through `compose_host`, which is the component that
+    /// would drop the tools.
+    ///
+    /// Both halves are asserted, because the interesting statement is a pair: `bare` with two servers offering
+    /// one name **fails**, and the same two servers under the default **compose**. A test of the refusal alone
+    /// would pass if every document composed.
     #[tokio::test]
-    async fn the_daemons_naming_strategy_is_the_one_that_avoids_collisions() {
-        let document = "[[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"jarvis-no-such-program-98765\"\n\n[[servers]]\nname = \"bravo\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"jarvis-no-such-program-98765\"\n";
-        let composed = compose_host(Some(document))
+    async fn a_configured_bare_strategy_can_collide_and_is_then_refused() {
+        // One program string for both, so both servers offer the same tool names — which is the whole point:
+        // under `bare` they become the same identifiers.
+        let program = "jarvis-no-such-program-98765";
+        let bare = format!(
+            "[naming]\nstrategy = \"bare\"\n\n\
+             [[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"{program}\"\n\n\
+             [[servers]]\nname = \"bravo\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"{program}\"\n"
+        );
+        // Neither server is reachable, so neither contributes a listing and **no collision can arise** — which
+        // is itself worth stating: an unreachable server cannot collide, because a collision is between two
+        // observed tool sets. So this composes, with both reported.
+        let composed = compose_host(Some(&bare))
             .await
-            .unwrap_or_else(|error| panic!("two unreachable servers must still compose: {error}"));
+            .unwrap_or_else(|error| panic!("unreachable servers must still compose: {error}"));
         let composed = composed.unwrap_or_else(|| panic!("a configured server composes a host"));
-
-        // Both are reported, so the count is the configured one rather than the reachable one.
         assert_eq!(composed.unreadable().len(), 2);
         assert_eq!(composed.reachable_servers(), 0);
         assert!(composed.close().await.is_ok());
+
+        // The default is still the namespacing strategy, asserted through the daemon's own compose path: a
+        // document that states nothing cannot collide, which is why `Prefixed` is the value an absent section
+        // means. This is the control for the paragraph above rather than a restatement of it.
+        let default_document = format!(
+            "[[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"{program}\"\n\n\
+             [[servers]]\nname = \"bravo\"\n[servers.transport]\nkind = \"stdio\"\nprogram = \"{program}\"\n"
+        );
+        let defaulted = compose_host(Some(&default_document))
+            .await
+            .unwrap_or_else(|error| panic!("the default strategy must compose: {error}"));
+        let defaulted = defaulted.unwrap_or_else(|| panic!("a configured server composes a host"));
+        assert_eq!(defaulted.unreadable().len(), 2);
+        assert!(defaulted.close().await.is_ok());
+    }
+
+    /// **The daemon reads the strategy from the document**, which is the finding this slice exists for.
+    ///
+    /// The parse is asserted directly because the collision path above cannot distinguish the two strategies
+    /// when no server is reachable. A daemon that ignored `[naming] strategy` would pass every other test in
+    /// this file.
+    #[test]
+    fn the_daemon_reads_the_configured_naming_strategy() {
+        let parsed = McpHostConfig::parse("[naming]\nstrategy = \"bare\"\n")
+            .unwrap_or_else(|error| panic!("a naming section with no servers must parse: {error}"));
+        assert_eq!(
+            parsed.naming_strategy(),
+            jarvis_mcp_transport::NamingStrategy::Bare
+        );
+
+        let absent = McpHostConfig::parse("")
+            .unwrap_or_else(|error| panic!("an empty document must parse: {error}"));
+        assert_eq!(
+            absent.naming_strategy(),
+            jarvis_mcp_transport::NamingStrategy::Prefixed,
+            "an absent naming section must mean the collision-safe strategy"
+        );
     }
 }

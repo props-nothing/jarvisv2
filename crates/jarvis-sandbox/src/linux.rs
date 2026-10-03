@@ -248,8 +248,17 @@ impl SandboxBackend for CgroupV2Backend {
                 })
             });
         };
+        // A request carrying an image belongs to the container backend, and this must name it rather than confine
+        // the `docker` **CLI**: the container's processes live in the daemon's cgroup, so `pids.max` written here
+        // would bound a client while the confined worker ran unbounded — with `doctor` reporting four guarantees.
+        // Silent and invisible from the outside, which is why it is a refusal rather than a best effort.
+        if let Err(error) = super::reject_container_request(policy.request(), "cgroup v2") {
+            return Box::pin(async move { Err(error) });
+        }
         let limits = policy.request().limits;
         let enforced = policy.enforced();
+        // Built before the cgroup is created, so a request the backend cannot serve leaves no directory behind.
+        let command = crate::host_command(policy.request());
         Box::pin(async move {
             let directory = delegation.join(unique_leaf());
             std::fs::create_dir(&directory).map_err(|error| SandboxError::Setup {
@@ -262,7 +271,7 @@ impl SandboxBackend for CgroupV2Backend {
                 Self::remove(&directory);
                 return Err(error);
             }
-            let child = match launcher() {
+            let child = match launcher(command) {
                 Ok(child) => child,
                 Err(error) => {
                     Self::remove(&directory);
@@ -367,6 +376,27 @@ struct CgroupChild {
 impl LaunchedProcess for CgroupChild {
     fn pid(&self) -> u32 {
         self.child.id().unwrap_or(0)
+    }
+
+    fn wait(self: Box<Self>) -> BackendFuture<Result<std::process::ExitStatus, SandboxError>> {
+        Box::pin(async move {
+            let Self {
+                mut child,
+                directory,
+            } = *self;
+            // Waiting does **not** remove the cgroup, and the order matters: a cgroup can only be removed once no
+            // process is left in it, and a child that exits can leave descendants behind — which is precisely
+            // what `TreeTermination` exists for. So a wait that succeeded still leaves the teardown to `kill`,
+            // and the directory is kept rather than dropped silently. That is a leak of one empty directory when
+            // a caller only waits, recorded as a limit rather than described as closed.
+            let status = child.wait().await.map_err(|error| SandboxError::Launch {
+                reason: format!("could not collect the child's status: {}", error.kind()),
+            });
+            // The directory is named in the error path only, so an uncollected child is findable: a cgroup with
+            // live processes in it is the state a caller needs to know about, and the path is how they find it.
+            let _ = directory;
+            status
+        })
     }
 
     fn kill(self: Box<Self>) -> BackendFuture<Result<(), SandboxError>> {

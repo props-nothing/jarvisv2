@@ -185,7 +185,7 @@ async fn a_configured_stdio_server_becomes_a_callable_tool() {
     assert_eq!(config.len(), 1);
 
     let host = config
-        .connect(NamingStrategy::Prefixed, &[])
+        .connect(&[])
         .await
         .unwrap_or_else(|error| panic!("a configured server must connect: {error}"));
 
@@ -232,7 +232,7 @@ async fn a_server_with_no_stated_posture_defaults_to_held() {
     let config = McpHostConfig::parse(&document).unwrap_or_else(|error| panic!("{error}"));
 
     let host = config
-        .connect(NamingStrategy::Prefixed, &[])
+        .connect(&[])
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -251,24 +251,31 @@ async fn a_server_with_no_stated_posture_defaults_to_held() {
 /// **A collision refuses the whole host**, which is the first caller of
 /// `McpCatalog::has_cross_server_collision()`. Two servers offering the same tool under a strategy that
 /// drops the namespace cannot be served: which one survived would depend on the order they were written.
+///
+/// **The strategy is now the document's**, and this test is where that shows: the collision is provoked by
+/// writing `[naming] strategy = "bare"` into the configuration rather than by passing `Bare` to `connect`. The
+/// old arrangement could not express this choice at all from a *file* — an operator wanting short names had to
+/// change a program — and it also let a caller pass a strategy the document disagreed with.
 #[tokio::test]
 async fn a_cross_server_collision_refuses_the_host() {
     let Some(fixture) = fixture_or_skip() else {
         return;
     };
-    // Two entries, two names, **one program**. Both offer `search`, and `Bare` drops the namespace, so the
-    // identifiers collide — the condition the catalog reports and nothing until now acted on.
+    // Two entries, two names, **one program**. Both offer `search`, and `bare` drops the namespace, so the
+    // identifiers collide — the condition the catalog reports and the host refuses to serve.
     let program = fixture
         .to_str()
         .unwrap_or_else(|| panic!("the fixture path must be UTF-8"));
-    let document = format!(
-        "[[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = '{program}'\n\n\
+    let collisions = format!(
+        "[naming]\nstrategy = \"bare\"\n\n\
+         [[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = '{program}'\n\n\
          [[servers]]\nname = \"bravo\"\n[servers.transport]\nkind = \"stdio\"\nprogram = '{program}'\n"
     );
-    let config = McpHostConfig::parse(&document).unwrap_or_else(|error| panic!("{error}"));
+    let config = McpHostConfig::parse(&collisions).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(config.naming_strategy(), NamingStrategy::Bare);
 
     let error = config
-        .connect(NamingStrategy::Bare, &[])
+        .connect(&[])
         .await
         .err()
         .unwrap_or_else(|| panic!("a collision must refuse the host"));
@@ -281,10 +288,22 @@ async fn a_cross_server_collision_refuses_the_host() {
     assert!(text.contains("alpha"), "{text}");
     assert!(text.contains("bravo"), "{text}");
 
-    // **The positive control**: the same two servers with a strategy that keeps them apart connect fine,
-    // so the refusal above is about the collision rather than about the configuration being unusable.
-    let separated = config
-        .connect(NamingStrategy::Prefixed, &[])
+    // **The positive control**: the same two servers under the default strategy connect fine, so the refusal
+    // above is about the collision rather than about the configuration being unusable.
+    let separated_document = format!(
+        "[[servers]]\nname = \"alpha\"\n[servers.transport]\nkind = \"stdio\"\nprogram = '{program}'\n\n\
+         [[servers]]\nname = \"bravo\"\n[servers.transport]\nkind = \"stdio\"\nprogram = '{program}'\n"
+    );
+    let separated_config =
+        McpHostConfig::parse(&separated_document).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        separated_config.naming_strategy(),
+        NamingStrategy::Prefixed,
+        "an absent naming section must mean the namespacing strategy, because a collision is the failure it \
+         prevents"
+    );
+    let separated = separated_config
+        .connect(&[])
         .await
         .unwrap_or_else(|error| panic!("a namespaced strategy must keep them apart: {error}"));
     assert_eq!(separated.tool_count(), 4);
@@ -309,7 +328,7 @@ async fn an_unreachable_server_is_reported_and_the_others_survive() {
     let config = McpHostConfig::parse(&document).unwrap_or_else(|error| panic!("{error}"));
 
     let host = config
-        .connect(NamingStrategy::Prefixed, &[])
+        .connect(&[])
         .await
         .unwrap_or_else(|error| panic!("one unreachable server must not fail the host: {error}"));
 
@@ -337,7 +356,7 @@ async fn a_tool_from_a_configured_host_runs() {
     let document = document_for(&fixture, "local", Some("read-only"));
     let config = McpHostConfig::parse(&document).unwrap_or_else(|error| panic!("{error}"));
     let host = config
-        .connect(NamingStrategy::Prefixed, &[])
+        .connect(&[])
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 

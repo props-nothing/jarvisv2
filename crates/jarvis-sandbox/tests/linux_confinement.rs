@@ -28,6 +28,9 @@ use jarvis_sandbox::{
 fn shell(script: &str) -> SandboxRequest {
     SandboxRequest {
         program: PathBuf::from("/bin/sh"),
+        // A host process rather than a container, so no image: this suite exercises the cgroup backend, which
+        // confines a pid rather than launching one from an image.
+        image: None,
         arguments: vec!["-c".to_owned(), script.to_owned()],
         working_directory: None,
         // An allowlist, and a minimal one: a shell needs no inherited environment to run its builtins, and
@@ -145,7 +148,7 @@ async fn a_confined_child_is_really_moved_into_the_launch_cgroup() {
     let request = shell("sleep 30");
     // `spawn`, not `launcher`: a name that close to `launched` trips `clippy::similar_names`, and the two are
     // genuinely easy to confuse in a test that reasons about both.
-    let spawn = jarvis_sandbox::launcher_for(&request, false);
+    let spawn = jarvis_sandbox::stdio_launcher(false);
     let policy = SandboxPolicy::new(request, backend.as_ref())
         .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));
 
@@ -198,7 +201,7 @@ async fn a_process_count_ceiling_is_enforced_by_the_kernel() {
     // Two tasks: the shell itself plus exactly one background sleep. Anything beyond that must fail.
     request.limits.max_processes = Some(2);
 
-    let spawn = jarvis_sandbox::launcher_for(&request, true);
+    let spawn = jarvis_sandbox::stdio_launcher(true);
     let policy = SandboxPolicy::new(request, backend.as_ref())
         .unwrap_or_else(|error| panic!("a cgroup host must support a process ceiling: {error}"));
     let mut launched = backend

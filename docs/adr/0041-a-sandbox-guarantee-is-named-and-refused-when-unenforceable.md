@@ -64,10 +64,18 @@ macOS's seatbelt facility expresses **filesystem and network** policy rather tha
 does not implement this crate's guarantees at all. Reporting a guarantee the host cannot provide would be the
 parity claim the architecture forbids.
 
+> **Amended by `ADR-0128` (`P3-020`).** The second sentence is no longer the whole truth: a Windows or macOS
+> host with a reachable container runtime now reports the **container** facility and three guarantees, because a
+> container backend is driven by spawning a CLI and therefore needs no FFI. The `unsafe_code = "forbid"`
+> reasoning above is unchanged and is why there is still no job-object or seatbelt backend. The decision below
+> about `RLIMIT_NPROC` also still stands, and is the reason `--ulimit cpu` and `--ulimit nproc` are refused
+> there while `--pids-limit` is claimed — see `ADR-0128` for why the two flags in the same table differ.
+
 `backend_for_host` **probes the running host** — `/sys/fs/cgroup/cgroup.controllers` for v2, then the process's
 own cgroup from `/proc/self/cgroup`, then the mount root — rather than reporting the compiled target. A Linux
 host with no delegated cgroup, which includes most containers and essentially every interactive shell, offers
-nothing: a unit only controls a cgroup the operator delegated to it.
+nothing: a unit only controls a cgroup the operator delegated to it. As of `ADR-0128` such a host falls through
+to the container backend when a runtime is reachable, which is a second probe rather than a second assumption.
 
 **4. `RLIMIT_NPROC` is not a `ProcessCountCeiling`, and is deliberately unused.**
 

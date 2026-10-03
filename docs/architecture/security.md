@@ -127,6 +127,26 @@ Sandbox policy declares image/runtime identity, user, mounts and access modes, n
 
 Prefer separate processes/containers/WASI. Platform-specific strong isolation differs; `doctor` reports effective guarantees rather than claiming parity. If a requested guarantee is unavailable, deny or require an explicitly weaker profile.
 
+**What is implemented so far, so the paragraph above is not read as a description of the code.** The contract
+names five guarantees — `TreeTermination`, `ProcessCountCeiling`, `MemoryCeiling`, `CpuRateCeiling`, and
+`CpuTimeCeiling` — and three backends implement some of them:
+
+- **cgroup v2** (Linux, when a cgroup was delegated): four of five. `CpuTimeCeiling` is refused, because cgroup
+  v2 accounts CPU time but has no limit file for a cumulative total (`ADR-0041`).
+- **container** (any platform with a reachable runtime): three of five. `CpuTimeCeiling` is refused because the
+  only flag is `--ulimit cpu`, which is per **process**, and `CpuRateCeiling` because the `--cpus` translation
+  is not written yet — a different reason from the first, recorded separately (`ADR-0128`).
+- **unconfined**: none, so any requirement is a refusal.
+
+The container backend always passes `--network none`, `--read-only`, and `--cap-drop ALL`, so in practice a
+container is confined more than the three guarantees say. Those are **not** guarantees: the model expresses
+resource ceilings, not a filesystem or network policy, so a caller cannot require them and `doctor` does not
+report them. A host-process child therefore still has this process's filesystem and network reach, which is why
+`Isolation::Restricted` must never be surfaced as "sandboxed" without the guarantee list beside it.
+
+Not implemented anywhere: **user/uid reduction**, mount and network-destination policy, disk, wall-time, output,
+and artifact limits. Each needs its own decision and evidence.
+
 ## Network Exposure
 
 - Default bind is loopback/local IPC.
@@ -181,7 +201,11 @@ Before remote beta, create a detailed incident runbook, severity model, notifica
 
 - root project license and release-signing authority
 - exact Linux encrypted secret fallback
-- minimum viable sandbox per OS
+- **minimum viable sandbox per OS — partly answered.** `ADR-0041` (contract plus cgroup v2) and `ADR-0128`
+  (container backend, which reaches every platform) decide what a host can enforce and what is refused. Still
+  open: a native Windows job-object or macOS seatbelt backend, which would need `unsafe_code` relaxed or an
+  out-of-workspace helper; and the filesystem, network-destination, disk, wall-time, output, and artifact
+  policy the paragraph above declares but no backend implements.
 - remote authentication and device-pairing protocol
 - audit integrity mechanism and retention defaults
 - jurisdiction-specific voice disclosure/recording policy

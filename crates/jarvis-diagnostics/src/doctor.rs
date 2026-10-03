@@ -915,6 +915,46 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("cgroup_v2")
         );
+
+        // The **container** facility, added by `P3-020`, asserted for the same reason the available branch is:
+        // this host reaches it, but a host without a runtime does not, and the report an operator reads must be
+        // checked wherever it can be. A facility whose label was never asserted is a label that can drift —
+        // `container` is the string an operator matches on to know a runtime is what confined their child, and
+        // the guarantee list below is the shorter one, so a copy-paste from the cgroup arm would show four
+        // guarantees where three are enforced.
+        let container = sandbox_finding(
+            &jarvis_sandbox::GuaranteeSupport::from_guarantees(
+                jarvis_sandbox::container_guarantees(),
+            ),
+            Support::Container,
+        );
+        assert_eq!(container.code(), FindingCode::SandboxAvailable);
+        assert_eq!(
+            container
+                .evidence()
+                .iter()
+                .find(|(key, _)| key == "facility")
+                .map(|(_, value)| value.as_str()),
+            Some("container"),
+            "the container facility must be reported under its own label, not as a cgroup"
+        );
+        let container_guarantees = container
+            .evidence()
+            .iter()
+            .find(|(key, _)| key == "guarantees")
+            .map_or_else(
+                || panic!("an available sandbox must name its guarantees, not just assert one"),
+                |(_, value)| value.clone(),
+            );
+        assert_eq!(
+            container_guarantees, "tree_termination,process_count_ceiling,memory_ceiling",
+            "the container backend's list is what an operator reads, and it is shorter than the cgroup's"
+        );
+        assert!(
+            !container_guarantees.contains("cpu_"),
+            "neither CPU guarantee is claimed by the container backend, and an operator must not read that one \
+             is: {container_guarantees}"
+        );
     }
 
     #[test]

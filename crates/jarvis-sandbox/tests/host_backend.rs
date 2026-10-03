@@ -15,10 +15,38 @@ use jarvis_sandbox::{
     refusing_launcher,
 };
 
+/// A backend that serves **host processes** on any platform.
+///
+/// # Why this replaced `backend_for_host()` in these tests
+///
+/// These tests are about the unconfined launch path: a real program, its environment, its working directory, and
+/// a kill that really ends it. `backend_for_host()` used to *be* that path on Windows and macOS, because an
+/// unconfined backend was the only one those hosts had. `P3-020` changed that: the container backend is now
+/// preferred wherever a runtime is reachable, so `backend_for_host()` on this development host returns a
+/// **container** backend — and a host-process request reaches it only to be refused, which is correct behaviour
+/// and made four of these tests fail for a reason that had nothing to do with what they assert.
+///
+/// Naming the backend here is the honest fix rather than passing an image so the container would accept it: these
+/// tests exist to prove that the *unconfined* path starts and stops a real process, and a container launch would
+/// satisfy the assertions while testing something else entirely.
+///
+/// What is deliberately **not** used here is `backend_for_host()`, so these tests no longer depend on which
+/// facility the host happens to prefer — which is a property of the machine, not of this path.
+///
+/// Boxed rather than returned by value so the call sites keep reading `backend.as_ref()` and `backend.launch(…)`
+/// exactly as they did, which is what makes this a change of *which* backend rather than a rewrite of four tests.
+fn host_process_backend() -> Box<dyn jarvis_sandbox::SandboxBackend> {
+    Box::new(jarvis_sandbox::UnconfinedBackend)
+}
+
 /// A request that requires nothing, so `SandboxPolicy::new` accepts it on any host.
 fn unconfined_request(program: PathBuf, arguments: Vec<String>) -> SandboxRequest {
     SandboxRequest {
         program,
+        // No image: this is a request for a **host process**, which is what the unconfined and cgroup backends
+        // serve. A container request carries one, and the field is optional precisely so a host-process request
+        // is not forced to invent a value it has no meaning for.
+        image: None,
         arguments,
         working_directory: None,
         environment: BTreeMap::new(),
@@ -102,46 +130,74 @@ fn long_runner_request() -> SandboxRequest {
     request
 }
 
-/// **The support set is exactly what this platform can enforce — never more.**
+/// **The support set is exactly what this platform can enforce — never more, and never less than the facility
+/// it names.**
 ///
 /// The claim `docs/architecture/security.md` makes — "reports effective guarantees rather than claiming parity"
-/// — is only meaningful if a host without a facility reports nothing. On Windows and macOS the only correct
-/// answer today is an **empty** set, because the facilities that exist need `unsafe` FFI this workspace forbids.
+/// — has two directions, and this test now asserts both. The first version of it asserted only the non-Linux
+/// half, as an empty set with an `unconfined` label, because an empty set really was the whole truth on a host
+/// with no facility: the job-object and seatbelt backends need `unsafe` FFI this workspace forbids. `P3-020`
+/// added a container backend, so the same host can now report either, and **which one it reports is a property
+/// of the running machine rather than of the target**.
 ///
-/// Falsified by mutation: returning any non-empty set from `UnconfinedBackend::support` fails here. The Linux
-/// half cannot be reached during development on Windows, which is why the list itself is asserted in
-/// `backend.rs::tests` instead — see that test's note.
+/// The invariant is therefore about the **pair**, which is why it is written this way rather than as two
+/// platform branches: a facility that enforces nothing and a facility that enforces something cannot both be
+/// labelled, and a report where they disagree is worse than either answer, because `doctor` would name a
+/// confinement that is not in force. That is a cross-platform claim, so it runs everywhere.
+///
+/// Falsified by mutation: pairing `Support::Container` with an empty set fails here, and so does pairing
+/// `Support::Unconfined` with a non-empty one — a mistake a platform-conditional version of this test would
+/// catch on only one of its branches.
 #[test]
 fn the_support_set_never_claims_more_than_the_platform_can_enforce() {
-    let support = backend_for_host().support();
+    let backend = backend_for_host();
+    let support = backend.support();
+    let facility = backend.facility();
+    assert_eq!(
+        support.is_empty(),
+        facility == jarvis_sandbox::Support::Unconfined,
+        "an unconfined facility enforces nothing and a named facility enforces something; got {facility:?} \
+         with {:?}",
+        support.guarantees()
+    );
+    // `CpuTimeCeiling` is the guarantee that no backend in this crate claims, for a different reason in each:
+    // cgroup v2 accounts CPU time in `cpu.stat` but has no limit file for a cumulative total, and the container
+    // flag for it, `--ulimit cpu`, is `RLIMIT_CPU` — per process, so a tree of N processes gets N budgets.
+    // Asserting its **absence** is the load-bearing half, because claiming it would let a caller believe a child
+    // was stopped after N seconds of CPU when it is only throttled, or stopped once when each descendant has its
+    // own budget. It holds on every platform, which is why it is asserted unconditionally.
+    assert!(
+        !support.supports(Guarantee::CpuTimeCeiling),
+        "no backend here can express a cumulative CPU ceiling, so this must never be claimed, got: {:?}",
+        support.guarantees()
+    );
     #[cfg(not(target_os = "linux"))]
     {
-        assert!(
-            support.is_empty(),
-            "no non-Linux backend is implemented, so this host must claim nothing, got: {:?}",
-            support.guarantees()
-        );
-        assert_eq!(
-            backend_for_host().facility().as_str(),
-            "unconfined",
-            "the facility label must match the empty support set"
-        );
+        // A Windows or macOS host has no host-process facility at all, so a non-empty set can only have come
+        // from a reachable container runtime — and the guarantees must then be exactly that backend's list.
+        if !support.is_empty() {
+            assert_eq!(
+                facility,
+                jarvis_sandbox::Support::Container,
+                "a non-Linux host with guarantees must be reporting the container backend"
+            );
+            for claimed in support.guarantees() {
+                assert!(
+                    jarvis_sandbox::container_guarantees().contains(claimed),
+                    "{claimed} is not in the container backend's list, so this host claimed more than the \
+                     facility provides"
+                );
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        // `CpuTimeCeiling` is the one guarantee cgroup v2 cannot express: it accounts CPU time in `cpu.stat` but
-        // has no limit file for a cumulative total, only the rate form in `cpu.max`. Asserting its **absence**
-        // is the load-bearing half, because claiming it is the specific mistake that would let a caller believe a
-        // child was stopped after N seconds of CPU when it is only throttled.
-        assert!(
-            !support.supports(Guarantee::CpuTimeCeiling),
-            "cgroup v2 has no cumulative CPU limit, so this must never be claimed"
-        );
         if support.is_empty() {
             assert!(
                 !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
-                "a v2 host must report guarantees; an empty set here means the probe failed to find a \
-                 delegation, which is a finding about the probe rather than about the platform"
+                "a v2 host with no delegation and no container runtime must report nothing; an empty set here \
+                 on a v2 host means both probes failed, which is a finding about the probes rather than about \
+                 the platform"
             );
         }
     }
@@ -211,11 +267,11 @@ fn a_guarantee_this_host_cannot_enforce_is_refused_and_named() {
 /// still alive); returning a fixed pid from `launch` fails the same way.
 #[tokio::test]
 async fn a_launch_starts_a_real_process_that_the_kill_really_terminates() {
-    let backend = backend_for_host();
+    let backend = host_process_backend();
     let (program, arguments) = long_runner();
     // Named `spawn` rather than `launcher`, because a binding that close to `launched` trips
     // `clippy::similar_names` — and the two really are easy to confuse in a test that reasons about both.
-    let spawn = jarvis_sandbox::launcher_for(&long_runner_request(), true);
+    let spawn = jarvis_sandbox::stdio_launcher(true);
     let policy = SandboxPolicy::new(long_runner_request(), backend.as_ref())
         .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));
     assert!(
@@ -302,7 +358,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// `.envs()` makes the sentinel disappear and fails it too.
 #[tokio::test]
 async fn the_child_environment_is_the_requests_map_and_nothing_else() {
-    let backend = backend_for_host();
+    let backend = host_process_backend();
     let (program, arguments) = env_dump();
     let mut request = unconfined_request(program, arguments);
     request
@@ -316,7 +372,7 @@ async fn the_child_environment_is_the_requests_map_and_nothing_else() {
     #[cfg(not(windows))]
     let inherited = "HOME";
 
-    let spawn = jarvis_sandbox::launcher_for(&request, true);
+    let spawn = jarvis_sandbox::stdio_launcher(true);
     let policy = SandboxPolicy::new(request, backend.as_ref())
         .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));
     let mut launched = backend
@@ -362,7 +418,7 @@ async fn the_child_environment_is_the_requests_map_and_nothing_else() {
 /// Falsified by mutation: removing the `current_dir` call fails here.
 #[tokio::test]
 async fn the_requested_working_directory_is_applied() {
-    let backend = backend_for_host();
+    let backend = host_process_backend();
     let working = std::env::temp_dir();
     let own = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     assert_ne!(
@@ -385,7 +441,7 @@ async fn the_requested_working_directory_is_applied() {
     let mut request = unconfined_request(program, arguments);
     request.working_directory = Some(working.clone());
 
-    let spawn = jarvis_sandbox::launcher_for(&request, true);
+    let spawn = jarvis_sandbox::stdio_launcher(true);
     let policy = SandboxPolicy::new(request, backend.as_ref())
         .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));
     let mut launched = backend
@@ -435,7 +491,7 @@ async fn the_requested_working_directory_is_applied() {
 /// mapping the launcher error to `SandboxError::Setup` fails the second.
 #[tokio::test]
 async fn the_launcher_is_called_exactly_when_a_launch_is_permitted() {
-    let backend = backend_for_host();
+    let backend = host_process_backend();
     let observed = Arc::new(AtomicBool::new(false));
     let policy = SandboxPolicy::new(long_runner_request(), backend.as_ref())
         .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));

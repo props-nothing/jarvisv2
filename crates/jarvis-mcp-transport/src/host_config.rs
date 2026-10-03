@@ -63,9 +63,59 @@ pub const MAX_HOST_CONFIG_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostDocument {
+    /// How server-supplied tool names become canonical identifiers.
+    ///
+    /// Absent means [`NamingStrategy::Prefixed`], which is the safe value rather than an arbitrary one: it
+    /// namespaces each tool by its server, so two servers offering `search` produce two identifiers instead of
+    /// a collision. The alternative has to be asked for.
+    #[serde(default)]
+    naming: NamingDocument,
     /// The servers the operator configured.
     #[serde(default)]
     servers: Vec<ServerDocument>,
+}
+
+/// The naming section an operator may write.
+///
+/// A section rather than a bare top-level key so the value has somewhere to grow — the per-server strategy is
+/// an obvious next step — and so its absence is one `default` rather than a rule about a top-level string.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamingDocument {
+    /// The strategy, by its stable name.
+    #[serde(default)]
+    strategy: StrategyName,
+}
+
+/// The strategies a configuration file can express.
+///
+/// Written out rather than deriving `Deserialize` on [`NamingStrategy`], even though that enum already has it,
+/// for the reason every vocabulary in this repository writes itself out: the doc comment on the domain type
+/// calls `Prefixed` "the default", and a `#[serde(default)]` on that type would be **that type choosing a
+/// security-relevant default for one consumer**. The default belongs where the consequence is, and here the
+/// consequence is which tools a model is offered. A rename in the domain type also cannot silently change what a
+/// document means.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum StrategyName {
+    /// `server.tool` — the safe value, and what an absent section means.
+    #[default]
+    Prefixed,
+    /// The tool's own name, for an operator who has established their servers cannot collide.
+    Bare,
+    /// `server.digest`, for a server whose names cannot be represented at all.
+    Hashed,
+}
+
+impl StrategyName {
+    /// Returns the strategy this name denotes.
+    const fn strategy(self) -> NamingStrategy {
+        match self {
+            Self::Prefixed => NamingStrategy::Prefixed,
+            Self::Bare => NamingStrategy::Bare,
+            Self::Hashed => NamingStrategy::Hashed,
+        }
+    }
 }
 
 /// One server entry.
@@ -177,6 +227,7 @@ pub enum ServerTransport {
 /// about.
 #[derive(Debug)]
 pub struct McpHostConfig {
+    naming: NamingStrategy,
     servers: Vec<ConfiguredServer>,
     transports: Vec<ServerTransport>,
 }
@@ -235,18 +286,37 @@ impl McpHostConfig {
         }
 
         Ok(Self {
+            naming: parsed.naming.strategy.strategy(),
             servers,
             transports,
         })
     }
 
     /// Parses an empty configuration, which configures no servers.
+    ///
+    /// The strategy is [`NamingStrategy::Prefixed`] rather than `StrategyName`'s default, because this
+    /// constructor **has no document** and so cannot read a section. It exists for callers that build an empty
+    /// configuration directly, and it names the safe value for the same reason an absent section means it.
     #[must_use]
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
+            naming: NamingStrategy::Prefixed,
             servers: Vec::new(),
             transports: Vec::new(),
         }
+    }
+
+    /// Returns how server-supplied tool names become canonical identifiers.
+    ///
+    /// Read from the document rather than supplied to [`Self::connect`], because the two were separate and the
+    /// daemon hardcoded the safe strategy while the configuration could state nothing — so an operator who
+    /// wanted short names could not ask for them, and a caller could pass a strategy the document disagreed
+    /// with. One owner removes both. **`Bare` is a real choice with a real consequence** (two servers cannot
+    /// both offer one tool name, and the collision is refused rather than resolved), so it is stated where the
+    /// servers are rather than chosen by whoever happens to build the host.
+    #[must_use]
+    pub const fn naming_strategy(&self) -> NamingStrategy {
+        self.naming
     }
 
     /// Returns the servers an operator configured.
@@ -269,8 +339,14 @@ impl McpHostConfig {
 
     /// Connects to every configured server and builds one catalog from their tools.
     ///
-    /// `strategy` decides how tool names become canonical identifiers; `seen_before` is what each server
-    /// reported on an earlier build, so a changed self-description is visible ([`McpCatalog::observed`]).
+    /// The naming strategy is **this configuration's own** ([`Self::naming_strategy`]) and is not a parameter,
+    /// because it was one and the arrangement was wrong: the daemon hardcoded `Prefixed` while the document
+    /// could express nothing, so the only way to shorten a tool name was to change a program. A caller that
+    /// could name a strategy the document disagreed with would also be able to disagree with the operator who
+    /// wrote the file.
+    ///
+    /// `seen_before` is what each server reported on an earlier build, so a changed self-description is visible
+    /// ([`McpCatalog::observed`]).
     ///
     /// A server that cannot be contacted does **not** fail the build — one flaky third-party process must
     /// not empty the model's tool list — and is reported in [`McpHost::unreadable`]. A server that
@@ -285,9 +361,9 @@ impl McpHostConfig {
     /// tools at all.
     pub async fn connect(
         &self,
-        strategy: NamingStrategy,
         seen_before: &[jarvis_mcp::ObservedServer],
     ) -> Result<McpHost, HostError> {
+        let strategy = self.naming;
         if self.servers.is_empty() {
             return Err(HostError::NoServers);
         }
@@ -943,7 +1019,7 @@ mod tests {
     async fn connecting_with_no_servers_is_an_error() {
         let config = McpHostConfig::none();
         let error = config
-            .connect(NamingStrategy::Prefixed, &[])
+            .connect(&[])
             .await
             .err()
             .unwrap_or_else(|| panic!("no servers must not yield a host"));
@@ -956,12 +1032,9 @@ mod tests {
     async fn an_unreachable_server_does_not_fail_the_build() {
         let document = "[[servers]]\nname = \"absent\"\ntransport = { kind = \"stdio\", program = \"jarvis-no-such-program-98765\" }";
         let config = McpHostConfig::parse(document).unwrap_or_else(|error| panic!("{error}"));
-        let host = config
-            .connect(NamingStrategy::Prefixed, &[])
-            .await
-            .unwrap_or_else(|error| {
-                panic!("an unreachable server must not fail the build: {error}")
-            });
+        let host = config.connect(&[]).await.unwrap_or_else(|error| {
+            panic!("an unreachable server must not fail the build: {error}")
+        });
 
         // The server is reported, by name, with the transport's own reason.
         assert_eq!(host.unreadable().len(), 1);

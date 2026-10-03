@@ -31,7 +31,7 @@ jarvis/
 |   |-- jarvis-mcp-transport/    MCP SDK adapter: discovery negotiation and wire transports
 |   |-- jarvis-runtimes/         runtime router, supervisor, adapters
 |   |-- jarvis-tools/            registry, policy pipeline, MCP, sandbox ports
-|   |-- jarvis-sandbox/          OS process confinement: contracts and the cgroup-v2 backend
+|   |-- jarvis-sandbox/          OS process confinement: contracts, the cgroup-v2 backend, and the container backend
 |   |-- jarvis-connectors/       first-party service connectors and OAuth
 |   |-- jarvis-memory/           admission, retrieval, entity resolution
 |   |-- jarvis-workflows/        durable events, schedules, workflow workers
@@ -165,11 +165,12 @@ It does not own business decisions. Generate TypeScript clients from its publish
 - `jarvis-models`: provider clients, capability discovery, streaming normalization, usage and errors.
 - `jarvis-runtimes`: runtime selection, process lifecycle, protocol sessions, health and adapter implementations.
 - `jarvis-tools`: canonical registry, schema checks, execution pipeline, sandbox adapters.
-- `jarvis-sandbox`: the sandbox **contract** (`Guarantee`, `SandboxPolicy`, `SandboxBackend`) and one real
-  backend. It is separate from `jarvis-tools` because a guarantee is an OS-level capability rather than a tool
-  concern, and because the answer differs per host: `backend_for_host()` probes the running machine, reports an
-  **empty** support set where no primitive is available, and refuses any policy that requires what it cannot
-  enforce. `jarvis-diagnostics` is the first consumer, reporting the guarantees in force (ADR-0041).
+- `jarvis-sandbox`: the sandbox **contract** (`Guarantee`, `SandboxPolicy`, `SandboxBackend`) and two real
+  backends — cgroup v2 for a Linux host with a delegated cgroup, and a container runtime for any host where one
+  is reachable. It is separate from `jarvis-tools` because a guarantee is an OS-level capability rather than a
+  tool concern, and because the answer differs per host: `backend_for_host()` probes the running machine, reports
+  an **empty** support set where no primitive is available, and refuses any policy that requires what it cannot
+  enforce. `jarvis-diagnostics` is the first consumer, reporting the guarantees in force (ADR-0041, ADR-0128).
 - `jarvis-mcp`: MCP-specific translation — server identity, canonical tool naming, tool posture,
   schema conformance, and multi-server catalog aggregation (ADR-0024, ADR-0025). Split out of
   `jarvis-tools` deliberately: `jarvis-tools` is

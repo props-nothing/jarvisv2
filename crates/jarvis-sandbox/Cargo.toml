@@ -17,8 +17,10 @@ tokio = { workspace = true, features = ["process", "rt"] }
 
 [dev-dependencies]
 # The tests assert against the **public** API and really spawn processes, so they need the async runtime,
-# `io-util` to drain a child's pipes, and the macros for `#[tokio::test]`.
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }
+# `io-util` to drain a child's pipes, the macros for `#[tokio::test]`, and `sync` for the lock the live container
+# tests take: a container runtime keeps **one** container list for the whole host, so those tests cannot run in
+# parallel and the guard has to be held across an await.
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true
