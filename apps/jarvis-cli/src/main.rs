@@ -21,6 +21,7 @@ mod output;
 mod schedule;
 mod skills;
 mod tools;
+mod watch;
 
 use std::{io, path::PathBuf, process::ExitCode};
 
@@ -72,6 +73,7 @@ async fn main() -> ExitCode {
             Err(status) => status,
         },
         Some("cancel") => cancel_command(&arguments).await,
+        Some("watch") => watch_command(&arguments).await,
         Some("approvals") => approvals_command(&arguments).await,
         // `schedule` and `runs` are the proactive half of the product: tasks that run while you are away, and
         // where you read what they said.
@@ -97,7 +99,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
@@ -173,6 +175,19 @@ async fn schedule_command(arguments: &[String], runs: bool) -> ExitStatus {
         schedule::run_runs(&client, arguments).await
     } else {
         schedule::run_schedule(&client, arguments).await
+    }
+}
+
+/// Runs `jarvis watch`, the live view of what the assistant is doing.
+async fn watch_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    match run_client(&root) {
+        Ok(client) => watch::run_watch(&client, arguments).await,
+        Err(status) => status,
     }
 }
 

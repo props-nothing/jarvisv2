@@ -2581,6 +2581,19 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **Limits:** the parent is not notified when a parked sub-agent is later approved; sub-agents share the parent's
     model and tool set minus delegation; cost scales with the number of sub-agents (cap 4).
 
+### P3-035: Visual presence, first step — `jarvis watch`
+
+- [x] `jarvis watch [--once] [--interval N]` (`apps/jarvis-cli/src/watch.rs`): one screen of the work, not the transcript —
+  **waiting for you** (each approval with its tool, risk, arguments and the exact approve/deny commands), **working**
+  (runs and sub-agents, state and age, with the cancel commands), **scheduled** (next fire and cadence) and **recent**
+  (outcome and answer). Reads `/runs`, `/approvals` and `/schedules` and keeps no state of its own, so it cannot disagree
+  with `jarvis runs`, `jarvis approvals` or `jarvis schedule`. Plain ASCII; prints once when output is not a terminal.
+  - Tests (4): spans and clipping, idle screen, and the section order and content of a busy screen.
+  - **Live:** during a parent run with two background sub-agents the screen showed all three working with ages and
+    `[sub-agent]` labels, then the parked code run under WAITING FOR YOU with its approve/deny commands.
+  - **Limits:** a terminal view, not yet the heads-up display the product is aiming at (no browser or overlay surface);
+    no keypress approvals; no per-run event detail.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

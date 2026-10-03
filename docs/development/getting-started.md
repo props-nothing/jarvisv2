@@ -193,6 +193,12 @@ Trust is yours to give per tool, never given by default, and never applies to a 
 `deny` or an `ask` override for the same tool wins. To be asked before every web page instead, set
 `[policy.approval] "jarvis.web.fetch" = "ask"`. See `ADR-0131`, `ADR-0133`.
 
+### Watching it work
+
+`jarvis watch` is a live screen of the work: what is **waiting for you** (with the exact approve/deny commands), what is
+**working** (runs and sub-agents, with ages and the cancel commands), what is **scheduled** next, and what just
+**finished**. `jarvis watch --once` prints it once.
+
 ### Sub-agents
 
 The assistant can hand a bounded task to a sub-agent (`jarvis.agent.delegate`) and collect the answer
