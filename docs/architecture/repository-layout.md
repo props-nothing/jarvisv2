@@ -4,7 +4,7 @@
 
 Create this tree incrementally. Phase 1 begins with only the six members named in `P1-001`; later crates appear when their behavior is implemented.
 
-Implemented so far beyond the initial six: `crates/jarvis-observability` (structured logging, redaction, and the readers behind `jarvis logs`), `crates/jarvis-diagnostics` (offline `doctor` checks, stable findings, and verified repair), `crates/jarvis-models` (provider-neutral model contracts plus one OpenAI-compatible adapter), `crates/jarvis-mcp` (MCP server identity, canonical tool naming, and schema conformance), `crates/jarvis-mcp-transport` (the MCP SDK dependency, `server/discover` negotiation, and stdio/Streamable-HTTP transports), `crates/jarvis-sandbox` (OS-level confinement contracts and the Linux cgroup-v2 backend), and `tests/e2e` (the process-level Phase 1 acceptance gate).
+Implemented so far beyond the initial six: `crates/jarvis-observability` (structured logging, redaction, and the readers behind `jarvis logs`), `crates/jarvis-diagnostics` (offline `doctor` checks, stable findings, and verified repair), `crates/jarvis-models` (provider-neutral model contracts plus one OpenAI-compatible adapter), `crates/jarvis-mcp` (MCP server identity, canonical tool naming, and schema conformance), `crates/jarvis-mcp-transport` (the MCP SDK dependency, `server/discover` negotiation, and stdio/Streamable-HTTP transports), `crates/jarvis-sandbox` (OS-level confinement contracts and the Linux cgroup-v2 backend), `crates/jarvis-web` (the guarded web fetch tool), and `tests/e2e` (the process-level Phase 1 acceptance gate).
 
 ```text
 jarvis/
@@ -32,6 +32,7 @@ jarvis/
 |   |-- jarvis-runtimes/         runtime router, supervisor, adapters
 |   |-- jarvis-tools/            registry, policy pipeline, MCP, sandbox ports
 |   |-- jarvis-sandbox/          OS process confinement: contracts, the cgroup-v2 backend, and the container backend
+|   |-- jarvis-web/              guarded web fetch tool: address policy, bounded read, fenced untrusted text
 |   |-- jarvis-connectors/       first-party service connectors and OAuth
 |   |-- jarvis-memory/           admission, retrieval, entity resolution
 |   |-- jarvis-workflows/        durable events, schedules, workflow workers

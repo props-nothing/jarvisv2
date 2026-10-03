@@ -38,6 +38,9 @@ jarvis-storage.workspace = true
 # keeps `AGENTS.md`'s rule structural — an adapter is only reachable from a binary that chose to
 # construct one, never from the application layer.
 jarvis-tools.workspace = true
+# The web fetch tool is composed here for the same reason the filesystem and memory tools are: an adapter is only
+# reachable from a binary that chose to construct one.
+jarvis-web.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

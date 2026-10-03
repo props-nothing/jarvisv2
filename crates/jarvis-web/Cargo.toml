@@ -1,0 +1,23 @@
+[package]
+name = "jarvis-web"
+description = "The web fetch tool: a guarded, bounded HTTP GET whose body is returned as untrusted text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+jarvis-tools.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

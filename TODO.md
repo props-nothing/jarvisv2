@@ -2441,6 +2441,26 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       against a daemon with **no tool surface** exits through the `Denied` path, which is the documented
       mapping for a refusal (the `404` body's remedy text is what distinguishes it).
 
+## P3-027: Web fetch tool
+
+- [x] `P3-027` Give the model a way to read the public web, behind the same policy gate as every other tool.
+  - Delivered: `crates/jarvis-web` (new) with `jarvis.web.fetch`, composed in `jarvisd` beside the memory tool. A
+    bare `GET` of a public `http`/`https` URL; the body comes back as fenced untrusted text. 29 tests in the crate,
+    plus 2 through the real pipeline in `jarvisd` (held by default; unattended is still refused by the address guard).
+  - Research: [web-fetch.md](docs/research/integrations/web-fetch.md). Decision: [ADR-0129](docs/adr/0129-a-fetch-is-checked-on-the-address-it-connects-to.md).
+  - Boundary: addresses are checked after resolution (allowlist of global unicast, embedded IPv4 judged by what it
+    embeds), the connection is pinned to the checked answers, every redirect hop is checked again, only ports 80/443,
+    no credentials/headers/cookies/proxy/decompression, body read stops at 256 KiB.
+  - **Held for approval by default** (`read_only`, risk 2, approval `policy`). Unattended use is the operator's opt-in
+    (`policy.approval_threshold = "high"`).
+  - Falsified: the address rule mutated to accept everything fails 7 tests, including the one asserting a loopback
+    server received **zero** connections. Gates: fmt, clippy `-D warnings`, `cargo test --workspace` (2,023 tests),
+    `cargo deny check`.
+  - **Limits:** a model-chosen URL can still carry data out once approved or opted in (not solvable by the tool);
+    the model sees at most 1,800 characters because the executor truncates every tool result to 4,000 (follow-up:
+    per-tool result budget and an `offset` argument); non-UTF-8 charsets are decoded lossily; no live-internet test;
+    `jarvis tools list` and the CLI were not exercised against a running daemon with this tool.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

@@ -1363,6 +1363,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-web"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jarvis-core",
+ "jarvis-tools",
+ "reqwest",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "jarvisd"
 version = "0.1.0"
 dependencies = [
@@ -1378,6 +1392,7 @@ dependencies = [
  "jarvis-protocol",
  "jarvis-storage",
  "jarvis-tools",
+ "jarvis-web",
  "serde",
  "serde_json",
  "thiserror",

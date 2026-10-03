@@ -1444,3 +1444,97 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
     ));
     assert_eq!(stored.intent().to_hex(), expected.to_hex());
 }
+
+/// A pipeline whose only adapter is the real web fetch tool, and the actor the daemon derives for it.
+async fn web_pipeline(
+    workspace: WorkspacePolicy,
+) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline, ToolActor) {
+    let (directory, database) = database_with_run().await;
+    let definition = must(jarvis_web::WebFetchTool::definition());
+    let pipeline = must(ToolPipeline::with_adapters(
+        Arc::clone(&database),
+        None,
+        workspace,
+        vec![(
+            vec![definition.clone()],
+            Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
+        )],
+        jarvis_storage::SecretStore::in_state(&directory.join("state")),
+    ));
+    // Derived from the composed definitions exactly as the daemon derives it, so a scope the tool declares is
+    // granted without a list that could omit it.
+    let actor = ToolActor::for_composed_tools(
+        LOCAL_WORKSPACE_ID,
+        RUN,
+        SessionChannel::Cli,
+        AuthenticationStrength::Credential,
+        "policy-1",
+        &[definition],
+    );
+    (directory, database, pipeline, actor)
+}
+
+/// **A model-chosen URL is held for a person under the default workspace policy.**
+///
+/// This is the decision `ADR-0129` rests on, asserted through the real pipeline and the real adapter rather
+/// than on the definition alone: if the declared risk and the default threshold ever stopped agreeing, the
+/// fetch would run unattended and nothing about the tool's own tests would notice.
+#[tokio::test]
+async fn a_web_fetch_is_held_for_approval_by_default() {
+    let (_root, _database, pipeline, actor) = web_pipeline(WorkspacePolicy::default()).await;
+    let outcome = must(
+        pipeline
+            .call_tool(
+                jarvis_web::FETCH_TOOL,
+                json!({ "url": "https://example.com/" }),
+                &actor,
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval { reason_code, .. } = outcome else {
+        panic!("a web fetch must be held under the default policy, got {outcome:?}");
+    };
+    assert_eq!(reason_code, "approval_required");
+}
+
+/// **With the operator's opt-in the call reaches the adapter, and the adapter's guard still refuses.**
+///
+/// The workspace threshold is raised so the policy allows the call. The URL is a loopback literal on the
+/// standard port, so the only thing that can stop it is the address rule — and what the pipeline records is the
+/// adapter's own refusal, not a policy denial. That shows the scope was granted, the call was authorized, the
+/// adapter ran, and the guard behind the policy is a second, independent layer.
+#[tokio::test]
+async fn an_unattended_web_fetch_is_still_refused_by_the_address_guard() {
+    let workspace = must(WorkspacePolicy::new(
+        jarvis_tools::Risk::High,
+        jarvis_tools::Risk::High,
+        true,
+        true,
+    ));
+    let (_root, _database, pipeline, actor) = web_pipeline(workspace).await;
+    let correlation = CorrelationId::new();
+    let outcome = must(
+        pipeline
+            .call_tool(
+                jarvis_web::FETCH_TOOL,
+                json!({ "url": "http://127.0.0.1/admin" }),
+                &actor,
+                correlation,
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::Executed(result) = outcome else {
+        panic!("an allowed call must execute, got {outcome:?}");
+    };
+    assert_eq!(result.outcome(), ToolOutcome::Failed);
+    let stored = must(pipeline.call(&correlation.to_string()).await);
+    assert_eq!(stored.outcome(), ToolOutcome::Failed);
+    assert_eq!(stored.record().reason(), Some("egress_refused"));
+    let output = result
+        .output()
+        .unwrap_or_else(|| panic!("a refusal explains itself to the model"))
+        .content()
+        .to_owned();
+    assert!(output.contains("not on the public internet"), "{output}");
+}

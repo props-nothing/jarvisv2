@@ -121,6 +121,16 @@ enum DaemonError {
         #[source]
         source: crate::memory_propose::ProposeToolError,
     },
+    /// The web fetch tool could not state its own contract.
+    ///
+    /// A startup fault for the same reason as the memory-proposal tool: the contract is a constant, so a
+    /// rejection is an authoring mistake in this build and the tool must not be offered to a model.
+    #[error("the web fetch tool could not be defined")]
+    WebFetchTool {
+        /// Which constant was rejected, named by the variant.
+        #[source]
+        source: jarvis_web::WebFetchToolError,
+    },
     /// The configured workspace policy was self-contradictory.
     ///
     /// The pair is refused at parse time too, so this is the belt to that suspenders: the composition
@@ -611,15 +621,28 @@ async fn compose_tools(
     let mut additional: Vec<(
         Vec<jarvis_tools::ToolDefinition>,
         Arc<dyn jarvis_tools::ToolExecutor>,
-    )> = vec![(
-        vec![
-            crate::memory_propose::MemoryProposeTool::definition()
-                .map_err(|source| DaemonError::MemoryProposeTool { source })?,
-        ],
-        Arc::new(crate::memory_propose::MemoryProposeTool::new(Arc::clone(
-            &database,
-        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
-    )];
+    )> = vec![
+        (
+            vec![
+                crate::memory_propose::MemoryProposeTool::definition()
+                    .map_err(|source| DaemonError::MemoryProposeTool { source })?,
+            ],
+            Arc::new(crate::memory_propose::MemoryProposeTool::new(Arc::clone(
+                &database,
+            ))) as Arc<dyn jarvis_tools::ToolExecutor>,
+        ),
+        // The web fetch tool is native too: it is JARVIS's own guarded `GET`, not a third party's server. It is
+        // registered unconditionally and **held for approval by default** (risk 2 against the default
+        // threshold), so offering it grants the model nothing until a person decides — see
+        // `docs/research/integrations/web-fetch.md` for how an operator opts in to unattended use.
+        (
+            vec![
+                jarvis_web::WebFetchTool::definition()
+                    .map_err(|source| DaemonError::WebFetchTool { source })?,
+            ],
+            Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
+        ),
+    ];
     additional.extend(
         mcp.as_ref()
             .map(|host| {

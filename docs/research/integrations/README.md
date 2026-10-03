@@ -7,6 +7,7 @@ Every external integration requires a dated record based on current official sou
 | Integration | Official AI/docs index | Record | Status |
 | --- | --- | --- | --- |
 | MCP | https://modelcontextprotocol.io/llms.txt | [mcp.md](mcp.md) | `P3-007` complete: spec `2026-07-28` and `rmcp` 3.4.0 selected; not implemented |
+| Web fetch (`jarvis.web.fetch`) | not applicable; IANA special-purpose registries and the pinned `reqwest` 0.13.5 source | [web-fetch.md](web-fetch.md) | `P3-027` implemented; exfiltration through a model-chosen URL is an open question, held for approval by default |
 | ElevenLabs | https://elevenlabs.io/docs/llms.txt | [elevenlabs.md](elevenlabs.md) | architecture researched; both custom-brain transports and turn-taking config recorded; not implemented |
 | Twilio | no usable single index; official TwiML/Media Streams/pricing pages | [twilio.md](twilio.md) | architecture researched; not implemented |
 | Deepgram (Flux) | https://developers.deepgram.com/llms.txt | [deepgram.md](deepgram.md) | architecture researched; not implemented |

@@ -70,7 +70,7 @@ Every context item, tool input/output, artifact, event, and trace can carry a cl
 | Malicious/compromised MCP server | explicit install consent; constrained process/network; schema and output bounds; per-server scopes; no inherited secrets |
 | Compromised external runtime | process isolation; environment allowlist; mediated tools; protocol validation; resource limits; kill/orphan cleanup |
 | Credential exfiltration | `SecretRef`; just-in-time adapter resolution; egress restrictions; structural redaction; no secrets in prompts/URLs |
-| SSRF and unsafe redirects | URL parser; scheme/host/IP policy; DNS rebinding defense; redirect revalidation; block metadata/private ranges by default |
+| SSRF and unsafe redirects | URL parser; scheme/host/IP policy; DNS rebinding defense; redirect revalidation; block metadata/private ranges by default. Implemented for `jarvis.web.fetch` in `jarvis-web` ([ADR-0129](../adr/0129-a-fetch-is-checked-on-the-address-it-connects-to.md)): every resolved address must be globally routable, the connection is pinned to the checked addresses, and each redirect hop is checked again |
 | Filesystem escape | granted roots; handle-based/race-resistant access; symlink/junction policy; path normalization; size/count limits |
 | Shell/command injection | structured commands where possible; sandbox; no host shell by default; resource/network/filesystem limits |
 | OAuth interception/CSRF | PKCE, state, nonce, exact redirect matching, short-lived setup transaction, verified provider account |
