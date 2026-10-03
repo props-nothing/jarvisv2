@@ -185,6 +185,198 @@ async fn a_subject(database: &SqliteDatabase) -> EntityId {
     id
 }
 
+/// Returns the field a decode refused, for the tests that write a broken row by hand.
+///
+/// Reads through the error rather than comparing a whole `Result`, because `StoredMemory` carries a decoded
+/// record and is deliberately not `PartialEq` — comparing two of them would be a test of the decoder's output
+/// rather than of the rule under test.
+async fn refusal_field(database: &SqliteDatabase, id: &str) -> &'static str {
+    match find_memory(database, id).await {
+        Err(DatabaseError::StoredMemoryInvalid { field }) => field,
+        other => panic!("expected a stored-memory refusal, got {other:?}"),
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Invariant: admission names its approver, and the row holds the decision
+// ------------------------------------------------------------------------------------------------
+
+/// **A confirmation records the approver and the moment, and both come back from the row.**
+///
+/// `P4-014` through the whole write path, which is the claim the requirement actually makes: the acceptance is
+/// durable rather than a reply field. Asserted against a **subsequent read** rather than the returned value,
+/// because the returned value is what an implementation that never wrote the columns would still produce.
+///
+/// The pair is asserted together and separately: a write that stored only one of the two would satisfy a check
+/// for either alone, and the domain refuses half a decision on the way back in — so a row carrying one would be
+/// unreadable, which is the failure this catches.
+#[tokio::test]
+async fn a_confirmation_records_its_approver_and_survives_the_round_trip() {
+    let (_directory, database) = seeded_database().await;
+    let subject = a_subject(&database).await;
+    let memory = preference(subject);
+    let key = key_for(&memory);
+    must(record_memory(&database, &memory, &key).await);
+
+    // A preference from a user statement starts `active` and names nobody: it needed no accepting.
+    let read = must(find_memory(&database, &memory.id().to_string()).await);
+    assert_eq!(read.record().admitted_by_actor_id(), None);
+    assert_eq!(read.record().admitted_at(), None);
+
+    // A relationship claim is the type the domain makes a proposal, so the fixture goes through the real
+    // constructor rather than being handed a status.
+    let proposal = record_of(
+        MemoryType::Relationship,
+        "Works with Dana",
+        must(MemorySource::of_kind(
+            MemorySourceKind::UserStatement,
+            "session:0198f000-0000-7000-8000-000000000003",
+        )),
+        MemoryConfidence::Confirmed,
+        subject,
+    );
+    assert_eq!(proposal.status(), MemoryStatus::Proposed);
+    let proposal_key = key_for(&proposal);
+    must(record_memory(&database, &proposal, &proposal_key).await);
+
+    let confirmed = must(
+        apply_memory_transition(
+            &database,
+            &proposal.id().to_string(),
+            MemoryTransition::Confirm {
+                approver_actor_id: "0198f000-0000-7000-8000-0000000000b2".to_owned(),
+            },
+            at(5),
+        )
+        .await,
+    );
+
+    let read_back = must(find_memory(&database, &proposal.id().to_string()).await);
+    assert_eq!(read_back.record().status(), MemoryStatus::Active);
+    assert_eq!(
+        read_back.record().admitted_by_actor_id(),
+        Some("0198f000-0000-7000-8000-0000000000b2"),
+        "the approver must be in the row, not only in the returned value"
+    );
+    assert_eq!(
+        read_back.record().admitted_at(),
+        Some(at(5)),
+        "and the moment, so the pair travels together"
+    );
+    assert_eq!(confirmed.version(), read_back.version());
+
+    // **A later correction keeps the admission.** Correcting archives the claim, and an archive yields `None`
+    // for both fields — so the write has to take them from the record rather than from the transition, or the
+    // record of who accepted a claim would be erased at the moment it was superseded, which is when an audit
+    // would want it.
+    let replacement = record_of(
+        MemoryType::Relationship,
+        "Works closely with Dana",
+        must(MemorySource::of_kind(
+            MemorySourceKind::UserStatement,
+            "session:0198f000-0000-7000-8000-000000000003",
+        )),
+        MemoryConfidence::Confirmed,
+        subject,
+    );
+    let replacement = must(replacement.replace_with(proposal.id(), at(6)));
+    let replacement_key = key_for(&replacement);
+    must(record_memory(&database, &replacement, &replacement_key).await);
+    let archived = must(
+        apply_memory_transition(
+            &database,
+            &proposal.id().to_string(),
+            MemoryTransition::ReplaceWith(replacement.id()),
+            at(6),
+        )
+        .await,
+    );
+    assert_eq!(archived.record().status(), MemoryStatus::Archived);
+    assert_eq!(
+        archived.record().admitted_by_actor_id(),
+        Some("0198f000-0000-7000-8000-0000000000b2"),
+        "archiving a confirmed claim must not erase who confirmed it"
+    );
+}
+
+/// **A row whose admission columns disagree with each other or with its status is refused on read.**
+///
+/// The schema cannot carry this rule for `memories`: `ALTER TABLE ADD COLUMN` takes only a column-def, so a
+/// `CHECK` mentioning `status` is rejected as soon as it is added. The decode is therefore the only enforcer,
+/// and this writes the three broken shapes directly to be sure it fires — a row that arrived from another
+/// build, a restored backup, or a hand edit is exactly what the rule exists for.
+#[tokio::test]
+async fn an_inconsistent_admission_row_is_refused_on_read() {
+    let (_directory, database) = seeded_database().await;
+    let subject = a_subject(&database).await;
+    let memory = preference(subject);
+    let key = key_for(&memory);
+    must(record_memory(&database, &memory, &key).await);
+    let id = memory.id().to_string();
+
+    // A proposed row naming an approver: accepted and awaiting acceptance at once. Written by hand because no
+    // code path can produce it -- `confirm_by` also sets the status.
+    let written = sqlx::query(
+        "UPDATE memories SET status = 'proposed', admitted_by_actor_id = 'approver', \
+            admitted_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+    )
+    .bind(&id)
+    .execute(database.pool())
+    .await;
+    assert!(
+        written.is_ok(),
+        "the fixture must bypass the domain to write this"
+    );
+    assert_eq!(
+        refusal_field(&database, &id).await,
+        "admitted_at",
+        "a proposal must not name an approver"
+    );
+
+    // Half a decision: an approver with no moment.
+    let written = sqlx::query(
+        "UPDATE memories SET status = 'active', admitted_by_actor_id = 'approver', admitted_at = NULL \
+         WHERE id = ?1",
+    )
+    .bind(&id)
+    .execute(database.pool())
+    .await;
+    assert!(written.is_ok());
+    assert_eq!(
+        refusal_field(&database, &id).await,
+        "admitted_at",
+        "an approver with no acceptance time is half a decision"
+    );
+
+    // And the other half, which is the direction a write that stored only the timestamp would produce.
+    let written = sqlx::query(
+        "UPDATE memories SET status = 'active', admitted_by_actor_id = NULL, \
+            admitted_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+    )
+    .bind(&id)
+    .execute(database.pool())
+    .await;
+    assert!(written.is_ok());
+    assert_eq!(
+        refusal_field(&database, &id).await,
+        "admitted_at",
+        "an acceptance time with no approver is half a decision"
+    );
+
+    // The control: a complete, consistent admission decodes, so the rule is not "refuse any row with these
+    // columns set".
+    let written = sqlx::query(
+        "UPDATE memories SET status = 'active', admitted_by_actor_id = 'approver', \
+            admitted_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+    )
+    .bind(&id)
+    .execute(database.pool())
+    .await;
+    assert!(written.is_ok());
+    let decoded = must(find_memory(&database, &id).await);
+    assert_eq!(decoded.record().admitted_by_actor_id(), Some("approver"));
+}
+
 // ------------------------------------------------------------------------------------------------
 // The canonical round trip
 // ------------------------------------------------------------------------------------------------
@@ -279,11 +471,16 @@ fn deconstruct(record: &MemoryRecord) -> MemoryRecordParts {
 // Invariant: an inferred preference never appears as confirmed fact
 // ------------------------------------------------------------------------------------------------
 
-/// **A model-produced claim cannot be stored as anything but unverified.**
+/// **A model-produced claim is stored as a proposal, and can never be read back as a fact.**
 ///
-/// The first acceptance invariant, as the write path a caller would actually take. `P4-001` refuses it at
-/// construction, and this asserts the refusal is still in force when a row is **written and read back** —
-/// because a decode that re-derived the confidence from somewhere else would undo the constructor's rule.
+/// The first acceptance invariant, as the write path a caller would actually take. `P4-001` refuses a raised
+/// confidence at construction, and this asserts the refusal is still in force when a row is **written and
+/// read back** — because a decode that re-derived the confidence from somewhere else would undo the
+/// constructor's rule.
+///
+/// It asserts the **status** as well as the confidence, and the two are different claims: bounding the
+/// confidence is what stops a model asserting a level, and deriving `Proposed` is what stops the claim being
+/// current truth at the one level that is permitted. This test passed for as long as only the first held.
 #[tokio::test]
 async fn a_model_inference_cannot_be_recorded_as_a_fact() {
     let (_directory, database) = seeded_database().await;
@@ -332,9 +529,20 @@ async fn a_model_inference_cannot_be_recorded_as_a_fact() {
         !read.record().is_stateable_as_fact_at(at(1)),
         "an inferred preference must not be stateable as fact, even when it is the current claim"
     );
-    // The workspace read returns it, because it exists — and it is the *presentation* predicate that keeps it
-    // from being asserted, which is why the two are separate.
-    assert!(read.record().effective_status_at(at(1)).is_current_truth());
+    // **And it is not the current claim either.** An earlier version of this line asserted the *opposite*,
+    // and its comment justified the divergence: the presentation predicate was what kept an inference from
+    // being asserted, "which is why the two are separate" from the status.
+    //
+    // Two layers disagreeing about one question is not a separation of concerns, and the status is the
+    // load-bearing one: the comparison stage reports a candidate whose text differs from the current claim at
+    // its key as a `Correction`, and a correction **supersedes**. So an inference that was `Active` silently
+    // retired an earlier claim — a real effect produced by the disagreement, not a labelling nicety.
+    //
+    // Both layers now agree, and this test's name is finally true of its body.
+    assert!(
+        !read.record().effective_status_at(at(1)).is_current_truth(),
+        "an inferred preference must not be the current claim, not merely unstateable"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------

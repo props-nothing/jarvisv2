@@ -36,9 +36,10 @@ use jarvis_core::{
     UtcTimestamp, WorkspaceId,
 };
 use jarvis_protocol::{
-    ClaimBody, CorrectMemoryRequest, DeletionReceipt, ExportedMemory, ForgetMemoryRequest,
-    MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference, MemoryReply,
-    MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest, SignalContribution,
+    ClaimBody, ConfirmMemoryRequest, CorrectMemoryRequest, DeletionReceipt, ExportedMemory,
+    ForgetMemoryRequest, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference,
+    MemoryReply, MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest,
+    SignalContribution,
 };
 use jarvis_storage::{
     DatabaseError, SqliteDatabase, StoredMemory, apply_memory_transition,
@@ -193,6 +194,26 @@ impl MemoryService {
             })
     }
 
+    /// Returns the seeded local user, read from the identity rather than supplied.
+    ///
+    /// # Why this replaced a literal, and what the literal had already broken
+    ///
+    /// This value used to be the string `"local-user"`, written at one call site, while every other write path
+    /// in the daemon uses `LOCAL_USER_ID` — the identifier `0005` actually seeds into `users`. The two never
+    /// matched. The consequence is not cosmetic: `confirm_by` refuses an approver equal to the claim's author,
+    /// so with a fabricated author the guard would have been **vacuous** — the real user could have accepted a
+    /// claim the real user had submitted, and the rule would have reported no violation because it was
+    /// comparing against a name nobody holds.
+    ///
+    /// A fabricated identity is the failure mode of every self-approval guard: the check is real, the value is
+    /// not, and the check passes. Reading it from the identity is what makes the comparison meaningful, and it
+    /// is why the value is derived here rather than accepted from the request — a caller able to name its own
+    /// author could name one that differs from its approver and defeat the same guard from the other side.
+    async fn actor_id(&self) -> Result<String, MemoryServiceError> {
+        let identity = load_local_identity(&self.database).await?;
+        Ok(identity.user_id().to_owned())
+    }
+
     /// Lists the workspace's claims, newest first.
     ///
     /// # Errors
@@ -311,7 +332,7 @@ impl MemoryService {
                 .as_ref()
                 .map(|value| parse_memory_id(value))
                 .transpose()?,
-            created_by_actor_id: "local-user".to_owned(),
+            created_by_actor_id: self.actor_id().await?,
             correlation_id: CorrelationId::new(),
         };
 
@@ -520,6 +541,56 @@ impl MemoryService {
                     .to_owned(),
             ],
         })
+    }
+
+    /// Accepts a proposed claim, recording **who** accepted it.
+    ///
+    /// This is `P4-014`'s "admission is a decision that names its approver", and the verb the memory surface
+    /// was missing: `MemoryTransition::Confirm` existed from `P4-002` and **no route called it**, so a
+    /// `Proposed` claim could be created over HTTP and never accepted — a claim the workspace held, offered to
+    /// nobody, with no way to make it current.
+    ///
+    /// # Why the approver is not a request field
+    ///
+    /// It is read from the seeded identity, exactly as the author is. This is the one place the guard the
+    /// requirement wants actually holds: the model can request *tools*, never call a route, so it cannot name
+    /// itself as the approver of anything. A caller-supplied approver would remove that and let a client accept
+    /// a candidate while attributing the decision to somebody else.
+    ///
+    /// Note what this does **not** do: it does not refuse an approval by the claim's own author. The document
+    /// requires "explicit user confirmation" of a high-impact inference, so the person confirming is expected
+    /// to be the person whose statement produced it. Refusing that would refuse the intended flow -- see the
+    /// limit recorded in `TODO.md` for this slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryServiceError::Conflict`] when the caller's version is stale,
+    /// [`MemoryServiceError::NotFound`] when the claim is not in this workspace, and
+    /// [`MemoryServiceError::Refused`] when the domain refuses the acceptance — which it does for a claim that
+    /// is not `Proposed`, and for an approver that is the claim's own author.
+    pub async fn confirm(
+        &self,
+        memory_id: &str,
+        request: &ConfirmMemoryRequest,
+    ) -> Result<MemoryReply, MemoryServiceError> {
+        let workspace = self.workspace().await?;
+        let existing = self.load_scoped(memory_id, workspace).await?;
+        if existing.version() != request.expected_version {
+            return Err(MemoryServiceError::Conflict);
+        }
+
+        let approver = self.actor_id().await?;
+        let stored = apply_memory_transition(
+            &self.database,
+            memory_id,
+            jarvis_storage::MemoryTransition::Confirm {
+                approver_actor_id: approver,
+            },
+            UtcTimestamp::now(&SystemClock),
+        )
+        .await?;
+
+        Ok(reply_of(&stored, "confirmed".to_owned(), None))
     }
 
     /// Exports every claim the workspace holds, including archived and deleted ones.
@@ -912,6 +983,11 @@ fn reference_of(stored: &StoredMemory) -> MemoryReference {
         updated_at: record.updated_at().to_string(),
         last_accessed_at: record.last_accessed_at().map(|at| at.to_string()),
         retrieval_count: record.retrieval_count(),
+        // Read from the record rather than derived from the status, because "somebody accepted this" and "this
+        // is a current claim" are different facts and only the first answers "who decided". Deriving it would
+        // report an approver for a claim that was admitted as current truth by the act of being stated.
+        admitted_by_actor_id: record.admitted_by_actor_id().map(str::to_owned),
+        admitted_at: record.admitted_at().map(|at| at.to_string()),
         // The value a correction or deletion must present. It is on the reference rather than only on a
         // write's reply, because the caller obtains an expectation by *reading* and a reply that omitted it
         // would leave the client re-reading and hoping — the lost update the guard exists to prevent.
@@ -976,6 +1052,8 @@ fn hit_of(scored: &jarvis_core::ScoredMemory) -> MemorySearchHit {
             updated_at: scored.record().updated_at().to_string(),
             last_accessed_at: scored.record().last_accessed_at().map(|at| at.to_string()),
             retrieval_count: scored.record().retrieval_count(),
+            admitted_by_actor_id: scored.record().admitted_by_actor_id().map(str::to_owned),
+            admitted_at: scored.record().admitted_at().map(|at| at.to_string()),
             // `0`, and this is the one place a reference carries no real version. The ranking holds a
             // `MemoryRecord`, which does not carry the optimistic-concurrency version, so a value here could
             // only be fabricated — and a fabricated expectation is worse than an absent one, because a

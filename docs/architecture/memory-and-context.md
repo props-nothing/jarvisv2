@@ -77,6 +77,17 @@ flowchart LR
 
 The model may propose candidates, labels, confidence, and entities. Deterministic code validates shape, source linkage, workspace, size, sensitivity, and retention. High-impact identity, medical, financial, authentication, and relationship inferences require explicit user confirmation before becoming trusted facts.
 
+**An admission is a decision that names its approver** (`P4-014`, `ADR-0124`). A proposal becomes current only
+through an explicit acceptance, and that acceptance records **who** made it and **when** — two columns that move
+together, because half a decision reads as a whole one. The approver is never a value a client supplies: the
+daemon records its own authenticated identity, which is what makes the attribution mean anything.
+
+The classes that require confirmation are derived rather than chosen. A `relationship` claim is the document's
+own high-impact class, and a `model_inference` is a proposal **at any confidence** — being stored as current
+truth would be the "second signal" its `unverified` level is documented as needing. So a client cannot record
+either as a fact by asserting a status, and the derivation runs on every write *and* every decode.
+
+
 ## Provenance And Trust
 
 Sources have origin and trust classes, for example:

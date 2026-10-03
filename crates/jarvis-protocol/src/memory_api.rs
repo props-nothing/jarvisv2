@@ -174,6 +174,19 @@ pub struct MemoryReference {
     pub last_accessed_at: Option<String>,
     /// How often it has been usefully retrieved.
     pub retrieval_count: u32,
+    /// The identity that accepted it, absent when no acceptance was recorded.
+    ///
+    /// `P4-014`: "admission is a decision that names its approver", and a client asking "who decided this
+    /// claim is true" has to be able to answer it. Absent means one of two things the status distinguishes:
+    /// the claim never needed accepting, or it was accepted before admission was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_by_actor_id: Option<String>,
+    /// When that acceptance was recorded, alongside [`Self::admitted_by_actor_id`].
+    ///
+    /// Present exactly when the approver is, because the domain refuses half a decision and a reply that
+    /// could carry one would present the other half as complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<String>,
     /// The version a correction or deletion must present.
     ///
     /// # Why this is on the reference rather than only on a write's reply
@@ -419,6 +432,25 @@ pub struct ForgetMemoryRequest {
     /// which of the two happened.
     #[serde(default)]
     pub allow_relearn: bool,
+}
+
+/// Request body for `POST /api/v1/memories/{id}/confirm`.
+///
+/// # Why the version is the only field
+///
+/// `P4-014` is "admission is a decision that names its approver", so the obvious shape is an
+/// `approver_actor_id` field beside the version. It is deliberately absent: the approver is read from the
+/// daemon's seeded identity, because a caller that could name its own approver could accept its own claim by
+/// naming somebody else. The guard that refuses a self-admission compares the approver against the claim's
+/// author, and it is only meaningful if neither side comes from the request.
+///
+/// The version is present for the same reason every other write carries it: an acceptance decided against a
+/// stale read would confirm a version of the claim the reviewer never saw.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmMemoryRequest {
+    /// The version the caller observed.
+    pub expected_version: i64,
 }
 
 /// Summary of what a deletion removed.

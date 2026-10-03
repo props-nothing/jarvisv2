@@ -173,6 +173,19 @@ pub enum InvalidMemory {
         /// The requested status.
         to: &'static str,
     },
+    /// The identity accepting a proposal was blank or longer than the column may hold.
+    ///
+    /// Carries no value, following [`Self::IllegalStatus`]: the bound is a constant and the offending text is
+    /// the caller's own, so a field would be a value nothing reads.
+    #[error("the approver identity must be non-empty and within the bound the column enforces")]
+    ApproverUnusable,
+    /// A row's admission columns do not agree with its status.
+    ///
+    /// The rule SQLite cannot hold here — `ALTER TABLE ADD COLUMN` takes only a column-def, so a `CHECK`
+    /// mentioning `status` is not expressible without rebuilding the table. Enforced on the read path, beside
+    /// the existing status-and-content rule.
+    #[error("a memory's admission record does not agree with its status")]
+    AdmissionInconsistent,
 }
 
 /// What a memory is for, and how long it is expected to matter.
@@ -1176,17 +1189,26 @@ pub struct MemoryRecordParts {
 
 /// The state a stored memory holds that construction derives.
 ///
-/// # Why these five fields travel together
+/// # Why these seven fields travel together
 ///
 /// Each is one `new` cannot know: the **stored status** (a confirmed relationship memory is `active` even
 /// though the type starts as a proposal), the **replacement** (set only after a later correction exists),
-/// `updated_at` (a row may have been edited since it was written), and the two retrieval counters.
+/// `updated_at` (a row may have been edited since it was written), the two retrieval counters, and the two
+/// **admission** columns.
 ///
 /// They travel together because they are all read from the same row, and because the status has to be judged
 /// with the content: `deleted` is the status whose content is empty and every other status must have content,
 /// so a decoder that derived a record and then stamped the status on could not apply that rule — which is how
-/// an earlier shape made a deleted memory unreadable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// an earlier shape made a deleted memory unreadable. The admission pair is the same shape one rule along:
+/// only an `active` row may carry one, so the status has to be in hand to judge them.
+///
+/// # Why this is no longer `Copy`
+///
+/// It was, and the admission columns ended that: an approver identifier is an owned `String`, and a type
+/// containing one cannot be copied. `Clone` is retained, which is what a decoder needs — the only `Copy`-shaped
+/// use was passing a value by value, and `clone` at those sites is explicit about the row being duplicated
+/// rather than implicitly cheap.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredMemoryState {
     /// The status the row holds.
     pub status: MemoryStatus,
@@ -1198,6 +1220,14 @@ pub struct StoredMemoryState {
     pub last_accessed_at: Option<UtcTimestamp>,
     /// How many times the memory has been usefully retrieved.
     pub retrieval_count: u32,
+    /// The actor who accepted it, read from the row.
+    ///
+    /// Part of the stored state rather than of the parts, because a decode must **not** derive it: the
+    /// derivation a write performs is "no admission yet", and re-applying that to a stored row would erase the
+    /// decision. Same reasoning as `status` above.
+    pub admitted_by_actor_id: Option<String>,
+    /// When the acceptance was recorded, read from the row.
+    pub admitted_at: Option<UtcTimestamp>,
 }
 
 /// One durable memory: a sourced claim with lifecycle metadata.
@@ -1231,6 +1261,10 @@ pub struct MemoryRecord {
     last_accessed_at: Option<UtcTimestamp>,
     /// How many times it has been usefully retrieved, which is the reinforcement signal.
     retrieval_count: u32,
+    /// The actor who accepted it, when a decision was recorded.
+    admitted_by_actor_id: Option<String>,
+    /// When that decision was recorded.
+    admitted_at: Option<UtcTimestamp>,
 }
 
 impl MemoryRecord {
@@ -1246,6 +1280,11 @@ impl MemoryRecord {
     ///   [`MemoryConfidence::Unverified`], which is the rule that stops a model asserting a fact.
     /// - [`InvalidMemory::Source`] when a **provider record** backs a [`MemoryType::Preference`], which is
     ///   the document's own example of trust that does not transfer between claim kinds.
+    ///
+    /// A **model inference** and a **relationship** claim are recorded as [`MemoryStatus::Proposed`]
+    /// regardless of what a caller asks for: a claim nothing can support, and a claim whose class requires
+    /// confirmation, are both proposals before either is a fact. The status is derived rather than taken, so
+    /// there is no argument a caller could pass to record either as current truth.
     pub fn new(parts: MemoryRecordParts) -> Result<Self, InvalidMemory> {
         Self::build(parts, true, false)
     }
@@ -1345,14 +1384,30 @@ impl MemoryRecord {
             return Err(InvalidMemory::Validity);
         }
 
-        // A relationship inference is high-impact, so it starts as a proposal rather than as a fact. The
-        // status is derived from the type here rather than taken from the caller, so the rule is a property
-        // of construction: a caller cannot record a `Relationship` claim already active.
+        // **Two independent reasons for a proposal, and either is sufficient.** The status is derived from
+        // the classification here rather than taken from the caller, so the rule is a property of
+        // construction: a caller cannot record either kind of claim already active.
+        //
+        // 1. A **relationship** claim is high-impact, so it starts as a proposal rather than as a fact.
+        // 2. A **model inference is a proposal at any confidence**, including at `Unverified` — the one level
+        //    the rule above permits. Refusing a higher confidence is not the same rule as refusing the claim
+        //    as current truth, and the two were once conflated here: the confidence ceiling made an inference
+        //    storable, and this derivation then called the result `Active`, so an inference the ceiling had
+        //    just bounded was recorded as a fact. `MemoryConfidence::Unverified` is documented as needing "a
+        //    second signal to be promoted past" it, and being stored as current truth *is* that promotion.
+        //
+        //    The pipeline already derives `Proposal` for exactly this reason
+        //    ([`crate::CandidateClassification::requires_proposal`]), so the disagreement this fixes was
+        //    between the two layers that are supposed to agree — which is what `MemoryAdmission::Proposal`
+        //    says writing one and reading it back is for. It matters beyond provenance: the comparison stage
+        //    reports a candidate whose text differs from the row at its key as a `Correction`, and a
+        //    correction *supersedes*. With an inference able to be `Active`, one model inference silently
+        //    retired an earlier claim.
         //
         // A decode passes `require_entities == false`, and the derived status is then overwritten by the
-        // stored one. The derivation still runs, so a decode cannot skip this rule — it is the *value* that
+        // stored one. The derivation still runs, so a decode cannot skip these rules — it is the *value* that
         // is replaced, not the check.
-        let status = if memory_type.requires_confirmation() {
+        let status = if memory_type.requires_confirmation() || source.kind().is_model_produced() {
             MemoryStatus::Proposed
         } else {
             MemoryStatus::Active
@@ -1381,6 +1436,13 @@ impl MemoryRecord {
             updated_at: created_at,
             last_accessed_at: None,
             retrieval_count: 0,
+            // **A new record carries no admission, and the shape enforces it.** `MemoryRecordParts` has no
+            // field for either value, so there is nothing here for a caller to supply: the only way a record
+            // comes to name an approver is `confirm_by`, which is a transition. Stating it as "absent from the
+            // type" rather than "defaulted to `None`" is what makes the requirement a property of construction
+            // instead of a value every future call site would have to remember to leave alone.
+            admitted_by_actor_id: None,
+            admitted_at: None,
         })
     }
 
@@ -1413,9 +1475,17 @@ impl MemoryRecord {
     /// Returns the same failures as [`Self::new`], except that the entity list is permitted to be empty —
     /// the links live in their own table, so a decoder reads them after this value exists — and that an
     /// empty content is permitted **only** in the `Deleted` status.
+    ///
+    /// # Why the state is borrowed
+    ///
+    /// The decode reads these fields and copies them onto the record; it does not consume them, and it could
+    /// not — a decoder that took ownership of a row's state would have nothing left to compare the next row
+    /// against. The value stopped being `Copy` when the admission columns were added (an approver identifier is
+    /// an owned `String`), which is what turned "passing it by value" from a cheap copy into an unnecessary
+    /// move that each caller had to clone around.
     pub fn from_stored(
         parts: MemoryRecordParts,
-        state: StoredMemoryState,
+        state: &StoredMemoryState,
     ) -> Result<Self, InvalidMemory> {
         let mut record = Self::build(parts, false, state.status == MemoryStatus::Deleted)?;
 
@@ -1438,11 +1508,38 @@ impl MemoryRecord {
             return Err(InvalidMemory::SupersedesSelf);
         }
 
+        // **The admission rule, which the schema cannot hold for this table.** The two columns move together
+        // — half of a decision reads as a whole one — and only an `active` row may carry one, because a
+        // `proposed` row naming an approver would be a claim accepted by somebody while still awaiting
+        // acceptance. `archived` is included with `active` deliberately: a confirmed claim that was later
+        // superseded keeps the trail of who accepted it, and refusing that would make the correction path
+        // unreadable.
+        if state.admitted_by_actor_id.is_some() != state.admitted_at.is_some() {
+            return Err(InvalidMemory::AdmissionInconsistent);
+        }
+        let admits_an_approver =
+            matches!(state.status, MemoryStatus::Active | MemoryStatus::Archived);
+        if state.admitted_by_actor_id.is_some() && !admits_an_approver {
+            return Err(InvalidMemory::AdmissionInconsistent);
+        }
+        // The same bounds the column carries, so a row that arrived some other way is refused rather than
+        // accepted merely because SQLite held it.
+        if let Some(approver) = &state.admitted_by_actor_id
+            && (approver.trim().is_empty()
+                || approver.len() > crate::approval::MAX_APPROVER_ID_CHARS)
+        {
+            return Err(InvalidMemory::ApproverUnusable);
+        }
+
         record.status = state.status;
         record.superseded_by = state.superseded_by;
         record.updated_at = state.updated_at;
         record.last_accessed_at = state.last_accessed_at;
         record.retrieval_count = state.retrieval_count;
+        record
+            .admitted_by_actor_id
+            .clone_from(&state.admitted_by_actor_id);
+        record.admitted_at = state.admitted_at;
         Ok(record)
     }
 
@@ -1600,6 +1697,23 @@ impl MemoryRecord {
         self.retrieval_count
     }
 
+    /// Returns the actor who accepted this claim, when an acceptance was recorded.
+    ///
+    /// `None` means one of two things and both are worth naming: the claim never needed accepting (a user
+    /// statement is admitted by the person stating it), or it was accepted before admission was recorded.
+    /// The two are distinguishable only by the status — a `proposed` claim has been accepted by nobody,
+    /// while an `active` one may have been accepted unrecorded. Nothing pretends to tell them apart.
+    #[must_use]
+    pub fn admitted_by_actor_id(&self) -> Option<&str> {
+        self.admitted_by_actor_id.as_deref()
+    }
+
+    /// Returns when this claim was accepted, when an acceptance was recorded.
+    #[must_use]
+    pub const fn admitted_at(&self) -> Option<UtcTimestamp> {
+        self.admitted_at
+    }
+
     /// Returns whether this claim may be offered to a user as established.
     ///
     /// Both conditions are needed and neither implies the other: a `Confirmed` claim that has been
@@ -1725,7 +1839,7 @@ impl MemoryRecord {
         self.workspace_id == workspace_id
     }
 
-    /// Confirms a proposed memory, making it current.
+    /// Confirms a proposed memory without attributing the decision.
     ///
     /// # Errors
     ///
@@ -1733,8 +1847,79 @@ impl MemoryRecord {
     /// [`InvalidMemory::AlreadyDeleted`] for a deleted memory. A proposal is the only state that may be
     /// confirmed: re-confirming an active memory would bump its `updated_at` and make "when did this become
     /// trusted" unanswerable, and reviving a deleted one would defeat deletion.
+    ///
+    /// # Why the unattributed form exists, and why new callers should not use it
+    ///
+    /// `P4-014` requires that "admission is a decision that names its approver", and [`Self::confirm_by`] is
+    /// that decision. This form is kept because it is the **decode** companion: a row written before
+    /// admission was recorded decodes to `active` with no approver, and re-applying the stored status must
+    /// not invent one. A caller reaching for this to *perform* a confirmation would produce a current claim
+    /// with nobody behind it, which is the state the requirement exists to remove — so the storage layer's
+    /// transition takes an approver and this is reachable only from it and from a decode.
     pub fn confirm(&self, at: UtcTimestamp) -> Result<Self, InvalidMemory> {
         self.transition(MemoryStatus::Active, at)
+    }
+
+    /// Confirms a proposed memory, recording **who** accepted it.
+    ///
+    /// This is `docs/architecture/memory-and-context.md`'s "propose review" decision, and the reason it is a
+    /// separate call from [`Self::confirm`] is that a decision and a state change are two facts. A state
+    /// change with no decision behind it is what the requirement forbids, so the two travel in one value and
+    /// the approver cannot be supplied separately from the acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMemory::IllegalStatus`] from a status other than `Proposed` and
+    /// [`InvalidMemory::AlreadyDeleted`] for a deleted memory, as [`Self::confirm`] does, plus:
+    ///
+    /// - [`InvalidMemory::ApproverUnusable`] when the identifier is blank or longer than
+    ///   [`MAX_APPROVER_ID_CHARS`], the bound `approvals.decided_by` and `skill_revisions.promoted_by_actor_id`
+    ///   both carry. Checked here rather than at the writer so a decision the schema would refuse cannot
+    ///   exist in memory first.
+    ///
+    /// # Why there is no self-approval refusal here
+    ///
+    /// `ADR-0117` §4 refuses a promotion by a procedure's own author, and the obvious symmetry is to refuse an
+    /// admission by a claim's own author. It is **not** done, because for a memory the two cases are not alike:
+    /// the document says a high-impact inference "requires explicit user confirmation", which is the person
+    /// confirming a candidate derived from their own statement. The rule worth wanting -- an agent must not
+    /// admit what it authored -- needs an actor vocabulary that distinguishes a model from a person, and this
+    /// build has one seeded human identity only. See the note in [`Self::confirm_by`] for what holds instead.
+    pub fn confirm_by(&self, approver_id: &str, at: UtcTimestamp) -> Result<Self, InvalidMemory> {
+        // The refusal order is deliberate: **what is being confirmed** first, then who is confirming. An
+        // archived claim that nobody may approve should be reported as the wrong state rather than as an
+        // unusable approver, because the state is what the caller has to change.
+        let approved = self.transition(MemoryStatus::Active, at)?;
+
+        let trimmed = approver_id.trim();
+        if trimmed.is_empty() || trimmed.len() > crate::approval::MAX_APPROVER_ID_CHARS {
+            return Err(InvalidMemory::ApproverUnusable);
+        }
+
+        // **There is deliberately no comparison against `created_by_actor_id` here, and the reason is that
+        // the rule this looks like would be wrong.**
+        //
+        // `memory-and-context.md` says a high-impact inference "requires explicit user confirmation before
+        // becoming a trusted fact" -- so the person confirming is expected to be the same person whose
+        // statement produced the candidate, and refusing that would refuse the architecture's own flow. The
+        // rule worth wanting is narrower: *an agent must not admit the claim it authored*. That needs an
+        // actor vocabulary that can tell a model from a person, and this build has none -- the identity table
+        // holds one seeded human, and even a run's model-produced candidate is stamped with that human's
+        // identifier by the executor. So `approver == author` cannot distinguish the forbidden case from the
+        // intended one, and a guard implementing it would refuse every legitimate self-confirmation.
+        //
+        // What does hold, and is enforced by construction rather than by a comparison: the approver is never a
+        // value a client supplies. The daemon reads its seeded identity, so the model -- which can only request
+        // *tools*, never call a route -- cannot name itself as the approver of anything. That is a transport
+        // property, and `P4-014`'s submission path is where it will need re-examining.
+        //
+        // Recorded rather than silently omitted: see the limit noted in `TODO.md` for this slice.
+
+        Ok(Self {
+            admitted_by_actor_id: Some(trimmed.to_owned()),
+            admitted_at: Some(at),
+            ..approved
+        })
     }
 
     /// Archives a memory, retaining it for audit without retrieving it as current.

@@ -516,7 +516,7 @@ pub async fn find_memory(
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
                 status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
-                retrieval_count, version \
+                retrieval_count, admitted_by_actor_id, admitted_at, version \
          FROM memories WHERE id = ?1",
     )
     .bind(id)
@@ -584,7 +584,7 @@ pub async fn read_workspace_memories(
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
                 status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
-                retrieval_count, version \
+                retrieval_count, admitted_by_actor_id, admitted_at, version \
          FROM memories WHERE workspace_id = ?1 AND status <> 'deleted' \
          ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2",
         workspace_id,
@@ -667,7 +667,7 @@ pub async fn read_retrievable_memories(
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
                 status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
-                retrieval_count, version \
+                retrieval_count, admitted_by_actor_id, admitted_at, version \
          FROM memories \
          WHERE workspace_id = ?1 \
            AND status = 'active' \
@@ -703,6 +703,7 @@ pub async fn read_entity_memories(
                 m.sensitivity, m.search_key, m.status, m.valid_from, m.valid_until, \
                 m.supersedes_memory_id, m.superseded_by_memory_id, m.run_id, m.created_by_actor_id, \
                 m.correlation_id, m.created_at, m.updated_at, m.last_accessed_at, m.retrieval_count, \
+                m.admitted_by_actor_id, m.admitted_at, \
                 m.version \
          FROM memories m JOIN memory_entities me ON me.memory_id = m.id \
          WHERE m.workspace_id = ?1 AND me.entity_id = ?2 AND m.status <> 'deleted' \
@@ -759,7 +760,7 @@ pub async fn read_all_memories(
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
                 status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
-                retrieval_count, version \
+                retrieval_count, admitted_by_actor_id, admitted_at, version \
          FROM memories WHERE workspace_id = ?1 \
          ORDER BY unixepoch(created_at) DESC, id DESC LIMIT ?2 OFFSET ?3",
     )
@@ -800,7 +801,7 @@ pub async fn find_memory_including_deleted(
                 source_trust, source_excerpt_hash, confidence, importance, sensitivity, search_key, \
                 status, valid_from, valid_until, supersedes_memory_id, superseded_by_memory_id, run_id, \
                 created_by_actor_id, correlation_id, created_at, updated_at, last_accessed_at, \
-                retrieval_count, version \
+                retrieval_count, admitted_by_actor_id, admitted_at, version \
          FROM memories WHERE id = ?1",
     )
     .bind(id)
@@ -1184,7 +1185,17 @@ pub async fn apply_memory_transition(
     let current = existing.record();
 
     let next = match transition {
-        MemoryTransition::Confirm => current.confirm(at),
+        // **The approver is a parameter of the transition, not a field of the request beside it.**
+        //
+        // `P4-014` is "admission is a decision that names its approver", and a decision is one fact: a
+        // `Confirm` that carried no approver would be a state change with nobody behind it, which is the shape
+        // the requirement removes. Folding it into the variant means the two cannot be supplied out of step,
+        // and `InvalidApprovalField`'s own reasoning in `jarvis-core::approval` records the same conclusion
+        // reached from the other direction -- a separate argument for one fact had already cost this repository
+        // a discarded value once.
+        MemoryTransition::Confirm { approver_actor_id } => {
+            current.confirm_by(&approver_actor_id, at)
+        }
         MemoryTransition::Archive => current.archive(at),
         MemoryTransition::Delete => current.delete(at),
         MemoryTransition::ReplaceWith(replacement) => current.replace_with(replacement, at),
@@ -1206,6 +1217,7 @@ pub async fn apply_memory_transition(
     let result = sqlx::query(
         "UPDATE memories SET status = ?3, content = ?4, claim_subject = ?5, claim_predicate = ?6, \
             claim_object = ?7, search_key = ?8, superseded_by_memory_id = ?9, updated_at = ?10, \
+            admitted_by_actor_id = ?11, admitted_at = ?12, \
             version = version + 1 \
          WHERE id = ?1 AND version = ?2",
     )
@@ -1222,6 +1234,12 @@ pub async fn apply_memory_transition(
             .map(|replacement| replacement.to_string()),
     )
     .bind(next.updated_at().to_string())
+    // **Written from the transition's output, not from the request.** `confirm_by` is the only thing that
+    // sets either field, and an archive, delete, or replacement yields `None` for both -- so a correction of a
+    // confirmed claim, which archives it, keeps the admission it had. Writing `None` there would erase the
+    // record of who accepted the claim at the moment it was superseded, which is when an audit would want it.
+    .bind(next.admitted_by_actor_id())
+    .bind(next.admitted_at().map(|value| value.to_string()))
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -1247,10 +1265,21 @@ pub async fn apply_memory_transition(
 }
 
 /// Which lifecycle change to apply.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// Not `Copy`, because the confirmation variant carries an owned approver identity. The three that carry no
+/// value could have been a separate unit-only enum, and that was rejected: `apply_memory_transition` takes one
+/// value and matches it once, so splitting the type would buy a cheaper discriminant in exchange for a second
+/// match arm on every caller and a shape where "a confirmation without an approver" is expressible again.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemoryTransition {
-    /// Accept a proposal, or restore an archived memory.
-    Confirm,
+    /// Accept a proposal, recording who accepted it.
+    ///
+    /// The approver is part of the variant rather than an argument beside the transition, so a state change
+    /// cannot be separated from the decision that justifies it — see the note in `apply_memory_transition`.
+    Confirm {
+        /// The identity accepting the claim.
+        approver_actor_id: String,
+    },
     /// Set aside without deleting.
     Archive,
     /// Remove the text and block a re-ingest.
@@ -1930,11 +1959,22 @@ async fn attach_entity_links(
 /// Decodes one memory row, re-checking the domain's invariants.
 ///
 /// The schema's `CHECK`s make a contradictory row unstorable through this repository, but a row written by
-/// another build, restored from a backup, or hand-edited is not covered by that argument â€” the same reasoning
+/// another build, restored from a backup, or hand-edited is not covered by that argument -- the same reasoning
 /// the approval and tool-call repositories use for their own re-checks.
+///
+/// # Why a refusal here is a **stored-row** error and not an invalid request
+///
+/// The mapping is deliberately not `memory_error`, and the difference is who can act. The same
+/// `InvalidMemory` value reaching this function came **from the row** rather than from an argument: nobody
+/// supplied the admission columns, the status, or the content. Reporting it as
+/// [`DatabaseError::InvalidMemoryRequest`] would name a request field for a value the caller never sent, which
+/// sends an operator to look at their request instead of at their data -- and it would also make a corrupt row
+/// answer `422`, telling the caller to change what they are asking for when what they need is a backup.
 fn decode_memory(row: &SqliteRow) -> Result<MemoryRecord, DatabaseError> {
     let (parts, state) = read_memory_fields(row)?;
-    MemoryRecord::from_stored(parts, state).map_err(|error| memory_error(&error))
+    MemoryRecord::from_stored(parts, &state).map_err(|error| DatabaseError::StoredMemoryInvalid {
+        field: invalid_memory_field(&error),
+    })
 }
 
 /// Reads every column a memory row carries.
@@ -2038,6 +2078,14 @@ fn read_memory_fields(
             .map_err(|_| invalid("retrieval_count"))?,
     )
     .unwrap_or(u32::MAX);
+    // The admission pair, read from the row rather than derived. Both are `Option`, and `from_stored` is what
+    // refuses a row where only one is present -- the rule this table's schema cannot express, because SQLite
+    // will not add a column-level `CHECK` that mentions `status`.
+    let admitted_by_actor_id = optional("admitted_by_actor_id")?;
+    let admitted_at = match optional("admitted_at")? {
+        Some(value) => Some(parse_timestamp(&value, "admitted_at")?),
+        None => None,
+    };
 
     // The parts are returned with the state rather than the parts alone, because the constructor applies the
     // two together: `deleted` is the one status whose content may be empty, so a caller that had to pass the
@@ -2070,6 +2118,8 @@ fn read_memory_fields(
             updated_at,
             last_accessed_at,
             retrieval_count,
+            admitted_by_actor_id,
+            admitted_at,
         },
     ))
 }
@@ -2174,6 +2224,22 @@ fn decode_relation(row: &SqliteRow) -> Result<StoredRelation, DatabaseError> {
 /// text and its source locator can name a provider identifier, so an error carrying either could put content
 /// in a log. `Debug` of the domain error is deliberately not used for the same reason.
 const fn memory_error(error: &jarvis_core::InvalidMemory) -> DatabaseError {
+    DatabaseError::InvalidMemoryRequest {
+        field: invalid_memory_field(error),
+    }
+}
+
+/// Returns the column a domain rule is about.
+///
+/// Shared by the two mappings rather than duplicated, because the question -- which column does this rule
+/// name -- has one answer whatever is being refused. Two copies would be two places to update when a rule is
+/// added, and the repository has already been bitten by a pair of values that had to agree and nothing holding
+/// both.
+///
+/// The field name is stable and the offending value is never included: a memory's content is user-authored
+/// text and its source locator can name a provider identifier, so an error carrying either could put content
+/// in a log. `Debug` of the domain error is deliberately not used for the same reason.
+const fn invalid_memory_field(error: &jarvis_core::InvalidMemory) -> &'static str {
     use jarvis_core::InvalidMemory as Field;
     // Several variants name the same column, and that is the point rather than an accident: `Content` and
     // `DeletedRetainsText` are two rules about one column, and `SupersedesMissing`/`SupersedesSelf` are two
@@ -2182,7 +2248,7 @@ const fn memory_error(error: &jarvis_core::InvalidMemory) -> DatabaseError {
     // both failures landing on the same field. The list stays exhaustive per variant, so adding a rule forces
     // a decision about which column it names.
     #[allow(clippy::match_same_arms)]
-    let field = match error {
+    match error {
         Field::Content => "content",
         Field::StructuredClaim => "structured_claim",
         Field::Source => "source",
@@ -2202,8 +2268,12 @@ const fn memory_error(error: &jarvis_core::InvalidMemory) -> DatabaseError {
         Field::AlreadyDeleted => "status",
         Field::DeletedRetainsText => "content",
         Field::IllegalStatus { .. } => "status",
-    };
-    DatabaseError::InvalidMemoryRequest { field }
+        // The two admission rules name the columns they are about rather than a caller-supplied field, because
+        // a caller supplies neither: both are decided from the stored row and from the identity a transition
+        // carries. A refusal here is an operator's diagnostic, not a request the caller can correct.
+        Field::ApproverUnusable => "admitted_by_actor_id",
+        Field::AdmissionInconsistent => "admitted_at",
+    }
 }
 
 #[cfg(test)]

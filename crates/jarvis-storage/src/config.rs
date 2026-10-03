@@ -862,10 +862,30 @@ pub enum ConfigError {
         key: String,
     },
     /// A recognized override could not be decoded or parsed.
-    #[error("invalid value for configuration environment variable {key}")]
+    ///
+    /// # Why this carries the accepted vocabulary rather than only the key
+    ///
+    /// The first version named the variable and stopped there: `invalid value for configuration environment
+    /// variable JARVIS_HTTP_ENABLED`. That is enough to identify **what** is wrong and nothing about what would
+    /// be right, so an operator has to guess — and the obvious guesses are wrong, because `http_enabled` is
+    /// parsed as a strict `bool` and `1` is refused while `true` is accepted. Two separate attempts on this
+    /// variable failed for exactly that reason before the message was fixed, which is the whole cost: the
+    /// message sent a reader to look for a problem with their setup when the problem was the value's spelling.
+    ///
+    /// `expected` states the accepted forms in the words the parser accepts, not a description of them. A
+    /// sentence like "must be a boolean" would leave `1`, `yes`, and `on` as open questions, and the
+    /// surprising one is always the value an operator already tried.
+    ///
+    /// It states what **this refusal's own parser** accepts, and no more. A value that parses but violates a
+    /// range rule is refused by the variant that rule owns (`InvalidShutdownTimeout`, `InvalidHttpPort`,
+    /// `InvalidMcpServePort`), and each of those already names its bound — so a range written here would claim
+    /// coverage this check does not have and send a reader to the wrong message.
+    #[error("invalid value for configuration environment variable {key}: expected {expected}")]
     InvalidEnvironmentValue {
         /// Static recognized environment key.
         key: &'static str,
+        /// The accepted values, in the spelling the parser accepts.
+        expected: &'static str,
     },
     /// The explicit configuration path was not absolute.
     #[error("the configuration file path must be absolute")]
@@ -1023,6 +1043,7 @@ where
                     .parse()
                     .map_err(|()| ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_LOG_LEVEL",
+                        expected: "one of trace, debug, info, warn, error",
                     })?;
             }
             "JARVIS_SHUTDOWN_TIMEOUT_SECONDS" => {
@@ -1031,6 +1052,11 @@ where
                         .parse()
                         .map_err(|_| ConfigError::InvalidEnvironmentValue {
                             key: "JARVIS_SHUTDOWN_TIMEOUT_SECONDS",
+                            // The **parser** accepts any whole number; the range rule is
+                            // `InvalidShutdownTimeout`, whose message names the range. Stating "1 to 300"
+                            // here would claim this refusal covers a value it does not check, and an operator
+                            // correcting a `0` would be told the wrong thing twice.
+                            expected: "a whole number of seconds",
                         })?;
             }
             "JARVIS_HTTP_ENABLED" => {
@@ -1038,10 +1064,15 @@ where
                 // as "yes" or "1" that silently meant `false` would leave an operator believing
                 // the transport was enabled when it was not, and the failure would appear as a
                 // refused connection rather than as a rejected setting.
+                //
+                // The refusal names **both** accepted spellings, because the strictness is the surprising
+                // part: `1` is a value most operators reach for first and it is refused here, so a message
+                // that only named the variable left them to guess. See the variant's own note.
                 config.daemon.http_enabled = environment_text(&value, "JARVIS_HTTP_ENABLED")?
                     .parse()
                     .map_err(|_| ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_HTTP_ENABLED",
+                        expected: "true or false",
                     })?;
             }
             "JARVIS_HTTP_PORT" => {
@@ -1049,6 +1080,9 @@ where
                     .parse()
                     .map_err(|_| ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_HTTP_PORT",
+                        // As above: the range is `InvalidHttpPort`'s to state. This refusal is about the value
+                        // not being a port number at all.
+                        expected: "a port number from 1 to 65535",
                     })?;
             }
             "JARVIS_EXECUTOR_MODEL" => {
@@ -1058,6 +1092,7 @@ where
                 if name.trim().is_empty() {
                     return Err(ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_EXECUTOR_MODEL",
+                        expected: "a non-empty built-in model implementation name",
                     });
                 }
                 config.daemon.executor_model = Some(name.to_owned());
@@ -1070,15 +1105,17 @@ where
                 if text.trim().is_empty() {
                     return Err(ConfigError::InvalidEnvironmentValue {
                         key: "JARVIS_MCP_SERVE_PORT",
+                        expected: "a port number from 1 to 65535, or leave the variable unset to serve \
+                                   nothing",
                     });
                 }
-                config.daemon.mcp_serve_port =
-                    Some(
-                        text.parse()
-                            .map_err(|_| ConfigError::InvalidEnvironmentValue {
-                                key: "JARVIS_MCP_SERVE_PORT",
-                            })?,
-                    );
+                config.daemon.mcp_serve_port = Some(text.parse().map_err(|_| {
+                    ConfigError::InvalidEnvironmentValue {
+                        key: "JARVIS_MCP_SERVE_PORT",
+                        expected: "a port number from 1 to 65535, or leave the variable unset to \
+                                           serve nothing",
+                    }
+                })?);
             }
             _ => {
                 // The live-provider variables are handled by a helper, so this function stays about the
@@ -1096,9 +1133,13 @@ where
 }
 
 fn environment_text<'a>(value: &'a OsString, key: &'static str) -> Result<&'a str, ConfigError> {
-    value
-        .to_str()
-        .ok_or(ConfigError::InvalidEnvironmentValue { key })
+    value.to_str().ok_or(ConfigError::InvalidEnvironmentValue {
+        key,
+        // The only failure this helper can produce is a value that is not text at all, so the vocabulary is
+        // the reason rather than a list: an operator with a non-UTF-8 value learns what to change from
+        // "valid Unicode text", and naming a set of literals would be false for every one of them.
+        expected: "valid Unicode text",
+    })
 }
 
 /// Applies the live-provider environment variables, returning whether the key was one of them.
@@ -1118,6 +1159,7 @@ fn apply_provider_environment(
             if name.trim().is_empty() {
                 return Err(ConfigError::InvalidEnvironmentValue {
                     key: "JARVIS_EXECUTOR_MODEL_NAME",
+                    expected: "a non-empty model name the provider knows",
                 });
             }
             daemon.executor_model_name = Some(name.to_owned());
@@ -1127,6 +1169,7 @@ fn apply_provider_environment(
             if url.trim().is_empty() {
                 return Err(ConfigError::InvalidEnvironmentValue {
                     key: "JARVIS_EXECUTOR_BASE_URL",
+                    expected: "a non-empty http or https URL",
                 });
             }
             // The raw text is stored rather than a trimmed copy: a URL with surrounding whitespace would be
@@ -1139,6 +1182,7 @@ fn apply_provider_environment(
             if path.trim().is_empty() {
                 return Err(ConfigError::InvalidEnvironmentValue {
                     key: "JARVIS_EXECUTOR_API_KEY_REF",
+                    expected: "a non-empty path to a file holding the credential",
                 });
             }
             daemon.executor_api_key_ref = Some(PathBuf::from(path));
@@ -1677,8 +1721,81 @@ shutdown_timeout_seconds = 20
         assert_eq!(
             Config::parse_with_environment(V1_CONFIG, environment),
             Err(ConfigError::InvalidEnvironmentValue {
-                key: "JARVIS_LOG_LEVEL"
+                key: "JARVIS_LOG_LEVEL",
+                expected: "valid Unicode text",
             })
+        );
+    }
+
+    /// **A refused environment value states what the parser accepts, and never echoes what it got.**
+    ///
+    /// The diagnostic is the deliverable of this variant, so it is asserted as text rather than as a variant.
+    /// Two properties, and each is its own mistake:
+    ///
+    /// - **the accepted forms are named**, because the strictness is the surprising part. `JARVIS_HTTP_ENABLED`
+    ///   parses as a strict `bool`, so `1` — the value an operator reaches for first — is refused; a message
+    ///   that only named the variable left them guessing, and two separate attempts on this variable were lost
+    ///   to exactly that.
+    /// - **the rejected value is not echoed.** An environment value can be a credential or a fragment of one,
+    ///   and a startup log line is read by more people than the shell that set it. This is the same rule the
+    ///   profile-name refusal above states for its own field; the two are asserted separately because they are
+    ///   different fields with different audiences.
+    #[test]
+    fn config_refused_environment_values_name_the_expected_forms() {
+        let error =
+            Config::parse_with_environment(V1_CONFIG, [("JARVIS_HTTP_ENABLED", "canary-1")])
+                .err()
+                .unwrap_or_else(|| panic!("a strict boolean must refuse `1`"));
+        assert_eq!(
+            error,
+            ConfigError::InvalidEnvironmentValue {
+                key: "JARVIS_HTTP_ENABLED",
+                expected: "true or false",
+            }
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("true or false"),
+            "the message must name both accepted spellings, got {text}"
+        );
+        assert!(
+            !text.contains("canary-1"),
+            "a refused value must not be echoed back, got {text}"
+        );
+
+        // Every variable with a closed vocabulary states it, so a reader is not left to guess at any of them.
+        // Checked as a set rather than one at a time, because the gap being fixed was a *systematic* omission:
+        // the first version named the key for every site and the vocabulary for none.
+        for (key, value, expected) in [
+            (
+                "JARVIS_LOG_LEVEL",
+                "verbose",
+                "one of trace, debug, info, warn, error",
+            ),
+            (
+                "JARVIS_SHUTDOWN_TIMEOUT_SECONDS",
+                "soon",
+                "a whole number of seconds",
+            ),
+            ("JARVIS_HTTP_PORT", "http", "a port number from 1 to 65535"),
+        ] {
+            let error = Config::parse_with_environment(V1_CONFIG, [(key, value)])
+                .err()
+                .unwrap_or_else(|| panic!("{key}={value} should fail"));
+            assert_eq!(
+                error,
+                ConfigError::InvalidEnvironmentValue { key, expected },
+                "{key}"
+            );
+        }
+
+        // And a value that parses but violates a **range** is refused by the variant that owns the range, whose
+        // own message states it. Asserted because the two refusals are easy to conflate from the outside: both
+        // arrive from one environment variable, and a caller that reported the parse refusal for an
+        // out-of-range value would name a rule with no bound in it.
+        assert_eq!(
+            Config::parse_with_environment(V1_CONFIG, [("JARVIS_SHUTDOWN_TIMEOUT_SECONDS", "0")]),
+            Err(ConfigError::InvalidShutdownTimeout)
         );
     }
 

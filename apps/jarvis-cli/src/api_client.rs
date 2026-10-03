@@ -42,13 +42,13 @@ use jarvis_core::LoopbackHost;
 // be a new direct dependency for a name.
 
 use jarvis_protocol::{
-    CorrectMemoryRequest, CreateSkillRequest, DeletionReceipt, ForgetMemoryRequest,
-    ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply,
-    MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest, PromoteSkillRequest,
-    RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT,
-    SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply, SkillReply,
-    SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest,
-    WireError, path_segment, run_path, run_stream_path, runs_path,
+    ConfirmMemoryRequest, CorrectMemoryRequest, CreateSkillRequest, DeletionReceipt,
+    ForgetMemoryRequest, ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply,
+    MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest,
+    PromoteSkillRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
+    SSE_ACCEPT, SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply,
+    SkillReply, SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply,
+    ToolPreviewRequest, WireError, path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -468,6 +468,35 @@ impl ApiClient {
         if status.is_success() {
             return response
                 .json::<DeletionReceipt>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Accepts a proposed claim, recording the daemon's own identity as the approver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` when the caller's version is stale, and with a `422` when the
+    /// claim is not a proposal — the two refusals are distinct because their remedies are: one is a re-read, the
+    /// other is a different verb.
+    pub async fn confirm_memory(
+        &self,
+        memory_id: &str,
+        request: &ConfirmMemoryRequest,
+    ) -> Result<MemoryReply, ApiError> {
+        let path = format!("{}/confirm", memory_path(memory_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<MemoryReply>()
                 .await
                 .map_err(|_| ApiError::Decode);
         }

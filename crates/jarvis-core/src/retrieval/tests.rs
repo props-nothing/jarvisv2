@@ -11,7 +11,7 @@ use super::*;
 use crate::id::{EntityId, MemoryId, WorkspaceId};
 use crate::memory::{
     EntityRef, MemoryConfidence, MemoryRecord, MemoryRecordParts, MemorySource, MemorySourceKind,
-    MemoryType,
+    MemoryStatus, MemoryType,
 };
 use crate::timestamp::UtcTimestamp;
 
@@ -383,19 +383,22 @@ fn the_caller_stated_requirements_each_refuse() {
     );
     assert_eq!(facts_only.is_eligible(&fact), Ok(()));
 
-    // Trust: an inference-sourced claim is refused when the caller requires authoritative sources. The
-    // fixture is built with its own kind and no confidence, which is what the domain allows.
-    let inferred = must(MemoryRecord::new(MemoryRecordParts {
+    // Trust: a claim from a `Derived` origin is refused when the caller requires authoritative sources. The
+    // fixture is a **tool observation** rather than a model inference, and the distinction matters: an
+    // inference is excluded for its *status* now, so using one here would assert the trust rule while the
+    // refusal came from the currency rule, and the test would pass while testing the wrong thing. A tool
+    // observation is `Derived` trust (not authoritative) and is still an ordinary current claim.
+    let observed = must(MemoryRecord::new(MemoryRecordParts {
         id: MemoryId::new(),
         workspace_id: workspace(),
         memory_type: MemoryType::Semantic,
-        content: "May prefer tea".to_owned(),
+        content: "The service restarted at 03:00".to_owned(),
         structured_claim: None,
         source: must(MemorySource::of_kind(
-            MemorySourceKind::ModelInference,
-            "run:0198f000-0000-7000-8000-000000000004",
+            MemorySourceKind::ToolObservation,
+            "tool:0198f000-0000-7000-8000-000000000004",
         )),
-        confidence: MemoryConfidence::Unverified,
+        confidence: MemoryConfidence::Confirmed,
         importance: 2,
         sensitivity: Sensitivity::Internal,
         entities: vec![EntityRef::confirmed(entity())],
@@ -408,7 +411,7 @@ fn the_caller_stated_requirements_each_refuse() {
         created_at: at(0),
     }));
     assert_eq!(
-        query().is_eligible(&inferred),
+        query().is_eligible(&observed),
         Err(Ineligibility::TrustBelowMinimum {
             trust: MemoryTrust::Derived,
             minimum: MemoryTrust::Authoritative
@@ -420,7 +423,7 @@ fn the_caller_stated_requirements_each_refuse() {
     let permissive = query()
         .with_minimum_trust(MemoryTrust::Derived)
         .with_minimum_confidence(MemoryConfidence::Unverified);
-    assert_eq!(permissive.is_eligible(&inferred), Ok(()));
+    assert_eq!(permissive.is_eligible(&observed), Ok(()));
 
     // Confidence: a caller requiring confirmation refuses a merely likely claim even from a good origin.
     let likely = must(MemoryRecord::new(MemoryRecordParts {
@@ -452,6 +455,53 @@ fn the_caller_stated_requirements_each_refuse() {
         trust_relaxed.is_eligible(&likely),
         Err(Ineligibility::ConfidenceBelowMinimum),
         "the confidence rule must be reachable once the trust rule passes"
+    );
+}
+
+/// **A model inference is refused for its status, and no relaxation of the query reaches it.**
+///
+/// This is the assertion the trust fixture above used to make by accident: the inference was a convenient
+/// `Derived`-trust value, and the trust rule is what refused it — so nothing there noticed that the claim was
+/// being stored as current truth.
+///
+/// It is refused as `NotCurrent` now, and the **same permissive query** that accepts a `Derived`-trust claim
+/// at `Unverified` confidence still refuses it. That is what makes the exclusion independent of the caller's
+/// stated requirements rather than a side effect of the strict defaults; relaxing every requirement is the
+/// only way to tell the two apart, which is why the relaxed query is the one under test.
+#[test]
+fn a_model_inference_is_ineligible_however_permissive_the_query_is() {
+    let inferred = must(MemoryRecord::new(MemoryRecordParts {
+        id: MemoryId::new(),
+        workspace_id: workspace(),
+        memory_type: MemoryType::Semantic,
+        content: "May prefer tea".to_owned(),
+        structured_claim: None,
+        source: must(MemorySource::of_kind(
+            MemorySourceKind::ModelInference,
+            "run:0198f000-0000-7000-8000-000000000004",
+        )),
+        confidence: MemoryConfidence::Unverified,
+        importance: 2,
+        sensitivity: Sensitivity::Internal,
+        entities: vec![EntityRef::confirmed(entity())],
+        valid_from: None,
+        valid_until: None,
+        supersedes: None,
+        run_id: None,
+        created_by_actor_id: ACTOR.to_owned(),
+        correlation_id: crate::id::CorrelationId::new(),
+        created_at: at(0),
+    }));
+    assert_eq!(inferred.status(), MemoryStatus::Proposed);
+    let permissive = query()
+        .with_minimum_trust(MemoryTrust::Derived)
+        .with_minimum_confidence(MemoryConfidence::Unverified);
+    assert_eq!(
+        permissive.is_eligible(&inferred),
+        Err(Ineligibility::NotCurrent {
+            status: EffectiveMemoryStatus::Proposed
+        }),
+        "a model inference is not eligible however permissive the query is"
     );
 }
 

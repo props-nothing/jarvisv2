@@ -109,6 +109,27 @@ Two of those deserve recording:
 The two filters are deliberately independent: one is about the *claim*, the other about the *type*, and a
 memory can fail either.
 
+**The exclusion is independent of the caller's stated requirements, and that took a fix to become true.** The
+predicate above assumes a model inference is never *current* — a `Proposed` row. It was not: `MemoryRecord`
+derived the status from the memory *type* alone, so an inference was stored `Active` and this filter, which
+would have excluded it, never saw it. The rule was enforced only by the confidence ceiling (`Unverified`), and
+those are two different rules: bounding the level is not the same as refusing the claim as current truth, and
+the pipeline had been deriving `Proposal` for exactly this case all along. The status is now derived from the
+classification (`requires_confirmation() || is_model_produced()`), which is the rule `jarvis-core/src/skill.rs`
+already applied to procedures.
+
+The disagreement was not cosmetic. `compare` reports a candidate whose text differs from the current claim at
+its key as a `Correction`, and a correction **supersedes** — so one model inference silently retired an
+earlier claim. Two further consequences are worth recording because they are how it survived:
+
+- **Its own acceptance test asserted the weaker claim.** The write-path test said the claim was
+  `is_current_truth()` and that the presentation predicate was what kept it from being asserted, "which is why
+  the two are separate". Two layers disagreeing about one question is not a separation of concerns.
+- **A retrieval test used an inference as a convenient `Derived`-trust fixture**, and the *trust* rule is what
+  refused it — so the currency rule was never reached, and the test would have kept passing while testing the
+  wrong rule. It now uses a tool observation, and the inference has its own test whose query is relaxed on
+  every requirement, which is the only way to show the exclusion is not an artifact of the strict defaults.
+
 ### 7. The model may follow an instruction anyway, and that is the design
 
 Prompt injection is **mitigated** here, not solved, and no fencing scheme solves it. What protects the system

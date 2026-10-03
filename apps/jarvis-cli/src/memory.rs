@@ -25,9 +25,9 @@
 use crate::api_client::{ApiClient, ApiError};
 use crate::output::ExitStatus;
 use jarvis_protocol::{
-    CorrectMemoryRequest, ForgetMemoryRequest, MemoryDetailReply, MemoryExportReply,
-    MemoryListReply, MemoryReference, MemorySearchHit, MemorySearchReply, MemorySearchRequest,
-    RememberRequest,
+    ConfirmMemoryRequest, CorrectMemoryRequest, ForgetMemoryRequest, MemoryDetailReply,
+    MemoryExportReply, MemoryListReply, MemoryReference, MemorySearchHit, MemorySearchReply,
+    MemorySearchRequest, RememberRequest,
 };
 
 /// Maximum claims one listing or search asks for.
@@ -45,6 +45,7 @@ pub async fn run(client: &ApiClient, arguments: &[String]) -> ExitStatus {
         Some("search") => search(client, arguments, json).await,
         Some("remember") => remember(client, arguments, json).await,
         Some("correct") => correct(client, arguments, json).await,
+        Some("confirm") => confirm(client, arguments, json).await,
         Some("forget") => forget(client, arguments, json).await,
         Some("export") => export(client, arguments, json).await,
         Some(other) => {
@@ -220,6 +221,31 @@ async fn forget(client: &ApiClient, arguments: &[String], json: bool) -> ExitSta
     }
 }
 
+/// `jarvis memory confirm <id> --version N`
+///
+/// Accepts a proposed claim, which is the only way one becomes current. The approver is deliberately **not** a
+/// flag: the daemon records its own seeded identity, because a client able to name the approver could attribute
+/// a decision to somebody else — and the same argument is why the CLI offers nothing to pass.
+async fn confirm(client: &ApiClient, arguments: &[String], json: bool) -> ExitStatus {
+    let Some(memory_id) = positional(arguments, 2) else {
+        eprintln!("jarvis: memory confirm requires a memory identifier");
+        return ExitStatus::Usage;
+    };
+    let Some(expected_version) = flag_value(arguments, "--version").and_then(|v| v.parse().ok())
+    else {
+        eprintln!("jarvis: memory confirm requires --version, taken from `jarvis memory show`");
+        return ExitStatus::Usage;
+    };
+    let request = ConfirmMemoryRequest { expected_version };
+    match client.confirm_memory(&memory_id, &request).await {
+        Ok(reply) => {
+            render_reply(&reply, json);
+            ExitStatus::Ok
+        }
+        Err(error) => report("confirm", &error),
+    }
+}
+
 /// `jarvis memory export [--limit N] [--offset N]`
 async fn export(client: &ApiClient, arguments: &[String], json: bool) -> ExitStatus {
     let limit = flag_value(arguments, "--limit")
@@ -391,6 +417,27 @@ fn render_outcome(reply: &jarvis_protocol::MemoryReply, json: bool) {
         "  version {} — pass this to `memory correct` or `memory forget`",
         reply.version
     );
+}
+
+/// Renders a write reply.
+///
+/// One helper for `remember`, `correct`, and `confirm` rather than three: all three answer with the same
+/// `MemoryReply`, and the `outcome` field already distinguishes them. Three renderers would be three places to
+/// update when the reply grows, and each would have to be checked against the others to stay consistent.
+fn render_reply(reply: &jarvis_protocol::MemoryReply, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(reply).unwrap_or_default()
+        );
+        return;
+    }
+    println!("{}: {}", reply.outcome, reply.memory_id);
+    println!("  status: {} ({})", reply.status, reply.effective_status);
+    println!("  version: {}", reply.version);
+    if let Some(detail) = &reply.detail {
+        println!("  {detail}");
+    }
 }
 
 /// Renders a deletion receipt.
@@ -604,6 +651,7 @@ pub const fn usage() -> &'static str {
      jarvis memory search <text...>\n       \
      jarvis memory remember --type T --source S --entity ID [--importance N] <text...>\n       \
      jarvis memory correct <id> --version N <text...>\n       \
+     jarvis memory confirm <id> --version N\n       \
      jarvis memory forget <id> --version N [--allow-relearn]\n       \
      jarvis memory export [--limit N] [--offset N]"
 }

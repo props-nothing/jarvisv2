@@ -45,9 +45,10 @@ use axum::{
 };
 use jarvis_core::{ClientCredential, ErrorCode, ReplayRequest, RunEventSequence};
 use jarvis_protocol::{
-    ApprovalDecisionBody, CorrectMemoryRequest, CreateSkillRequest, ForgetMemoryRequest,
-    ForgetSkillRequest, MAX_STREAM_PAGE, MemorySearchRequest, PromoteSkillRequest, RememberRequest,
-    RunEventPageReply, SkillTransitionRequest, StartRunRequest, rest_error, safe,
+    ApprovalDecisionBody, ConfirmMemoryRequest, CorrectMemoryRequest, CreateSkillRequest,
+    ForgetMemoryRequest, ForgetSkillRequest, MAX_STREAM_PAGE, MemorySearchRequest,
+    PromoteSkillRequest, RememberRequest, RunEventPageReply, SkillTransitionRequest,
+    StartRunRequest, rest_error, safe,
 };
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/memories/export", get(export_memories))
         .route("/memories/{id}", get(read_memory))
         .route("/memories/{id}/correct", post(correct_memory))
+        .route("/memories/{id}/confirm", post(confirm_memory))
         .route("/memories/{id}/forget", post(forget_memory))
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/export", get(export_skills))
@@ -1104,6 +1106,21 @@ async fn forget_memory(
 ) -> Response {
     match state.memories().forget(&id, &request).await {
         Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/memories/{id}/confirm`
+///
+/// Accepts a proposed claim. The handler takes no approver from the body: the daemon reads its seeded
+/// identity, which is what makes the self-admission guard meaningful — see `MemoryService::confirm`.
+async fn confirm_memory(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmMemoryRequest>,
+) -> Response {
+    match state.memories().confirm(&id, &request).await {
+        Ok(reply) => Json(reply).into_response(),
         Err(error) => memory_error(&error),
     }
 }
@@ -2853,6 +2870,295 @@ mod tests {
         assert!(
             search.matches[0].is_a_match,
             "a keyword hit matched the query; it was not merely included for recency"
+        );
+    }
+
+    /// **A model-produced claim is stored as a proposal, never as current truth.**
+    ///
+    /// The inference boundary at the surface a model would actually use, and the half of it that was not
+    /// enforced: `source_kind` is a request field, so `model_inference` is reachable over HTTP, and the
+    /// pipeline and the record **disagreed** about what it produced. `MemoryCandidate::admit` decided
+    /// `Proposal` — its own code says a model inference "is never written as current truth" — and
+    /// `MemoryRecord::build` derived `Active` from the type alone, so the reply reported an empty status for
+    /// a claim that was current.
+    ///
+    /// Asserted through a *subsequent read* rather than the reply, because the reply's status is the one field
+    /// the defect produced wrongly, and reading it back is what distinguishes a store that agrees with its
+    /// pipeline from one that merely reports differently. The `201` is deliberate: a proposal is still stored.
+    #[tokio::test]
+    async fn a_model_inference_is_stored_as_a_proposal_and_never_as_current_truth() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let responded = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Probably prefers tea",
+                    "memory_type": "semantic",
+                    "source_kind": "model_inference",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(responded.status(), StatusCode::CREATED);
+        let body = body_text(responded).await;
+        let remembered: jarvis_protocol::MemoryReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        let memory_id = remembered.memory_id.clone();
+
+        let read = app
+            .oneshot(get_request(
+                &format!("/api/v1/memories/{memory_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(read.status(), StatusCode::OK);
+        let read_body = body_text(read).await;
+        let detail: jarvis_protocol::MemoryDetailReply = serde_json::from_str(&read_body)
+            .unwrap_or_else(|error| panic!("decode {read_body}: {error}"));
+        assert_eq!(
+            detail.reference.status.as_str(),
+            "proposed",
+            "a claim no source can support must not be the workspace's current truth"
+        );
+        assert_eq!(
+            detail.reference.effective_status.as_str(),
+            "proposed",
+            "and no later instant makes it current, so the status the read reports agrees with the stored one"
+        );
+        assert_eq!(
+            detail.reference.confidence, "unverified",
+            "and it may carry no confidence at all, which is the other half of the boundary"
+        );
+        assert!(
+            !detail.is_stated_as_fact,
+            "the presentation predicate and the status must agree here, and the defect was their disagreement"
+        );
+    }
+
+    /// **A proposal can be accepted over HTTP, and the acceptance names the approver.**
+    ///
+    /// `P4-014`'s verb, and the one the memory surface was missing: `MemoryTransition::Confirm` existed from
+    /// `P4-002` and **no route called it**, so a `Proposed` claim could be created and never accepted. The two
+    /// assertions are the status becoming current and the approver being recorded — either alone is satisfied
+    /// by a handler that merely flipped the status.
+    ///
+    /// The approver asserted is the **seeded user**, read from the daemon's identity, and that is a deliberate
+    /// part of the test: `remember` used to write the literal `"local-user"` as the author while the seeded user
+    /// is `LOCAL_USER_ID`, so an approver read from the identity would never have matched a claim's author and
+    /// the self-admission guard would have been vacuous. Asserting the identifier the row actually holds is
+    /// what pins the two to one source.
+    #[tokio::test]
+    async fn the_confirm_route_accepts_a_proposal_and_names_its_approver() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        // A relationship claim is a proposal by the domain's own derivation, so the fixture cannot hold a
+        // status the pipeline would not produce — the same rule `memory/tests.rs` follows.
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Works with Dana",
+                    "memory_type": "relationship",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(remembered.status, "proposed");
+        let memory_id = remembered.memory_id.clone();
+
+        let confirmed = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/confirm"),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        let confirmed_body = body_text(confirmed).await;
+        let reply: jarvis_protocol::MemoryReply = serde_json::from_str(&confirmed_body)
+            .unwrap_or_else(|error| panic!("decode {confirmed_body}: {error}"));
+        assert_eq!(reply.status, "active");
+        assert_eq!(reply.outcome, "confirmed");
+
+        // And the state is read back rather than taken from the reply, because the reply is what a defect here
+        // would have produced wrongly.
+        let read = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/memories/{memory_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let read_body = body_text(read).await;
+        let detail: jarvis_protocol::MemoryDetailReply = serde_json::from_str(&read_body)
+            .unwrap_or_else(|error| panic!("decode {read_body}: {error}"));
+        assert_eq!(detail.reference.status.as_str(), "active");
+        assert_eq!(
+            detail.reference.admitted_by_actor_id.as_deref(),
+            Some(jarvis_storage::LOCAL_USER_ID),
+            "the acceptance must name the identity that made it, read from the daemon's own identity"
+        );
+        assert!(
+            detail.reference.admitted_at.is_some(),
+            "and the moment it was decided"
+        );
+
+        // **The version guard, asserted because a confirmation is a write.** A second attempt against the
+        // version read before the first is stale, and the claim is no longer a proposal anyway — so this pins
+        // which of the two refusals a caller gets, and the staleness one must win because the caller has to
+        // re-read before it can act at all.
+        let stale = app
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/confirm"),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+    }
+
+    /// **The confirmation is the person confirming their own workspace's claim, and it works.**
+    ///
+    /// This asserts a **non**-refusal, which is unusual and deliberate. `ADR-0117` §4 refuses a promotion by a
+    /// procedure's author, so the tempting symmetry is to refuse an admission by a claim's author — and that
+    /// would have blocked `memory-and-context.md`'s own requirement that a high-impact inference get "explicit
+    /// user confirmation". There is one seeded identity, so the author and the approver are always the same
+    /// value, and a guard comparing them would refuse every legitimate confirmation.
+    ///
+    /// The test exists so the symmetry cannot be "restored" without this case failing and showing why. What
+    /// actually holds is that the approver is never client-supplied — see `MemoryService::confirm`.
+    #[tokio::test]
+    async fn a_claim_can_be_confirmed_by_the_identity_that_stated_it() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Works with Dana",
+                    "memory_type": "relationship",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+
+        let confirmed = app
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{}/confirm", remembered.memory_id),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        let confirmed_body = body_text(confirmed).await;
+        let reply: jarvis_protocol::MemoryReply = serde_json::from_str(&confirmed_body)
+            .unwrap_or_else(|error| panic!("decode {confirmed_body}: {error}"));
+        assert_eq!(reply.status, "active");
+    }
+
+    /// **The acceptance is recorded with the identity and the moment, and the version guard refuses a replay.**
+    ///
+    /// The read-back half: the reply's status is the one field a handler that only set the status would have
+    /// produced correctly, so the approver and the timestamp are asserted against a *subsequent* read. The
+    /// replay then pins the guard, and it is the case that matters — a confirmation is idempotent-looking, so
+    /// a second acceptance against the old version must be a conflict rather than a silent second decision.
+    #[tokio::test]
+    async fn the_confirm_route_records_the_approver_and_refuses_a_replay() {
+        let (app, presented, _profile, database) = memory_router().await;
+        let subject = fixture_entity(&database).await;
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &serde_json::json!({
+                    "content": "Works with Dana",
+                    "memory_type": "relationship",
+                    "source_kind": "user_statement",
+                    "entity_ids": [subject],
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(created).await;
+        let remembered: jarvis_protocol::MemoryReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        let memory_id = remembered.memory_id.clone();
+
+        let confirmed = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/confirm"),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(confirmed.status(), StatusCode::OK);
+
+        let read = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/memories/{memory_id}"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let read_body = body_text(read).await;
+        let detail: jarvis_protocol::MemoryDetailReply = serde_json::from_str(&read_body)
+            .unwrap_or_else(|error| panic!("decode {read_body}: {error}"));
+        assert_eq!(detail.reference.status.as_str(), "active");
+        assert_eq!(
+            detail.reference.admitted_by_actor_id.as_deref(),
+            Some(jarvis_storage::LOCAL_USER_ID),
+            "the acceptance must name the identity that made it, read from the daemon's own identity"
+        );
+        assert!(
+            detail.reference.admitted_at.is_some(),
+            "and the moment it was decided, so the pair travels together"
+        );
+
+        let replay = app
+            .oneshot(post_json(
+                &format!("/api/v1/memories/{memory_id}/confirm"),
+                &presented,
+                &serde_json::json!({ "expected_version": remembered.version }).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            replay.status(),
+            StatusCode::CONFLICT,
+            "an acceptance against the version read before the first is stale"
         );
     }
 

@@ -186,6 +186,51 @@ fn a_model_inference_cannot_claim_confidence() {
     }
 }
 
+/// **A model inference is a proposal, so it cannot be recorded as current truth.**
+///
+/// The half of the inference boundary the confidence ceiling does **not** provide, and the case the test
+/// above left unasserted: it checks that a *higher* confidence is refused and only that the `Unverified`
+/// value is `is_ok()`. So an implementation that bounded the confidence and then derived `Active` passed it
+/// while storing the model's own claim as a fact.
+///
+/// Both halves are asserted here, because either alone is satisfied by the defect: the status must be
+/// `Proposed` **and** the claim must not be `is_active`. An assertion of one is what a mutant can survive.
+#[test]
+fn a_model_inference_cannot_be_recorded_as_current_truth() {
+    let source = must(MemorySource::of_kind(
+        MemorySourceKind::ModelInference,
+        "run:0198f000-0000-7000-8000-0000000000c3",
+    ));
+    let mut inference = parts(MemoryType::Semantic, source);
+    inference.confidence = MemoryConfidence::Unverified;
+
+    let record = must(MemoryRecord::new(inference));
+    assert_eq!(
+        record.status(),
+        MemoryStatus::Proposed,
+        "a claim nothing can support is a proposal, not a fact"
+    );
+    assert!(
+        !record.status().is_current_claim(),
+        "a model inference must never be current truth"
+    );
+}
+
+/// **The control for the proposal rule: a supported claim is still a fact.**
+///
+/// Without this, the derivation above is satisfied by an implementation that proposes **everything** — and a
+/// store in which every claim needs confirming is the opposite failure. A `Semantic` claim from a user's own
+/// statement can be supported, so it is `Active`, and it is the type the inference test uses precisely so the
+/// only difference between the two is the source.
+#[test]
+fn a_supported_semantic_claim_is_still_recorded_as_a_fact() {
+    let record = must(MemoryRecord::new(parts(
+        MemoryType::Semantic,
+        user_source(),
+    )));
+    assert_eq!(record.status(), MemoryStatus::Active);
+}
+
 /// **A provider record cannot back a preference claim.**
 ///
 /// `memory-and-context.md`: "A provider may be authoritative for an event timestamp but not for a person's
@@ -371,14 +416,20 @@ fn a_deleted_row_decodes_but_only_in_the_deleted_status() {
         updated_at: at(5),
         last_accessed_at: None,
         retrieval_count: 0,
+        // The admission pair, absent. A deleted row cannot carry one -- `from_stored` refuses it -- so a
+        // fixture that supplied one would be asserting a state the decoder rejects.
+        admitted_by_actor_id: None,
+        admitted_at: None,
     };
 
     // The same rows, decoded: the tombstone passes and the non-deleted statuses are refused, so the content
-    // rule is enforced at decode rather than bypassed by it.
+    // rule is enforced at decode rather than bypassed by it. Cloned rather than moved because the state is no
+    // longer `Copy` -- the admission columns it now carries include an owned approver identifier -- and this
+    // test decodes the same row under four statuses.
     let mut tombstone = parts(MemoryType::Preference, memory.source().clone());
     tombstone.content = String::new();
     tombstone.structured_claim = None;
-    let decoded = must(MemoryRecord::from_stored(tombstone.clone(), stored));
+    let decoded = must(MemoryRecord::from_stored(tombstone.clone(), &stored));
     assert_eq!(decoded.status(), MemoryStatus::Deleted);
     assert!(!decoded.effective_status_at(at(6)).is_current_truth());
 
@@ -387,8 +438,13 @@ fn a_deleted_row_decodes_but_only_in_the_deleted_status() {
         MemoryStatus::Active,
         MemoryStatus::Archived,
     ] {
-        let refusal =
-            MemoryRecord::from_stored(tombstone.clone(), StoredMemoryState { status, ..stored });
+        let refusal = MemoryRecord::from_stored(
+            tombstone.clone(),
+            &StoredMemoryState {
+                status,
+                ..stored.clone()
+            },
+        );
         assert_eq!(
             refusal,
             Err(InvalidMemory::Content),
@@ -401,7 +457,7 @@ fn a_deleted_row_decodes_but_only_in_the_deleted_status() {
     retaining.content = deleted.content().to_owned();
     retaining.content = "Still here".to_owned();
     assert_eq!(
-        MemoryRecord::from_stored(retaining, stored),
+        MemoryRecord::from_stored(retaining, &stored),
         Err(InvalidMemory::DeletedRetainsText)
     );
 }
@@ -435,6 +491,235 @@ fn a_relationship_memory_cannot_start_active() {
     assert_eq!(confirmed.status(), MemoryStatus::Active);
     assert!(confirmed.effective_status_at(at(1)).is_current_truth());
     assert_eq!(confirmed.updated_at(), at(1));
+}
+
+/// A proposal, which is the fixture the admission rules are about.
+///
+/// Built through the real constructor from a relationship claim, because that is the type the constructor
+/// itself makes a proposal — so a fixture cannot hold a `Proposed` record the domain would not produce.
+fn proposal() -> MemoryRecord {
+    let mut candidate = parts(
+        MemoryType::Relationship,
+        must(MemorySource::of_kind(
+            MemorySourceKind::ExternalContent,
+            "https://example.invalid/org",
+        )),
+    );
+    candidate.confidence = MemoryConfidence::Unverified;
+    must(MemoryRecord::new(candidate))
+}
+
+/// **A confirmed claim records who accepted it, and an unattributed acceptance records nobody.**
+///
+/// `P4-014`: "admission is a decision that names its approver". Two calls with the same effect on the status
+/// and different answers about attribution, asserted together because the difference is the whole point — an
+/// implementation that recorded an approver for both would pass a test that only checked `confirm_by`, and one
+/// that recorded none for either would pass a test that only checked `confirm`.
+#[test]
+fn confirming_records_the_approver_and_only_when_one_is_named() {
+    let memory = proposal();
+    // Nobody has decided anything yet, so the claim names no approver whatever its status.
+    assert_eq!(memory.admitted_by_actor_id(), None);
+    assert_eq!(memory.admitted_at(), None);
+
+    // The unattributed form moves the status and leaves attribution empty. It exists for a decode, where the
+    // stored status must be re-applied without inventing the decision that produced it.
+    let bare = must(memory.confirm(at(1)));
+    assert_eq!(bare.status(), MemoryStatus::Active);
+    assert_eq!(
+        bare.admitted_by_actor_id(),
+        None,
+        "an unattributed acceptance must not name an approver"
+    );
+    assert_eq!(bare.admitted_at(), None);
+
+    // The attributed form records both.
+    let attributed = must(memory.confirm_by("0198f000-0000-7000-8000-0000000000b1", at(2)));
+    assert_eq!(attributed.status(), MemoryStatus::Active);
+    assert_eq!(
+        attributed.admitted_by_actor_id(),
+        Some("0198f000-0000-7000-8000-0000000000b1")
+    );
+    assert_eq!(attributed.admitted_at(), Some(at(2)));
+}
+
+/// **The self-admission rule is consciously absent, and the case it would have refused is legitimate.**
+///
+/// This is a test asserting a **non**-rule, which is unusual and deliberate. `ADR-0117` §4 refuses a
+/// promotion by a procedure's own author, so the symmetry is tempting — and applying it here would have
+/// blocked the architecture's own requirement that a high-impact inference get "explicit user confirmation",
+/// where the person confirming is the person whose statement produced the candidate. With one seeded identity
+/// the two are always the same, so a guard would refuse the intended flow.
+///
+/// The test exists so a later reader cannot "restore" the symmetry without seeing what it breaks. The rule
+/// worth wanting — an agent must not admit what it authored — needs an actor vocabulary that can tell a model
+/// from a person, which this build does not have.
+#[test]
+fn a_claim_may_be_accepted_by_its_own_author() {
+    let memory = proposal();
+    assert_eq!(memory.created_by_actor_id(), ACTOR);
+    let accepted = must(memory.confirm_by(ACTOR, at(1)));
+    assert_eq!(accepted.status(), MemoryStatus::Active);
+    assert_eq!(
+        accepted.admitted_by_actor_id(),
+        Some(ACTOR),
+        "the confirmation is the person confirming the claim their own statement produced"
+    );
+}
+
+/// **An approver outside the bound the column enforces is refused here rather than at the writer.**
+///
+/// The storage error would name a `CHECK` on `admitted_by_actor_id`, which is an operator's diagnostic for a
+/// value that should never have been constructible. The bound matches `approvals.decided_by` and
+/// `skill_revisions.promoted_by_actor_id`, and every edge is asserted: at the bound accepted, past it
+/// refused, and blank refused. The identifier is trimmed on the way in, so the recorded value is the identity
+/// rather than its padding.
+#[test]
+fn an_approver_outside_the_column_bound_is_refused() {
+    let memory = proposal();
+    let at_limit = "a".repeat(crate::approval::MAX_APPROVER_ID_CHARS);
+    let accepted = must(memory.confirm_by(&at_limit, at(1)));
+    assert_eq!(accepted.admitted_by_actor_id(), Some(at_limit.as_str()));
+    assert_eq!(
+        memory.confirm_by(
+            &"a".repeat(crate::approval::MAX_APPROVER_ID_CHARS + 1),
+            at(1)
+        ),
+        Err(InvalidMemory::ApproverUnusable)
+    );
+    assert_eq!(
+        memory.confirm_by("   ", at(1)),
+        Err(InvalidMemory::ApproverUnusable),
+        "a blank approver is not an identity"
+    );
+    // Padding is stripped, so the value read back is the identity rather than its surrounding whitespace.
+    let padded = must(memory.confirm_by("  other-approver  ", at(1)));
+    assert_eq!(padded.admitted_by_actor_id(), Some("other-approver"));
+}
+
+/// **The stored admission must agree with the stored status, and a decode is where that is enforced.**
+///
+/// The rule SQLite cannot hold for this table: `ALTER TABLE ADD COLUMN` takes only a column-def, so a `CHECK`
+/// mentioning `status` is rejected as soon as it is added. Enforced on the read path beside the existing
+/// status-and-content rule, so a row that arrived from another build, a restored backup, or a hand edit is
+/// refused rather than trusted.
+///
+/// Each half is asserted separately, because the three conditions are three different mistakes: a decision
+/// with no moment, a moment with no decision, and either one on a row that is not a current claim.
+#[test]
+fn a_stored_admission_must_agree_with_the_stored_status() {
+    let memory = proposal();
+    let active = must(memory.confirm_by("approver", at(1)));
+
+    // Round-trips: the pair is accepted on an `active` row.
+    let state = |status, by: Option<&str>, when: Option<UtcTimestamp>| StoredMemoryState {
+        status,
+        superseded_by: None,
+        updated_at: at(2),
+        last_accessed_at: None,
+        retrieval_count: 0,
+        admitted_by_actor_id: by.map(str::to_owned),
+        admitted_at: when,
+    };
+    let mut decoded_parts = parts(MemoryType::Semantic, user_source());
+    decoded_parts.content = memory.content().to_owned();
+    assert!(
+        MemoryRecord::from_stored(
+            decoded_parts.clone(),
+            &state(MemoryStatus::Active, Some("approver"), Some(at(1)))
+        )
+        .is_ok(),
+        "a complete admission on an active row must decode"
+    );
+
+    // An approver with no moment: half of a decision, which is the shape that reads as a whole one.
+    assert_eq!(
+        MemoryRecord::from_stored(
+            decoded_parts.clone(),
+            &state(MemoryStatus::Active, Some("approver"), None)
+        ),
+        Err(InvalidMemory::AdmissionInconsistent),
+        "an approver with no acceptance time is half a decision"
+    );
+    // A moment with no approver: the same mistake from the other side.
+    assert_eq!(
+        MemoryRecord::from_stored(
+            decoded_parts.clone(),
+            &state(MemoryStatus::Active, None, Some(at(1)))
+        ),
+        Err(InvalidMemory::AdmissionInconsistent),
+        "an acceptance time with no approver is half a decision"
+    );
+    // A **proposed** row naming an approver: accepted and awaiting acceptance at once.
+    assert_eq!(
+        MemoryRecord::from_stored(
+            decoded_parts.clone(),
+            &state(MemoryStatus::Proposed, Some("approver"), Some(at(1)))
+        ),
+        Err(InvalidMemory::AdmissionInconsistent),
+        "a proposal must not name an approver"
+    );
+    // A deleted row cannot carry one either, and the control is that `archived` may — a confirmed claim that
+    // was later superseded keeps the trail of who accepted it.
+    //
+    // The fixture's content is **cleared** for this case, because the deleted-row content rule runs first and
+    // would otherwise refuse with `DeletedRetainsText` — the assertion would pass while testing a rule that
+    // already existed. Making the row satisfy that rule is what puts the admission rule under test.
+    let mut tombstone_parts = decoded_parts.clone();
+    tombstone_parts.content = String::new();
+    tombstone_parts.structured_claim = None;
+    assert_eq!(
+        MemoryRecord::from_stored(
+            tombstone_parts,
+            &state(MemoryStatus::Deleted, Some("approver"), Some(at(1)))
+        ),
+        Err(InvalidMemory::AdmissionInconsistent),
+        "a deleted row must not name an approver"
+    );
+    assert!(
+        MemoryRecord::from_stored(
+            decoded_parts,
+            &state(MemoryStatus::Archived, Some("approver"), Some(at(1)))
+        )
+        .is_ok(),
+        "an archived claim keeps the admission it had"
+    );
+
+    // And the recorded value survives the round trip, which is what makes it a record rather than a flag.
+    let read_back = must(MemoryRecord::from_stored(
+        parts(MemoryType::Semantic, user_source()),
+        &state(MemoryStatus::Active, Some("approver"), Some(at(1))),
+    ));
+    // The parts carry a different content, so the comparison is about the admission fields alone.
+    assert_eq!(read_back.admitted_by_actor_id(), Some("approver"));
+    assert_eq!(read_back.admitted_at(), Some(at(1)));
+    assert_eq!(active.status(), MemoryStatus::Active);
+}
+
+/// **The confirmation only accepts a proposal, and the refusal names the state rather than the approver.**
+///
+/// The refusal order is a decision: an `active` claim offered an approver reports "the status change is not
+/// permitted", because the state is what the caller has to change. Reporting an unusable approver instead
+/// would send them looking for a problem with the identity.
+#[test]
+fn confirming_a_claim_that_is_not_a_proposal_reports_the_state() {
+    let memory = proposal();
+    let already = must(memory.confirm_by("approver", at(1)));
+    assert_eq!(
+        already.confirm_by("approver", at(2)),
+        Err(InvalidMemory::IllegalStatus {
+            from: "active",
+            to: "active"
+        })
+    );
+    // A blank approver on a non-proposal still reports the state, which is what proves the order.
+    assert_eq!(
+        already.confirm_by("", at(2)),
+        Err(InvalidMemory::IllegalStatus {
+            from: "active",
+            to: "active"
+        })
+    );
 }
 
 /// **The status transition table permits restore and refuses a silent demotion.**

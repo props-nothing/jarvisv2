@@ -295,6 +295,43 @@ pub trait MemoryRepository: Send + Sync {
 
 `MemoryQuery` includes workspace, eligible types/sensitivity, temporal/entity constraints, ranking budget, and caller purpose. Repositories enforce workspace eligibility; they do not accept a globally unscoped search.
 
+## Memory Control Plane (`P4-008` — implemented; admission by `P4-014`)
+
+The `FR-MEM-005` lifecycle over the canonical store: list, inspect, search, remember, correct, **confirm**,
+forget, and export.
+
+| Route | Verb | What it answers |
+| --- | --- | --- |
+| `/api/v1/memories` | `GET` | the workspace's claims as **references** — no claim text |
+| `/api/v1/memories` | `POST` | records a claim the caller states, through the candidate pipeline |
+| `/api/v1/memories/search` | `POST` | ranked matches, with each signal's contribution |
+| `/api/v1/memories/export` | `GET` | every claim **with** text, including archived and deleted |
+| `/api/v1/memories/{id}` | `GET` | one claim, with its text, claim triple, and admission |
+| `/api/v1/memories/{id}/correct` | `POST` | replaces the text, linking `supersedes` |
+| `/api/v1/memories/{id}/confirm` | `POST` | **accepts a proposal**, recording who accepted it |
+| `/api/v1/memories/{id}/forget` | `POST` | deletes it, returning a `DeletionReceipt` |
+
+**The two write verbs that change trust require `expected_version`**, as the skill verbs do, and every read
+returns it — a guard value a client cannot obtain is one it cannot send.
+
+**`confirm` carries the version and nothing else.** It is the one place a decision is recorded, and the
+approver is **not** a field: the daemon reads its own seeded identity, so a caller cannot attribute a decision
+to somebody else. `admitted_by_actor_id` and `admitted_at` appear on the reference and travel together, because
+the domain refuses half a decision — a row carrying one without the other is a stored-row error rather than an
+answer.
+
+**Only a proposal may be confirmed.** A claim is `proposed` when the domain's own derivation says it must be:
+a `relationship` claim (the document's "high-impact" class), and any `model_inference` at any confidence. `422`
+for a claim that is not a proposal; `409` for a stale version, because the remedy is a re-read and it outranks
+the state refusal — a caller has to re-read before it can act at all.
+
+**There is deliberately no self-admission refusal.** `ADR-0117` §4 refuses a promotion by a procedure's own
+author, and the symmetry does not transfer: the document requires "explicit user confirmation" of a high-impact
+inference, so the person confirming **is** the person whose statement produced the candidate. With one seeded
+identity the two are always the same value. What holds instead is that the approver is never client-supplied —
+see `ADR-0124`.
+
+
 ## Skill Control Plane (`P4-013` — implemented)
 
 The `FR-MEM-005` lifecycle applied to a **stored procedure**: list, inspect, create, promote, disable, enable,

@@ -3303,6 +3303,25 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       "invalid value for configuration environment variable" with no indication of what would be valid. The hint
       now spells out `true`. **A hint that names a value the daemon rejects sends an operator to look for a
       problem that is in the hint.**
+      **⚠ AND THE DAEMON'S OWN MESSAGE HAD THE SAME GAP, which cost two failed attempts to find.** While
+      verifying against a live daemon I set `JARVIS_HTTP_ENABLED=1` and read
+      `invalid value for configuration environment variable JARVIS_HTTP_ENABLED` — naming the variable and
+      nothing about what would be accepted. `ConfigError::InvalidEnvironmentValue` now carries an `expected`
+      field, and every site states the vocabulary **its own parser** accepts: `true or false`,
+      `one of trace, debug, info, warn, error`, `a whole number of seconds`, `a port number from 1 to 65535`,
+      `valid Unicode text`. The real daemon now answers `…: expected true or false`.
+      - **The expected string is bounded by what that check actually parses, not by the rule that matters most.**
+        A value like `JARVIS_SHUTDOWN_TIMEOUT_SECONDS=0` parses fine and is refused later by
+        `InvalidShutdownTimeout`, whose own message names the range — so writing "1 to 300" in the parse refusal
+        would claim coverage it does not have. Both refusals are asserted, because they arrive from one variable
+        and are easy to conflate.
+      - **The rejected value is never echoed**, and that is asserted: an environment value can be a credential,
+        and a startup log is read by more people than the shell that set it. The two properties are one test with
+        two assertions because either alone is satisfiable by the wrong message.
+      - **Class of defect worth naming: a message that identifies the problem and not the remedy.** This is the
+        third instance in this slice (the `JARVIS_HTTP_ENABLED=1` hint, this message, and the absent-route
+        report), and the shape is always the same: the text says *what* failed and leaves *what would work* to
+        be guessed, and the obvious guess is the one the code rejects.
       **Limits, recorded rather than glossed:** **the execution path is still not built**, so nothing runs a
       skill's steps and the lifecycle ends at "this is available"; `correct` is expressed as a creation with
       `--supersedes` + `--skill` rather than a dedicated route, and a correction's `skill_id` must be **stated**
@@ -3314,6 +3333,86 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       deterministic code supports becomes a `Proposed` record, and admission is a decision that names its
       approver. The inference boundary is unchanged (`P4-001`, `ADR-0049` §6): a model inference is never
       admitted above `Unverified`.
+      **⭐ PARTIALLY DONE — the "becomes a `Proposed` record" half was BROKEN and is now fixed, and the
+      decision that names its approver now exists.** Starting the slice, I checked the boundary's *claim*
+      against the code rather than adding to it, and the two layers that are supposed to agree disagreed:
+      - `MemoryCandidate::admit` decides `MemoryAdmission::Proposal` for a model inference. Its own comment
+        says one "is never written as current truth", and `CandidateClassification::requires_proposal` is the
+        predicate. `MemoryAdmission`'s doc says writing a `Proposal` and reading it back "is what proves the
+        two layers agree rather than merely intending to" — **nothing did that**.
+      - `MemoryRecord::build` derived the status from `memory_type.requires_confirmation()` **alone**, so it
+        answered `Active` for every inference. A `source_kind` of `model_inference` sent to
+        `POST /api/v1/memories` was answered `201` with status `active`: the model's own claim stored as the
+        workspace's current truth, contradicting `ADR-0049` §6 and the module comment in both crates.
+      - **The harm is concrete, not a labelling nicety.** `compare` reports a candidate whose text differs
+        from the current claim at its key as a `Correction`, and a correction **supersedes**. So one model
+        inference silently retired an earlier claim — an effect produced by the disagreement.
+      - **The fix is one condition**, `|| source.kind().is_model_produced()`, which is the rule
+        `jarvis-core/src/skill.rs` already applies to procedures in two places — so the memory layer was the
+        one that lacked it. The confidence ceiling (`Unverified`) and the status were two different rules, and
+        only the first was enforced: bounding the level is not the same as refusing the claim as current truth.
+      - **Three tests encoded the old behaviour, and one had the invariant as its NAME.** `memory/tests.rs`'s
+        inference test asserted a raised confidence is refused and that `Unverified` is `is_ok()` — so a
+        derivation returning `Active` passed it. `retrieval/tests.rs` used an inference as a convenient
+        `Derived`-trust fixture and was actually refused by the **trust** rule, so the currency rule was never
+        reached; it now uses a tool observation and the inference has its own test asserting the exclusion
+        holds even against a query relaxed on every requirement. `jarvis-storage`'s test named
+        `a_model_inference_cannot_be_recorded_as_a_fact` while asserting, in a comment, that the claim **was**
+        `is_current_truth()` and that the *presentation* predicate was the thing keeping it from being
+        asserted — "which is why the two are separate". Two layers disagreeing about one question is not a
+        separation of concerns.
+      - **Falsified at both layers.** Reverting the one condition failed the new `jarvis-core` test
+        (`a claim nothing can support is a proposal, not a fact`) **and** the new gateway test
+        (`a claim no source can support must not be the workspace's current truth`), each in the binary a
+        developer would run. A control asserts a user-stated `Semantic` claim is still `Active`, so the rule
+        is not satisfied by proposing everything.
+
+      **Delivered for the second half — the decision that names its approver:**
+      - **Migration `0011_memory_admission.sql`** adds `admitted_by_actor_id` and `admitted_at`, modelled on
+        `skill_revisions.promoted_by_actor_id`/`promoted_at`. `CURRENT_SCHEMA_VERSION` 10 → 11. The backfill is
+        deliberately **empty**: rows that predate admission were confirmed by a route that recorded nobody, and
+        inventing an approver would fabricate an authorization for a decision nobody made.
+      - **`MemoryRecord::confirm_by(approver, at)`** records the decision; `confirm` is kept as the **decode**
+        companion, because a row written before admission decodes to `active` with no approver and re-applying
+        the stored status must not invent one.
+      - **`MemoryTransition::Confirm { approver_actor_id }`** — the approver is part of the variant, not an
+        argument beside it, so a state change cannot be separated from the decision that justifies it.
+      - **`POST /api/v1/memories/{id}/confirm`** plus `ConfirmMemoryRequest` (which carries **only**
+        `expected_version`) and a `jarvis memory confirm <id> --version N` verb. `MemoryTransition::Confirm`
+        existed from `P4-002` and **no route called it**, so a `Proposed` claim could be created over HTTP and
+        never accepted — a claim the workspace held, offered to nobody, with no way to make it current.
+      - **A defect found on the way: the author identity was fabricated.** `remember` hardcoded the string
+        `"local-user"` while every other write path uses `LOCAL_USER_ID` (`0198f000-…-0000000000b1`, what
+        `0005` actually seeds). It now reads the identity, as `SkillService::actor_id` does.
+
+      **⭐ A GUARD I WROTE AND THEN DELETED, BECAUSE IT BLOCKED THE ARCHITECTURE'S OWN FLOW.** I first added a
+      self-admission refusal mirroring `ADR-0117` §4 — an approver must not be the claim's own author. It made
+      the live route answer `503` and, once that was diagnosed, `422` on the *intended* case:
+      `memory-and-context.md` says a high-impact inference "requires explicit user confirmation", so the person
+      confirming **is** the person whose statement produced the candidate. With one seeded identity the author
+      and approver are always the same value, so the guard refused every legitimate confirmation. The rule worth
+      wanting — *an agent must not admit what it authored* — needs an actor vocabulary that distinguishes a
+      model from a person, and this build has one seeded human; even a run's model-produced candidate is stamped
+      with that human's identifier. **`ADR-0117`'s rule is about a procedure's promotion, where the author can
+      be a model; copying it onto a memory, where the author is a person, inverts it.** Two tests now assert the
+      *non*-refusal so the symmetry cannot be restored without seeing why.
+      - **Also fixed: a corrupt row answered `422`.** `decode_memory` mapped a domain refusal to
+        `InvalidMemoryRequest`, which names a **request** field for a value the caller never sent — sending an
+        operator to inspect their request instead of their data, and telling a caller to change what they ask
+        for when what they need is a backup. It now reports `StoredMemoryInvalid`, and the field table is shared
+        between the two mappings rather than duplicated.
+      - **Falsified:** binding `None` for `admitted_at` (the "did not write the column" bug) failed the new
+        storage round-trip test **and** both gateway tests. The half-decision rule catches it too — the mutant
+        produces a row the decoder refuses, which is the property that makes the pair safe to store.
+
+      **Still unbuilt, and now the whole of the remaining work:** no **tool** touches memory at all (every
+      module in `jarvis-tools` is files/documents/policy/registry), so the model has no submission path; the
+      route therefore needs a `source_kind` a model cannot set itself, and the submission path is what makes
+      "a model may propose" true. `SkillService` documents a `propose` path for an agent-authored revision that
+      still does not exist. The admission columns carry only their own bounds — SQLite cannot add a
+      column-level `CHECK` mentioning `status`, and a table-level one needs the twelve-step rebuild that
+      recreates four indexes and two self-referencing foreign keys — so the cross-column rule is enforced on
+      the read path, which is the only enforcer; see `ADR-0124`.
 - [ ] `P4-015` Add session summarization as derived memory: a compressed summary of a session is stored as a
       `Derived` claim with provenance and a retention rule, and is never presented as user-authored fact.
 
