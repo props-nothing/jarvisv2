@@ -49,8 +49,9 @@
 use std::process::Stdio;
 
 use crate::backend::{
-    BackendFuture, GuaranteeSupport, Launched, LaunchedProcess, MINIMUM_CONTAINER_MEMORY_BYTES,
-    ProcessLauncher, SandboxBackend, Support, container_guarantees, container_image,
+    BackendFuture, Completion, GuaranteeSupport, Launched, LaunchedProcess,
+    MINIMUM_CONTAINER_MEMORY_BYTES, ProcessLauncher, SandboxBackend, Support, container_guarantees,
+    container_image,
 };
 use crate::policy::{Limits, SandboxError, SandboxPolicy, SandboxRequest};
 
@@ -483,6 +484,34 @@ impl LaunchedProcess for ContainerChild {
                     error.kind()
                 ),
             })
+        })
+    }
+
+    fn wait_for(
+        self: Box<Self>,
+        limit: std::time::Duration,
+    ) -> BackendFuture<Result<Completion, SandboxError>> {
+        Box::pin(async move {
+            let Self {
+                mut child,
+                container,
+            } = *self;
+            if let Ok(status) = tokio::time::timeout(limit, child.wait()).await {
+                return status
+                    .map(Completion::Exited)
+                    .map_err(|error| SandboxError::Launch {
+                        reason: format!(
+                            "could not collect the status of container {container}: {}",
+                            error.kind()
+                        ),
+                    });
+            }
+            // The limit passed. Removing the **container** is what stops the work — killing the CLI alone would
+            // leave it running in the daemon, a confined process outliving its confinement. The CLI is reaped
+            // afterwards, and a failed removal is the failure worth reporting.
+            let removed = removal(&container).await;
+            let _ = child.kill().await;
+            removed.map(|()| Completion::TimedOut)
         })
     }
 

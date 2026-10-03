@@ -46,8 +46,9 @@ that, because the address is public.
 - The model can read public pages, held for approval by default.
 - A model-chosen URL can still carry data out **after approval or opt-in**. This is recorded as the first unresolved
   question in `docs/research/integrations/web-fetch.md` and must not be described as solved.
-- The model sees at most 1,800 characters of a page: the executor truncates every tool result to 4,000 characters and
-  the fence must survive. A per-tool result budget and an `offset` argument are the follow-up; the limit is asserted by
+- The model sees at most 4,000 characters of a page: the executor truncates every tool result to 12,000 characters
+  (`jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS`, raised from 4,000 by `P3-029`, which also made the fetch cap derive
+  from it) and the fence must survive. An `offset` argument is the follow-up; the limit is asserted by
   `the_worst_escaping_page_still_fits_the_executors_result_budget`.
 - `http` is allowed; the result reports the final URL so the scheme is visible.
 - Non-UTF-8 charsets are decoded lossily.

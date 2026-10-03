@@ -125,7 +125,7 @@ attempted the honest classification is a provider-unreachable failure. There is 
    opt-in is an operator's informed choice. Blocks: nothing, but it must stay visible in `docs/architecture/security.md`.
 2. **`http` is allowed.** A plain-HTTP response can be altered in transit. The result says which scheme was used, and
    the output is untrusted either way. Revisit with an `https_only` setting if operators ask.
-3. **The model sees at most 1,800 characters of page text** because the executor truncates every tool result to 4,000
+3. **The model sees at most 4,000 characters of page text** because the executor truncates every tool result to 12,000
    characters and the fence must survive intact. Pagination (`offset`) is a follow-up.
 
 ## Verification Log

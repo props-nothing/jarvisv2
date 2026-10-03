@@ -53,10 +53,17 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Characters of page text returned.
 ///
-/// Small on purpose: the run executor truncates every tool result to 4,000 characters, and a truncation that cut
-/// the closing fence would hand the model unterminated untrusted text. The fenced content plus the JSON around it
-/// has to fit with room to spare, including the characters JSON escapes.
-pub const MAX_TEXT_CHARS: usize = 1800;
+/// Bounded by the executor's per-result budget ([`jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS`]) and by
+/// `IsolatedText`'s own 4,096-character limit. A truncation that cut the closing fence would hand the model
+/// unterminated untrusted text, so the fenced content plus the JSON around it must fit with room to spare,
+/// **including the characters JSON escapes** (a page of lone quotation marks doubles in size) — which the const
+/// assertion below holds.
+pub const MAX_TEXT_CHARS: usize = 4000;
+
+const _: () = assert!(
+    2 * MAX_TEXT_CHARS + 1500 <= jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS,
+    "the worst-escaping page must still fit the executor's result budget"
+);
 
 /// The longest URL echoed back in a result.
 const MAX_ECHOED_URL_CHARS: usize = 300;

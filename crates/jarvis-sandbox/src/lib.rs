@@ -77,8 +77,8 @@ mod backend;
 mod policy;
 
 pub use backend::{
-    BackendFuture, ContainerBackend, GuaranteeSupport, Launched, LaunchedProcess, ProcessLauncher,
-    SandboxBackend, Support, UnconfinedBackend, backend_for_host, cgroup_v2_guarantees,
-    container_guarantees, host_command, refusing_launcher, stdio_launcher,
+    BackendFuture, Completion, ContainerBackend, GuaranteeSupport, Launched, LaunchedProcess,
+    ProcessLauncher, SandboxBackend, Support, UnconfinedBackend, backend_for_host,
+    cgroup_v2_guarantees, container_guarantees, host_command, refusing_launcher, stdio_launcher,
 };
 pub use policy::{Guarantee, Isolation, Limits, SandboxError, SandboxPolicy, SandboxRequest};

@@ -1,6 +1,7 @@
 //! JARVIS daemon composition root.
 
 mod build_info;
+mod code_run;
 mod control;
 mod dispatch;
 mod entity_service;
@@ -130,6 +131,13 @@ enum DaemonError {
         /// Which constant was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebFetchToolError,
+    },
+    /// The code-running tool could not state its own contract.
+    #[error("the code-running tool could not be defined")]
+    CodeRunTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::code_run::CodeRunToolError,
     },
     /// The configured workspace policy was self-contradictory.
     ///
@@ -643,6 +651,36 @@ async fn compose_tools(
             Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
         ),
     ];
+    // The code-running tool is composed **only** when an operator configured an image and an interpreter AND this
+    // host can actually run a container. An absent tool is the honest state otherwise: a registered tool that
+    // failed every call would be offered to a model and read as a broken one. When configured but unavailable the
+    // operator is told, once, at startup — not on the first run.
+    if let Some(image) = config.daemon().code_sandbox_image() {
+        let backend = jarvis_sandbox::ContainerBackend::probe();
+        let tool = crate::code_run::CodeRunTool::new(
+            backend,
+            image.to_owned(),
+            config.daemon().code_sandbox_interpreter().to_vec(),
+        )
+        .map_err(|source| DaemonError::CodeRunTool { source })?;
+        if tool.is_available() {
+            additional.push((
+                vec![
+                    crate::code_run::CodeRunTool::definition(
+                        config.daemon().code_sandbox_interpreter(),
+                    )
+                    .map_err(|source| DaemonError::CodeRunTool { source })?,
+                ],
+                Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+            ));
+            tracing::info!(image, "the code-running tool is available");
+        } else {
+            tracing::warn!(
+                image,
+                "a code sandbox is configured but no container runtime is reachable, so the code-running tool is not offered"
+            );
+        }
+    }
     additional.extend(
         mcp.as_ref()
             .map(|host| {

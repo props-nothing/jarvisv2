@@ -151,6 +151,18 @@ jarvis approvals deny                                                   # the ru
 `approve` shows the arguments and asks; without a terminal it needs `--yes`. A held action survives a daemon
 restart. See `ADR-0130`.
 
+**Letting the model run code.** Pull an image once (the sandbox never pulls), then name it and its interpreter:
+
+```toml
+[daemon]
+code_sandbox_image = "node:22-alpine"
+code_sandbox_interpreter = ["node", "-e"]      # the snippet is appended as the last argument; there is no shell
+```
+
+(or `JARVIS_CODE_SANDBOX_IMAGE` and `JARVIS_CODE_SANDBOX_INTERPRETER="node -e"`). `jarvis.code.run` then appears in
+`jarvis tools list`. Each snippet runs in a throwaway container with no network, a read-only filesystem, and 30
+seconds, and **every run waits for your approval** — you read the code first. See `ADR-0131`.
+
 ### Chatting (multi-turn)
 
 `jarvis chat` needs the same configuration as `ask`:

@@ -13,7 +13,7 @@ thiserror.workspace = true
 # `TokioChildProcess`. A runtime-neutral abstraction would be converted straight back at the boundary for no
 # gain, and it would hide that spawning is the operation. This mirrors `jarvis-storage`, which is likewise
 # non-pure because the thing it wraps is.
-tokio = { workspace = true, features = ["process", "rt"] }
+tokio = { workspace = true, features = ["process", "rt", "time"] }
 
 [dev-dependencies]
 # The tests assert against the **public** API and really spawn processes, so they need the async runtime,

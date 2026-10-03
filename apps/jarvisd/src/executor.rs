@@ -158,7 +158,7 @@ const MAX_TOOL_CALLS: u32 = 16;
 /// not unlimited and a result should be one turn, not a document. Truncation is on a character boundary
 /// and the elision is stated, so a model reading a short result knows it was cut rather than assuming
 /// the tool returned little.
-const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+const MAX_TOOL_RESULT_CHARS: usize = jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS;
 
 /// Events read back when locating a run's completed answer.
 ///

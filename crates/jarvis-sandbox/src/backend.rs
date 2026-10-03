@@ -146,6 +146,45 @@ pub trait LaunchedProcess: Send {
     /// Takes `self` by value because termination ends the confinement: whatever keeps the tree captured is
     /// released here, so the value cannot be used afterwards to observe a process it no longer owns.
     fn kill(self: Box<Self>) -> BackendFuture<Result<(), SandboxError>>;
+
+    /// Waits for the child to exit, **killing it if it has not within `limit`**.
+    ///
+    /// This is the redesign the trait's own header predicted: "wait with a timeout, then kill" is not
+    /// expressible with two consuming methods, because dropping a timed-out `wait` drops the child and leaves
+    /// nothing to kill. A caller that runs code someone else wrote needs exactly that, so the two are one
+    /// operation here, implemented by whoever owns the child and the means to stop it.
+    ///
+    /// The default **refuses** rather than waiting without a bound. A backend that has not implemented this
+    /// cannot honour the limit, and an unbounded wait presented as a bounded one is the quiet failure this
+    /// crate exists to prevent. The container and unconfined backends implement it; the cgroup backend does
+    /// not yet, which is recorded rather than papered over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Launch`] when the wait fails, when the kill after a timeout fails (the child may
+    /// still be running), or when this backend does not support a bounded wait.
+    #[must_use = "a bounded wait that is not awaited neither waits nor enforces its limit"]
+    fn wait_for(
+        self: Box<Self>,
+        limit: std::time::Duration,
+    ) -> BackendFuture<Result<Completion, SandboxError>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(SandboxError::Launch {
+                reason: "this backend cannot bound a wait, so it cannot run untrusted code with a time limit"
+                    .to_owned(),
+            })
+        })
+    }
+}
+
+/// How a bounded wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Completion {
+    /// The child exited by itself, with this status.
+    Exited(std::process::ExitStatus),
+    /// The limit passed first and the child was killed.
+    TimedOut,
 }
 
 /// The result of a successful [`SandboxBackend::launch`].
@@ -481,6 +520,26 @@ impl LaunchedProcess for ChildHandle {
             child.kill().await.map_err(|error| SandboxError::Launch {
                 reason: format!("kill failed: {}", error.kind()),
             })
+        })
+    }
+
+    fn wait_for(
+        self: Box<Self>,
+        limit: std::time::Duration,
+    ) -> BackendFuture<Result<Completion, SandboxError>> {
+        Box::pin(async move {
+            let mut child = self.child;
+            if let Ok(status) = tokio::time::timeout(limit, child.wait()).await {
+                return status
+                    .map(Completion::Exited)
+                    .map_err(|error| SandboxError::Launch {
+                        reason: format!("could not collect the child's status: {}", error.kind()),
+                    });
+            }
+            child.kill().await.map_err(|error| SandboxError::Launch {
+                reason: format!("kill after the time limit failed: {}", error.kind()),
+            })?;
+            Ok(Completion::TimedOut)
         })
     }
 }

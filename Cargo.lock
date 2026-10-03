@@ -1390,6 +1390,7 @@ dependencies = [
  "jarvis-models",
  "jarvis-observability",
  "jarvis-protocol",
+ "jarvis-sandbox",
  "jarvis-storage",
  "jarvis-tools",
  "jarvis-web",

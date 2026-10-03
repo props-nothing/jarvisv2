@@ -292,8 +292,8 @@ async fn a_page_cannot_close_its_own_fence() {
 
 #[tokio::test]
 async fn the_worst_escaping_page_still_fits_the_executors_result_budget() {
-    // The run executor truncates a tool result to 4,000 characters. A page of lone quotation marks is the
-    // densest case for JSON escaping: every character becomes two, and every line break another two.
+    // The run executor truncates a tool result to `MAX_MODEL_FACING_RESULT_CHARS`. A page of lone quotation
+    // marks is the densest case for JSON escaping: every character becomes two, and every line break another two.
     let server = Server::start(site).await;
     let tool = WebFetchTool::for_loopback_port(server.port);
     let result = fetch_result(&tool, &server.url("/quotes")).await;
@@ -302,7 +302,7 @@ async fn the_worst_escaping_page_still_fits_the_executors_result_budget() {
         .map(|output| output.content().to_owned())
         .unwrap_or_default();
     assert!(
-        text.chars().count() < 4_000,
+        text.chars().count() < jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS,
         "{} characters",
         text.chars().count()
     );

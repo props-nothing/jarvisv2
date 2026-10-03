@@ -98,11 +98,34 @@ fn render_list(reply: &ApprovalListReply) {
 }
 
 /// Renders the arguments an approval is waiting on, or says plainly that there are none to show.
+///
+/// A multi-line string value — a program, say — is shown as the lines it is, indented, because a person asked to
+/// approve code reads it as code and not as one line full of `\n`. Everything else is shown as JSON.
 fn describe_arguments(approval: &PendingApprovalReply) -> String {
-    approval.arguments.as_ref().map_or_else(
-        || "arguments: not held (too large to show), so this cannot be approved here".to_owned(),
-        |arguments| format!("arguments: {arguments}"),
-    )
+    let Some(arguments) = approval.arguments.as_ref() else {
+        return "arguments: not held (too large to show), so this cannot be approved here"
+            .to_owned();
+    };
+    let Some(object) = arguments.as_object() else {
+        return format!("arguments: {arguments}");
+    };
+    let multiline = object
+        .values()
+        .any(|value| value.as_str().is_some_and(|text| text.contains('\n')));
+    if !multiline {
+        return format!("arguments: {arguments}");
+    }
+    let mut lines = vec!["arguments:".to_owned()];
+    for (key, value) in object {
+        match value.as_str() {
+            Some(text) if text.contains('\n') => {
+                lines.push(format!("    {key}:"));
+                lines.extend(text.lines().map(|line| format!("      | {line}")));
+            }
+            _ => lines.push(format!("    {key}: {value}")),
+        }
+    }
+    lines.join("\n")
 }
 
 /// `jarvis approvals approve|deny [ID] [--yes]`
@@ -331,6 +354,20 @@ mod tests {
             Some(serde_json::json!({"url": "https://example.com"})),
         ));
         assert!(shown.contains("https://example.com"), "{shown}");
+    }
+
+    #[test]
+    fn a_multiline_program_is_shown_as_lines_not_as_an_escaped_string() {
+        let shown = describe_arguments(&approval(
+            "a",
+            Some(serde_json::json!({"code": "let a = 1;\nconsole.log(a);"})),
+        ));
+        assert!(shown.contains("| let a = 1;"), "{shown}");
+        assert!(shown.contains("| console.log(a);"), "{shown}");
+        assert!(
+            !shown.contains("\\n"),
+            "no escaped newline may remain: {shown}"
+        );
     }
 
     #[test]

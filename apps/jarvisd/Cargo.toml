@@ -41,13 +41,15 @@ jarvis-tools.workspace = true
 # The web fetch tool is composed here for the same reason the filesystem and memory tools are: an adapter is only
 # reachable from a binary that chose to construct one.
 jarvis-web.workspace = true
+# The code-running tool drives the container backend; confinement itself stays in that crate.
+jarvis-sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # `unfold` builds the SSE stream without a generator macro, so the stream type stays a plain
 # `Stream` impl and no `async-stream` dependency is introduced for one call site.
 futures-util.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

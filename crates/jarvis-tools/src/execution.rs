@@ -61,6 +61,14 @@ use crate::{ToolOutcome, ToolOutcomeRecord};
 /// truncation is *reported* rather than silent, which is what makes a generous bound safe.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// Characters of one tool result the run executor carries back to the model.
+///
+/// Published here, beside [`MAX_TOOL_OUTPUT_BYTES`], because **two parties must agree on it**: the executor
+/// truncates to this, and a tool that returns fenced untrusted text must produce a result that fits *inside* it,
+/// since a truncation that cut a closing fence would hand the model unterminated untrusted data. Two copies of
+/// one number in two crates is the defect class this repository keeps finding, so there is one.
+pub const MAX_MODEL_FACING_RESULT_CHARS: usize = 12_000;
+
 /// Characters of provider evidence that may be retained.
 ///
 /// Much smaller than the output bound, and for a different reason: evidence is a provider identifier,

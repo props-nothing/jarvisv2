@@ -1549,3 +1549,62 @@ async fn an_unattended_web_fetch_is_still_refused_by_the_address_guard() {
         .to_owned();
     assert!(output.contains("not on the public internet"), "{output}");
 }
+/// **No workspace setting makes model-authored code run unattended.**
+///
+/// The code tool declares `Ask` at risk 3, and a workspace can only tighten an approval (`ADR-0122`). So even
+/// with the ceiling and the approval threshold both raised to `High` — the most permissive document an operator
+/// can write — the call is held, and the approval carries the code so the person sees what they would run.
+#[tokio::test]
+async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
+    let (directory, database) = database_with_run().await;
+    let interpreter = vec!["sh".to_owned(), "-c".to_owned()];
+    let definition = must(crate::code_run::CodeRunTool::definition(&interpreter));
+    let tool = must(crate::code_run::CodeRunTool::new(
+        jarvis_sandbox::ContainerBackend::probe(),
+        "alpine:3".to_owned(),
+        interpreter,
+    ));
+    let workspace = must(WorkspacePolicy::new(
+        jarvis_tools::Risk::High,
+        jarvis_tools::Risk::High,
+        false,
+        false,
+    ));
+    let pipeline = must(ToolPipeline::with_adapters(
+        Arc::clone(&database),
+        None,
+        workspace,
+        vec![(
+            vec![definition.clone()],
+            Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+        )],
+        jarvis_storage::SecretStore::in_state(&directory.join("state")),
+    ));
+    let actor = ToolActor::for_composed_tools(
+        LOCAL_WORKSPACE_ID,
+        RUN,
+        SessionChannel::Cli,
+        AuthenticationStrength::Credential,
+        "policy-1",
+        &[definition],
+    );
+    let outcome = must(
+        pipeline
+            .call_tool(
+                crate::code_run::RUN_TOOL,
+                json!({ "code": "echo hi" }),
+                &actor,
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    let ToolPipelineOutcome::AwaitingApproval { approval_id, .. } = outcome else {
+        panic!("code must be held whatever the workspace allows, got {outcome:?}");
+    };
+    let held = must(jarvis_storage::read_approval_arguments(&database, &approval_id).await);
+    assert_eq!(
+        held.as_deref(),
+        Some(r#"{"code":"echo hi"}"#),
+        "the person deciding must be able to see the code"
+    );
+}

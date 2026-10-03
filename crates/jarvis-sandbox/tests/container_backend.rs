@@ -541,3 +541,67 @@ fn owned_containers() -> Vec<String> {
         .filter(|name| name.starts_with("jarvis-sandbox-"))
         .collect()
 }
+/// **A child that outlives its limit is killed, and its container is gone — not merely its client.**
+///
+/// This is the property that makes running untrusted code possible at all: "wait, then give up" has to *stop the
+/// work*. The `docker` CLI is a client, so killing it alone would leave the container running in the daemon, a
+/// confined process outliving its confinement. The container's absence is asserted by asking the runtime, not by
+/// trusting the return value.
+///
+/// Falsified by mutation: replacing the container removal in `wait_for` with only `child.kill()` leaves the
+/// `sleep` container listed and the last assertion fails.
+#[tokio::test]
+async fn a_child_past_its_limit_is_killed_and_its_container_removed() {
+    let _guard = exclusive().await;
+    let (Some(backend), Some(image)) = (backend(), image()) else {
+        return;
+    };
+    let request = request(&image, "/bin/sleep", vec!["60".to_owned()]);
+    let launched = launch(&backend, request, true).await;
+    let started = std::time::Instant::now();
+    let completion = launched
+        .process
+        .wait_for(std::time::Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|error| panic!("a bounded wait must report a timeout, not fail: {error}"));
+    assert_eq!(completion, jarvis_sandbox::Completion::TimedOut);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the wait must end at the limit, not at the child's own end"
+    );
+    let running = std::process::Command::new("docker")
+        .args(["ps", "--format", "{{.Command}}"])
+        .output()
+        .unwrap_or_else(|error| panic!("docker ps: {error}"));
+    let text = String::from_utf8_lossy(&running.stdout);
+    assert!(
+        !text.contains("sleep 60"),
+        "the container must be removed, not left running: {text:?}"
+    );
+}
+
+/// A child that finishes inside its limit reports its own status, and is not killed.
+#[tokio::test]
+async fn a_child_inside_its_limit_reports_its_own_status() {
+    let _guard = exclusive().await;
+    let (Some(backend), Some(image)) = (backend(), image()) else {
+        return;
+    };
+    let request = request(
+        &image,
+        "/bin/sh",
+        vec!["-c".to_owned(), "exit 7".to_owned()],
+    );
+    let launched = launch(&backend, request, true).await;
+    let completion = launched
+        .process
+        .wait_for(std::time::Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|error| panic!("a bounded wait must succeed: {error}"));
+    match completion {
+        jarvis_sandbox::Completion::Exited(status) => assert_eq!(status.code(), Some(7)),
+        jarvis_sandbox::Completion::TimedOut => {
+            panic!("a fast child must not be reported as timed out")
+        }
+    }
+}

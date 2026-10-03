@@ -2488,6 +2488,25 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     because it is decided — a `resume`-only verb is the follow-up); SQLite only (no Postgres `approvals` migration
     exists yet).
 
+## P3-029: The model can run code, in a disposable container
+
+- [x] `P3-029` Give the model a way to calculate, behind the sandbox and the approval gate.
+  - Delivered: `jarvis.code.run` (`apps/jarvisd/src/code_run.rs`), `LaunchedProcess::wait_for` (bounded wait that
+    stops the work), operator config `daemon.code_sandbox_image` / `daemon.code_sandbox_interpreter`, a shared
+    per-result budget (`MAX_MODEL_FACING_RESULT_CHARS` 12,000, from 4,000; the fetch cap rose from 1,800 to 4,000),
+    and multi-line programs shown as lines by `jarvis approvals`. [ADR-0131](docs/adr/0131-model-authored-code-runs-in-a-disposable-container.md).
+  - **Live:** asked for the sum of the first 100 primes, the model (Ollama `glm-5.3:cloud`) wrote JavaScript, I read and
+    approved it, it ran in `node:22-alpine` with no network, and the answer (24,133) was right.
+  - **Always held:** `code_execution` at risk 3 with `ApprovalPolicy::Ask`, which a workspace cannot relax
+    (`ADR-0122`); test raises ceiling and threshold to `High` and still gets a hold.
+  - **Falsified against a real runtime:** network blocked, root and `/tmp` read-only, host environment absent, a
+    runaway snippet stopped and its container *removed* (asked of `docker ps`), unbounded output cut and still inside
+    the budget, output unable to close its own fence. Tests skip loudly without a runtime or image.
+  - **Limits:** the cgroup backend has no `wait_for` yet (the default refuses rather than waiting unbounded); no files in
+    or out and no state between runs; limits (30 s, 64 processes, 256 MiB) are constants; a program too large for the
+    8 KiB approval payload cannot be approved from the CLI; `jarvis.code.run` only exists when an image is configured,
+    pulled, and a runtime is reachable.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

@@ -70,9 +70,9 @@ pub use evaluation::{
 };
 pub use execution::{
     ApprovalCitation, AuthorizationReceipt, AuthorizationReceiptParts, BoundedOutput,
-    EvidenceError, IdempotencyKey, IdempotencyKeyError, MAX_POLICY_VERSION_CHARS,
-    MAX_PROVIDER_EVIDENCE_CHARS, MAX_TOOL_OUTPUT_BYTES, OutputError, ProviderEvidence,
-    ReceiptError, ToolCallResult,
+    EvidenceError, IdempotencyKey, IdempotencyKeyError, MAX_MODEL_FACING_RESULT_CHARS,
+    MAX_POLICY_VERSION_CHARS, MAX_PROVIDER_EVIDENCE_CHARS, MAX_TOOL_OUTPUT_BYTES, OutputError,
+    ProviderEvidence, ReceiptError, ToolCallResult,
 };
 pub use executor::{
     AdapterError, ExecutionRequestError, ToolExecutionRequest, ToolExecutionRequestParts,

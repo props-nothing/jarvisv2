@@ -29,6 +29,10 @@ pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const LIVE_PROVIDER_MODEL_NAME: &str = "openai-compatible";
 
 const MAX_PROFILE_NAME_BYTES: usize = 64;
+/// The longest single code sandbox value, in bytes.
+const MAX_CODE_SANDBOX_ARGUMENT_BYTES: usize = 256;
+/// The most arguments an interpreter command may have.
+const MAX_CODE_SANDBOX_INTERPRETER_ARGUMENTS: usize = 8;
 const MAX_SHUTDOWN_TIMEOUT_SECONDS: u16 = 300;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -177,6 +181,23 @@ pub struct DaemonConfig {
     /// inbound protocol port unasked would contradict the reason this project prefers OS-native local IPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_serve_port: Option<u16>,
+    /// The container image the code-running tool executes snippets in, or `None` for no such tool.
+    ///
+    /// # Why an operator names it
+    ///
+    /// The sandbox never pulls an image (`ADR-0128`): a sandbox that reaches a registry on demand is one whose
+    /// contents nobody reviewed. So the image is a decision the operator makes by having pulled it, and the tool
+    /// is **absent** — not present and failing — until they have. Always paired with
+    /// [`Self::code_sandbox_interpreter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_sandbox_image: Option<String>,
+    /// The command inside the image that runs a snippet, with the snippet appended as its final argument
+    /// (`["python3", "-c"]`, `["node", "-e"]`, `["sh", "-c"]`).
+    ///
+    /// An argument vector, never a shell string: there is no shell to interpret a metacharacter, and the
+    /// snippet is one argument. The first element's name is also what the model is told the language is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    code_sandbox_interpreter: Vec<String>,
 }
 
 fn default_http_port() -> u16 {
@@ -252,6 +273,18 @@ impl DaemonConfig {
     pub const fn mcp_serve_port(&self) -> Option<u16> {
         self.mcp_serve_port
     }
+
+    /// Returns the container image the code-running tool executes in, when one is configured.
+    #[must_use]
+    pub fn code_sandbox_image(&self) -> Option<&str> {
+        self.code_sandbox_image.as_deref()
+    }
+
+    /// Returns the interpreter command a snippet is passed to, empty when no code sandbox is configured.
+    #[must_use]
+    pub fn code_sandbox_interpreter(&self) -> &[String] {
+        &self.code_sandbox_interpreter
+    }
 }
 
 impl Default for DaemonConfig {
@@ -270,6 +303,8 @@ impl Default for DaemonConfig {
             tool_workspace_roots: Vec::new(),
             // Not served: an inbound MCP endpoint is opt-in, deliberately.
             mcp_serve_port: None,
+            code_sandbox_image: None,
+            code_sandbox_interpreter: Vec::new(),
         }
     }
 }
@@ -548,7 +583,40 @@ impl Config {
         {
             return Err(ConfigError::RelativeModelApiKeyRef);
         }
+        self.validate_code_sandbox()?;
         self.validate_policy()?;
+        Ok(())
+    }
+
+    /// Validates the code sandbox pair: both or neither, and each a usable value.
+    ///
+    /// An image with no interpreter has nothing to run and an interpreter with no image has nowhere to run, so
+    /// either alone is refused at startup rather than registered as a tool that fails every call. Whitespace in
+    /// the image is refused because an image reference has none, and a space would mean two arguments to the
+    /// runtime rather than one name.
+    fn validate_code_sandbox(&self) -> Result<(), ConfigError> {
+        let image = self.daemon.code_sandbox_image.as_deref();
+        let interpreter = &self.daemon.code_sandbox_interpreter;
+        match (image, interpreter.is_empty()) {
+            (None, true) => return Ok(()),
+            (Some(_), false) => {}
+            _ => return Err(ConfigError::IncompleteCodeSandbox),
+        }
+        let usable = |value: &str| {
+            !value.trim().is_empty()
+                && value.len() <= MAX_CODE_SANDBOX_ARGUMENT_BYTES
+                && !value.chars().any(char::is_control)
+        };
+        if let Some(image) = image
+            && (!usable(image) || image.chars().any(char::is_whitespace))
+        {
+            return Err(ConfigError::InvalidCodeSandbox);
+        }
+        if interpreter.len() > MAX_CODE_SANDBOX_INTERPRETER_ARGUMENTS
+            || !interpreter.iter().all(|argument| usable(argument))
+        {
+            return Err(ConfigError::InvalidCodeSandbox);
+        }
         Ok(())
     }
 
@@ -824,6 +892,18 @@ pub enum ConfigError {
          daemon.executor_model = openai-compatible"
     )]
     ModelProviderWithoutImplementation,
+    /// Only one half of the code sandbox was configured.
+    #[error(
+        "daemon.code_sandbox_image and daemon.code_sandbox_interpreter must be set together: an image \
+         with nothing to run, or an interpreter with nowhere to run it, is a tool that would fail every call"
+    )]
+    IncompleteCodeSandbox,
+    /// A code sandbox value was blank, oversized, contained a control character, or the image had whitespace.
+    #[error(
+        "daemon.code_sandbox_image must be an image reference with no whitespace, and \
+         daemon.code_sandbox_interpreter a short list of non-blank arguments"
+    )]
+    InvalidCodeSandbox,
     /// The API key file path was not absolute.
     ///
     /// Refused for the same reason the configuration path is: a relative path resolves against the
@@ -982,6 +1062,8 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "executor_api_key_ref",
                 "tool_workspace_roots",
                 "mcp_serve_port",
+                "code_sandbox_image",
+                "code_sandbox_interpreter",
             ],
             &mut unknown,
         );
@@ -1186,6 +1268,29 @@ fn apply_provider_environment(
                 });
             }
             daemon.executor_api_key_ref = Some(PathBuf::from(path));
+        }
+        "JARVIS_CODE_SANDBOX_IMAGE" => {
+            let image = environment_text(value, "JARVIS_CODE_SANDBOX_IMAGE")?;
+            if image.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvironmentValue {
+                    key: "JARVIS_CODE_SANDBOX_IMAGE",
+                    expected: "a non-empty container image reference",
+                });
+            }
+            daemon.code_sandbox_image = Some(image.to_owned());
+        }
+        "JARVIS_CODE_SANDBOX_INTERPRETER" => {
+            // Whitespace-separated, because an environment variable is one string. An interpreter whose own
+            // arguments contain a space belongs in the document, where it is an array.
+            let text = environment_text(value, "JARVIS_CODE_SANDBOX_INTERPRETER")?;
+            let words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+            if words.is_empty() {
+                return Err(ConfigError::InvalidEnvironmentValue {
+                    key: "JARVIS_CODE_SANDBOX_INTERPRETER",
+                    expected: "a command such as `python3 -c`",
+                });
+            }
+            daemon.code_sandbox_interpreter = words;
         }
         _ => return Ok(false),
     }
@@ -1940,6 +2045,83 @@ shutdown_timeout_seconds = 20
         );
     }
 
+    /// The code sandbox is an image **and** an interpreter, from the document or the environment.
+    #[test]
+    fn the_code_sandbox_is_configurable_from_document_and_environment() {
+        let document = V1_CONFIG.replace(
+            "[daemon]",
+            "[daemon]\ncode_sandbox_image = \"python:3.13-slim\"\ncode_sandbox_interpreter = [\"python3\", \"-c\"]",
+        );
+        let loaded = Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>())
+            .unwrap_or_else(|error| panic!("a complete pair must load: {error}"));
+        let daemon = loaded.config().daemon();
+        assert_eq!(daemon.code_sandbox_image(), Some("python:3.13-slim"));
+        assert_eq!(daemon.code_sandbox_interpreter(), ["python3", "-c"]);
+
+        let from_environment = Config::parse_with_environment(
+            V1_CONFIG,
+            [
+                ("JARVIS_CODE_SANDBOX_IMAGE", "node:22-alpine"),
+                ("JARVIS_CODE_SANDBOX_INTERPRETER", "node -e"),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("the environment must be able to supply the pair: {error}"));
+        assert_eq!(
+            from_environment
+                .config()
+                .daemon()
+                .code_sandbox_interpreter(),
+            ["node", "-e"]
+        );
+    }
+
+    /// Half a sandbox is refused at startup, in both directions, rather than registered as a tool that fails.
+    #[test]
+    fn half_a_code_sandbox_is_refused() {
+        let image_only = Config::parse_with_environment(
+            V1_CONFIG,
+            [("JARVIS_CODE_SANDBOX_IMAGE", "node:22-alpine")],
+        );
+        assert!(
+            matches!(image_only, Err(ConfigError::IncompleteCodeSandbox)),
+            "{image_only:?}"
+        );
+        let interpreter_only = Config::parse_with_environment(
+            V1_CONFIG,
+            [("JARVIS_CODE_SANDBOX_INTERPRETER", "node -e")],
+        );
+        assert!(
+            matches!(interpreter_only, Err(ConfigError::IncompleteCodeSandbox)),
+            "{interpreter_only:?}"
+        );
+    }
+
+    /// An image reference with whitespace would be two arguments to the runtime, and a blank value is nothing.
+    #[test]
+    fn an_unusable_code_sandbox_value_is_refused() {
+        let spaced = Config::parse_with_environment(
+            V1_CONFIG,
+            [
+                ("JARVIS_CODE_SANDBOX_IMAGE", "node:22 --privileged"),
+                ("JARVIS_CODE_SANDBOX_INTERPRETER", "node -e"),
+            ],
+        );
+        assert!(
+            matches!(spaced, Err(ConfigError::InvalidCodeSandbox)),
+            "{spaced:?}"
+        );
+        let empty = Config::parse_with_environment(
+            V1_CONFIG,
+            [
+                ("JARVIS_CODE_SANDBOX_IMAGE", "   "),
+                ("JARVIS_CODE_SANDBOX_INTERPRETER", "node -e"),
+            ],
+        );
+        assert!(
+            matches!(empty, Err(ConfigError::InvalidEnvironmentValue { .. })),
+            "{empty:?}"
+        );
+    }
     #[cfg(unix)]
     fn non_unicode_os_string() -> OsString {
         use std::os::unix::ffi::OsStringExt;
