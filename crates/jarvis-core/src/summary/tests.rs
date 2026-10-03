@@ -294,7 +294,6 @@ fn loss_metadata_is_bounded_at_both_ends() {
 }
 
 /// **The compression ratio is reported when the input's size is known, and absent when it is not.**
-///
 /// `None` rather than a guess, because a producer that did not measure its input must not report a figure: a
 /// fabricated ratio is worse than an absent one, exactly as an invented approver would be. And a ratio **above
 /// one is permitted and asserted** — a summary of a very short exchange is legitimately longer, and refusing
@@ -310,12 +309,52 @@ fn the_compression_ratio_is_reported_only_when_the_input_size_is_known() {
     let ratio = known
         .compression_ratio(&short)
         .unwrap_or_else(|| panic!("a known source size yields a ratio"));
-    assert!(ratio < 1.0, "a summary of 900 characters is shorter: {ratio}");
+    assert!(
+        ratio < 1.0,
+        "a summary of 900 characters is shorter: {ratio}"
+    );
 
     // The permitted direction: a summary larger than its source. Constructed from a *zero-length* source,
     // which is the one case the ratio cannot express — asserted as `None` so the division cannot panic.
     let empty_source = must(SummaryLoss::new(1, Some(0)));
     assert_eq!(empty_source.compression_ratio(&short), None);
+}
+
+/// **A span is inside a session only when every message it names exists, and the count is a strict bound.**
+///
+/// The rule that stops a summary claiming turns that were never written — and the reason it must be *strict*
+/// is the whole point of the test. Sequences run `0..count-1`, so a span whose `last` equals the count names
+/// one message too many. Written as `<=` the check accepts `4..4` against a 4-message session, which is the
+/// off-by-one a range check gets by default.
+///
+/// Both ends are asserted, including the empty session: with no messages there is no turn to summarize, and a
+/// check that treated `0 >= 0` as acceptable would record a summary of a conversation that has not happened.
+#[test]
+fn a_span_is_inside_a_session_only_when_every_message_it_names_exists() {
+    let session_id = session();
+    let span = |first, last| must(SummarySpan::new(session_id, first, last));
+
+    // Four messages, sequences 0..3.
+    assert!(
+        span(0, 3).covers_only_existing_messages(4),
+        "the whole session"
+    );
+    assert!(span(2, 3).covers_only_existing_messages(4), "a suffix");
+    assert!(span(0, 0).covers_only_existing_messages(4), "one message");
+
+    // The exact boundary: `last == count` names a message that does not exist.
+    assert!(
+        !span(0, 4).covers_only_existing_messages(4),
+        "a span ending at the count names one message too many"
+    );
+    assert!(
+        !span(4, 4).covers_only_existing_messages(4),
+        "a span entirely past the end is refused"
+    );
+
+    // An empty session has no turn to summarize, in either direction.
+    assert!(!span(0, 0).covers_only_existing_messages(0));
+    assert!(!span(0, 1).covers_only_existing_messages(0));
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -336,12 +375,18 @@ fn overlapping_spans_are_detected_in_both_directions() {
     // Identical, contained, and straddling — three ways two spans overlap.
     assert!(spans_overlap(span(1, 4), span(1, 4)), "identical spans");
     assert!(spans_overlap(span(1, 9), span(3, 5)), "a contained span");
-    assert!(spans_overlap(span(3, 5), span(1, 9)), "the same pair reversed");
+    assert!(
+        spans_overlap(span(3, 5), span(1, 9)),
+        "the same pair reversed"
+    );
     assert!(spans_overlap(span(1, 4), span(4, 8)), "sharing one message");
 
     // And disjoint spans do not, including adjacent ones — the boundary each direction must get right.
     assert!(!spans_overlap(span(1, 4), span(5, 8)), "adjacent spans");
-    assert!(!spans_overlap(span(5, 8), span(1, 4)), "the same pair reversed");
+    assert!(
+        !spans_overlap(span(5, 8), span(1, 4)),
+        "the same pair reversed"
+    );
     // A different session never overlaps, whatever the sequences, because the relation is about one session.
     let other = must(SummarySpan::new(session(), 1, 4));
     assert!(!spans_overlap(span(1, 4), other), "a different session");
@@ -409,7 +454,11 @@ fn the_summary_is_about_the_subject_the_caller_supplied() {
     }));
     let record = must(value.into_record());
     assert_eq!(
-        record.entities().iter().map(crate::memory::EntityRef::entity_id).collect::<Vec<_>>(),
+        record
+            .entities()
+            .iter()
+            .map(crate::memory::EntityRef::entity_id)
+            .collect::<Vec<_>>(),
         vec![entity],
         "the summary must be about exactly the subject the caller named"
     );

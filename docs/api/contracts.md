@@ -311,6 +311,39 @@ forget, and export.
 | `/api/v1/memories/{id}/confirm` | `POST` | **accepts a proposal**, recording who accepted it |
 | `/api/v1/memories/{id}/forget` | `POST` | deletes it, returning a `DeletionReceipt` |
 
+### Session summaries
+
+`P4-015`. The route is under `sessions`, because the **session** is what is being summarized and its identifier
+is what the path names; that the result is stored as a memory is the daemon's concern.
+
+| Route | Verb | What it answers |
+| --- | --- | --- |
+| `/api/v1/sessions/{id}/summaries` | `POST` | records a compressed summary of a span of turns |
+| `/api/v1/sessions/{id}/summaries` | `GET` | the session's **current** summaries, largest span first |
+| `/api/v1/sessions/{id}/summaries/retire` | `POST` | applies the retention rule, archiving them |
+
+**A summary's trust is not a request field.** `SummarizeSessionRequest` has no `confidence`, `status`, or
+`trust`, and there is no `MemorySourceKind` in it either: a summary is always `Conversation` + `Document`, hence
+`Derived`. A caller able to send `authoritative` could present a model's compression as the user's own words,
+which is the one outcome the slice names as forbidden.
+
+**The span is required and is checked against the transcript.** `first_sequence`, `last_sequence`, and
+`turns_covered` are all in the body; the last is validated **against** the span's width rather than derived from
+it, so a producer that read one range and reported another is refused instead of storing a compression ratio
+computed from the wrong denominator. `source_chars` is optional, and absent means "not measured" — no ratio is
+reported from a zero, because a fabricated compression figure is worse than an absent one.
+
+**A span is refused `422` when it names turns the session does not have, when its turn count disagrees with its
+width, or when it overlaps a stored span** — and the overlap refusal **names the stored range**, because a
+producer summarizing a long session in pieces has to know which turns are done. `422` rather than `503`: all
+three are requests a caller can fix, and a retryable status would send it to retry a request that can never
+succeed.
+
+**The complement is on the reply.** `unsummarized` lists the ranges no summary covers, oldest first, because
+that is what a producer needs in order to continue — and deriving it from the stored spans is the subtraction
+that omits the range between two adjacent covered spans. The same list appears once on the list reply rather
+than per summary, since it is a fact about the session.
+
 **The two write verbs that change trust require `expected_version`**, as the skill verbs do, and every read
 returns it — a guard value a client cannot obtain is one it cannot send.
 

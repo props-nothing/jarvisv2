@@ -1,48 +1,49 @@
 //! Durable storage for session summaries (`P4-015`).
 //!
 //! A summary is recorded as a `memories` row and, separately, a `session_summaries` row naming the turns it
-//! compressed. `into_record` produces the memory; this adapter writes both halves **in one transaction** and
-//! answers the one question the writer cannot answer alone.
+//! compressed. `SessionSummary::into_record` produces the memory; this adapter writes both halves **in one
+//! transaction** and answers the one question the writer cannot answer alone: has this session already been
+//! summarized here?
 //!
-//! # The overlap check is read-then-write, and that is why it is one transaction
+//! # The overlap check is read-then-write, and that is why it must be one transaction
 //!
 //! The write refuses to record a summary of turns another summary already covers. That check is a `SELECT`
-//! over `session_summaries` followed by two inserts, and a deferred transaction that reads and then writes
-//! fails with `SQLITE_BUSY_SNAPSHOT` if another connection commits in between — which is the failure
-//! `purge_memory` records in its own note, found the same way. So the check and both writes run on **one**
-//! connection, through this one function, and a caller cannot split them.
+//! followed by two inserts, and a deferred transaction that reads and then writes fails with
+//! `SQLITE_BUSY_SNAPSHOT` if another connection commits in between — the failure `purge_memory` records in its
+//! own note, found the same way. So the check and both writes run on **one** connection, through this one
+//! function, and a caller cannot split them.
 //!
 //! # What this module deliberately does not do
 //!
 //! It does not compose the summary text. Compression is a model's job and the *quality* of the text is not
 //! something a schema can judge; what the schema and this adapter enforce is that whatever text arrives is
 //! **attributed**: `Conversation` type, `Document` source kind (so `Derived` trust), a locator naming the
-//! session and the exact span, and the span recorded against the transcript it claims. That is the half of
-//! "is never presented as user-authored fact" that is checkable.
+//! session and the exact span, and the span recorded against the transcript it claims. That is the checkable
+//! half of "is never presented as user-authored fact".
 //!
-//! It also does not delete a summary whose span a newer summary subsumes. Supersession is a status
-//! transition on the memory (`MemoryRecord::supersede`), and the overlap check refuses to *create* the
-//! overlap in the first place — which is the cheaper moment to notice it.
+//! It also does not delete a summary a newer one subsumes. Supersession is a status transition on the memory
+//! (`MemoryRecord::supersede`), and the overlap check refuses to *create* the overlap — the cheaper moment to
+//! notice it, and the one where the reason is still visible.
 
 use jarvis_core::{
-    CurrentClock, MemorySearchKey, SessionId, SessionSummary, SummaryLoss, SummarySpan, UtcTimestamp,
-    spans_overlap,
+    MemoryRecord, MemorySearchKey, SessionId, SessionSummary, SummaryLoss, SummarySpan,
+    UtcTimestamp, spans_overlap,
 };
 use sqlx::Row;
 
 use crate::database::{DatabaseError, SqliteDatabase};
+use crate::memory_repository::{insert_memory_on, invalid_memory_field};
 
 /// One stored summary, with the span and loss that make it a summary.
 ///
-/// # Why the span and loss are returned and not only the memory id
+/// # Why the span and loss are returned and not only the memory identifier
 ///
-/// They are what a caller needs to decide anything about a summary and what no `memories` column holds. A
-/// consumer that had to reconstruct the span from the source locator would be parsing a string this module
-/// formats, which is a contract kept in two places and broken by editing either.
+/// They are what a caller needs to decide anything about a summary, and they are exactly what no `memories`
+/// column holds. A consumer that had to reconstruct the span from the source locator would be parsing a
+/// string this module formats — a contract kept in two places and broken by editing either.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredSummary {
     memory_id: String,
-    session_id: String,
     span: SummarySpan,
     loss: SummaryLoss,
     created_at: UtcTimestamp,
@@ -63,8 +64,8 @@ impl StoredSummary {
 
     /// Returns what the summary compressed.
     #[must_use]
-    pub const fn loss(&self) -> &SummaryLoss {
-        &self.loss
+    pub const fn loss(&self) -> SummaryLoss {
+        self.loss
     }
 
     /// Returns when the summary was recorded.
@@ -76,57 +77,72 @@ impl StoredSummary {
 
 /// Records a summary and the span it covers, refusing an overlap with a summary already stored.
 ///
-/// `session_message_count` is the session's current message count, read by the caller — `jarvisd` holds the
-/// database and the transcript is its own concern. It is passed in rather than read here so the check happens
-/// on the **same connection and inside the same transaction** as the write: a caller that read the count
-/// first and then opened a transaction would be checking against a snapshot it no longer holds.
+/// `session_message_count` is the session's current message count, read by the caller. It is passed in rather
+/// than read here for a specific reason: `jarvisd` holds the database and the transcript is its own concern,
+/// and a caller that read the count first and then called this would be checking a span against a snapshot it
+/// no longer holds. Passing it in makes the caller fetch it on the path that is about to write.
 ///
 /// # Errors
 ///
-/// - [`DatabaseError::SummaryOverlapsExisting`] when a stored summary covers any of these turns.
 /// - [`DatabaseError::InvalidSummaryRequest`] when the span names turns the session does not have, or the
-///   claimed turn count disagrees with the span.
+///   claimed turn count disagrees with the span's width.
+/// - [`DatabaseError::SummaryOverlapsExisting`] when a stored summary covers any of these turns.
 /// - [`DatabaseError::MemoryDuplicate`] when a memory already exists for the summary's search key.
+/// - [`DatabaseError::StoredMemoryInvalid`] when the summary cannot be expressed as a memory.
 /// - [`DatabaseError::Sqlite`] for any other persistence failure.
 pub async fn record_summary(
     database: &SqliteDatabase,
     summary: &SessionSummary,
-    actor_name: &str,
+    session_message_count: i64,
 ) -> Result<StoredSummary, DatabaseError> {
-    // The span is checked against the transcript before anything is written, so a fabricated range never
-    // reaches the table. `covers_only_existing_messages` states the direction: the span must be a subset.
-    let message_count = crate::message_repository::count_messages(database, &summary.session_id().to_string())
-        .await
-        .map_err(|source| match source {
-            DatabaseError::SessionNotFound => DatabaseError::SessionNotFound,
-            other => other,
-        })?;
     let span = summary.span();
-    if !span.covers_only_existing_messages(message_count) {
-        return Err(DatabaseError::InvalidSummaryRequest {
-            field: "span",
-        });
+
+    // The span is checked against the transcript before anything is written, so a fabricated range never
+    // reaches the table. The direction is the one `covers_only_existing_messages` states in its name: the
+    // span must be a **subset** of the session's messages.
+    if !span.covers_only_existing_messages(session_message_count) {
+        return Err(DatabaseError::InvalidSummaryRequest { field: "span" });
     }
-    if summary.loss().turns_covered() != u32::try_from(span.message_count()).unwrap_or(u32::MAX) {
+
+    // The loss figures describe the input, so a count that disagrees with the span's width is a producer that
+    // read one range and reported another. Refused here rather than reconciled: trusting either one silently
+    // would store a compression ratio computed against the wrong denominator.
+    let width =
+        u32::try_from(span.message_count()).map_err(|_| DatabaseError::InvalidSummaryRequest {
+            field: "turns_covered",
+        })?;
+    if summary.loss().turns_covered != width {
         return Err(DatabaseError::InvalidSummaryRequest {
             field: "turns_covered",
         });
     }
 
-    let record = summary.into_record()?;
-    let key = MemorySearchKey::from(actor_name, record.content());
+    let record =
+        summary
+            .clone()
+            .into_record()
+            .map_err(|error| DatabaseError::StoredMemoryInvalid {
+                field: invalid_memory_field(&error),
+            })?;
+    let key = MemorySearchKey::new(record.memory_type(), record.entities(), record.content())
+        .map_err(|error| DatabaseError::StoredMemoryInvalid {
+            field: invalid_memory_field(&error),
+        })?;
 
-    let mut transaction = database.pool().begin().await.map_err(|source| {
-        DatabaseError::Sqlite {
-            operation: "begin a summary write",
-            source,
-        }
-    })?;
+    let mut transaction =
+        database
+            .pool()
+            .begin()
+            .await
+            .map_err(|source| DatabaseError::Sqlite {
+                operation: "begin a summary write",
+                source,
+            })?;
 
-    // The overlap check, on this connection. `spans_overlap` is `jarvis-core`'s rule, applied here to rows
-    // this query brings back rather than restated as a `WHERE` clause: the relation is
-    // session-equality plus interval intersection, and a SQL transcription of it would be a second
-    // definition that can disagree with the one the domain uses.
+    // The overlap check, on this connection. `spans_overlap` is `jarvis-core`'s relation, applied here to the
+    // rows this query brings back rather than transcribed into a `WHERE` clause: the rule is "same session and
+    // the intervals intersect", and a SQL version would be a second definition that can disagree with the one
+    // the domain uses.
     let existing = sqlx::query(
         "SELECT first_sequence, last_sequence FROM session_summaries WHERE session_id = ?1",
     )
@@ -138,57 +154,29 @@ pub async fn record_summary(
         source,
     })?;
     for row in &existing {
-        let stored = SummarySpan::new(
-            summary.session_id(),
-            read_sequence(row, "first_sequence")?,
-            read_sequence(row, "last_sequence")?,
-        )?;
+        let stored = decode_span(row, summary.session_id())?;
         if spans_overlap(stored, span) {
-            transaction.commit().await.map_err(|source| DatabaseError::Sqlite {
-                operation: "commit a summary write",
-                source,
-            })?;
+            commit(transaction, "a summary write").await?;
             return Err(DatabaseError::SummaryOverlapsExisting {
-                first_sequence: stored.first_sequence(),
-                last_sequence: stored.last_sequence(),
+                first_sequence: stored.first_sequence,
+                last_sequence: stored.last_sequence,
             });
         }
     }
 
-    // The memory half. The tombstone check and the duplicate resolution are deliberately **not** here: a
-    // tombstone for a summary's search key means the user removed a summary of these same words, and the
-    // resurrection rule is `record_memory`'s. A summary is not re-ingested from a source, so this write does
-    // not consult them — recorded as a limit in `docs/data/schema.md`.
-    let affected = insert_memory_in(&mut transaction, &record, &key).await?;
+    // The memory half, sharing `record_memory`'s statement rather than listing twenty-six columns a second
+    // time. A column omitted from a second copy is not a compile error; it is a memory stored with that field
+    // defaulted, and a defaulted `source_trust` would change whether its content may instruct.
+    let affected = insert_memory_on(&mut *transaction, &record, &key).await?;
     if affected == 0 {
-        transaction.commit().await.map_err(|source| DatabaseError::Sqlite {
-            operation: "commit a summary write",
-            source,
-        })?;
-        let existing_id =
-            find_memory_id_by_key_in(&mut transaction, record.workspace_id(), key.as_str())
-                .await
-                .unwrap_or(None);
+        let existing_id = find_key_on(&mut transaction, &record, key.as_str()).await?;
+        commit(transaction, "a summary write").await?;
         return Err(DatabaseError::MemoryDuplicate {
             existing_memory_id: existing_id.unwrap_or_default(),
         });
     }
 
-    for entity in record.entities() {
-        sqlx::query(
-            "INSERT INTO memory_entities (memory_id, entity_id, matched_by) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (memory_id, entity_id) DO UPDATE SET matched_by = excluded.matched_by",
-        )
-        .bind(record.id().to_string())
-        .bind(entity.entity_id().to_string())
-        .bind(entity.matched_by().as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| DatabaseError::Sqlite {
-            operation: "link a summary to its subject",
-            source,
-        })?;
-    }
+    link_entities_on(&mut transaction, &record).await?;
 
     sqlx::query(
         "INSERT INTO session_summaries (\
@@ -197,12 +185,15 @@ pub async fn record_summary(
     )
     .bind(record.id().to_string())
     .bind(summary.session_id().to_string())
-    .bind(span.first_sequence())
-    .bind(span.last_sequence())
-    .bind(i64::from(summary.loss().turns_covered()))
-    .bind(summary.loss().source_chars().map(|chars| {
-        i64::try_from(chars).unwrap_or(i64::MAX)
-    }))
+    .bind(span.first_sequence)
+    .bind(span.last_sequence)
+    .bind(i64::from(summary.loss().turns_covered))
+    .bind(
+        summary
+            .loss()
+            .source_chars
+            .map(|chars| i64::try_from(chars).unwrap_or(i64::MAX)),
+    )
     .execute(&mut *transaction)
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -210,26 +201,38 @@ pub async fn record_summary(
         source,
     })?;
 
-    transaction.commit().await.map_err(|source| DatabaseError::Sqlite {
-        operation: "commit a summary write",
-        source,
-    })?;
+    commit(transaction, "a summary write").await?;
 
     Ok(StoredSummary {
         memory_id: record.id().to_string(),
-        session_id: summary.session_id().to_string(),
         span,
-        loss: *summary.loss(),
+        loss: summary.loss(),
         created_at: record.created_at(),
     })
 }
 
-/// Reads a session's summaries, newest span first.
+/// Maximum summaries one read may return.
+pub const MAX_SUMMARY_PAGE: u32 = 128;
+
+/// Reads a session's **current** summaries, largest span first.
+///
+/// # Why this filters on `active` and the span read does not
+///
+/// The two reads answer different questions and the difference is deliberate. This one answers "what does this
+/// session's summary currently say", so it excludes a summary that was deleted **and** one that retention
+/// archived — `MemoryStatus::Archived` is "retained for audit, not retrieved as current truth", and a read that
+/// returned an archived summary would present a set-aside claim as the current one.
+///
+/// [`read_session_summary_spans`] does not filter, because the overlap check must still see a set-aside span:
+/// otherwise archiving or removing a summary would re-open its turns to a second claim about the same passage.
+/// An audit or export path that wants archived summaries reads them through the memory read, which includes
+/// archived rows — not through this one.
 ///
 /// # Errors
 ///
-/// Returns [`DatabaseError::Sqlite`] when the read fails, and [`DatabaseError::StoredSummaryInvalid`] when a
-/// stored row names a span the domain refuses.
+/// Returns [`DatabaseError::InvalidSummaryRequest`] when `limit` is out of range,
+/// [`DatabaseError::StoredSummaryInvalid`] when a stored row names a span the domain refuses, and
+/// [`DatabaseError::Sqlite`] when the read fails.
 pub async fn read_session_summaries(
     database: &SqliteDatabase,
     session_id: SessionId,
@@ -239,10 +242,10 @@ pub async fn read_session_summaries(
         return Err(DatabaseError::InvalidSummaryRequest { field: "limit" });
     }
     let rows = sqlx::query(
-        "SELECT s.memory_id, s.session_id, s.first_sequence, s.last_sequence, s.turns_covered, \
-                s.source_chars, m.created_at \
+        "SELECT s.memory_id, s.first_sequence, s.last_sequence, s.turns_covered, s.source_chars, \
+                m.created_at \
          FROM session_summaries s JOIN memories m ON m.id = s.memory_id \
-         WHERE s.session_id = ?1 AND m.status <> 'deleted' \
+         WHERE s.session_id = ?1 AND m.status = 'active' \
          ORDER BY s.last_sequence DESC, s.memory_id DESC LIMIT ?2",
     )
     .bind(session_id.to_string())
@@ -254,22 +257,22 @@ pub async fn read_session_summaries(
         source,
     })?;
 
-    rows.iter().map(|row| decode_summary(row, session_id)).collect()
+    rows.iter()
+        .map(|row| decode_summary(row, session_id))
+        .collect()
 }
 
-/// Maximum summaries one read may return.
-pub const MAX_SUMMARY_PAGE: u32 = 128;
-
-/// Reads the spans of a session's summaries, for the overlap check a caller runs before writing.
+/// Reads the spans of a session's summaries, lowest first.
 ///
-/// This is the input [`jarvis_core::is_offerable_as_context`] takes: a caller building a prompt supplies the
+/// This is the input [`jarvis_core::is_offerable_as_context`] takes: a caller assembling a prompt supplies the
 /// spans it is **replaying** and asks whether a summary may be offered. Exposed as its own read rather than
-/// left to `read_session_summaries` so a caller that wants only the spans does not decode loss metadata it
-/// will not use.
+/// left to [`read_session_summaries`] so a caller that wants only the spans does not decode loss metadata it
+/// will not use — and so "what has already been covered" is not a query that also returns text.
 ///
 /// # Errors
 ///
-/// Returns [`DatabaseError::Sqlite`] when the read fails.
+/// Returns [`DatabaseError::StoredSummaryInvalid`] when a stored row names a span the domain refuses, and
+/// [`DatabaseError::Sqlite`] when the read fails.
 pub async fn read_session_summary_spans(
     database: &SqliteDatabase,
     session_id: SessionId,
@@ -287,32 +290,27 @@ pub async fn read_session_summary_spans(
     })?;
 
     rows.iter()
-        .map(|row| {
-            SummarySpan::new(
-                session_id,
-                read_sequence(row, "first_sequence")?,
-                read_sequence(row, "last_sequence")?,
-            )
-            .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "span" })
-        })
+        .map(|row| decode_span(row, session_id))
         .collect()
 }
 
 /// Reads the message ranges a session's summaries **do not** cover, oldest first.
 ///
-/// # Why the caller needs this rather than the covered spans
+/// # Why the caller wants the complement rather than the covered spans
 ///
-/// "Is this session summarized" is the wrong question: a long session is summarized in pieces, and a
-/// consumer deciding whether to compress more needs the turns that remain — not the union of what is done.
-/// Returning the complement means the caller does not re-derive it by subtracting two sorted lists, which is
-/// the kind of arithmetic that quietly omits the range between two adjacent covered spans.
+/// "Is this session summarized" is the wrong question: a long session is summarized in pieces, and a consumer
+/// deciding whether to compress more needs the turns that **remain**, not the union of what is done. Returning
+/// the complement means the caller does not derive it by subtracting two sorted lists, which is the arithmetic
+/// that quietly omits the range between two adjacent covered spans.
 ///
-/// It is also the answer to "is the retention rule meaningful yet": with a complement of the whole transcript
-/// the summary has compressed nothing, and with an empty complement the transcript is fully represented.
+/// It is also the answer to whether the retention rule is meaningful yet. An empty complement means the
+/// transcript is fully represented by summaries — the state in which offering a summary stops being a
+/// duplicate — and a complement of the whole transcript means nothing has been compressed.
 ///
 /// # Errors
 ///
-/// Returns [`DatabaseError::Sqlite`] when the read fails.
+/// Returns [`DatabaseError::StoredSummaryInvalid`] when a stored row names a span the domain refuses, and
+/// [`DatabaseError::Sqlite`] when the read fails.
 pub async fn read_unsummarized_ranges(
     database: &SqliteDatabase,
     session_id: SessionId,
@@ -322,52 +320,185 @@ pub async fn read_unsummarized_ranges(
         return Ok(Vec::new());
     }
     let mut covered = read_session_summary_spans(database, session_id).await?;
-    covered.sort_by_key(|span| span.first_sequence());
+    covered.sort_by_key(|span| span.first_sequence);
 
     let mut gaps = Vec::new();
     let mut next = 0_i64;
     for span in covered {
-        if span.first_sequence() > next {
-            gaps.push(SummarySpan::new(
-                session_id,
-                next,
-                span.first_sequence() - 1,
-            )?);
+        if span.first_sequence > next {
+            gaps.push(
+                SummarySpan::new(session_id, next, span.first_sequence - 1)
+                    .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "gap" })?,
+            );
         }
-        next = next.max(span.last_sequence() + 1);
+        // `max` rather than assignment: two stored spans can overlap if they were written by another build,
+        // and a later span that ends earlier must not move the cursor backwards.
+        next = next.max(span.last_sequence + 1);
     }
     if next < message_count {
-        gaps.push(SummarySpan::new(session_id, next, message_count - 1)?);
+        gaps.push(
+            SummarySpan::new(session_id, next, message_count - 1)
+                .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "gap" })?,
+        );
     }
     Ok(gaps)
 }
 
-fn read_sequence(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> Result<i64, DatabaseError> {
-    row.try_get(field)
-        .map_err(|_| DatabaseError::StoredSummaryInvalid { field })
+/// Which session memories a retention sweep may archive, as a SQL predicate.
+///
+/// # Why this is derived from `MemoryType::is_durable` rather than written out
+///
+/// `docs/architecture/memory-and-context.md` says `Conversation` is the type whose "session retention applies",
+/// and `MemoryType::is_durable` already states which types those are: `Working` and `Conversation`. Writing the
+/// list again here as `memory_type IN ('working', 'conversation')` would be a **second definition of the same
+/// rule**, and the two would drift the first time a type is added — the drift being that a new session-scoped
+/// type is never collected, or a durable one is archived by a sweep. Generating the `IN` list from the
+/// predicate makes the schema's filter and the domain's rule the same fact.
+///
+/// `pub(crate)` because it is a query fragment: it is not a safe string to build a statement with, and the one
+/// caller below is the statement that uses it.
+pub(crate) fn collection_predicate() -> String {
+    let names: Vec<String> = jarvis_core::MemoryType::all()
+        .iter()
+        .filter(|memory_type| !memory_type.is_durable())
+        .map(|memory_type| format!("'{}'", memory_type.as_str()))
+        .collect();
+    format!("memory_type IN ({})", names.join(", "))
+}
+
+/// Archives every summary of one session, returning how many rows changed.
+///
+/// # The retention rule, and why a summary has one
+///
+/// "Session retention applies" is the documented rule for a `Conversation` memory, and `P4-015` requires the
+/// summary to carry one. The rule is not a timer: a summary is archived when the **session** it belongs to is
+/// archived, because the session is the unit whose retention the rule names. Nothing expires on a clock here,
+/// which is consistent with `P4-008`'s recorded limit ("no retention policy is implemented — the verbs exist
+/// and the sweeper does not").
+///
+/// # Why this is archive and not delete
+///
+/// `MemoryStatus::Archived` is "retained for audit, not retrieved as current truth" — which is exactly the
+/// outcome wanted: a session's summary stops being offered, and the text is still there for the export and for a
+/// user who changes their mind. Deleting would also have to clear the search key and write a tombstone, turning
+/// a retention decision into a **forget**, which is a different verb with a different receipt.
+///
+/// # Why it does not filter on the session's own status
+///
+/// The caller decides *when*; this decides *what*. A statement that also read `sessions.status` would refuse to
+/// run after a hand-edit archived the session without setting the timestamp, and its count would silently be
+/// zero — the failure shape where a sweep reports success and did nothing.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the update fails.
+pub async fn archive_session_summaries(
+    database: &SqliteDatabase,
+    session_id: SessionId,
+    at: UtcTimestamp,
+) -> Result<u64, DatabaseError> {
+    // Both halves in one statement: the join restricts to this session's summaries, and the predicate from
+    // `collection_predicate` is what makes "this is a session-scoped record" a rule rather than a comment.
+    let sql = format!(
+        "UPDATE memories SET status = 'archived', updated_at = ?2, version = version + 1 \
+         WHERE id IN (SELECT memory_id FROM session_summaries WHERE session_id = ?1) \
+           AND status = 'active' AND {}",
+        collection_predicate()
+    );
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(session_id.to_string())
+        .bind(at.to_string())
+        .execute(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "archive a session's summaries",
+            source,
+        })?;
+    Ok(result.rows_affected())
+}
+
+/// Commits a transaction, naming the operation for the error.
+async fn commit(
+    transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
+    operation: &'static str,
+) -> Result<(), DatabaseError> {
+    transaction
+        .commit()
+        .await
+        .map_err(|source| DatabaseError::Sqlite { operation, source })
+}
+
+/// Writes the memory's entity links on this connection.
+async fn link_entities_on(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &MemoryRecord,
+) -> Result<(), DatabaseError> {
+    for entity in record.entities() {
+        sqlx::query(
+            "INSERT INTO memory_entities (memory_id, entity_id, matched_by) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (memory_id, entity_id) DO UPDATE SET matched_by = excluded.matched_by",
+        )
+        .bind(record.id().to_string())
+        .bind(entity.entity_id().to_string())
+        .bind(entity.matched_by().as_str())
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "link a summary to its subject",
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Finds the memory already recorded for this search key, on this connection.
+async fn find_key_on(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &MemoryRecord,
+    search_key: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let row = sqlx::query("SELECT id FROM memories WHERE workspace_id = ?1 AND search_key = ?2")
+        .bind(record.workspace_id().to_string())
+        .bind(search_key)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "find a memory by its search key",
+            source,
+        })?;
+    row.map(|row| {
+        row.try_get::<String, _>("id")
+            .map_err(|_| DatabaseError::StoredMemoryInvalid { field: "id" })
+    })
+    .transpose()
+}
+
+fn decode_span(
+    row: &sqlx::sqlite::SqliteRow,
+    session_id: SessionId,
+) -> Result<SummarySpan, DatabaseError> {
+    let sequence = |field: &'static str| -> Result<i64, DatabaseError> {
+        row.try_get(field)
+            .map_err(|_| DatabaseError::StoredSummaryInvalid { field })
+    };
+    SummarySpan::new(
+        session_id,
+        sequence("first_sequence")?,
+        sequence("last_sequence")?,
+    )
+    .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "span" })
 }
 
 fn decode_summary(
     row: &sqlx::sqlite::SqliteRow,
     session_id: SessionId,
 ) -> Result<StoredSummary, DatabaseError> {
-    let fields = |field: &'static str| -> Result<String, DatabaseError> {
-        row.try_get(field)
-            .map_err(|_| DatabaseError::StoredSummaryInvalid { field })
-    };
-    let span = SummarySpan::new(
-        session_id,
-        read_sequence(row, "first_sequence")?,
-        read_sequence(row, "last_sequence")?,
-    )
-    .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "span" })?;
+    let span = decode_span(row, session_id)?;
     let turns_covered = row
         .try_get::<i64, _>("turns_covered")
-        .map_err(|_| DatabaseError::StoredSummaryInvalid {
-            field: "turns_covered",
-        })?;
-    let turns_covered =
-        u32::try_from(turns_covered).map_err(|_| DatabaseError::StoredSummaryInvalid {
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(DatabaseError::StoredSummaryInvalid {
             field: "turns_covered",
         })?;
     let source_chars = row
@@ -383,21 +514,21 @@ fn decode_summary(
         .transpose()?;
     let loss = SummaryLoss::new(turns_covered, source_chars)
         .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "loss" })?;
-    let created_at = fields("created_at")?;
+    let created_at = row.try_get::<String, _>("created_at").map_err(|_| {
+        DatabaseError::StoredSummaryInvalid {
+            field: "created_at",
+        }
+    })?;
     Ok(StoredSummary {
-        memory_id: fields("memory_id")?,
-        session_id: session_id.to_string(),
+        memory_id: row
+            .try_get::<String, _>("memory_id")
+            .map_err(|_| DatabaseError::StoredSummaryInvalid { field: "memory_id" })?,
         span,
         loss,
         created_at: crate::memory_repository::parse_timestamp(&created_at, "created_at")?,
     })
 }
 
-/// Re-exported so this module's callers do not need the memory repository for the write it delegates.
-use crate::memory_repository::{find_memory_id_by_key_in, insert_memory_in};
-
-/// The clock a caller may use when it has none of its own, so a call site cannot forget one.
-#[must_use]
-pub fn system_clock() -> CurrentClock {
-    CurrentClock
-}
+#[cfg(test)]
+#[path = "summary_tests.rs"]
+mod tests;

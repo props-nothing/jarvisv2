@@ -464,6 +464,38 @@ pub enum DatabaseError {
         /// Stable field name without the offending value.
         field: &'static str,
     },
+    /// A summary request violated a bound or a relationship between its own parts.
+    ///
+    /// Separate from [`Self::InvalidMemoryRequest`] because the field names here belong to a **summary** — its
+    /// span and its loss figures — and a caller told `content` was invalid when the span is what is wrong would
+    /// be sent to the wrong half of its own input.
+    #[error("the summary {field} is invalid")]
+    InvalidSummaryRequest {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// A summary's span intersects a span already summarized in this session.
+    ///
+    /// The stored range is carried because it is what the caller needs: a producer summarizing a session in
+    /// pieces has to know **which** turns are done, and a bare refusal would leave it re-reading the table to
+    /// find out. This is `jarvis_core::spans_overlap`'s refusal, reported with the evidence.
+    #[error("turns {first_sequence}..{last_sequence} of this session are already summarized")]
+    SummaryOverlapsExisting {
+        /// The first sequence of the stored span that overlaps.
+        first_sequence: i64,
+        /// The last sequence of the stored span that overlaps.
+        last_sequence: i64,
+    },
+    /// A stored `session_summaries` row contradicted the domain's own rules.
+    ///
+    /// A storage-integrity finding, as [`Self::StoredMemoryInvalid`] is for memories: a row written by another
+    /// build, restored from a backup, or edited outside JARVIS is reported rather than defaulted, because a
+    /// defaulted span is a provenance claim about turns that may not exist.
+    #[error("the stored summary has an invalid {field}")]
+    StoredSummaryInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
     /// No entity exists for the requested identifier.
     #[error("no entity exists for the requested identifier")]
     EntityNotFound,

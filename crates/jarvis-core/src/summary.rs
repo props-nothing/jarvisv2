@@ -51,8 +51,8 @@
 
 use crate::id::{MemoryId, SessionId, WorkspaceId};
 use crate::memory::{
-    MAX_MEMORY_CONTENT_CHARS, MemoryRecord, MemoryRecordParts, MemorySource, MemorySourceKind,
-    MemoryStatus, MemoryType, InvalidMemory,
+    InvalidMemory, MAX_MEMORY_CONTENT_CHARS, MemoryRecord, MemoryRecordParts, MemorySource,
+    MemorySourceKind, MemoryStatus, MemoryType,
 };
 use crate::sensitivity::Sensitivity;
 use crate::timestamp::UtcTimestamp;
@@ -97,7 +97,10 @@ impl SummaryLoss {
     ///
     /// Returns [`InvalidSummary::NoTurnsCovered`] for a zero count, and
     /// [`InvalidSummary::TooManyTurns`] above [`MAX_SUMMARIZED_TURNS`].
-    pub const fn new(turns_covered: u32, source_chars: Option<usize>) -> Result<Self, InvalidSummary> {
+    pub const fn new(
+        turns_covered: u32,
+        source_chars: Option<usize>,
+    ) -> Result<Self, InvalidSummary> {
         if turns_covered == 0 {
             return Err(InvalidSummary::NoTurnsCovered);
         }
@@ -244,7 +247,10 @@ impl std::fmt::Display for InvalidSummary {
                 "a summary may claim at most {MAX_SUMMARIZED_TURNS} covered turns"
             ),
             Self::InvertedSpan => {
-                write!(formatter, "a summary's covered span must not end before it begins")
+                write!(
+                    formatter,
+                    "a summary's covered span must not end before it begins"
+                )
             }
             Self::NoEntity => write!(
                 formatter,
@@ -252,7 +258,10 @@ impl std::fmt::Display for InvalidSummary {
                  its session"
             ),
             Self::SessionMismatch => {
-                write!(formatter, "a summary's span must name the session it summarizes")
+                write!(
+                    formatter,
+                    "a summary's span must name the session it summarizes"
+                )
             }
         }
     }
@@ -291,7 +300,9 @@ impl SessionSummary {
     /// two loss-metadata refusals.
     pub fn new(parts: SessionSummaryParts) -> Result<Self, InvalidSummary> {
         let text = parts.text.trim();
-        if text.chars().count() < MIN_SUMMARY_CHARS || text.chars().count() > MAX_MEMORY_CONTENT_CHARS {
+        if text.chars().count() < MIN_SUMMARY_CHARS
+            || text.chars().count() > MAX_MEMORY_CONTENT_CHARS
+        {
             return Err(InvalidSummary::Text);
         }
         if parts.span.session_id != parts.session_id {
@@ -319,7 +330,8 @@ impl SessionSummary {
         // of one fact: a producer reporting 20 turns over a 3-message span has a bug, and storing it would
         // make "how much did this compress" answerable two ways. The reverse is permitted — a span may cover
         // messages that contributed nothing, since a turn can be empty of extractable content.
-        if parts.loss.turns_covered > u32::try_from(parts.span.message_count()).unwrap_or(u32::MAX) {
+        if parts.loss.turns_covered > u32::try_from(parts.span.message_count()).unwrap_or(u32::MAX)
+        {
             return Err(InvalidSummary::NoTurnsCovered);
         }
         Ok(Self {

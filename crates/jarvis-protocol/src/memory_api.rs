@@ -329,6 +329,114 @@ pub struct SignalContribution {
     pub contribution: u32,
 }
 
+/// Request body for `POST /api/v1/sessions/{id}/summaries` (`P4-015`).
+///
+/// # Why the span replaces the session's message range as the caller's statement
+///
+/// A summary is *of* a range of turns, so the range is the claim. The caller states it explicitly rather than
+/// letting the daemon summarize "the whole session", because the daemon cannot tell a complete conversation
+/// from one whose tail has not been written yet — and a summary of turns `0..3` recorded as a summary of
+/// `0..9` would misattribute six turns nobody read.
+///
+/// # Why there is no `confidence`, `status`, or `trust` here
+///
+/// The same rule `RememberRequest` states, one step further. A summary is always `Derived` and `proposed` is
+/// never its status: a caller able to send `authoritative` would be able to present a model's compression as
+/// the user's own words, which is the single outcome `P4-015` names as forbidden. The values are set by
+/// `SessionSummary::into_record` and cannot be supplied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummarizeSessionRequest {
+    /// The compressed text. Bounded by the memory contract.
+    pub summary: String,
+    /// The sequence of the first message the summary covers, inclusive.
+    pub first_sequence: i64,
+    /// The sequence of the last message the summary covers, inclusive.
+    pub last_sequence: i64,
+    /// How many turns the summary covers, as the producer measured it.
+    ///
+    /// Required rather than derived from the span: the two are checked against each other, so a producer that
+    /// read one range and reported another is refused instead of storing a compression ratio computed from the
+    /// wrong denominator.
+    pub turns_covered: u32,
+    /// The characters in the input the summary was derived from, when the producer measured it.
+    ///
+    /// Optional, and absent means "not measured" rather than `0`: a fabricated compression figure is worse
+    /// than an absent one, and no ratio is reported from a zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chars: Option<usize>,
+    /// The entity the summary is about, by its stored identifier.
+    ///
+    /// Required, because a memory must name what it is about and a summary is about a conversation. Supplied
+    /// rather than resolved here, following the remember path: there is no entity resolution yet (`P4-008`
+    /// limit), so a caller that does not hold an identifier gets a refusal rather than a placeholder subject.
+    pub entity_id: String,
+}
+
+/// Reply body for a summarize.
+///
+/// # Why this is not `MemoryReply`
+///
+/// `MemoryReply` answers "what is the state of this memory now". A summary's reply has to answer something a
+/// memory reply cannot: **which turns were covered**, and what is left. A caller that had to re-read the
+/// summaries to find out would be doing the work the write already did, and would derive the complement by the
+/// subtraction that omits the range between two adjacent spans.
+/// # Why this is not `Eq`
+///
+/// It carries a compression ratio, which is an `f64` and therefore has no total equality. `PartialEq` is kept
+/// so a test can compare a reply, and `Eq` is dropped rather than the field being moved to a string — a ratio
+/// rendered into text would be a second representation of one number, and the two could disagree about its
+/// precision.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SummaryReply {
+    /// The identifier of the memory holding the summary text.
+    pub memory_id: String,
+    /// The session it summarizes.
+    pub session_id: String,
+    /// The covered span's first sequence.
+    pub first_sequence: i64,
+    /// The covered span's last sequence.
+    pub last_sequence: i64,
+    /// How many turns were covered, as stored.
+    pub turns_covered: u32,
+    /// The characters the summary compressed, absent when unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chars: Option<usize>,
+    /// How much smaller the summary is than its input, absent when the input was not measured.
+    ///
+    /// A figure **above one is reported rather than refused**: a summary of a short exchange is legitimately
+    /// longer, and reporting it is what lets a caller decide not to store one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// The turns of the session that no summary covers, oldest first.
+    ///
+    /// The complement is on the reply because it is what a producer summarizing a long session in pieces needs,
+    /// and deriving it from the stored spans is the arithmetic that drops the range between two adjacent ones.
+    pub unsummarized: Vec<SequenceRange>,
+}
+
+/// One inclusive range of message sequences.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SequenceRange {
+    /// The first sequence, inclusive.
+    pub first_sequence: i64,
+    /// The last sequence, inclusive.
+    pub last_sequence: i64,
+}
+
+/// Reply body for `GET /api/v1/sessions/{id}/summaries`.
+///
+/// Not `Eq`, for the reason [`SummaryReply`] gives: it holds replies that carry a ratio.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SummaryListReply {
+    /// The summaries, largest span first.
+    pub summaries: Vec<SummaryReply>,
+    /// How many were returned.
+    pub returned: u32,
+    /// The bound that was applied, so a caller can tell a complete listing from a truncated one.
+    pub limit: u32,
+}
+
 /// Reply body for `GET /api/v1/memories/export`.
 ///
 /// # Why the export carries content

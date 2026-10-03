@@ -87,6 +87,28 @@ own high-impact class, and a `model_inference` is a proposal **at any confidence
 truth would be the "second signal" its `unverified` level is documented as needing. So a client cannot record
 either as a fact by asserting a status, and the derivation runs on every write *and* every decode.
 
+**A summary is a memory plus the span it compressed** (`P4-015`, `ADR-0125`). Step 6 above — "compact or
+summarize only with source links and loss metadata" — is satisfied by two halves: the text is an ordinary
+`memories` row with `Conversation` type and `Document` source (hence `Derived` trust), and the turns it covers
+are a `session_summaries` row keyed by that memory's identifier. The loss metadata is stored rather than
+derived, because it measures the **input** and the input is the transcript, which changes.
+
+Two rules about a span have no schema, because `session_summaries` cannot see `messages` and SQLite cannot
+express an interval non-intersection without a trigger. They are enforced in the writer, on one connection with
+its writes: a span must name only turns the session has, and two spans in one session must not intersect. The
+second is what stops a session being summarized twice over the same passage, which would be two claims about it
+with no way for a reader to tell which is current.
+
+**Retention for a session's summaries is an explicit verb**, following `MemoryType::is_durable` — which is where
+"session retention policy" in the table above is decided. `POST /sessions/{id}/summaries/retire` archives them:
+`Archived` is "retained for audit, not retrieved as current truth", so the text survives the sweep and simply
+stops being a current claim. Nothing expires on a clock, which is consistent with `P4-008`'s recorded limit.
+
+**A summary is offered as context only when the turns it compressed are no longer replayed.** Offering both a
+summary and its transcript would present one passage twice, and the second copy reads as independent
+corroboration of the first — the same error `MODEL_MEMORY_TYPES` excludes `Conversation` to avoid. The predicate
+takes the spans a caller is replaying, because this is a fact about the session rather than about the summary.
+
 
 ## Provenance And Trust
 

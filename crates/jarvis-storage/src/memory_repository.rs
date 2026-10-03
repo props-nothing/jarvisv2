@@ -432,7 +432,7 @@ pub async fn record_memory(
 /// with `SQLITE_BUSY_SNAPSHOT` when it reads and then writes. Each caller sequences them for its own case.
 ///
 /// Returns the number of rows affected — zero means the `ON CONFLICT` clause suppressed the insert.
-async fn insert_memory_on<'c, E>(
+pub(crate) async fn insert_memory_on<'c, E>(
     executor: E,
     record: &MemoryRecord,
     search_key: &MemorySearchKey,
@@ -2267,7 +2267,7 @@ const fn memory_error(error: &jarvis_core::InvalidMemory) -> DatabaseError {
 /// The field name is stable and the offending value is never included: a memory's content is user-authored
 /// text and its source locator can name a provider identifier, so an error carrying either could put content
 /// in a log. `Debug` of the domain error is deliberately not used for the same reason.
-const fn invalid_memory_field(error: &jarvis_core::InvalidMemory) -> &'static str {
+pub(crate) const fn invalid_memory_field(error: &jarvis_core::InvalidMemory) -> &'static str {
     use jarvis_core::InvalidMemory as Field;
     // Several variants name the same column, and that is the point rather than an accident: `Content` and
     // `DeletedRetainsText` are two rules about one column, and `SupersedesMissing`/`SupersedesSelf` are two

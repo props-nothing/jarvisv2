@@ -156,6 +156,14 @@ Logical secret ID, provider/store, owner scope, purpose, version/rotation timest
 
 Fields described in [memory-and-context.md](../architecture/memory-and-context.md), including type, content, structured claim, source, confidence, importance, sensitivity, validity, status, supersession, actor, embedding metadata, and timestamps.
 
+### `session_summaries`
+
+The span a summary covers, keyed by the memory that holds its text: session, first and last sequence (inclusive), turns covered, and the characters the input held (`NULL` when unmeasured). Added by `P4-015`; see [ADR-0125](../adr/0125-a-summary-is-a-memory-plus-a-span.md).
+
+Two rules here have **no schema**: the span must name only turns the session has, and two spans in one session must not intersect. SQLite cannot see `messages` from this table and cannot express an interval non-intersection without a trigger, so both are enforced in `record_summary` — which reads the message count and the session's stored spans on the same connection as its two inserts.
+
+The loss figures describe the **input**, so they are stored rather than derived: the input is the transcript and the transcript changes, so recomputing at read time would measure a summary of messages 1..4 against messages 1..400.
+
 ### `memory_embeddings`
 
 Memory, embedding model/version/dimensions, input hash, vector/blob, created timestamp. PostgreSQL uses pgvector; SQLite may use a selected local extension or an application-managed index. Rebuildable.

@@ -16,7 +16,7 @@ pub use memory_api::{
     ClaimBody, ConfirmMemoryRequest, CorrectMemoryRequest, DeletionReceipt, ExportedMemory,
     ForgetMemoryRequest, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference,
     MemoryReply, MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest,
-    SignalContribution,
+    SequenceRange, SignalContribution, SummarizeSessionRequest, SummaryListReply, SummaryReply,
 };
 pub use rest::{
     JSON_CONTENT_TYPE, MAX_STREAM_PAGE, RESYNC_HINT_SECONDS, RunEventPageReply, RunEventReply,

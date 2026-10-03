@@ -13,6 +13,7 @@ mod pgvector;
 mod run_event_repository;
 mod run_repository;
 mod session_repository;
+mod summary_repository;
 
 mod approval_repository;
 mod secret_store;
@@ -80,6 +81,10 @@ pub use skill_repository::{
     read_usable_skill_revisions, read_workspace_skill_revision_states,
     read_workspace_skill_revisions, record_skill_revision, restore_skill_revision,
     supersede_skill_revision,
+};
+pub use summary_repository::{
+    MAX_SUMMARY_PAGE, StoredSummary, archive_session_summaries, read_session_summaries,
+    read_session_summary_spans, read_unsummarized_ranges, record_summary,
 };
 pub use tool_call_repository::{
     CallBinding, CallOrigin, CallTarget, NewToolCall, StoredToolCall, admit_tool_call,

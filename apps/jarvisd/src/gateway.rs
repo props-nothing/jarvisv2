@@ -48,7 +48,7 @@ use jarvis_protocol::{
     ApprovalDecisionBody, ConfirmMemoryRequest, CorrectMemoryRequest, CreateSkillRequest,
     ForgetMemoryRequest, ForgetSkillRequest, MAX_STREAM_PAGE, MemorySearchRequest,
     PromoteSkillRequest, RememberRequest, RunEventPageReply, SkillTransitionRequest,
-    StartRunRequest, rest_error, safe,
+    StartRunRequest, SummarizeSessionRequest, rest_error, safe,
 };
 use jarvis_storage::{DatabaseError, SqliteDatabase, highest_run_event_sequence, read_run_events};
 use serde::{Deserialize, Serialize};
@@ -174,6 +174,14 @@ pub fn router(state: GatewayState) -> Router {
         .route("/memories/{id}/correct", post(correct_memory))
         .route("/memories/{id}/confirm", post(confirm_memory))
         .route("/memories/{id}/forget", post(forget_memory))
+        .route(
+            "/sessions/{id}/summaries",
+            get(list_session_summaries).post(summarize_session),
+        )
+        .route(
+            "/sessions/{id}/summaries/retire",
+            post(retire_session_summaries),
+        )
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/export", get(export_skills))
         .route("/skills/{id}", get(read_skill).delete(forget_skill))
@@ -1164,6 +1172,68 @@ async fn confirm_memory(
     }
 }
 
+/// `POST /api/v1/sessions/{id}/summaries`
+///
+/// Records a compressed summary of part of a session. The route is under `sessions` rather than `memories`
+/// because the **session** is what is being summarized and its identifier is what the path names; the fact
+/// that the result is stored as a memory is the daemon's concern, not the caller's.
+///
+/// The span is in the body rather than the path: it is two numbers that only make sense together, and a path
+/// like `/sessions/{id}/summaries/0..3` would make a range look like an identifier.
+async fn summarize_session(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<SummarizeSessionRequest>,
+) -> Response {
+    match state.memories().summarize_session(&id, &request).await {
+        // `201`, matching the run creation: a summary is a resource that did not exist before, and its
+        // identifier is in the reply. A `200` would tell a client the request was a read or an update.
+        Ok(reply) => (StatusCode::CREATED, Json(reply)).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `GET /api/v1/sessions/{id}/summaries`
+async fn list_session_summaries(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let limit = match parse_summary_limit(raw.as_deref()) {
+        Ok(limit) => limit,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, ErrorCode::Validation, message);
+        }
+    };
+    match state.memories().list_summaries(&id, limit).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// `POST /api/v1/sessions/{id}/summaries/retire`
+///
+/// The **retention rule** made reachable. `P4-008` records that nothing expires on its own: a session that is
+/// over is retired by a caller, and this archives every current summary of it. A `POST` rather than a `DELETE`,
+/// because the summaries are retained — `MemoryStatus::Archived` is "retained for audit, not retrieved as
+/// current truth" — and a `DELETE` would tell a client the data is gone.
+async fn retire_session_summaries(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.memories().retire_session_summaries(&id).await {
+        Ok(archived) => Json(RetiredSummariesReply { archived }).into_response(),
+        Err(error) => memory_error(&error),
+    }
+}
+
+/// Reply body for a retention sweep.
+#[derive(Debug, Serialize)]
+struct RetiredSummariesReply {
+    /// How many summaries stopped being current claims.
+    archived: u64,
+}
+
 /// `GET /api/v1/memories/export`
 ///
 /// The one memory read that returns **content**, because the user asked for their own data and an export
@@ -1197,6 +1267,37 @@ pub struct MemoryPageQuery {
     limit: Option<u32>,
     /// How many rows to skip, for an export that pages.
     offset: Option<u32>,
+}
+
+/// Parses the summary listing's `limit` parameter.
+///
+/// # Why this is a parser rather than `parse_memory_page`,
+/// despite reading the same parameter
+///
+/// The two bounds differ — `MAX_MEMORY_PAGE` is 200 and `MAX_SUMMARY_PAGE` is 128 — so sharing the parser would
+/// mean one of the two routes accepting a page the other refuses, and the *bound* is what a page parameter is
+/// for. The rule is stated once per bound rather than a shared maximum that is wrong for at least one of them.
+///
+/// # Errors
+///
+/// Returns a message naming the parameter that could not be read.
+fn parse_summary_limit(raw: Option<&str>) -> Result<u32, &'static str> {
+    let default = jarvis_storage::MAX_SUMMARY_PAGE;
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "limit" {
+            return value
+                .parse()
+                .map_err(|_| "the limit parameter is not a positive integer");
+        }
+    }
+    Ok(default)
 }
 
 /// Parses the memory listing's query parameters.
@@ -1521,19 +1622,36 @@ mod tests {
     /// Builds a router over a real migrated database, so the identity rows migration `0005`
     /// seeds are present without a fixture writing them.
     async fn test_router() -> (Router, String, TempProfile) {
+        let (app, _database, presented, profile) = test_router_and_database().await;
+        (app, presented, profile)
+    }
+
+    /// Builds a router **and** the database handle, for a test that seeds rows no route can write.
+    ///
+    /// The session and message tables are written by `P2-004` and read by several routes, and the only way to
+    /// create a session today is to start a run. Handing back the database handle rather than opening a second
+    /// connection keeps the fixture honest: the rows are committed through the same pool the handlers use.
+    async fn test_router_and_database() -> (
+        Router,
+        Arc<jarvis_storage::SqliteDatabase>,
+        String,
+        TempProfile,
+    ) {
         let profile = TempProfile::new();
-        let database = jarvis_storage::SqliteDatabase::open(&profile.database_path())
-            .await
-            .unwrap_or_else(|error| panic!("open fixture database: {error}"));
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
         let credential = ClientCredential::generate()
             .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
         let presented = credential.expose().to_owned();
         let state = GatewayState::new(
-            Arc::new(database),
+            Arc::clone(&database),
             credential,
             jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
         );
-        (router(state), presented, profile)
+        (router(state), database, presented, profile)
     }
 
     fn get_request(path: &str, credential: Option<&str>) -> Request<Body> {
@@ -4274,5 +4392,336 @@ mod tests {
     fn approval_asking_id() -> jarvis_tools::ToolId {
         jarvis_tools::ToolId::new(crate::approval_fixture::APPROVAL_TOOL)
             .unwrap_or_else(|error| panic!("the fixture identifier: {error}"))
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Session summaries (`P4-015`)
+    // ---------------------------------------------------------------------------------------------
+
+    /// Seeds a session holding **exactly** `messages` messages plus a conversation entity, returning both
+    /// identifiers.
+    ///
+    /// # Why the count is made exact rather than appended blindly
+    ///
+    /// Starting the run writes the objective as the session's first message, so appending `messages` of them
+    /// leaves `messages + 1` — which silently shifted every expected span by one when this fixture was first
+    /// written, and the spans still looked plausible. The fixture therefore asserts the count it promises,
+    /// using the count `count_messages` reports, so a change to what a run writes fails **here** rather than as
+    /// an off-by-one in a caller's expectations.
+    ///
+    /// # Why the session comes from `POST /api/v1/runs` rather than an `INSERT`
+    ///
+    /// There is no route that creates a session on its own, and the two ways to get one in a test are a raw
+    /// insert or the route that creates one **as part of starting a run**. The insert was the first attempt and
+    /// it required `SqliteDatabase::pool()` to become public — widening a production API so a test could write a
+    /// row. `start_run` returns the `session_id` in its reply, so the production path is available.
+    ///
+    /// The messages then go through `append_message`, the same writer the conversation path uses, so the
+    /// sequences a summary span is checked against are allocated by the component that owns that rule.
+    async fn seed_session(
+        app: &Router,
+        presented: &str,
+        database: &jarvis_storage::SqliteDatabase,
+        messages: i64,
+    ) -> (String, String) {
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/runs",
+                presented,
+                r#"{"objective":"a session to summarize"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = body_text(created).await;
+        let run: jarvis_protocol::RunReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        let session_id = run.session_id.clone();
+
+        // The run wrote one message, so this fills the session to the promised size.
+        let already = jarvis_storage::count_messages(database, &session_id)
+            .await
+            .unwrap_or_else(|error| panic!("count messages: {error}"));
+        assert_eq!(already, 1, "starting a run writes exactly one message");
+        for index in already..messages {
+            jarvis_storage::append_message(
+                database,
+                &session_id,
+                None,
+                &jarvis_core::NewMessage::new(
+                    format!("message {index}"),
+                    jarvis_core::MessageRole::User,
+                    jarvis_core::MessageSource::User,
+                    jarvis_core::Sensitivity::Internal,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("build message: {error}")),
+                jarvis_core::CorrelationId::new(),
+                jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("append message: {error}"));
+        }
+        let total = jarvis_storage::count_messages(database, &session_id)
+            .await
+            .unwrap_or_else(|error| panic!("count messages: {error}"));
+        assert_eq!(total, messages, "the fixture's promised transcript size");
+
+        let identity = jarvis_storage::load_local_identity(database)
+            .await
+            .unwrap_or_else(|error| panic!("load identity: {error}"));
+        let entity_id = jarvis_core::EntityId::new();
+        jarvis_storage::record_entity(
+            database,
+            &jarvis_storage::NewEntity {
+                id: entity_id,
+                workspace_id: identity
+                    .workspace_id()
+                    .parse()
+                    .unwrap_or_else(|error| panic!("parse workspace: {error}")),
+                kind: jarvis_storage::EntityKind::Conversation,
+                label: "A session".to_owned(),
+                attributes: None,
+                confidence: jarvis_core::MemoryConfidence::Confirmed,
+                created_at: jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed entity: {error}"));
+
+        (session_id, entity_id.to_string())
+    }
+
+    /// **A summary can be written over HTTP, read back, and its subject is what the reply claims.**
+    ///
+    /// The reachability proof `P4-015` needed: the domain, the storage rule, and the retention sweep all
+    /// existed and **no request could reach any of them**. Every assertion is on the reply body rather than on
+    /// the call's success, because a route wired to a stub would return `201` for anything.
+    #[tokio::test]
+    async fn a_session_summary_can_be_recorded_and_read_back() {
+        let (app, database, presented, _profile) = test_router_and_database().await;
+        let (session_id, entity_id) = seed_session(&app, &presented, &database, 6).await;
+
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &format!(
+                    r#"{{"summary":"Three turns compressed.","first_sequence":1,"last_sequence":3,
+                        "turns_covered":3,"source_chars":900,"entity_id":"{entity_id}"}}"#
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = body_text(created).await;
+        let reply: jarvis_protocol::SummaryReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.first_sequence, 1);
+        assert_eq!(reply.last_sequence, 3);
+        assert_eq!(reply.turns_covered, 3);
+        assert_eq!(reply.session_id, session_id);
+        assert!(
+            reply.compression_ratio.is_some(),
+            "a measured input yields a ratio: {body}"
+        );
+        // The complement, computed by the write: a prefix and a remainder, so the gap case is covered.
+        assert_eq!(
+            reply
+                .unsummarized
+                .iter()
+                .map(|range| (range.first_sequence, range.last_sequence))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (4, 5)]
+        );
+
+        let listed = app
+            .oneshot(get_request(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = body_text(listed).await;
+        let page: jarvis_protocol::SummaryListReply = serde_json::from_str(&listed_body)
+            .unwrap_or_else(|error| panic!("decode {listed_body}: {error}"));
+        assert_eq!(page.returned, 1);
+        assert_eq!(page.summaries[0].memory_id, reply.memory_id);
+        // The read reports no ratio, because this path does not load the text — asserted so the `None` is a
+        // decision rather than an accident.
+        assert_eq!(page.summaries[0].compression_ratio, None);
+    }
+
+    /// **A span already summarized is refused with a remedy, and the refusal is not a `503`.**
+    ///
+    /// The status matters as much as the body: a caller told `503` retries a request that can never succeed.
+    /// The detail names the stored range because that is what the caller needs to summarize the remaining
+    /// turns.
+    #[tokio::test]
+    async fn an_overlapping_summary_is_refused_with_the_range_that_is_taken() {
+        let (app, database, presented, _profile) = test_router_and_database().await;
+        let (session_id, entity_id) = seed_session(&app, &presented, &database, 6).await;
+        let body = |first: i64, last: i64, text: &str| {
+            format!(
+                r#"{{"summary":"{text}","first_sequence":{first},"last_sequence":{last},
+                    "turns_covered":{},"entity_id":"{entity_id}"}}"#,
+                last - first + 1
+            )
+        };
+
+        let first = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &body(0, 3, "The opening exchange."),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let overlapping = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &body(2, 5, "An overlapping range."),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            overlapping.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an overlap is a request the caller can fix, not an infrastructure failure"
+        );
+        let text = body_text(overlapping).await;
+        assert!(
+            text.contains("turns 0..3"),
+            "the refusal must name the range that is taken: {text}"
+        );
+
+        // The boundary: 4..5 begins where 0..3 ends and is accepted.
+        let adjacent = app
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &body(4, 5, "The closing exchange."),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(adjacent.status(), StatusCode::CREATED);
+    }
+
+    /// **A span past the end of the transcript is refused, so a summary cannot claim turns that do not exist.**
+    ///
+    /// The rule with no schema behind it: `session_summaries` cannot see `messages`, so this is the only place
+    /// the fabrication is stoppable — and over the wire, where the range arrives from a caller.
+    #[tokio::test]
+    async fn a_summary_span_past_the_transcript_is_refused() {
+        let (app, database, presented, _profile) = test_router_and_database().await;
+        let (session_id, entity_id) = seed_session(&app, &presented, &database, 4).await;
+
+        // 0..3 is the whole transcript. 0..4 names a message that does not exist.
+        let accepted = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &format!(
+                    r#"{{"summary":"The whole session.","first_sequence":0,"last_sequence":3,
+                        "turns_covered":4,"entity_id":"{entity_id}"}}"#
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+
+        let beyond = app
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &format!(
+                    r#"{{"summary":"One message too many.","first_sequence":4,"last_sequence":4,
+                        "turns_covered":1,"entity_id":"{entity_id}"}}"#
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(beyond.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = body_text(beyond).await;
+        assert!(
+            text.contains("span"),
+            "the refusal must name the span: {text}"
+        );
+    }
+
+    /// **The retention rule is reachable, and it retires the summary without deleting it.**
+    ///
+    /// `P4-015` requires a retention rule; `P4-008` records that the sweeper does not exist, so the rule is an
+    /// explicit verb. Both halves are asserted: the summary stops being read as a current claim, and it is
+    /// still **held** — an archived claim is retained for audit, and a `DELETE` would have told the client
+    /// otherwise.
+    #[tokio::test]
+    async fn retiring_a_session_archives_its_summaries_and_keeps_them() {
+        let (app, database, presented, _profile) = test_router_and_database().await;
+        let (session_id, entity_id) = seed_session(&app, &presented, &database, 4).await;
+
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                &presented,
+                &format!(
+                    r#"{{"summary":"Retired later.","first_sequence":0,"last_sequence":3,
+                        "turns_covered":4,"entity_id":"{entity_id}"}}"#
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let retired = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/sessions/{session_id}/summaries/retire"),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(retired.status(), StatusCode::OK);
+        let text = body_text(retired).await;
+        assert!(
+            text.contains("\"archived\":1"),
+            "one summary retired: {text}"
+        );
+
+        // The read stops returning it, and the export still holds it — the two halves of "archived".
+        let listed = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/api/v1/sessions/{session_id}/summaries"),
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let listed_body = body_text(listed).await;
+        let page: jarvis_protocol::SummaryListReply = serde_json::from_str(&listed_body)
+            .unwrap_or_else(|error| panic!("decode {listed_body}: {error}"));
+        assert_eq!(page.returned, 0, "an archived summary is not a current one");
+
+        let exported = app
+            .oneshot(get_request("/api/v1/memories/export", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(exported.status(), StatusCode::OK);
+        let exported_body = body_text(exported).await;
+        assert!(
+            exported_body.contains("Retired later."),
+            "the export must still hold the retired text: {exported_body}"
+        );
     }
 }

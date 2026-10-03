@@ -3505,8 +3505,57 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         status; that reasoning is asserted beside the declaration, so changing the status rule forces a decision
         about the approval.
 
-- [ ] `P4-015` Add session summarization as derived memory: a compressed summary of a session is stored as a
+- [x] `P4-015` Add session summarization as derived memory: a compressed summary of a session is stored as a
       `Derived` claim with provenance and a retention rule, and is never presented as user-authored fact.
+      **Domain vocabulary** in `crates/jarvis-core/src/summary.rs` (`SessionSummary`, `SummarySpan`,
+      `SummaryLoss`, `spans_overlap`, `is_offerable_as_context`, **15 tests**); **storage** in
+      `crates/jarvis-storage/src/summary_repository.rs` + migration `0012` (**14 tests**); **surface** as
+      `POST|GET /api/v1/sessions/{id}/summaries` and `POST …/summaries/retire`, with **4 route tests**.
+      `ADR-0125`.
+      - **A summary is a memory plus a span table, and the split is the decision.** The memory half is what every
+        memory rule already covers (workspace, entity links, tombstones, sensitivity), produced by
+        `into_record` as `Conversation` + `Document` → `Derived`. The span half is what no `memories` column can
+        hold, in a table whose **primary key is the memory identifier**, so "this row is a summary" and "this row
+        has a span" are one fact rather than a nullable pair meaningless for six of seven types.
+      - **Its own rules live in the writer, because SQLite cannot state them.** `session_summaries` cannot see
+        `messages`, so it cannot refuse a span naming turns that do not exist; and "two intervals in one session
+        must not intersect" needs a trigger. Both are checked in `record_summary`, which reads the message count
+        and the session's spans on the **same connection** as its two inserts — a deferred read-then-write over
+        the pool is the `SQLITE_BUSY_SNAPSHOT` failure `purge_memory` already records.
+      - **The retention rule had a predicate and no caller.** `MemoryType::is_durable` states that `Working` and
+        `Conversation` do not survive, and only a test named it; `P4-008` recorded "no retention policy is
+        implemented — the verbs exist and the sweeper does not". The sweep now **generates** its SQL predicate
+        from `is_durable` rather than listing type names, so the rule and the sweep cannot drift when a type is
+        added. Archive rather than delete, because `Archived` is "retained for audit, not retrieved as current
+        truth" — and deleting would additionally clear the search key and write a tombstone, turning a retention
+        decision into a *forget*.
+      - **A predicate whose answer never varied was a decision that decided nothing.** `is_offerable_as_context`
+        first returned `false` unconditionally, which reads as a policy and encodes none; it now takes the spans
+        a caller is **replaying** and answers the real rule, which also gave `spans_overlap` the production
+        caller it lacked.
+      - **Two defects the tests found, both by mutation rather than by review.** An archived summary was still
+        returned by `read_session_summaries` — it filtered `deleted` and admitted `archived`, the same
+        admitted-but-never-current shape `P4-007` recorded — so the read now filters `active` while the *span*
+        read deliberately does not, or archiving a summary would re-open its turns to a second claim.
+      - **A test named for the wrong guard.** `the_same_sequences_in_another_session_do_not_overlap` claimed to
+        catch a missing query filter; mutating `spans_overlap` to ignore session identity **survived** it, and
+        only `jarvis_core`'s `overlapping_spans_are_detected_in_both_directions` caught that. Mutating the
+        query's `session_id` filter *did* fail it. Two guards, two detectors, and the comment now says which is
+        which — a test named for a rule nothing checks reads as coverage.
+      - **A fixture that promised a count it did not deliver.** `seed_session` appended N messages, but starting
+        the run already writes the objective as message 0, so every session held N+1 and every expected span was
+        shifted by one while still looking plausible. It now asserts the count it promises.
+      - **Verified live** against a real daemon (`database_schema=12` in the readiness line, so the migration
+        ran): `GET /sessions/{id}/summaries` → `{"summaries":[],"returned":0,"limit":128}`; a summary whose
+        subject is a fabricated entity → `404` (the service's subject check, reached); a malformed session
+        identifier → `422`; `?limit=0` → `422`; `POST …/summaries/retire` → `{"archived":0}`.
+      - **Limits:** with no entity-creation or entity-listing route (the `P4-008` gap, unchanged), a real
+        end-to-end **store** over the wire was not possible — the write path is proven by 14 storage tests and
+        the routes by 4, and everything before the subject check is proven live. Nothing yet moves a history
+        window past a span, so `is_offerable_as_context`'s `true` branch is reachable only from a caller
+        supplying non-overlapping spans: the rule is complete and falsified, and what is missing is a windowing
+        component. The summary route is HTTP-only — no CLI verb, matching `P4-014`'s tool, because both need an
+        entity identifier the CLI has no way to obtain.
 
 ## P5: Connectors
 

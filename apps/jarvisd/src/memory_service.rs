@@ -39,13 +39,14 @@ use jarvis_protocol::{
     ClaimBody, ConfirmMemoryRequest, CorrectMemoryRequest, DeletionReceipt, ExportedMemory,
     ForgetMemoryRequest, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference,
     MemoryReply, MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest,
-    SignalContribution,
+    SequenceRange, SignalContribution, SummarizeSessionRequest, SummaryListReply, SummaryReply,
 };
 use jarvis_storage::{
-    DatabaseError, SqliteDatabase, StoredMemory, apply_memory_transition,
-    count_memory_entity_links, find_entity, find_memory_including_deleted, load_local_identity,
-    purge_memory, read_all_memories, read_retrievable_memories, read_workspace_memories,
-    record_memory,
+    DatabaseError, SqliteDatabase, StoredMemory, StoredSummary, apply_memory_transition,
+    archive_session_summaries, count_memory_entity_links, count_messages, find_entity,
+    find_memory_including_deleted, load_local_identity, purge_memory, read_all_memories,
+    read_retrievable_memories, read_session_summaries, read_unsummarized_ranges,
+    read_workspace_memories, record_memory, record_summary,
 };
 
 /// The most claims one listing, search, or export page returns.
@@ -640,6 +641,172 @@ impl MemoryService {
         Ok(reply_of(&stored, "confirmed".to_owned(), None))
     }
 
+    /// Records a compressed summary of part of a session, refusing a span already summarized (`P4-015`).
+    ///
+    /// # Why the message count is read here rather than taken from the request
+    ///
+    /// The span is checked against **what the transcript actually holds**, and a caller-supplied count would
+    /// let a caller assert that a session has 400 messages. The count is read on the path that is about to
+    /// write, and `record_summary` refuses a span that is not a subset of it. The check is what closes the
+    /// fabrication a schema cannot see: `session_summaries` has no view of `messages`.
+    ///
+    /// # Why the compression ratio is computed from the summary's own text
+    ///
+    /// `SummaryLoss::compression_ratio` needs the output's length, which is the text just supplied. It is
+    /// computed **after** a successful store, so a ratio is only ever reported for a summary that exists — a
+    /// figure returned beside a refusal would be a measurement of something that was not kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryServiceError::Refused`] for a span outside the transcript, a turn count disagreeing with
+    /// the span, or a span another summary already covers; [`MemoryServiceError::NotFound`] when the session or
+    /// the subject entity does not exist.
+    pub async fn summarize_session(
+        &self,
+        session_id: &str,
+        request: &SummarizeSessionRequest,
+    ) -> Result<SummaryReply, MemoryServiceError> {
+        let workspace = self.workspace().await?;
+        let session = session_id
+            .parse()
+            .map_err(|_| MemoryServiceError::UnknownValue {
+                field: "session_id",
+                value: session_id.to_owned(),
+            })?;
+        let actor = self.actor_id().await?;
+
+        // The subject must be a real entity. The foreign key would refuse the link, but only after the memory
+        // row was written inside the transaction, so it is checked first and the reason is resolved here.
+        // Parsed before the read so a malformed identifier is reported as a request problem rather than as a
+        // missing entity, which would send the caller looking for an entity it never named.
+        let entity = request
+            .entity_id
+            .parse()
+            .map_err(|_| MemoryServiceError::UnknownValue {
+                field: "entity_id",
+                value: request.entity_id.clone(),
+            })?;
+        let _subject = find_entity(&self.database, &request.entity_id)
+            .await
+            .map_err(|error| match error {
+                DatabaseError::EntityNotFound => MemoryServiceError::NotFound,
+                other => MemoryServiceError::Storage(other),
+            })?;
+
+        let message_count = count_messages(&self.database, session_id).await?;
+        let span =
+            jarvis_core::SummarySpan::new(session, request.first_sequence, request.last_sequence)
+                .map_err(|_| MemoryServiceError::Refused {
+                reason: "invalid_span",
+                detail: "the span must not end before it begins".to_owned(),
+            })?;
+        let loss = jarvis_core::SummaryLoss::new(request.turns_covered, request.source_chars)
+            .map_err(|refusal| MemoryServiceError::Refused {
+                reason: "invalid_loss",
+                detail: refusal.to_string(),
+            })?;
+        let summary = jarvis_core::SessionSummary::new(jarvis_core::SessionSummaryParts {
+            summary_id: MemoryId::new(),
+            workspace_id: workspace,
+            session_id: session,
+            text: request.summary.clone(),
+            span,
+            loss,
+            created_by_actor_id: actor,
+            correlation_id: CorrelationId::new(),
+            created_at: UtcTimestamp::now(&SystemClock),
+            entities: vec![jarvis_core::EntityRef::confirmed(entity)],
+        })
+        .map_err(|refusal| MemoryServiceError::Refused {
+            reason: "invalid_summary",
+            detail: refusal.to_string(),
+        })?;
+
+        let stored = record_summary(&self.database, &summary, message_count)
+            .await
+            .map_err(summary_refusal)?;
+
+        // The complement, after the write, so the reply describes the state the write produced.
+        let unsummarized = read_unsummarized_ranges(&self.database, session, message_count).await?;
+        Ok(summary_reply(
+            &stored,
+            &summary,
+            unsummarized.iter().map(range_of).collect(),
+        ))
+    }
+
+    /// Reads a session's current summaries, largest span first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryServiceError::PageTooLarge`] for an oversized page and a storage failure when a row
+    /// cannot be read.
+    pub async fn list_summaries(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<SummaryListReply, MemoryServiceError> {
+        if limit == 0 || limit > jarvis_storage::MAX_SUMMARY_PAGE {
+            return Err(MemoryServiceError::PageTooLarge {
+                requested: limit,
+                maximum: jarvis_storage::MAX_SUMMARY_PAGE,
+            });
+        }
+        let session = session_id
+            .parse()
+            .map_err(|_| MemoryServiceError::UnknownValue {
+                field: "session_id",
+                value: session_id.to_owned(),
+            })?;
+        let stored = read_session_summaries(&self.database, session, limit).await?;
+        let message_count = count_messages(&self.database, session_id).await?;
+        // The complement is computed once for the reply rather than per summary: it is a fact about the
+        // session, and a per-summary copy would be the same list repeated N times.
+        let unsummarized: Vec<SequenceRange> =
+            read_unsummarized_ranges(&self.database, session, message_count)
+                .await?
+                .iter()
+                .map(range_of)
+                .collect();
+        let summaries = stored
+            .iter()
+            .map(|stored| summary_reply_of(stored, unsummarized.clone()))
+            .collect::<Vec<_>>();
+        Ok(SummaryListReply {
+            returned: u32::try_from(summaries.len()).unwrap_or(u32::MAX),
+            summaries,
+            limit,
+        })
+    }
+
+    /// Applies the retention rule to one session's summaries, returning how many were archived.
+    ///
+    /// # Why this is the caller that makes the rule real
+    ///
+    /// `P4-015` requires a retention rule and `P4-008` records that nothing expires on its own. This is the
+    /// **explicit** sweep: a session that is over is retired by a caller, and this archives every summary of it
+    /// that is still a current claim. `archive_session_summaries` derives which types that covers from
+    /// `MemoryType::is_durable`, so a durable memory in the same workspace is untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage failure when the update fails.
+    pub async fn retire_session_summaries(
+        &self,
+        session_id: &str,
+    ) -> Result<u64, MemoryServiceError> {
+        let session = session_id
+            .parse()
+            .map_err(|_| MemoryServiceError::UnknownValue {
+                field: "session_id",
+                value: session_id.to_owned(),
+            })?;
+        Ok(
+            archive_session_summaries(&self.database, session, UtcTimestamp::now(&SystemClock))
+                .await?,
+        )
+    }
+
     /// Exports every claim the workspace holds, including archived and deleted ones.
     ///
     /// # Errors
@@ -1025,6 +1192,96 @@ fn reply_of(stored: &StoredMemory, outcome: String, detail: Option<String>) -> M
         // wrote without a second read.
         version: stored.version(),
         detail,
+    }
+}
+
+/// Turns a storage refusal of a summary into the service's own error.
+///
+/// # Why the storage error is not passed through
+///
+/// A summary refusal has a **remedy** the caller can act on — the span is outside the transcript, or its turns
+/// are already covered — while a `DatabaseError` describes the database. Two of the three summary refusals are
+/// caller errors and one is a duplicate, so they are separated here rather than collapsed into `Storage`,
+/// which maps to a `503` and would tell a caller to retry a request that can never succeed.
+fn summary_refusal(error: DatabaseError) -> MemoryServiceError {
+    match error {
+        DatabaseError::SummaryOverlapsExisting {
+            first_sequence,
+            last_sequence,
+        } => MemoryServiceError::Refused {
+            reason: "already_summarized",
+            detail: format!(
+                "turns {first_sequence}..{last_sequence} of this session already have a summary; \
+                 summarize the remaining turns instead"
+            ),
+        },
+        DatabaseError::InvalidSummaryRequest { field } => MemoryServiceError::Refused {
+            reason: "invalid_summary",
+            detail: format!("the summary {field} is invalid for this session's transcript"),
+        },
+        // A summary's deduplication key is derived from its text and its subject, so two summaries of
+        // **different** spans that say the same words collide. That is a request the caller can fix — by
+        // wording the second differently — so it is a refusal rather than a `503`, and saying "retry" would be
+        // telling a caller to repeat a request that can never succeed.
+        DatabaseError::MemoryDuplicate { .. } => MemoryServiceError::Refused {
+            reason: "already_summarized",
+            detail: "a summary of these same words and subject already exists for this workspace; \
+                     reword the summary so it describes the turns it covers"
+                .to_owned(),
+        },
+        // The subject entity is the only foreign key this write names besides the session, and a missing one is
+        // a request problem rather than an infrastructure one.
+        DatabaseError::EntityNotFound => MemoryServiceError::NotFound,
+        other => MemoryServiceError::Storage(other),
+    }
+}
+
+/// Builds a reply for a summary that was just written.
+fn summary_reply(
+    stored: &StoredSummary,
+    summary: &jarvis_core::SessionSummary,
+    unsummarized: Vec<SequenceRange>,
+) -> SummaryReply {
+    let loss = stored.loss();
+    SummaryReply {
+        memory_id: stored.memory_id().to_owned(),
+        session_id: summary.session_id().to_string(),
+        first_sequence: stored.span().first_sequence,
+        last_sequence: stored.span().last_sequence,
+        turns_covered: loss.turns_covered,
+        source_chars: loss.source_chars,
+        compression_ratio: loss.compression_ratio(summary),
+        unsummarized,
+    }
+}
+
+/// Builds a reply for a summary read back from storage.
+///
+/// # Why no compression ratio is reported here
+///
+/// The ratio needs the summary's **text** length, and this path reads spans and loss metadata without loading
+/// the memory text — so a ratio computed here would be computed against nothing. `None` is the honest answer:
+/// the input size is known and the output's is not, and a caller that wants the figure reads the memory. This
+/// is the same rule `SummaryLoss::compression_ratio` states for an unmeasured input, applied to the other side.
+fn summary_reply_of(stored: &StoredSummary, unsummarized: Vec<SequenceRange>) -> SummaryReply {
+    let loss = stored.loss();
+    SummaryReply {
+        memory_id: stored.memory_id().to_owned(),
+        session_id: stored.span().session_id.to_string(),
+        first_sequence: stored.span().first_sequence,
+        last_sequence: stored.span().last_sequence,
+        turns_covered: loss.turns_covered,
+        source_chars: loss.source_chars,
+        compression_ratio: None,
+        unsummarized,
+    }
+}
+
+/// Converts a domain span into its wire range.
+fn range_of(span: &jarvis_core::SummarySpan) -> SequenceRange {
+    SequenceRange {
+        first_sequence: span.first_sequence,
+        last_sequence: span.last_sequence,
     }
 }
 
