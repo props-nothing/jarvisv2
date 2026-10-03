@@ -1806,7 +1806,7 @@ async fn run_tool_round(
 
         let result_text = match parse_arguments(call.arguments()) {
             Some(arguments) => {
-                match run_tool_call(tools, &actor, call.name(), &arguments, correlation_id).await {
+                match run_tool_call(tools, &actor, call.name(), &arguments).await {
                     StepOutcome::Text(text) => text,
                     // A held call stops the run here. The assistant turn is already in the transcript,
                     // so the run's own stream explains that it asked and then parked.
@@ -1871,15 +1871,21 @@ fn tool_result_text(result: &jarvis_tools::ToolCallResult) -> String {
 ///
 /// The actor is built once by the caller and passed here, so every call in one turn runs under the
 /// same authority — see [`run_tool_round`] for why it is built from the stored run.
+///
+/// # Why each call gets its own correlation identifier
+///
+/// The pipeline uses the correlation identifier as the **call's identity**: the `tool_calls` primary key, the
+/// receipt and the approval all carry it. A run's correlation is one value for the whole drive, so a second tool
+/// call in the same run — which is what a model asking for two files does — collided on that key and was refused
+/// as "failed to admit a tool call". Every test and live run before this used one call per run.
 async fn run_tool_call(
     tools: &Arc<ToolPipeline>,
     actor: &crate::tool_actor::ToolActor,
     tool: &str,
     arguments: &serde_json::Value,
-    correlation_id: CorrelationId,
 ) -> StepOutcome {
     match tools
-        .call_tool(tool, arguments.clone(), actor, correlation_id)
+        .call_tool(tool, arguments.clone(), actor, CorrelationId::new())
         .await
     {
         Ok(ToolPipelineOutcome::Executed(result)) => StepOutcome::Text(tool_result_text(&result)),
@@ -3513,6 +3519,58 @@ mod tests {
         assert!(
             kinds.contains(&RunEventKind::OutputCompleted),
             "the stream must record the final answer: {kinds:?}"
+        );
+    }
+
+    /// **A run can call tools more than once.**
+    ///
+    /// A call's identity is derived from a correlation identifier that used to be one value for the whole run,
+    /// so the second call collided on the `tool_calls` key and the model was told the call "could not be
+    /// completed". Found by a live run in which the model listed a folder and then read a file. Asserted on what
+    /// the model is handed back for **each** call.
+    #[tokio::test]
+    async fn a_run_can_make_two_tool_calls() {
+        let (profile, database) = database().await;
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        std::fs::write(root.join("note.txt"), "the sky is blue")
+            .unwrap_or_else(|error| panic!("write the fixture file: {error}"));
+
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "read note.txt twice").await;
+        let model = model(vec![
+            Turn::tool_call("call_1", "jarvis.files.read", r#"{"path":"note.txt"}"#),
+            Turn::tool_call("call_2", "jarvis.files.read", r#"{"path":"note.txt"}"#),
+            Turn::answer("Done."),
+        ]);
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+
+        let requests = model.seen_messages();
+        let last = requests
+            .last()
+            .unwrap_or_else(|| panic!("the model was called"));
+        let results: Vec<String> = last
+            .iter()
+            .filter(|message| message.role() == jarvis_models::Role::Tool)
+            .map(jarvis_models::ChatMessage::text)
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results.iter().all(|text| text.contains("the sky is blue")),
+            "both calls must have run: {results:?}"
         );
     }
 

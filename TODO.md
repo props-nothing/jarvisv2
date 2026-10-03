@@ -2520,6 +2520,21 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **Limits:** nothing releases an approved call *automatically* at startup (a person runs `resume`); an approved
     approval whose call is never released keeps its payload until a retention sweep exists.
 
+### P3-031: First run — `jarvis init` and `jarvis start`, and a multi-call run bug found by using it
+
+- [x] A fresh install reaches a conversation in three commands. `init` detects a local Ollama, refuses a model it does
+  not list, writes the key file and a configuration validated by the daemon's own parser, never overwrites without
+  `--force`, and grants no folder unless one is named. `start` spawns the sibling `jarvisd` detached and waits until it
+  listens, or reports that it exited. (`apps/jarvis-cli/src/init.rs`, 6 unit tests.)
+- [x] **Defect found by the live run:** a second tool call in one run failed with "failed to admit a tool call". The
+  call's identity is its correlation identifier, and the executor passed the run's single one to every call, so the
+  second collided on `tool_calls.id`. Every earlier test and live run made one call per run. Fixed in
+  `executor::run_tool_call` (a fresh identifier per call); regression test `a_run_can_make_two_tool_calls`,
+  falsified by restoring the shared identifier.
+  - **Live:** `init` → `start` → `ask` with no environment variables; the model listed a folder and read a file in one run.
+  - **Limits:** `init` needs an existing `--root` directory; a hosted provider is checked only for a readable key file,
+    not a live call; no Windows service or autostart.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

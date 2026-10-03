@@ -27,6 +27,21 @@ The next implementation task is the first unchecked item in [TODO.md](../../TODO
 
 ## Run It Locally
 
+### First run: `jarvis init`, `jarvis start`
+
+```text
+jarvis init      # finds your local Ollama, asks which model and which folder, writes the configuration
+jarvis start     # starts the daemon in the background and waits until it answers
+jarvis chat
+```
+
+`init` lists the models your Ollama has and refuses a model it does not list. It writes `model.key` (a placeholder
+Ollama ignores) and a validated `config.toml`, and it **never overwrites** an existing configuration without
+`--force`. It grants **no folder unless you name one** (`--workspace DIR`, repeatable, or the prompt). For another
+OpenAI-compatible server: `jarvis init --base-url URL --model NAME --api-key-file C:/path/to/key.txt` (the key stays in
+your file; it never passes through the command). `start` returns once the daemon listens, or says why it exited.
+`--root DIR` (an existing directory) keeps a throwaway profile. The manual route below stays available for operators.
+
 In one terminal:
 
 ```powershell

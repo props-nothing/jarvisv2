@@ -14,6 +14,7 @@ mod approvals;
 mod chat;
 mod connector;
 mod entity;
+mod init;
 mod memory;
 mod output;
 mod schedule;
@@ -60,6 +61,15 @@ async fn main() -> ExitCode {
         Some("tools") => tools_command(&arguments).await,
         // `approvals` is how a person releases or refuses an action a tool call was held on: without it a held
         // call parked its run and nothing in the shipped product could finish the conversation.
+        // `init` and `start` are first-run: a configuration written for you, and a daemon started for you.
+        Some("init") => match resolve_paths(&arguments) {
+            Ok(paths) => init::init(&paths, &arguments).await,
+            Err(status) => status,
+        },
+        Some("start") => match resolve_paths(&arguments) {
+            Ok(paths) => init::start(&paths, &arguments),
+            Err(status) => status,
+        },
         Some("approvals") => approvals_command(&arguments).await,
         // `schedule` and `runs` are the proactive half of the product: tasks that run while you are away, and
         // where you read what they said.
@@ -85,7 +95,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|tools|approvals|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
