@@ -28,6 +28,7 @@ mod retrieval;
 mod risk;
 mod secretbytes;
 mod skill;
+mod summary;
 mod tool_outcome;
 
 pub use approval::{
@@ -104,7 +105,12 @@ pub use skill::{
     MAX_SKILL_DROPPED_FIELD_NAME_CHARS, MAX_SKILL_DROPPED_FIELDS, MAX_SKILL_STEP_CHARS,
     MAX_SKILL_STEPS, MAX_SKILL_VERSION_CHARS, SelectedSkill, SkillDroppedField, SkillIneligibility,
     SkillQuery, SkillRevision, SkillRevisionParts, SkillSelection, SkillSelectionReason,
-    SkillState, SkillStep, estimate_skill_tokens, matches_text, select_skills, skill_context_item,
+    SkillState, SkillStep, estimate_skill_tokens, matches_text, render_procedure, select_skills,
+    skill_context_item,
+};
+pub use summary::{
+    InvalidSummary, MAX_SUMMARIZED_TURNS, MIN_SUMMARY_CHARS, SUMMARY_STATUS, SessionSummary,
+    SessionSummaryParts, SummaryLoss, SummarySpan, is_offerable_as_context, spans_overlap,
 };
 pub use testkit::{
     MAX_SCRATCH_REMOVAL_ATTEMPTS, SCRATCH_REMOVAL_INTERVAL, remove_scratch_dir, scratch_tag,

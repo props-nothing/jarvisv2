@@ -990,14 +990,11 @@ async fn load_skills(
         // to refuse a question.
         let item = skill_context_item(&selected.revision, ContextPriority::Optional)
             .map_err(|_| DatabaseError::InvalidRunRequest { field: "skill" })?;
-        // The procedure's **rendered** text: its prose and then its steps in position order, which is the
-        // order `SkillRevision::build` already sorted them into. Rendered here so that the isolation, the
-        // item's estimate, and the text that is sent are all derived from one string.
-        let mut procedure = selected.revision.description().to_owned();
-        for step in selected.revision.steps() {
-            procedure.push_str("\n- ");
-            procedure.push_str(step.instruction());
-        }
+        // The procedure's rendered text, from the **domain's own renderer** rather than concatenated here.
+        // That is what makes the isolation, the item's estimate, and the text that is sent all derive from one
+        // string — and the first version of this loop built its own, which omitted each step's tool and so sent
+        // a procedure the model could not perform. See `render_procedure`.
+        let procedure = jarvis_core::render_procedure(&selected.revision);
         let isolated = jarvis_core::IsolatedText::new(&procedure)
             .map_err(|_| DatabaseError::InvalidRunRequest { field: "skill" })?;
         offered.push(RetrievedSkill {
@@ -3667,6 +3664,145 @@ mod tests {
             "the step instruction is the procedure's body and must be sent too: {}",
             retrieved.text()
         );
+        // **And the step's TOOL must reach the model, which is the assertion that was missing.**
+        //
+        // `P4-012` is "every step is an ordinary tool request", and a step names a tool at a version. The first
+        // renderer concatenated the prose and each step's instruction and dropped the tool, so this test — which
+        // asserted the fence, the prose, and the instruction — passed while a procedure reached the model as a
+        // list of intentions with no way to perform them.
+        //
+        // This is the general shape worth remembering: a test that asserts several fields of a rendering is not
+        // a test of the rendering. Each assertion named a field that was present, and the one that was absent
+        // had nothing asserting it.
+        assert!(
+            retrieved.text().contains("jarvis.files.read@1.0.0"),
+            "a step's tool and version must be sent, or the model cannot perform the step: {}",
+            retrieved.text()
+        );
+    }
+
+    /// **A procedure cannot lower a step's approval requirement, which is `ADR-0117` §6.**
+    ///
+    /// The rule the ADR states: "the effect vocabulary, risk level, and approval requirement of a step are
+    /// properties of the *tool*, decided by policy at execution. A skill cannot lower them, cannot pre-select an
+    /// approver, and cannot carry an approval." And the corollary: "whether the current grant still covers a step
+    /// is decided when that step runs, not when the skill was loaded — a grant revoked between load and run must
+    /// refuse the step, and only an execution-time check can see that."
+    ///
+    /// So a procedure naming a tool whose declaration **asks** must produce a hold, and nothing the procedure
+    /// carries may change that. There is deliberately no "skill execution" path to test: the step is an ordinary
+    /// tool request through the whole pipeline, and that is exactly how the property is true. What this test
+    /// adds is the **evidence that a skill's presence does not bypass the pipeline** — a procedure that reached
+    /// a model is still only a model's reason to *ask*.
+    ///
+    /// `ADR-0117` §6 also says "a grant revoked between load and run must refuse the step", and that half is
+    /// **not** asserted here because it is not reachable in this build: nothing revokes a grant while a run is
+    /// live, and the tool registry is fixed at composition. `P3-026`'s control plane can change a workspace
+    /// *policy*, which is read per call, so a policy change between load and run would be refused by the
+    /// evaluation — but building that scenario needs a run paused between load and execution, which this
+    /// executor does not expose. Recorded as a limit rather than claimed.
+    #[tokio::test]
+    async fn a_procedure_cannot_lower_a_steps_approval_requirement() {
+        let (profile, database) = database().await;
+        let (tools, adapter) = approval_pipeline(&profile, &database);
+        let identity = jarvis_storage::load_local_identity(&database)
+            .await
+            .unwrap_or_else(|error| panic!("the fixture must have a seeded identity: {error}"));
+
+        // A procedure whose step names the tool that **declares** an approval. Its prose and instruction carry
+        // every word of the objective, so the conjunctive selection rule keeps it.
+        let run = start(&database, "run the approval step in the notes").await;
+        record_skill_naming(
+            &database,
+            identity.workspace_id(),
+            "Run the approval step in the notes.",
+            crate::approval_fixture::APPROVAL_TOOL,
+        )
+        .await;
+
+        // The model asks for the tool the procedure named, which is what a model following a procedure does.
+        let tool_model = model(vec![Turn::tool_call(
+            "call_1",
+            crate::approval_fixture::APPROVAL_TOOL,
+            r#"{"path":"notes.txt"}"#,
+        )]);
+        let parked = execute_run_with_tools(
+            &database,
+            &tool_model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+
+        // **The hold is the tool's own declaration, and the procedure changed nothing about it.** Asserted on
+        // the run's state and on the adapter's call count together: a status alone would be satisfied by a
+        // pipeline that parked for some other reason, and a count alone by one that never reached the tool.
+        assert_eq!(
+            parked.state(),
+            RunState::AwaitingApproval,
+            "a step whose tool asks for approval must park the run, whatever a procedure says"
+        );
+        assert_eq!(
+            adapter.calls(),
+            0,
+            "and the effect must not have happened, so the procedure's step did not run"
+        );
+    }
+
+    /// Records a skill whose single step names `tool`, for the tests that need a procedure in the store.
+    ///
+    /// Separate from `record_skill` because that fixture hard-codes `jarvis.files.read`, and a test about
+    /// *which* tool a procedure names needs to choose it — a fixture that fixes the tool cannot exercise the
+    /// case where the choice matters.
+    async fn record_skill_naming(
+        database: &Arc<SqliteDatabase>,
+        workspace_id: &str,
+        description: &str,
+        tool: &str,
+    ) {
+        let parts = jarvis_core::SkillRevisionParts {
+            skill_id: jarvis_core::SkillId::new(),
+            workspace_id: workspace_id
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture workspace: {error}")),
+            revision_id: jarvis_core::SkillId::new(),
+            version: "1".to_owned(),
+            description: description.to_owned(),
+            steps: vec![
+                jarvis_core::SkillStep::new(
+                    1,
+                    tool,
+                    "1.0.0",
+                    "Do the thing described.",
+                    |identifier: &str| {
+                        identifier
+                            .split_once('.')
+                            .is_some_and(|(ns, name)| !ns.is_empty() && !name.is_empty())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("fixture step: {error}")),
+            ],
+            source: jarvis_core::MemorySource::of_kind(
+                jarvis_core::MemorySourceKind::UserStatement,
+                "session-1",
+            )
+            .unwrap_or_else(|error| panic!("fixture source: {error}")),
+            sensitivity: jarvis_core::Sensitivity::Internal,
+            state: jarvis_core::SkillState::Active,
+            supersedes: None,
+            dropped_fields: Vec::new(),
+            run_id: None,
+            created_by_actor_id: LOCAL_USER_ID.to_owned(),
+            correlation_id: CorrelationId::new(),
+            created_at: UtcTimestamp::now(&SystemClock),
+        };
+        let revision = jarvis_core::SkillRevision::new(parts)
+            .unwrap_or_else(|error| panic!("fixture revision: {error}"));
+        jarvis_storage::record_skill_revision(database, &revision)
+            .await
+            .unwrap_or_else(|error| panic!("record skill: {error}"));
     }
 
     /// A pipeline whose only tool **declares** an approval, with an adapter that counts its calls.

@@ -3095,7 +3095,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       migration with the reasoning; and no `P4-012` retrieval selection existed at the time of this slice —
       selection and envelope inclusion were delivered later (see `P4-012`), and **the execution path still does
       not**, so nothing has run a skill's steps and nothing in the daemon calls `select_skills`.
-- [ ] `P4-012` Retrieve and use a skill: selection by relevance to the task, inclusion in the context envelope
+- [x] `P4-012` Retrieve and use a skill: selection by relevance to the task, inclusion in the context envelope
       as derived content, and an execution path in which **every step is an ordinary tool request** through
       the full gateway. There is deliberately **no "skill execution" path**, so a step whose grant was revoked
       between load and run must refuse at execution — the check can only be an execution-time one.
@@ -3241,6 +3241,42 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       call first; there is still **no creation surface** and no `P4-013` inspection verbs, so a skill remains
       reachable only from a test; text matching is whole-word containment over the prose and step
       instructions, deliberately **not** the nine-signal ranking a memory gets, for the reason recorded above.
+
+      **⭐ PART 2 — a procedure reached the model with NO TOOL IN IT, and three artefacts hid it.** `P4-013`'s
+      creation route made a stored procedure reachable for the first time, so I checked what a *selected*
+      procedure actually sends. It sent the prose and each step's **instruction** and **dropped the tool**:
+      - **One cause, three silent consequences.** The executor concatenated the body itself; `estimate_skill_tokens`
+      counted the same fields; `skill_haystack` indexed the same fields. So (1) the prompt had no tool, and
+      `P4-012` is literally "every step is an **ordinary tool request**"; (2) the budget **under-measured** the
+      text it sent, so a skill reporting itself as fitting could overflow; (3) `matches_word`'s own doc comment
+      — "what makes a query naming a tool find a procedure that calls it" — was **false**, because an objective
+      containing `jarvis.files.read` splits into segments the haystack did not contain.
+      - **The fix is one function, `jarvis_core::render_procedure`**, which the executor, the estimate, and the
+      haystack all derive from. Three artefacts that must agree can no longer disagree.
+      - **The e2e test asserted three fields of the rendering and never the tool**, which is why it passed: a
+      test that checks several fields is not a test of the rendering, and the absent field had nothing
+      asserting it. It now asserts `jarvis.files.read@1.0.0` reaches the prompt.
+      - **Falsified at both layers** — reverting the renderer failed the exact-string test, the tool-matcher
+      test, **and** the `jarvisd` prompt test.
+      - **⭐ THE RENDERING MADE A LATENT INJECTION REACHABLE: a step's `tool_version` was validated by LENGTH
+      ONLY.** It is interpolated into the body, so a version containing a newline forges a second step that the
+      author never wrote — in a body a model then follows as a procedure. The rule was length-only in
+      `SkillStep::new`, length-only in `0010`'s `CHECK`, and the migration's own comment claimed the two
+      "cannot disagree about what a version looks like" while **neither looked at a character**. Now validated
+      by its characters (`[A-Za-z0-9.\-_+]`, the set `ToolId::validate_version` accepts, restated because
+      `jarvis-core` cannot depend on `jarvis-tools`). The decode goes through the same constructor, so a row
+      that arrived another way is refused on read too.
+      - **And the §6 property is now asserted:** a procedure naming a tool that **declares** an approval still
+      parks the run with zero adapter calls. There is deliberately no "skill execution" path to test — the step
+      is an ordinary tool request through the whole pipeline, and that is how the property is true.
+      - **Still not built, and the remainder is now narrowed:** nothing gives a model a *first step*. The
+      procedure now says which tool each step needs, so a model following it can issue the call; what no surface
+      does is tell the model to begin, and a procedure whose step names a tool the model is not offered cannot
+      be performed by it. The ADR's "a grant revoked between load and run must refuse the step" is also
+      **unasserted** because nothing revokes a grant while a run is live and the registry is fixed at
+      composition — recorded as a limit rather than claimed.
+      - **Verified live:** a procedure created through `jarvis skills create` is `active`, and
+      `jarvis skills show` renders `1. jarvis.memory.propose (1.0.0)`, so the tool and version survive the store.
 - [x] `P4-013` Add skill inspection and control: list, inspect (what it is, what it names, its source), correct,
       forget, export, and disable — the `FR-MEM-005` lifecycle surface, applied to a stored procedure.
       **Delivered:** `jarvis-protocol::skill_api` (14 DTOs), `apps/jarvisd/src/skill_service.rs`,

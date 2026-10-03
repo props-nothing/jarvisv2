@@ -393,6 +393,53 @@ pub async fn record_memory(
         return Err(DatabaseError::MemoryTombstoned);
     }
 
+    let affected = insert_memory_on(database.pool(), record, search_key).await?;
+
+    if affected == 0 {
+        // The conflict clause suppressed the insert, so a memory already exists for this key. Its identifier
+        // is returned so the caller reinforces rather than guesses.
+        let existing =
+            find_memory_id_by_key(database, record.workspace_id(), search_key.as_str()).await?;
+        return Err(DatabaseError::MemoryDuplicate {
+            existing_memory_id: existing.ok_or(DatabaseError::Sqlite {
+                operation: "resolve a memory duplicate",
+                source: sqlx::Error::RowNotFound,
+            })?,
+        });
+    }
+
+    // The links are written after the row, in one transaction with it in principle; here they follow, and a
+    // failure leaves a memory with fewer entity links rather than a link to a memory that does not exist.
+    for entity in record.entities() {
+        link_memory_entity(database, record.id(), entity.clone()).await?;
+    }
+
+    Ok(record.id().to_string())
+}
+
+/// Inserts one memory row on `executor`, reporting whether it was written.
+///
+/// # Why this is a helper rather than a statement inside [`record_memory`]
+///
+/// The summary writer records memories too, and it must do so **inside a transaction** with its own row. Two
+/// statements listing the same twenty-six columns in the same order are two chances to omit one, and an
+/// omitted column is not a compile error — it is a memory stored with that field defaulted, which for
+/// `source_trust` would silently change whether its content may instruct. Extracting the statement makes the
+/// two writers name the columns once.
+///
+/// It deliberately does **not** do the tombstone check, resolve a duplicate, or write entity links: those need
+/// the workspace and the pool, and a caller inside a transaction must do them on that same connection or fail
+/// with `SQLITE_BUSY_SNAPSHOT` when it reads and then writes. Each caller sequences them for its own case.
+///
+/// Returns the number of rows affected — zero means the `ON CONFLICT` clause suppressed the insert.
+async fn insert_memory_on<'c, E>(
+    executor: E,
+    record: &MemoryRecord,
+    search_key: &MemorySearchKey,
+) -> Result<u64, DatabaseError>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
     let structured = claim_columns(record.structured_claim());
 
     let result = sqlx::query(
@@ -435,33 +482,14 @@ pub async fn record_memory(
     .bind(record.created_at().to_string())
     .bind(record.last_accessed_at().map(|at| at.to_string()))
     .bind(i64::from(record.retrieval_count()))
-    .execute(database.pool())
+    .execute(executor)
     .await
     .map_err(|source| DatabaseError::Sqlite {
         operation: "record a memory",
         source,
     })?;
 
-    if result.rows_affected() == 0 {
-        // The conflict clause suppressed the insert, so a memory already exists for this key. Its identifier
-        // is returned so the caller reinforces rather than guesses.
-        let existing =
-            find_memory_id_by_key(database, record.workspace_id(), search_key.as_str()).await?;
-        return Err(DatabaseError::MemoryDuplicate {
-            existing_memory_id: existing.ok_or(DatabaseError::Sqlite {
-                operation: "resolve a memory duplicate",
-                source: sqlx::Error::RowNotFound,
-            })?,
-        });
-    }
-
-    // The links are written after the row, in one transaction with it in principle; here they follow, and a
-    // failure leaves a memory with fewer entity links rather than a link to a memory that does not exist.
-    for entity in record.entities() {
-        link_memory_entity(database, record.id(), entity.clone()).await?;
-    }
-
-    Ok(record.id().to_string())
+    Ok(result.rows_affected())
 }
 
 /// Links a memory to an entity, recording **how** the entity was matched.

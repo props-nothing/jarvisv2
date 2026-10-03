@@ -450,7 +450,21 @@ impl SkillStep {
             return Err(InvalidSkill::ToolIdentifier);
         }
         let tool_version = tool_version.into();
-        if tool_version.is_empty() || tool_version.chars().count() > MAX_SKILL_VERSION_CHARS {
+        if tool_version.is_empty()
+            || tool_version.chars().count() > MAX_SKILL_VERSION_CHARS
+            // **The characters matter, and a length check alone was not enough.** `render_procedure`
+            // interpolates this value into a rendered body, so a version containing a newline could forge a
+            // step — the text would read as two steps, one of which the author never wrote. The set is the one
+            // `ToolId::validate_version` accepts, restated because this crate cannot depend on `jarvis-tools`
+            // and stated here so a version is validated by what it may contain rather than by how long it is.
+            //
+            // This was a real hole, not a hypothetical: the rule was length-only in `SkillStep::new`, only
+            // length in `0010`'s `CHECK`, and the migration's own comment claimed the two "cannot disagree
+            // about what a version looks like" while neither looked at a single character.
+            || !tool_version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        {
             return Err(InvalidSkill::ToolVersion);
         }
         let instruction = instruction.into();
@@ -1316,12 +1330,11 @@ pub fn matches_text(revision: &SkillRevision, text: &str) -> bool {
 /// Lowercased once here so a caller does not repeat it, and joined with a space so a word cannot be formed
 /// across the boundary between the prose and a step.
 fn skill_haystack(revision: &SkillRevision) -> String {
-    let mut haystack = revision.description().to_lowercase();
-    for step in revision.steps() {
-        haystack.push(' ');
-        haystack.push_str(&step.instruction().to_lowercase());
-    }
-    haystack
+    // Derived from the **rendering** rather than rebuilt field by field. The two were separate
+    // concatenations of the same fields, and both omitted the tool identifier — so `matches_word`'s
+    // documented property (a query naming a tool finds a procedure that calls it) was untrue, silently, for
+    // as long as the omission existed. Deriving one from the other makes that unrepresentable.
+    render_procedure(revision).to_lowercase()
 }
 
 /// Returns whether one **query word** is present in the haystack.
@@ -1517,18 +1530,66 @@ pub fn select_skills(revisions: &[SkillRevision], query: &SkillQuery) -> SkillSe
 /// under-counts. Over-counting evicts a skill that might have fit; under-counting overflows the budget,
 /// which is the direction that produces a prompt the model cannot receive.
 ///
-/// The count includes the prose and every step's instruction, because those are what would be rendered.
+/// # It measures `render_procedure`, and only that
+///
+/// The count is of the string that is actually sent, because an estimate of a *different* string is what lets
+/// a budget be exceeded: the first version counted the prose and the instructions and **not** the tool
+/// identifiers, so the rendered text was longer than the estimate said and a skill that reported itself as
+/// fitting could overflow. Measuring the rendering itself leaves no length arithmetic to get wrong, and
+/// `skill_selection`'s own token test pins the two together.
 #[must_use]
 pub fn estimate_skill_tokens(revision: &SkillRevision) -> u32 {
     /// Characters per token, at the **low** end of the usual range so the estimate over-counts.
     const CHARACTERS_PER_TOKEN: usize = 3;
 
-    let characters = skill_haystack(revision).chars().count();
+    let characters = render_procedure(revision).chars().count();
     // At least one token, because `ContextItem` refuses a zero estimate and a non-empty revision always
     // costs something to render.
     u32::try_from(characters.div_ceil(CHARACTERS_PER_TOKEN))
         .unwrap_or(u32::MAX)
         .max(1)
+}
+
+/// Renders a procedure as the text a model reads.
+///
+/// # Why this lives in the domain rather than in the caller that builds the prompt
+///
+/// `P4-012` is "every step is an **ordinary tool request**", and a step is a tool at a version. The first
+/// renderer concatenated the prose and each step's *instruction* and **dropped the tool**, so a procedure
+/// reached the model as a numbered list of intentions with no way to perform any of them — the model had to
+/// guess which tool a step meant, which is the one thing a procedure exists to say. It was load-bearing in
+/// three places at once, all silent:
+///
+/// 1. The prompt had no tool name, so the procedure was unusable as a procedure.
+/// 2. [`estimate_skill_tokens`] counted the same fields, so the budget under-measured what it sent.
+/// 3. [`skill_haystack`] indexed the same fields, so `matches_word`'s own documented property — "a query
+///    naming a tool finds a procedure that calls it" — was false: an objective containing
+///    `jarvis.files.read` split into segments (`jarvis`, `files`, `read`) that the haystack did not contain,
+///    so the search the sentence described could never match.
+///
+/// So the rendering is one function, the estimate measures *it*, and the haystack is derived from it: three
+/// artefacts that must agree now cannot disagree, and each was previously a separate concatenation of the
+/// same fields with the same field missing.
+///
+/// # The form
+///
+/// The tool identifier is written in the **exact spelling the model must emit** in a tool call, including its
+/// version, so a model can copy it rather than infer it. A step names a tool at a version because a procedure
+/// is a pinned sequence (`ADR-0117` §5), and the version is rendered for the same reason the name is: the
+/// executor resolves a call against the registry, and a step recorded against a version is a statement about
+/// which behaviour the author meant.
+#[must_use]
+pub fn render_procedure(revision: &SkillRevision) -> String {
+    let mut rendered = revision.description().to_owned();
+    for step in revision.steps() {
+        rendered.push_str("\n- ");
+        rendered.push_str(step.tool());
+        rendered.push('@');
+        rendered.push_str(step.tool_version());
+        rendered.push_str(": ");
+        rendered.push_str(step.instruction());
+    }
+    rendered
 }
 
 /// Renders one selected skill as a context item, **fenced as derived data**.
@@ -1542,9 +1603,13 @@ pub fn estimate_skill_tokens(revision: &SkillRevision) -> u32 {
 ///    its **provenance**, and never `User`. Deriving it here from the source kind means a caller cannot
 ///    label a model-authored procedure as the person's own instruction, and
 ///    [`ContextSourceKind::Skill`]'s own trust set refuses it if they try.
-/// 2. **The step text.** The instructions are what a model would follow, so they are carried in the item's
-///    reference rather than left for a caller to concatenate — and the reference is what a fenced renderer
-///    uses to place the content.
+/// 2. **The step text.** The instructions are what a model would follow, and [`render_procedure`] is the one
+///    statement of how they are rendered — prose, then every tool at its version with its instruction. The
+///    item's reference names the **revision** (`skill:<id>`), which is provenance and fits the reference's
+///    bound; the body is built by the caller from `render_procedure`, because a revision's text is far longer
+///    than a reference may be. This doc previously said the step text was carried *in the reference*, which
+///    was never true of this function and is the kind of comment that hides a missing field: a reader who
+///    trusted it would look for the body in the wrong place.
 ///
 /// # Why `quoted` is always true
 ///
