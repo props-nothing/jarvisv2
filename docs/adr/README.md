@@ -141,7 +141,9 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0121](0121-a-providers-credential-is-a-file-path-not-a-value.md) | A provider's credential is a file path, and a partial provider is refused rather than guessed | Accepted |
 | [0122](0122-an-approval-override-can-only-tighten.md) | An operator's approval override can only tighten, and the risk vocabulary moved to core | Accepted |
 | [0123](0123-the-control-plane-reads-the-policy-in-force.md) | The control plane reads the policy in force, and a preview is a decision not a prediction | Accepted |
-| [0129](0129-a-fetch-is-checked-on-the-address-it-connects-to.md) | A fetch is checked on the address it connects to, and a model-chosen URL is held for a person by default | Accepted |
+| [0129](0129-a-fetch-is-checked-on-the-address-it-connects-to.md) | A fetch is checked on the address it connects to, and a model-chosen URL was held for a person by default (amended by 0133) | Accepted |
 | [0130](0130-a-pending-approval-holds-what-it-is-waiting-on.md) | A pending approval holds what it is waiting on, so a person can decide it (amends 0013) | Accepted |
-| [0131](0131-model-authored-code-runs-in-a-disposable-container.md) | Model-authored code runs in a disposable container, and is always held for a person | Accepted |
+| [0131](0131-model-authored-code-runs-in-a-disposable-container.md) | Model-authored code runs in a disposable container, and is held for a person unless the owner trusts it (amended by 0133) | Accepted |
 | [0132](0132-a-schedule-is-a-request-to-start-an-ordinary-run.md) | A schedule is a request to start an ordinary run, fired at most once and never piled up | Accepted |
+| [0133](0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md) | Approval is for what can hurt, and the owner can decide once (amends 0129, 0131) | Accepted |
+| [0134](0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md) | A sub-agent is an ordinary run, one level deep | Accepted |

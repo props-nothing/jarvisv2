@@ -36,7 +36,7 @@ use jarvis_protocol::{
 use jarvis_storage::{
     API_SESSION_CHANNEL, DatabaseError, SecretStore, SessionTarget, SqliteDatabase, StartRunInput,
     find_approval, find_run, load_local_identity, record_decision, request_run_cancellation,
-    start_run,
+    settle_parked_run_cancelled, start_run,
 };
 
 /// A run use-case failure that maps onto a status and the shared error envelope.
@@ -189,9 +189,18 @@ impl RunService {
     ///
     /// Returns [`RunServiceError`] when the run is absent or has already settled.
     pub async fn cancel(&self, id: &str) -> Result<RunReply, RunServiceError> {
-        let run = request_run_cancellation(&self.database, id, UtcTimestamp::now(&SystemClock))
+        let now = UtcTimestamp::now(&SystemClock);
+        let run = request_run_cancellation(&self.database, id, now)
             .await
             .map_err(|error| map_database_error(&error))?;
+        // A run waiting for a person has no driver to notice a request, so it is settled here and what it was
+        // waiting on is withdrawn. Without this the kill switch reported success for a run that never stopped.
+        if run.state() == jarvis_core::RunState::AwaitingApproval {
+            let settled = settle_parked_run_cancelled(&self.database, &run, now)
+                .await
+                .map_err(|error| map_database_error(&error))?;
+            return Ok(reply::from_stored(&settled));
+        }
         Ok(reply::from_stored(&run))
     }
 

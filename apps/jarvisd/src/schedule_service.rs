@@ -158,12 +158,16 @@ async fn previous_run_is_active(state: &GatewayState, schedule: &StoredSchedule)
     }
 }
 
-/// The objective as a person would recognise it: a scheduled run's framing line is for the model, not for a list.
+/// The objective as a person would recognise it: a scheduled or delegated run's framing line is for the model, not
+/// for a list.
 fn shown_objective(objective: &str) -> String {
-    objective.strip_prefix(UNATTENDED_NOTICE).map_or_else(
-        || objective.to_owned(),
-        |task| format!("[scheduled] {task}"),
-    )
+    if let Some(task) = objective.strip_prefix(UNATTENDED_NOTICE) {
+        return format!("[scheduled] {task}");
+    }
+    if let Some(task) = objective.strip_prefix(crate::delegate::DELEGATED_NOTICE) {
+        return format!("[sub-agent] {task}");
+    }
+    objective.to_owned()
 }
 
 fn schedule_reply(schedule: &StoredSchedule) -> ScheduleReply {

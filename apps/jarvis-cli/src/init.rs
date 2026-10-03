@@ -57,6 +57,9 @@ struct InitRequest {
     base_url: Option<String>,
     api_key_file: Option<PathBuf>,
     workspaces: Vec<PathBuf>,
+    code_image: Option<String>,
+    code_interpreter: Option<String>,
+    trust_code: bool,
     force: bool,
 }
 
@@ -84,6 +87,9 @@ fn parse_init(arguments: &[String]) -> InitRequest {
             .into_iter()
             .map(PathBuf::from)
             .collect(),
+        code_image: flag_value(arguments, "--code-image"),
+        code_interpreter: flag_value(arguments, "--code-interpreter"),
+        trust_code: arguments.iter().any(|argument| argument == "--trust-code"),
         force: arguments.iter().any(|argument| argument == "--force"),
     }
 }
@@ -178,12 +184,47 @@ fn literal(value: &str) -> Result<String, String> {
     Ok(format!("'{value}'"))
 }
 
+/// The optional code tool: a container image and the interpreter it runs a snippet with.
+#[derive(Debug, Eq, PartialEq)]
+struct CodeSetup {
+    image: String,
+    interpreter: Vec<String>,
+    /// The owner's standing decision that a snippet in the throwaway container may run without asking.
+    trusted: bool,
+}
+
+/// Reads the code-tool flags. `--trust-code` without an image is refused, because there would be nothing to trust.
+fn code_setup(request: &InitRequest) -> Result<Option<CodeSetup>, String> {
+    let Some(image) = &request.code_image else {
+        if request.code_interpreter.is_some() || request.trust_code {
+            return Err("--code-interpreter and --trust-code need --code-image".to_owned());
+        }
+        return Ok(None);
+    };
+    let interpreter = request
+        .code_interpreter
+        .as_deref()
+        .unwrap_or("sh -c")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if interpreter.is_empty() {
+        return Err("--code-interpreter must name a program".to_owned());
+    }
+    Ok(Some(CodeSetup {
+        image: image.clone(),
+        interpreter,
+        trusted: request.trust_code,
+    }))
+}
+
 /// Builds the configuration document `init` saves.
 fn render_config(
     model: &str,
     base_url: &str,
     key_file: &Path,
     workspaces: &[PathBuf],
+    code: Option<&CodeSetup>,
 ) -> Result<String, String> {
     let mut lines = vec![
         "schema_version = 1".to_owned(),
@@ -212,6 +253,21 @@ fn render_config(
             .collect::<Result<Vec<_>, _>>()?;
         lines.push(format!("tool_workspace_roots = [{}]", roots.join(", ")));
     }
+    if let Some(code) = code {
+        lines.push(format!("code_sandbox_image = {}", literal(&code.image)?));
+        let words = code
+            .interpreter
+            .iter()
+            .map(|word| literal(word))
+            .collect::<Result<Vec<_>, _>>()?;
+        lines.push(format!("code_sandbox_interpreter = [{}]", words.join(", ")));
+        if code.trusted {
+            // After the `[daemon]` keys, because a table header ends them.
+            lines.push(String::new());
+            lines.push("[policy]".to_owned());
+            lines.push("trust = [\"jarvis.code.run\"]".to_owned());
+        }
+    }
     let document = lines.join("\n") + "\n";
     Ok(document)
 }
@@ -237,7 +293,7 @@ fn resolve_folders(named: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 /// What was written and what to do next.
-fn report(path: &Path, model: &str, base_url: &str, roots: &[PathBuf]) {
+fn report(path: &Path, model: &str, base_url: &str, roots: &[PathBuf], code: Option<&CodeSetup>) {
     println!("configured {}", path.display());
     println!("  model   {model}");
     println!("  server  {base_url}");
@@ -250,9 +306,32 @@ fn report(path: &Path, model: &str, base_url: &str, roots: &[PathBuf]) {
             println!("  folder  {}", root.display());
         }
     }
+    if let Some(code) = code {
+        println!(
+            "  code    {} ({}){}",
+            code.image,
+            code.interpreter.join(" "),
+            if code.trusted {
+                ", runs without asking"
+            } else {
+                ", asks before each run"
+            }
+        );
+    }
     println!();
     println!("next:  jarvis start     # start the assistant in the background");
     println!("       jarvis chat      # talk to it");
+}
+
+/// What to do when neither `--base-url` nor a local Ollama is available.
+fn explain_no_server() {
+    eprintln!("jarvis: no Ollama answered on {OLLAMA_ORIGIN}, and no --base-url was given.");
+    eprintln!(
+        "jarvis: install Ollama (https://ollama.com) and pull a model, or point at another OpenAI-compatible server:"
+    );
+    eprintln!(
+        "jarvis:   jarvis init --base-url https://api.example.com/v1 --model NAME --api-key-file C:/path/to/key.txt"
+    );
 }
 
 /// `jarvis init`
@@ -277,13 +356,7 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         );
         (OLLAMA_BASE_URL.to_owned(), Some(models), true)
     } else {
-        eprintln!("jarvis: no Ollama answered on {OLLAMA_ORIGIN}, and no --base-url was given.");
-        eprintln!(
-            "jarvis: install Ollama (https://ollama.com) and pull a model, or point at another OpenAI-compatible server:"
-        );
-        eprintln!(
-            "jarvis:   jarvis init --base-url https://api.example.com/v1 --model NAME --api-key-file C:/path/to/key.txt"
-        );
+        explain_no_server();
         return ExitStatus::Unavailable;
     };
 
@@ -327,6 +400,13 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         }
     };
 
+    let code = match code_setup(&request) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("jarvis: {message}");
+            return ExitStatus::Usage;
+        }
+    };
     let roots = match resolve_folders(&request.workspaces) {
         Ok(roots) => roots,
         Err(message) => {
@@ -334,7 +414,7 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
             return ExitStatus::Rejected;
         }
     };
-    let document = match render_config(&model, &base_url, &key_file, &roots) {
+    let document = match render_config(&model, &base_url, &key_file, &roots, code.as_ref()) {
         Ok(document) => document,
         Err(message) => {
             eprintln!("jarvis: {message}");
@@ -355,7 +435,7 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         return ExitStatus::Internal;
     }
 
-    report(store.path(), &model, &base_url, &roots);
+    report(store.path(), &model, &base_url, &roots, code.as_ref());
     ExitStatus::Ok
 }
 
@@ -501,6 +581,7 @@ mod tests {
             "http://localhost:11434/v1",
             Path::new("C:/Users/me/AppData/jarvis/model.key"),
             &[PathBuf::from("C:/Users/me/notes")],
+            None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
         let loaded = Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>())
@@ -517,11 +598,53 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_path_is_written_verbatim_and_a_quote_is_refused() {
-        let document = render_config("m", "http://h/v1", Path::new(r"C:\Users\me\model.key"), &[])
+    fn a_code_tool_and_its_trust_are_written_and_the_daemon_accepts_them() {
+        let mut request = parse_init(&words("init --code-image node:22-alpine --trust-code"));
+        request.code_interpreter = Some("node -e".to_owned());
+        let code = code_setup(&request)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("a code setup"));
+        assert!(code.trusted);
+        let document = render_config("m", "http://h/v1", Path::new("C:/k"), &[], Some(&code))
             .unwrap_or_else(|error| panic!("{error}"));
+        let loaded = Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>())
+            .unwrap_or_else(|error| panic!("{error}\n{document}"));
+        assert_eq!(
+            loaded.config().daemon().code_sandbox_image(),
+            Some("node:22-alpine")
+        );
+        assert_eq!(loaded.config().policy().trust(), ["jarvis.code.run"]);
+
+        // Without `--trust-code` no trust is written: the default stays a question.
+        let plain = parse_init(&words("init --code-image alpine:3"));
+        let code = code_setup(&plain)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("a code setup"));
+        let document = render_config("m", "http://h/v1", Path::new("C:/k"), &[], Some(&code))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!document.contains("trust"), "{document}");
+        assert_eq!(code.interpreter, ["sh", "-c"]);
+    }
+
+    #[test]
+    fn trust_without_an_image_is_refused() {
+        assert!(code_setup(&parse_init(&words("init --trust-code"))).is_err());
+        assert!(code_setup(&parse_init(&words("init --code-interpreter node"))).is_err());
+        assert_eq!(code_setup(&parse_init(&words("init"))), Ok(None));
+    }
+
+    #[test]
+    fn a_windows_path_is_written_verbatim_and_a_quote_is_refused() {
+        let document = render_config(
+            "m",
+            "http://h/v1",
+            Path::new(r"C:\Users\me\model.key"),
+            &[],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert!(document.contains(r"'C:\Users\me\model.key'"), "{document}");
-        assert!(render_config("it's", "http://h/v1", Path::new("/k"), &[]).is_err());
+        assert!(render_config("it's", "http://h/v1", Path::new("/k"), &[], None).is_err());
     }
 
     #[test]

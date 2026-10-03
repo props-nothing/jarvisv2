@@ -217,6 +217,9 @@ pub struct WorkspacePolicy {
     /// be defined. Entries are validated by [`Self::requiring`], which is why the field is private
     /// and this type has no `Deserialize` path that could populate it unchecked.
     approval_tools: BTreeMap<ToolId, ApprovalPolicy>,
+    /// Tools the owner trusts to run without a per-call approval. See [`Self::trusting`].
+    #[serde(default)]
+    trusted_tools: BTreeSet<ToolId>,
 }
 
 impl Default for WorkspacePolicy {
@@ -234,6 +237,7 @@ impl Default for WorkspacePolicy {
             requires_strong_authentication_for_high_risk: true,
             denied_tools: BTreeSet::new(),
             approval_tools: BTreeMap::new(),
+            trusted_tools: BTreeSet::new(),
         }
     }
 }
@@ -265,6 +269,7 @@ impl WorkspacePolicy {
             requires_strong_authentication_for_high_risk,
             denied_tools: BTreeSet::new(),
             approval_tools: BTreeMap::new(),
+            trusted_tools: BTreeSet::new(),
         })
     }
 
@@ -278,8 +283,41 @@ impl WorkspacePolicy {
         // `denies` is checked before the approval steps, so a lingering `Ask` entry would be
         // unreachable state that reads as if the tool could still be approved.
         self.approval_tools.remove(&id);
+        self.trusted_tools.remove(&id);
         self.denied_tools.insert(id);
         self
+    }
+
+    /// Trusts a tool to run without asking each time: the owner's decision, made once and in advance.
+    ///
+    /// # The one setting that relaxes a tool's own declaration
+    ///
+    /// Everything else here only tightens (`ADR-0017`, `ADR-0122`), because a workspace setting that removed a
+    /// tool author's guard would be a way to defeat it. A person who has decided "snippets in a no-network,
+    /// no-files throwaway container may simply run" is not defeating a guard, though: they are the party the
+    /// guard asks. Without this, a tool declaring `Ask` is held for ever, and a product that interrupts its owner
+    /// for every calculation is one that owner turns off. So the relaxation exists, and is as narrow as it can be:
+    ///
+    /// - it waives **only** the approval obligations (the tool's own `Ask` and the risk threshold) and the
+    ///   authentication strength a risk level asks for, which the owner's advance decision stands in for;
+    /// - it does **not** waive the `max_risk` ceiling, a denial, the actor's scopes, or the
+    ///   external-communication rule — each is evaluated as before;
+    /// - it is **never** consulted for a tool with an external-communication effect, so trusting a mail-sending
+    ///   tool changes nothing;
+    /// - a later denial or approval override for the same tool **wins**: tightening outranks trust, whichever
+    ///   order the two were declared in.
+    #[must_use]
+    pub fn trusting(mut self, id: ToolId) -> Self {
+        if !self.denied_tools.contains(&id) && !self.approval_tools.contains_key(&id) {
+            self.trusted_tools.insert(id);
+        }
+        self
+    }
+
+    /// Returns whether the owner trusts this tool to run without a per-call approval.
+    #[must_use]
+    pub fn trusts(&self, id: &ToolId) -> bool {
+        self.trusted_tools.contains(id)
     }
 
     /// Overrides a tool's approval policy, tightening it and never relaxing it.
@@ -308,6 +346,9 @@ impl WorkspacePolicy {
         // A denial is authoritative and is already at the top of the order, so an approval override
         // for a denied tool would be state that `denies` short-circuits before anyone reads it.
         if !self.denied_tools.contains(&id) {
+            // A tightening outranks trust: asking for an approval and trusting the tool contradict, and the
+            // safer reading is the one that keeps the question.
+            self.trusted_tools.remove(&id);
             self.approval_tools.insert(id, approval);
         }
         self
@@ -824,14 +865,19 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     //    `Policy` is deliberately **not** consulted here: it means "the workspace's policy decides",
     //    which is exactly the threshold below. Treating it as `Ask` would collapse a distinction the
     //    `ApprovalPolicy` documentation calls out as a real member rather than a synonym.
-    let tool_requires_approval = effective_approval == ApprovalPolicy::Ask;
-    let risk_requires_approval = risk >= request.workspace.approval_threshold();
+    //
+    //    The owner's standing trust waives the first two obligations for a tool that does not communicate
+    //    externally, and nothing else (`WorkspacePolicy::trusting`).
+    let externally_communicates = definition
+        .effects()
+        .contains(ToolEffect::ExternalCommunication);
+    let trusted = request.workspace.trusts(definition.id()) && !externally_communicates;
+    let tool_requires_approval = !trusted && effective_approval == ApprovalPolicy::Ask;
+    let risk_requires_approval = !trusted && risk >= request.workspace.approval_threshold();
     let external_requires_approval = request
         .workspace
         .requires_approval_for_external_communication()
-        && definition
-            .effects()
-            .contains(ToolEffect::ExternalCommunication);
+        && externally_communicates;
 
     if tool_requires_approval || risk_requires_approval || external_requires_approval {
         // The strength an approval must be supplied with. `Present` for a high-risk action in a
@@ -858,7 +904,9 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     // 8. Authentication strength. Reached only when no approval is required, so a request that is
     //    already held is not reported as under-authenticated — the approval is the stronger
     //    obligation, and reporting both would give an operator two remedies for one problem.
-    if effective_strength < AuthenticationStrength::required_for(risk) {
+    //    Standing trust stands in for the presence a risk level asks for: the owner already decided, so a call
+    //    that arrives by voice or by a background task is not held for a strength it cannot supply.
+    if !trusted && effective_strength < AuthenticationStrength::required_for(risk) {
         return held(
             DenyReason::InsufficientAuthentication,
             Some(AuthenticationStrength::required_for(risk)),
@@ -1012,6 +1060,90 @@ mod tests {
         );
         assert_eq!(decision.reason(), Some(DenyReason::ToolDeniedByWorkspace));
         assert_eq!(decision.reason_code(), "tool_denied_by_workspace");
+    }
+
+    /// **Standing trust waives an `Ask` and the risk threshold, and nothing else.**
+    ///
+    /// The one relaxing setting (`WorkspacePolicy::trusting`), so each of its limits is asserted from the side
+    /// that would catch the limit being lost: a trusted tool runs; the same tool with its trust removed is held;
+    /// and a denial, an approval override, the ceiling, a missing scope and an external-communication effect each
+    /// still win over trust.
+    #[test]
+    fn standing_trust_waives_the_ask_and_nothing_else() {
+        let asking = || {
+            tool(
+                "jarvis.code.run",
+                EffectSet::single(ToolEffect::CodeExecution),
+                3,
+                ApprovalPolicy::Ask,
+                ScopeSet::single(scope("code.run")),
+            )
+        };
+        let actor = || ActorAuthority::active(ScopeSet::single(scope("code.run")));
+        let definition = asking();
+
+        // Held without trust: the baseline the rest is measured against.
+        let plain = WorkspacePolicy::default();
+        assert!(evaluate(&request(&definition, &plain, actor())).is_held());
+
+        // Trusted, it is allowed.
+        let trusted = WorkspacePolicy::default().trusting(id("jarvis.code.run"));
+        let decision = evaluate(&request(&definition, &trusted, actor()));
+        assert!(decision.is_allowed(), "{decision:?}");
+
+        // It stands in for presence: an actor claiming no authentication strength is not held for it.
+        let mut anonymous = request(&definition, &trusted, actor());
+        anonymous.claimed_strength = AuthenticationStrength::Absent;
+        assert!(
+            evaluate(&anonymous).is_allowed(),
+            "trust must stand in for presence"
+        );
+
+        // A missing scope still refuses.
+        let unscoped = ActorAuthority::active(ScopeSet::none());
+        let decision = evaluate(&request(&definition, &trusted, unscoped));
+        assert_eq!(decision.reason(), Some(DenyReason::MissingScope));
+
+        // The ceiling still refuses.
+        let low_ceiling = WorkspacePolicy::new(Risk::Moderate, Risk::Moderate, true, true)
+            .unwrap_or_else(|error| panic!("consistent policy: {error}"))
+            .trusting(id("jarvis.code.run"));
+        let decision = evaluate(&request(&definition, &low_ceiling, actor()));
+        assert_eq!(decision.reason(), Some(DenyReason::AboveWorkspaceCeiling));
+
+        // A denial or an approval override outranks trust, in either declaration order.
+        for workspace in [
+            WorkspacePolicy::default()
+                .trusting(id("jarvis.code.run"))
+                .denying(id("jarvis.code.run")),
+            WorkspacePolicy::default()
+                .denying(id("jarvis.code.run"))
+                .trusting(id("jarvis.code.run")),
+        ] {
+            assert!(evaluate(&request(&definition, &workspace, actor())).is_denied());
+        }
+        for workspace in [
+            WorkspacePolicy::default()
+                .trusting(id("jarvis.code.run"))
+                .requiring(id("jarvis.code.run"), ApprovalPolicy::Ask),
+            WorkspacePolicy::default()
+                .requiring(id("jarvis.code.run"), ApprovalPolicy::Ask)
+                .trusting(id("jarvis.code.run")),
+        ] {
+            assert!(
+                evaluate(&request(&definition, &workspace, actor())).is_held(),
+                "an approval override must outrank trust"
+            );
+        }
+
+        // An external-communication effect is never waived: trusting a sender changes nothing.
+        let sending = sender();
+        let trusted_sender = WorkspacePolicy::default().trusting(id("jarvis.mail.send"));
+        let sender_actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
+        assert!(
+            evaluate(&request(&sending, &trusted_sender, sender_actor)).is_held(),
+            "trust must not release a tool that communicates externally"
+        );
     }
 
     /// **A suspended actor is refused even holding every scope.**

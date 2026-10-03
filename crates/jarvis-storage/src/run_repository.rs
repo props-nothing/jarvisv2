@@ -381,6 +381,9 @@ pub async fn recover_interrupted_runs(
         settled.push(id);
     }
 
+    // A run cancelled while parked is settled above; what it was waiting on is withdrawn with it, and any left
+    // by an earlier build is repaired here.
+    withdraw_cancelled_run_approvals(database).await?;
     Ok(settled)
 }
 
@@ -797,6 +800,101 @@ pub async fn request_run_cancellation(
     find_run(database, id).await
 }
 
+/// Settles a run that is **parked** at `awaiting_approval` as cancelled, and withdraws what it was waiting on.
+///
+/// # Why a request alone is not enough here
+///
+/// A cancellation is a request the run's driver honours at its next step boundary (`ADR-0013`). A parked run has
+/// **no driver** — that is what parked means — so nothing would ever read the request, and `jarvis cancel` would
+/// report success for a run that stays in the approvals list for ever. The state machine allows
+/// `awaiting_approval → cancelled`, so the cancelling request settles it directly.
+///
+/// # What is withdrawn
+///
+/// A pending approval becomes `expired` with its payload and nonce gone, so it can neither be decided nor listed; an
+/// approved-but-unreleased one loses its held arguments, so `resume` cannot run an action for a run the person
+/// cancelled. The run is settled **first**: the guarded transition is what loses a race with a concurrent decision,
+/// and a decision that won leaves the run executing, which this function then refuses to touch.
+///
+/// # Errors
+///
+/// [`DatabaseError::RunConflict`] when the run moved on between the read and the write (a decision won the race), or
+/// [`DatabaseError::Sqlite`] for a persistence failure.
+pub async fn settle_parked_run_cancelled(
+    database: &SqliteDatabase,
+    run: &StoredRun,
+    now: UtcTimestamp,
+) -> Result<StoredRun, DatabaseError> {
+    // Only a parked run: `executing → cancelled` is also a legal edge, but a run with a driver is stopped by that
+    // driver at its next boundary, and settling it from here would race the driver's own writes.
+    if run.state() != RunState::AwaitingApproval {
+        return Err(DatabaseError::RunConflict);
+    }
+    let event = NewRunEvent::new(
+        jarvis_core::RunId::new().to_string(),
+        run.id(),
+        RunEventKind::RunCancelled,
+        Some(
+            EventSummary::new("the run was cancelled while waiting for approval")
+                .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "summary" })?,
+        ),
+        RunEventPayload::new(r#"{"outcome":"cancelled","while":"awaiting_approval"}"#)
+            .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "payload" })?,
+        CorrelationId::new(),
+        now,
+    )?;
+    let settlement = TerminalTransition::new(
+        ExpectedRunState::new(run.state(), run.version()),
+        RunTransition::cancelled(),
+        &event,
+    )?;
+    let settled = settle_run(database, &settlement).await?;
+
+    withdraw_cancelled_run_approvals(database).await?;
+    Ok(settled)
+}
+
+/// Withdraws what every **cancelled** run was waiting on.
+///
+/// A pending approval becomes `expired` with its payload and nonce gone, so it can neither be decided nor listed; an
+/// approved-but-unreleased one loses its held arguments, so `resume` cannot run an action for a run the person
+/// cancelled. Written as a sweep over cancelled runs rather than for one run so the same statement also repairs a run
+/// that was cancelled by [`recover_interrupted_runs`] (a request made while parked, settled at the next start), which
+/// had no other path to its approvals. It touches only approvals of runs in the terminal `cancelled` state.
+///
+/// # Errors
+///
+/// [`DatabaseError::Sqlite`] for a persistence failure.
+pub async fn withdraw_cancelled_run_approvals(
+    database: &SqliteDatabase,
+) -> Result<(), DatabaseError> {
+    // The empty digest is what a decided approval's nonce is rotated to, so the stored value can never match a
+    // presented nonce again (`ADR-0018`).
+    sqlx::query(
+        "UPDATE approvals SET state = 'expired', arguments_json = NULL, nonce_hash = ?1 \
+         WHERE state = 'pending' \
+           AND run_id IN (SELECT id FROM agent_runs WHERE state = 'cancelled')",
+    )
+    .bind(crate::approval_repository::digest(""))
+    .execute(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "withdraw a cancelled run's pending approvals",
+        source,
+    })?;
+    sqlx::query(
+        "UPDATE approvals SET arguments_json = NULL \
+         WHERE state = 'approved' AND arguments_json IS NOT NULL \
+           AND run_id IN (SELECT id FROM agent_runs WHERE state = 'cancelled')",
+    )
+    .execute(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "withdraw a cancelled run's approved arguments",
+        source,
+    })?;
+    Ok(())
+}
 fn decode_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, DatabaseError> {
     let state = row
         .try_get::<String, _>("state")
@@ -2023,6 +2121,36 @@ mod tests {
         assert_eq!(recovered, vec![waiting.id().to_owned()]);
         let settled = must(find_run(&database, waiting.id()).await);
         assert_eq!(settled.state(), RunState::Cancelled);
+        database.close().await;
+    }
+
+    /// **Cancelling a parked run settles it, because nothing else would.**
+    ///
+    /// A parked run has no driver to read a cancellation request, so before this the request was recorded and the
+    /// run sat at `awaiting_approval` for ever. A run that has a driver is refused here, not settled from outside.
+    #[tokio::test]
+    async fn cancelling_a_parked_run_settles_it_and_a_running_one_is_refused() {
+        let (_directory, database) = seeded_database().await;
+        let run = one_run(&database, RUN_A).await;
+        let context = advance(&database, run, RunState::ContextBuilding).await;
+        let planning = advance(&database, context, RunState::Planning).await;
+
+        // Planning is where a run with a driver stands when it is about to be parked.
+        let refused = settle_parked_run_cancelled(&database, &planning, at(2)).await;
+        assert!(
+            matches!(refused, Err(DatabaseError::RunConflict)),
+            "a run with a driver must not be settled from outside: {refused:?}"
+        );
+        assert_eq!(
+            must(find_run(&database, planning.id()).await).state(),
+            RunState::Planning
+        );
+
+        let waiting = advance(&database, planning, RunState::AwaitingApproval).await;
+        let requested = must(request_run_cancellation(&database, waiting.id(), at(2)).await);
+        let settled = must(settle_parked_run_cancelled(&database, &requested, at(3)).await);
+        assert_eq!(settled.state(), RunState::Cancelled);
+        assert_eq!(settled.terminal_outcome(), Some(RunOutcome::Cancelled));
         database.close().await;
     }
 

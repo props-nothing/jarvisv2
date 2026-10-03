@@ -38,7 +38,7 @@ use crate::database::{DatabaseError, SqliteDatabase};
 /// SHA-256 rather than a password hash: the nonce is 32 bytes of platform randomness, so there is no
 /// dictionary to attack and no need for a work factor. A slow hash would add latency to every
 /// approval decision without adding strength.
-fn digest(text: &str) -> String {
+pub(crate) fn digest(text: &str) -> String {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());

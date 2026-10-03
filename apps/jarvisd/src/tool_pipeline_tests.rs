@@ -1474,14 +1474,34 @@ async fn web_pipeline(
     (directory, database, pipeline, actor)
 }
 
-/// **A model-chosen URL is held for a person under the default workspace policy.**
+/// **A web fetch runs under the default policy, and an operator's `ask` override holds it for a person.**
 ///
-/// This is the decision `ADR-0129` rests on, asserted through the real pipeline and the real adapter rather
-/// than on the definition alone: if the declared risk and the default threshold ever stopped agreeing, the
-/// fetch would run unattended and nothing about the tool's own tests would notice.
+/// `ADR-0133` moved the fetch from risk 2 (held on every page) to risk 1. Both halves are asserted through the
+/// real pipeline and adapter, because the posture is the agreement between the declared risk and the threshold:
+/// the default must let it through, and the override must be able to bring the question back.
 #[tokio::test]
-async fn a_web_fetch_is_held_for_approval_by_default() {
-    let (_root, database, pipeline, actor) = web_pipeline(WorkspacePolicy::default()).await;
+async fn a_web_fetch_runs_by_default_and_an_ask_override_holds_it() {
+    let (_root, _database, pipeline, actor) = web_pipeline(WorkspacePolicy::default()).await;
+    let outcome = must(
+        pipeline
+            .call_tool(
+                jarvis_web::FETCH_TOOL,
+                json!({ "url": "http://127.0.0.1/admin" }),
+                &actor,
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(
+        matches!(outcome, ToolPipelineOutcome::Executed(_)),
+        "a fetch must not be held by default: {outcome:?}"
+    );
+
+    let asking = WorkspacePolicy::default().requiring(
+        must(jarvis_tools::ToolId::new(jarvis_web::FETCH_TOOL)),
+        jarvis_tools::ApprovalPolicy::Ask,
+    );
+    let (_root, database, pipeline, actor) = web_pipeline(asking).await;
     let outcome = must(
         pipeline
             .call_tool(
@@ -1498,7 +1518,7 @@ async fn a_web_fetch_is_held_for_approval_by_default() {
         ..
     } = outcome
     else {
-        panic!("a web fetch must be held under the default policy, got {outcome:?}");
+        panic!("a web fetch with an ask override must be held, got {outcome:?}");
     };
     assert_eq!(reason_code, "approval_required");
 
@@ -1549,11 +1569,11 @@ async fn an_unattended_web_fetch_is_still_refused_by_the_address_guard() {
         .to_owned();
     assert!(output.contains("not on the public internet"), "{output}");
 }
-/// **No workspace setting makes model-authored code run unattended.**
+/// **No threshold setting makes model-authored code run unattended.**
 ///
-/// The code tool declares `Ask` at risk 3, and a workspace can only tighten an approval (`ADR-0122`). So even
-/// with the ceiling and the approval threshold both raised to `High` — the most permissive document an operator
-/// can write — the call is held, and the approval carries the code so the person sees what they would run.
+/// The code tool declares `Ask` at risk 3, and a threshold or ceiling can only tighten an approval (`ADR-0122`).
+/// So even with both raised to `High` the call is held, and the approval carries the code so the person sees what
+/// they would run. Only the owner's explicit `policy.trust` entry waives it (`ADR-0133`), asserted next.
 #[tokio::test]
 async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
     let (directory, database) = database_with_run().await;
@@ -1606,5 +1626,70 @@ async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
         held.as_deref(),
         Some(r#"{"code":"echo hi"}"#),
         "the person deciding must be able to see the code"
+    );
+}
+
+/// **A tool the owner trusts runs without a hold, and trust is per tool.**
+///
+/// The default workspace holds code on its own (`Ask`, risk 3). With the owner's `policy.trust` entry the same
+/// call reaches the adapter — whether Docker is present decides only *how it ends*, so the assertion is that the
+/// call executed rather than was held — and an untrusted sibling with the same declaration is still held.
+#[tokio::test]
+async fn a_trusted_code_tool_runs_without_a_hold() {
+    let (directory, database) = database_with_run().await;
+    let interpreter = vec!["sh".to_owned(), "-c".to_owned()];
+    let definition = must(crate::code_run::CodeRunTool::definition(&interpreter));
+    let build = |workspace: WorkspacePolicy| {
+        let tool = must(crate::code_run::CodeRunTool::new(
+            jarvis_sandbox::ContainerBackend::probe(),
+            "alpine:3".to_owned(),
+            interpreter.clone(),
+        ));
+        must(ToolPipeline::with_adapters(
+            Arc::clone(&database),
+            None,
+            workspace,
+            vec![(
+                vec![definition.clone()],
+                Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+            )],
+            jarvis_storage::SecretStore::in_state(&directory.join("state")),
+        ))
+    };
+    let actor = ToolActor::for_composed_tools(
+        LOCAL_WORKSPACE_ID,
+        RUN,
+        SessionChannel::Cli,
+        AuthenticationStrength::Credential,
+        "policy-1",
+        std::slice::from_ref(&definition),
+    );
+    let call = |pipeline: ToolPipeline| {
+        let actor = actor.clone();
+        async move {
+            must(
+                pipeline
+                    .call_tool(
+                        crate::code_run::RUN_TOOL,
+                        json!({ "code": "echo hi" }),
+                        &actor,
+                        CorrelationId::new(),
+                    )
+                    .await,
+            )
+        }
+    };
+
+    let untrusted = call(build(WorkspacePolicy::default())).await;
+    assert!(
+        matches!(untrusted, ToolPipelineOutcome::AwaitingApproval { .. }),
+        "without trust the default workspace holds code: {untrusted:?}"
+    );
+    let trusted_policy = WorkspacePolicy::default()
+        .trusting(must(jarvis_tools::ToolId::new(crate::code_run::RUN_TOOL)));
+    let trusted = call(build(trusted_policy)).await;
+    assert!(
+        matches!(trusted, ToolPipelineOutcome::Executed(_)),
+        "a trusted tool must reach the adapter: {trusted:?}"
     );
 }

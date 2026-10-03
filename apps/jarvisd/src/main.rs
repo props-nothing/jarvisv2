@@ -3,6 +3,7 @@
 mod build_info;
 mod code_run;
 mod control;
+mod delegate;
 mod dispatch;
 mod entity_service;
 mod executor;
@@ -132,6 +133,13 @@ enum DaemonError {
         /// Which constant was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebFetchToolError,
+    },
+    /// The delegation tools could not state their own contract.
+    #[error("the delegation tools could not be defined")]
+    DelegateTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::delegate::DelegateToolError,
     },
     /// The code-running tool could not state its own contract.
     #[error("the code-running tool could not be defined")]
@@ -445,7 +453,13 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
     // Extracted into its own function because composing them carries its own failure policy — an MCP failure
     // is not fatal while a pipeline failure is — and `start` was at the length where clippy's `too_many_lines`
     // is a signal that a function has grown a second responsibility.
-    let (mcp, tools) = compose_tools(loaded_config.config(), &paths, Arc::clone(&database)).await?;
+    let (mcp, tools) = compose_tools(
+        loaded_config.config(),
+        &paths,
+        Arc::clone(&database),
+        executor.as_ref(),
+    )
+    .await?;
 
     // The **inbound** endpoint, composed after the pipeline for the forced reason that it serves the
     // pipeline's own definitions. A failure here is fatal unlike the outbound host's, because the operator
@@ -577,6 +591,7 @@ async fn compose_tools(
     config: &jarvis_storage::Config,
     paths: &AppPaths,
     database: Arc<SqliteDatabase>,
+    executor: Option<&Arc<executor::Executor>>,
 ) -> Result<
     (
         Option<crate::mcp_host::ComposedHost>,
@@ -652,6 +667,52 @@ async fn compose_tools(
             Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
         ),
     ];
+    push_code_tool(config, &mut additional)?;
+    // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
+    let agent = executor.map(|executor| {
+        Arc::new(crate::delegate::AgentTool::new(
+            Arc::clone(&database),
+            jarvis_storage::SecretStore::in_state(paths.state()),
+            Arc::clone(executor),
+        ))
+    });
+    if let Some(agent) = &agent {
+        additional.push((
+            crate::delegate::AgentTool::definitions()
+                .map_err(|source| DaemonError::DelegateTool { source })?,
+            Arc::clone(agent) as Arc<dyn jarvis_tools::ToolExecutor>,
+        ));
+    }
+    additional.extend(
+        mcp.as_ref()
+            .map(|host| {
+                host.adapters
+                    .iter()
+                    .map(|(definitions, adapter)| (definitions.clone(), Arc::clone(adapter)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+
+    let tools = compose_tool_pipeline(config, database, additional, paths)?;
+    if let (Some(agent), Some(pipeline)) = (&agent, &tools) {
+        agent.bind(pipeline);
+    }
+    Ok((mcp, tools))
+}
+
+/// Adds the code-running tool to the composition, when it is configured and this host can run it.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::CodeRunTool`] when the tool's own contract is rejected.
+fn push_code_tool(
+    config: &jarvis_storage::Config,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
     // The code-running tool is composed **only** when an operator configured an image and an interpreter AND this
     // host can actually run a container. An absent tool is the honest state otherwise: a registered tool that
     // failed every call would be offered to a model and read as a broken one. When configured but unavailable the
@@ -682,19 +743,7 @@ async fn compose_tools(
             );
         }
     }
-    additional.extend(
-        mcp.as_ref()
-            .map(|host| {
-                host.adapters
-                    .iter()
-                    .map(|(definitions, adapter)| (definitions.clone(), Arc::clone(adapter)))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-    );
-
-    let tools = compose_tool_pipeline(config, database, additional, paths)?;
-    Ok((mcp, tools))
+    Ok(())
 }
 
 /// Composes the tool pipeline from the configured workspace roots, or `None` when none are granted.
@@ -826,6 +875,16 @@ fn compose_workspace_policy(
             }
         })?;
         policy = policy.requiring(id, *approval);
+    }
+    // After the tightenings, so a tool both trusted and overridden stays asked (`WorkspacePolicy::trusting`).
+    for identifier in configured.trust() {
+        let id = jarvis_tools::ToolId::new(identifier.clone()).map_err(|source| {
+            DaemonError::WorkspacePolicyTool {
+                tool: identifier.clone(),
+                source,
+            }
+        })?;
+        policy = policy.trusting(id);
     }
     Ok(policy)
 }
@@ -1407,6 +1466,38 @@ deny = ["jarvis.mail.send"]
             ),
             jarvis_tools::ApprovalPolicy::Ask,
             "an override must not lower a tool's own `Ask`, wherever it is read from"
+        );
+    }
+
+    /// **A configured trust reaches the composed policy, and a denial or override on the same tool outranks it.**
+    ///
+    /// Asserted through `trusts`, which is what `evaluate` calls. The second half is the composition-seam version
+    /// of the direction rule: the operator writing both lines gets the question kept.
+    #[test]
+    fn a_configured_trust_reaches_the_policy_and_tightening_outranks_it() {
+        let config = config_with_policy(
+            r#"[policy]
+trust = ["jarvis.code.run", "jarvis.web.fetch", "jarvis.files.read"]
+deny = ["jarvis.web.fetch"]
+
+[policy.approval]
+"jarvis.files.read" = "ask"
+"#,
+        );
+        let policy = compose_workspace_policy(&config)
+            .unwrap_or_else(|error| panic!("the configured policy must compose: {error}"));
+        assert!(policy.trusts(&tool_id("jarvis.code.run")));
+        assert!(
+            !policy.trusts(&tool_id("jarvis.web.fetch")),
+            "a denial outranks trust"
+        );
+        assert!(
+            !policy.trusts(&tool_id("jarvis.files.read")),
+            "an override outranks trust"
+        );
+        assert!(
+            !policy.trusts(&tool_id("jarvis.memory.propose")),
+            "trust names tools, it is not a default"
         );
     }
 

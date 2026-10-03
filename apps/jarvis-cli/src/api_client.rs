@@ -453,6 +453,17 @@ impl ApiClient {
         Err(self.refusal(response).await)
     }
 
+    /// Asks the daemon to stop a run: the kill switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the run is unknown or already settled.
+    pub async fn cancel_run(&self, run_id: &str) -> Result<RunReply, ApiError> {
+        let path = format!("/api/v1/runs/{}/cancel", path_segment(run_id)?);
+        self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
+            .await
+    }
+
     /// Lists the most recent runs with what each answered.
     ///
     /// # Errors

@@ -2535,6 +2535,52 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **Limits:** `init` needs an existing `--root` directory; a hosted provider is checked only for a readable key file,
     not a live call; no Windows service or autostart.
 
+### P3-032: Less asking — approval is for what can hurt, and the owner can decide once
+
+- [x] `jarvis.web.fetch` is risk 1 and runs under the default workspace (`ADR-0133`, amends `ADR-0129`). Residual
+  exfiltration-by-URL risk is bounded (2,048-character URL cap, address rule, audit) and documented in `security.md`;
+  `"jarvis.web.fetch" = "ask"` restores the hold.
+- [x] `[policy] trust = [...]` / `WorkspacePolicy::trusting`: the owner's advance decision waives a tool's `Ask`, the
+  risk threshold and the authentication strength — and not the ceiling, a denial, scopes or the external-communication
+  rule; never consulted for externally communicating tools; a denial or approval override wins in either order.
+- [x] `jarvis init --code-image IMAGE [--code-interpreter "node -e"] [--trust-code]` writes the code sandbox and, only
+  on request, the trust.
+  - Tests: `standing_trust_waives_the_ask_and_nothing_else` (7 limits), `a_trusted_code_tool_runs_without_a_hold`,
+    `a_web_fetch_runs_by_default_and_an_ask_override_holds_it`, a composition test, 2 init tests.
+  - **Live:** with `--trust-code`, one prompt fetched example.com and ran a prime-sum snippet in `node:22-alpine`
+    (answer 5117, correct) with **no approval requested**.
+  - **Limits:** no "always allow" at the approval prompt (needs a writable policy); trust is per tool, not per argument.
+
+### P3-033: The kill switch — `jarvis cancel`, and a parked run that actually stops
+
+- [x] `jarvis cancel RUN` (identifier prefix; ambiguous or finished refused) and `jarvis cancel --all` (everything not
+  yet settled). Reports the request, not a stop that has not happened.
+- [x] **Defect found by the live run:** cancelling a run parked at `awaiting_approval` recorded a request nobody read (a
+  parked run has no driver), so the run stayed in the approvals list for ever. `settle_parked_run_cancelled` now settles
+  it directly (`awaiting_approval → cancelled`, refused for a run with a driver) and
+  `withdraw_cancelled_run_approvals` expires its pending approvals (payload and nonce gone) and drops approved-but-
+  unreleased arguments, so `resume` cannot run an action for a cancelled run. Restart recovery runs the same sweep, which
+  also repaired the orphan the live run had already left. Amends `ADR-0013`.
+  - Tests: storage `cancelling_a_parked_run_settles_it_and_a_running_one_is_refused`, gateway
+    `cancelling_a_parked_run_withdraws_its_approval` (cancelled, unlisted, undecidable, tool never ran), 2 CLI selection tests.
+  - **Limits:** a run in the middle of a model call stops at its next step boundary, not instantly; no `jarvis stop`
+    for the daemon itself; no sub-agent supervision yet (nothing to supervise).
+
+### P3-034: Sub-agents — delegation to a staff of ordinary runs
+
+- [x] `jarvis.agent.delegate` (optionally `background`, for parallel work) and `jarvis.agent.result`
+  (`apps/jarvisd/src/delegate.rs`, `ADR-0134`): a sub-agent is an ordinary run with the same policy, approvals, audit and
+  budgets, visible in `jarvis runs` as `[sub-agent]` and stoppable with `jarvis cancel`; delegation is one level deep (the
+  executor withholds `jarvis.agent.*` and the scope from a run whose objective carries the notice); at most 4 active; the
+  answer is fenced untrusted data; `result` refuses any run that is not a sub-agent of the workspace; a parked
+  sub-agent is reported as waiting for the person.
+  - Tests (7): delegate end to end with a fenced answer, a sub-agent is offered and granted no delegation, `result`
+    refuses an ordinary run, a parked sub-agent is reported waiting and not moved, definitions, marker, objective fit.
+  - **Live:** two sub-agents in parallel with `background: true` (fetch a page; compute with code), both collected by the
+    parent and reported correctly.
+  - **Limits:** the parent is not notified when a parked sub-agent is later approved; sub-agents share the parent's
+    model and tool set minus delegation; cost scales with the number of sub-agents (cap 4).
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

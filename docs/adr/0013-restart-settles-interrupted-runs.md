@@ -101,3 +101,7 @@ reviewable. A run that was interrupted is reported as interrupted.
   one. A second startup finds nothing to do.
 - This is the **second** place the settlement primitive is required, which is evidence for ADR-0011's
   conclusion that a terminal transition and its terminal event have no valid order as separate calls.
+
+## Amendment (2026-10-03, `P3-033`): cancelling a parked run settles it
+
+A cancellation is a request a run's driver honours at its next boundary, and a run parked at `awaiting_approval` has no driver, so the request was never read. Cancelling such a run now settles it as `cancelled` at once and withdraws its approvals (`settle_parked_run_cancelled`, `withdraw_cancelled_run_approvals`); startup recovery runs the same withdrawal for any cancelled run.

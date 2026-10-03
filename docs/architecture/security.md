@@ -65,6 +65,8 @@ Every context item, tool input/output, artifact, event, and trace can carry a cl
 
 | Threat | Control |
 | --- | --- |
+| Data leaving in a model-chosen URL | `jarvis.web.fetch` runs by default at risk 1 ([ADR-0133](../adr/0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md)): the URL is capped at 2,048 characters, private addresses are refused, every call is audited with its URL; an operator who does not accept the residual risk sets `"jarvis.web.fetch" = "ask"` under `[policy.approval]` |
+| A model multiplying itself or reading another run | a sub-agent is an ordinary run with the same policy and approvals; delegation is one level deep (the executor withholds the delegation tools and scope from a sub-agent), at most 4 are active, its answer is fenced as untrusted data, and `jarvis.agent.result` reads only sub-agents of the workspace ([ADR-0134](../adr/0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md)) |
 | Prompt injection in email/web/docs | mark external content untrusted; isolate instructions; enforce policy outside model; minimize tools/context |
 | Model self-approval/confused deputy | authenticated approval receipt bound to exact intent, actor, policy version, expiry, and state version |
 | Malicious/compromised MCP server | explicit install consent; constrained process/network; schema and output bounds; per-server scopes; no inherited secrets |

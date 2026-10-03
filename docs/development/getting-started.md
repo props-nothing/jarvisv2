@@ -39,7 +39,9 @@ jarvis chat
 Ollama ignores) and a validated `config.toml`, and it **never overwrites** an existing configuration without
 `--force`. It grants **no folder unless you name one** (`--workspace DIR`, repeatable, or the prompt). For another
 OpenAI-compatible server: `jarvis init --base-url URL --model NAME --api-key-file C:/path/to/key.txt` (the key stays in
-your file; it never passes through the command). `start` returns once the daemon listens, or says why it exited.
+your file; it never passes through the command). Add `--code-image node:22-alpine --code-interpreter "node -e"` to give
+the assistant a no-network throwaway container for code, and `--trust-code` to let it run without asking each time
+(`ADR-0133`); web pages already run without asking, and anything with an external effect is still asked. `start` returns once the daemon listens, or says why it exited.
 `--root DIR` (an existing directory) keeps a throwaway profile. The manual route below stays available for operators.
 
 In one terminal:
@@ -153,15 +155,19 @@ jarvisd --root C:/path/to/a/scratch/profile
 ### Tools and approvals
 
 The model is offered the daemon's tools: file read/list inside `daemon.tool_workspace_roots`, memory proposals,
-any configured MCP servers, and `jarvis.web.fetch` (a guarded read of a public web page). A tool the default policy
-holds — `jarvis.web.fetch` is one — **parks the run** until you decide it:
+any configured MCP servers, and `jarvis.web.fetch` (a guarded read of a public web page, which runs without asking). A
+tool the policy holds — code, anything with an external effect, or anything you set to `ask` — **parks the run** until you
+decide it:
 
 ```powershell
-jarvis ask "Fetch https://example.com and tell me the page heading."   # exits 11: waiting for approval
+jarvis ask "Run a snippet that prints 6*7."                            # exits 11: waiting for approval
 jarvis approvals list                                                   # shows the tool and its exact arguments
 jarvis approvals approve                                                # confirms, runs it once, prints the answer
 jarvis approvals deny                                                   # the run answers that you declined
 ```
+
+`jarvis cancel RUN` (a prefix is enough) or `jarvis cancel --all` is the kill switch: it stops a run that is waiting for you
+at once and one that is working at its next step, and withdraws any approval the run was waiting on.
 
 `approve` shows the arguments and asks; without a terminal it needs `--yes`. A held action survives a daemon
 restart. See `ADR-0130`.
@@ -176,7 +182,23 @@ code_sandbox_interpreter = ["node", "-e"]      # the snippet is appended as the 
 
 (or `JARVIS_CODE_SANDBOX_IMAGE` and `JARVIS_CODE_SANDBOX_INTERPRETER="node -e"`). `jarvis.code.run` then appears in
 `jarvis tools list`. Each snippet runs in a throwaway container with no network, a read-only filesystem, and 30
-seconds, and **every run waits for your approval** — you read the code first. See `ADR-0131`.
+seconds, and **every run waits for your approval** — you read the code first — unless you trust it:
+
+```toml
+[policy]
+trust = ["jarvis.code.run"]                    # or: jarvis init --code-image ... --trust-code
+```
+
+Trust is yours to give per tool, never given by default, and never applies to a tool that communicates externally; a
+`deny` or an `ask` override for the same tool wins. To be asked before every web page instead, set
+`[policy.approval] "jarvis.web.fetch" = "ask"`. See `ADR-0131`, `ADR-0133`.
+
+### Sub-agents
+
+The assistant can hand a bounded task to a sub-agent (`jarvis.agent.delegate`) and collect the answer
+(`jarvis.agent.result`), several at once with `background: true`. A sub-agent is an ordinary run: same tools, same
+approvals (it parks if it needs one — decide it with `jarvis approvals`), shown in `jarvis runs` as `[sub-agent]`,
+stopped with `jarvis cancel`. It cannot start further sub-agents, and at most four run at once. See `ADR-0134`.
 
 ### Tasks that run while you are away
 

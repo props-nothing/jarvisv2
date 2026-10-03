@@ -1057,12 +1057,16 @@ async fn load_skills(
 /// The schema is read through the registry (`definition.input_schema()`) rather than reconstructed, so
 /// the schema the model is offered is the one the pipeline validates arguments against — one statement
 /// of the contract, not two that could disagree.
-fn tool_specs(tools: &Arc<ToolPipeline>) -> Vec<ToolSpec> {
+fn tool_specs(tools: &Arc<ToolPipeline>, sub_agent: bool) -> Vec<ToolSpec> {
     tools
         .registry()
         .discover()
         .tools
         .iter()
+        // A sub-agent is offered no delegation tool, so delegation is one level deep (`ADR-0134`).
+        .filter(|summary| {
+            !(sub_agent && summary.id.starts_with(crate::delegate::AGENT_TOOL_PREFIX))
+        })
         .map(|summary| {
             let parameters = jarvis_tools::ToolId::new(&summary.id)
                 .ok()
@@ -1073,6 +1077,15 @@ fn tool_specs(tools: &Arc<ToolPipeline>) -> Vec<ToolSpec> {
                 );
             ToolSpec::new(summary.id.clone(), summary.description.clone(), parameters)
         })
+        .collect()
+}
+
+/// The names a run would be offered, for tests of what a sub-agent is not offered.
+#[cfg(test)]
+pub(crate) fn tool_specs_for_test(tools: &Arc<ToolPipeline>, sub_agent: bool) -> Vec<String> {
+    tool_specs(tools, sub_agent)
+        .iter()
+        .map(|spec| spec.name().to_owned())
         .collect()
 }
 
@@ -1565,7 +1578,10 @@ async fn generate(
     let model = deps.model;
     // The tool surface is re-derived from the registry on every call rather than carried in the
     // transcript, so the offered set is always the current one and there is one statement of it.
-    let specs = deps.tools.map_or_else(Vec::new, tool_specs);
+    let sub_agent = crate::delegate::is_delegated_objective(run.objective());
+    let specs = deps
+        .tools
+        .map_or_else(Vec::new, |tools| tool_specs(tools, sub_agent));
     let mut request = ChatRequest::new(
         deps.model_id.clone(),
         state.messages.clone(),
@@ -1776,6 +1792,19 @@ async fn run_tool_round(
             .await;
         }
     };
+    // A sub-agent's authority is derived from the surface **without** the delegation tools, so a call it makes
+    // to one anyway (a name it was never offered) is refused for a missing scope rather than run.
+    let sub_agent = crate::delegate::is_delegated_objective(run.objective());
+    let composed_definitions: Vec<_> = composed_definitions
+        .into_iter()
+        .filter(|definition| {
+            !(sub_agent
+                && definition
+                    .id()
+                    .to_string()
+                    .starts_with(crate::delegate::AGENT_TOOL_PREFIX))
+        })
+        .collect();
     let actor = crate::tool_actor::ToolActor::for_composed_tools(
         run.workspace_id(),
         run.id(),

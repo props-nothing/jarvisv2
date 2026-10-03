@@ -121,8 +121,9 @@ attempted the honest classification is a provider-unreachable failure. There is 
 
 ## Unresolved Questions
 
-1. **Exfiltration through the URL is not preventable by the tool.** The fetch is held by default for that reason; the
-   opt-in is an operator's informed choice. Blocks: nothing, but it must stay visible in `docs/architecture/security.md`.
+1. **Exfiltration through the URL is not preventable by the tool.** `ADR-0133` moved the fetch from held-by-default
+   to risk 1 (runs by default; a URL is capped at 2,048 characters, which bounds each call); `"jarvis.web.fetch" = "ask"`
+   under `[policy.approval]` restores the hold. The residual risk is an operator's informed choice. Blocks: nothing, but it must stay visible in `docs/architecture/security.md`.
 2. **`http` is allowed.** A plain-HTTP response can be altered in transit. The result says which scheme was used, and
    the output is untrusted either way. Revisit with an `https_only` setting if operators ask.
 3. **The model sees at most 4,000 characters of page text** because the executor truncates every tool result to 12,000

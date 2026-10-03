@@ -149,10 +149,10 @@ async fn fetch_result(tool: &WebFetchTool, url: &str) -> ToolCallResult {
 }
 
 #[test]
-fn the_contract_is_a_read_that_a_person_sees_by_default() {
+fn the_contract_is_a_low_risk_read_the_workspace_decides() {
     let definition = WebFetchTool::definition().unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(definition.id().to_string(), FETCH_TOOL);
-    assert_eq!(definition.risk().level(), 2);
+    assert_eq!(definition.risk().level(), 1);
     assert_eq!(definition.approval(), ApprovalPolicy::Policy);
     assert!(definition.effects().contains(ToolEffect::ReadOnly));
     assert_eq!(definition.required_scopes().len(), 1);

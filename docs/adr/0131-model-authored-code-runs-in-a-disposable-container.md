@@ -32,7 +32,7 @@ this signature"*), and there was no way for an operator to say which image a sni
    neither: half a sandbox is refused at startup. The interpreter is an argument vector with the snippet appended as
    one argument — there is no shell. The tool is **absent**, not present-and-failing, unless both are set and the
    host can run a container; a configured sandbox with no reachable runtime is reported once at startup.
-4. **Every run is held for a person, whatever the workspace allows.** The tool is `code_execution` (risk floor 3)
+4. **Every run is held for a person, whatever the workspace allows** — *amended by [ADR-0133](0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md): a threshold never lifts the hold, but the owner's explicit `policy.trust` entry does.* The tool is `code_execution` (risk floor 3)
    with `ApprovalPolicy::Ask`, which is unconditional; a workspace can only tighten an approval (`ADR-0122`), so no
    `approval_threshold` makes model-authored code run unattended. The person sees the code first, because a pending
    approval carries its arguments (`ADR-0130`) and `jarvis approvals` prints a multi-line program as lines.

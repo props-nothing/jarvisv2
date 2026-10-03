@@ -161,13 +161,14 @@ impl WebFetchTool {
             input_schema: ToolSchema::parse(INPUT_SCHEMA)?,
             output_schema: ToolSchema::parse(OUTPUT_SCHEMA)?,
             // A fetch changes nothing here, so the effect is `read_only`. It is **not** risk 0: the model
-            // chooses the URL, a URL carries data to its destination, and a page the model just read may have
-            // chosen it. Risk 2 is the workspace's default approval threshold, so by default a person sees the
-            // URL before it is requested. `ExternalCommunication` would say the same thing less usefully: it
-            // forces approval through a flag the operator cannot relax, and a tool nobody can ever run
-            // unattended is a tool nobody will enable. Raising `policy.approval_threshold` is the opt-in.
+            // chooses the URL, and a URL carries data to its destination. It is **not** risk 2 either, which
+            // this tool declared at first: that held every page for a person, and an assistant that asks before
+            // every web lookup is one nobody can use for research (`ADR-0133`). Risk 1 runs under the default
+            // workspace, bounded where the leak is: a URL is capped at `MAX_URL_CHARS`, the address rule keeps
+            // it off private networks, and every call is audited with its URL. An operator who wants the old
+            // behaviour writes `"jarvis.web.fetch" = "ask"` under `[policy.approval]`.
             effects: EffectSet::single(ToolEffect::ReadOnly),
-            risk: 2,
+            risk: 1,
             required_scopes: ScopeSet::single(Scope::new(FETCH_SCOPE)?),
             approval: ApprovalPolicy::Policy,
             timeout_seconds: TIMEOUT_SECONDS,

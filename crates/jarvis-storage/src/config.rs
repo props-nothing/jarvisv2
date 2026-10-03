@@ -353,9 +353,22 @@ pub struct PolicyConfig {
     /// [`jarvis_tools::WorkspacePolicy::requiring`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     approval: BTreeMap<String, ApprovalPolicy>,
+    /// Tools the owner has decided, once and in advance, may run without asking each time.
+    ///
+    /// The one setting that **relaxes** a tool's own approval declaration, which is why it is a separate list
+    /// rather than a value in `approval`: see [`jarvis_tools::WorkspacePolicy::trusting`] for what it waives and
+    /// what it never does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trust: Vec<String>,
 }
 
 impl PolicyConfig {
+    /// Returns the tool identifiers the owner trusts to run without a per-call approval, in written order.
+    #[must_use]
+    pub fn trust(&self) -> &[String] {
+        &self.trust
+    }
+
     /// Returns the configured ceiling, when one was written.
     #[must_use]
     pub const fn max_risk(&self) -> Option<Risk> {
@@ -658,6 +671,11 @@ impl Config {
         for identifier in &self.policy.deny {
             if identifier.trim().is_empty() {
                 return Err(ConfigError::BlankPolicyTool { key: "deny" });
+            }
+        }
+        for identifier in &self.policy.trust {
+            if identifier.trim().is_empty() {
+                return Err(ConfigError::BlankPolicyTool { key: "trust" });
             }
         }
         Ok(())
@@ -1046,7 +1064,13 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
         collect_nested_unknown(
             table,
             "policy",
-            &["max_risk", "approval_threshold", "deny", "approval"],
+            &[
+                "max_risk",
+                "approval_threshold",
+                "deny",
+                "approval",
+                "trust",
+            ],
             &mut unknown,
         );
         collect_nested_unknown(

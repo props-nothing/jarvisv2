@@ -3426,6 +3426,85 @@ mod tests {
         );
     }
 
+    /// **The kill switch stops a run that is waiting for a person, and withdraws what it was waiting on.**
+    ///
+    /// Found live: `jarvis cancel` recorded the request and the run stayed at `awaiting_approval`, because a parked
+    /// run has no driver to read it. Asserted from the person's side: the run is cancelled, the approval is no longer
+    /// listed, deciding it afterwards is refused, and the tool never ran.
+    #[tokio::test]
+    async fn cancelling_a_parked_run_withdraws_its_approval() {
+        let adapter =
+            std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let (app, presented, _profile, approval_id, nonce, database) =
+            approval_router_with(adapter.clone()).await;
+
+        // The fixture holds a call made directly, so the run is still at its start: walk it to the state a driver
+        // leaves it in when a call is held.
+        let run =
+            jarvis_storage::read_recent_runs(&database, jarvis_storage::LOCAL_WORKSPACE_ID, 1)
+                .await
+                .unwrap_or_else(|error| panic!("read the run: {error}"))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("the fixture created a run"));
+        let mut current = run;
+        for next in [
+            jarvis_core::RunState::ContextBuilding,
+            jarvis_core::RunState::Planning,
+            jarvis_core::RunState::AwaitingApproval,
+        ] {
+            current = jarvis_storage::transition_run(
+                &database,
+                current.id(),
+                current.expectation(),
+                &jarvis_core::RunTransition::new(next, next.required_outcome(), None)
+                    .unwrap_or_else(|error| panic!("transition: {error}")),
+                jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("advance to {next:?}: {error}"));
+        }
+
+        let cancelled = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/runs/{}/cancel", current.id()),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let reply: jarvis_protocol::RunReply = serde_json::from_str(&body_text(cancelled).await)
+            .unwrap_or_else(|error| panic!("decode the reply: {error}"));
+        assert_eq!(reply.state, jarvis_core::RunState::Cancelled, "{reply:?}");
+
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/approvals", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let listed: jarvis_protocol::ApprovalListReply =
+            serde_json::from_str(&body_text(listed).await)
+                .unwrap_or_else(|error| panic!("decode the list: {error}"));
+        assert!(listed.approvals.is_empty(), "{listed:?}");
+
+        let decided = app
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce, "resume": true }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert!(
+            !decided.status().is_success(),
+            "a withdrawn approval must not be decidable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(adapter.calls(), 0, "the cancelled call must never run");
+    }
+
     /// A decision without `resume` releases nothing, and the approval then still holds what it needs for
     /// `POST /approvals/{id}/resume` — the recovery path for a daemon that died between the two steps.
     #[tokio::test]
