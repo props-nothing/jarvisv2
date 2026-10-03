@@ -782,13 +782,29 @@ async fn a_pending_approval_holds_its_arguments_until_it_is_decided() {
     must(record_decision(&database, &id, request.nonce_for_storage(), &approve(1)).await);
     assert_eq!(
         must(read_approval_arguments(&database, &id).await),
-        None,
-        "a decided approval must hold no tool payload"
+        Some(arguments.to_string()),
+        "an APPROVED approval keeps its arguments until the call has run, so a crash cannot lose the call"
     );
     assert!(
         !must(attach_approval_arguments(&database, &id, &arguments.to_string()).await),
         "a payload can never be attached to an approval that was already decided"
     );
+    must(clear_approval_arguments(&database, &id).await);
+    assert_eq!(must(read_approval_arguments(&database, &id).await), None);
+}
+
+/// A **refused** approval holds nothing: there is no call to finish, so there is no reason to keep a payload.
+#[tokio::test]
+async fn a_denied_approval_clears_its_arguments_at_once() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    let arguments = serde_json::json!({"url": "https://example.com"});
+    let request = approval_for("jarvis.web.fetch", &arguments);
+    let id = request.id().to_string();
+    must(create_approval(&database, &request).await);
+    must(attach_approval_arguments(&database, &id, &arguments.to_string()).await);
+    must(record_decision(&database, &id, request.nonce_for_storage(), &deny(1)).await);
+    assert_eq!(must(read_approval_arguments(&database, &id).await), None);
 }
 
 /// A payload too large to hold is not held, and that is not an error: the approval stands, and is simply not

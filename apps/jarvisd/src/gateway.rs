@@ -181,6 +181,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/calls/{id}/resume", post(resume_call))
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}/decision", post(decide_approval))
+        .route("/approvals/{id}/resume", post(resume_approval))
         .route("/memories", get(list_memories).post(remember))
         .route("/memories/search", post(search_memories))
         .route("/memories/export", get(export_memories))
@@ -501,6 +502,19 @@ async fn resume_call(
     Path(call_id): Path<String>,
     Json(body): Json<ResumeCallRequest>,
 ) -> Response {
+    resume_core(&state, &call_id, body.arguments).await
+}
+
+/// Releases a decided call: the whole of what both resume routes do, once.
+///
+/// The arguments come from the caller of this function, not from the request — the client route passes the ones
+/// it was given, and the approval route passes the ones the daemon held — so the one thing that differs between
+/// the two is *who supplies the payload*, and the intent digest decides whether it is the approved one.
+async fn resume_core(
+    state: &GatewayState,
+    call_id: &str,
+    arguments: serde_json::Value,
+) -> Response {
     let Some(tools) = state.tools() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -512,7 +526,7 @@ async fn resume_call(
     // The run comes from the **call's own row**, not from the request. Reading it first also makes an
     // unknown call a `404` before any authority is derived, so a caller cannot probe for call identifiers
     // by watching which ones produce a policy answer.
-    let stored = match jarvis_storage::find_tool_call(state.database(), &call_id).await {
+    let stored = match jarvis_storage::find_tool_call(state.database(), call_id).await {
         Ok(stored) => stored,
         Err(jarvis_storage::DatabaseError::ToolCallNotFound) => {
             return error_response(
@@ -555,10 +569,9 @@ async fn resume_call(
         &composed_definitions,
     );
 
-    let arguments = body.arguments;
     match tools
         .resume(
-            &call_id,
+            call_id,
             arguments.clone(),
             &actor,
             jarvis_core::CorrelationId::new(),
@@ -571,7 +584,15 @@ async fn resume_call(
             // than awaited for the same reason `start_run` spawns: the outcome is already durable and the
             // run identifier is known, so a continuation that fails leaves a run visibly unfinished
             // rather than a response that claims a completion it did not make.
-            continue_parked_run(&state, stored.run_id(), &call_id).await;
+            continue_parked_run(state, stored.run_id(), call_id).await;
+            // The call has run, so the held arguments have served their purpose. They were kept past the
+            // decision for exactly this: a daemon that died between the two could still finish the call.
+            if let Some(approval) = stored.approval_id()
+                && let Err(error) =
+                    jarvis_storage::clear_approval_arguments(state.database(), approval).await
+            {
+                tracing::warn!(%error, "an executed call's held arguments could not be cleared");
+            }
             (StatusCode::OK, Json(tool_call_reply(&result))).into_response()
         }
         // A resumed call cannot be held again: the approval is what released it. Reaching `AwaitingApproval`
@@ -699,6 +720,17 @@ async fn decide_approval(
 ) -> Response {
     match state.runs.decide(&id, &body).await {
         Ok(reply) => {
+            // A client that asks for it has the daemon release the call as part of the decision. It is opt-in
+            // because the REST clients that predate it decide and then resume themselves, and a resume that has
+            // already happened is refused. The release is spawned: running the tool can take longer than a
+            // request should, and the client follows the run's own stream for the outcome.
+            if body.resume && body.decision == jarvis_protocol::ApprovalDecisionRequest::Approve {
+                let state = state.clone();
+                let approval_id = id.clone();
+                tokio::spawn(async move {
+                    release_approved_call(&state, &approval_id).await;
+                });
+            }
             // A refusal is a decision the run has to hear about. An **approval** is continued by the resume
             // route, because releasing the call needs the arguments; a refusal needs nothing but to tell the
             // model, so it is continued here, where the decision is made.
@@ -709,6 +741,59 @@ async fn decide_approval(
         }
         Err(error) => error.into_response(),
     }
+}
+
+/// Releases the call an **approved** approval is holding, from the arguments the daemon kept.
+///
+/// Reads the approval, not the request: the call is the approval's own correlation identity, and the payload is
+/// what was held when the call was admitted. Nothing here is supplied by a client, so the only way to run a call
+/// through this path is for the approval to exist, be approved, and still hold its arguments — and the intent
+/// digest, recomputed from them, is the last check.
+async fn release_approved_call(state: &GatewayState, approval_id: &str) -> Response {
+    let approval = match jarvis_storage::find_approval(state.database(), approval_id).await {
+        Ok(approval) => approval,
+        Err(jarvis_storage::DatabaseError::ApprovalNotFound) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                ErrorCode::Validation,
+                "no approval exists for the requested identifier",
+            );
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Internal,
+                "the local database is not available",
+            );
+        }
+    };
+    if approval.stored_state() != jarvis_core::ApprovalState::Approved {
+        return error_response(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "only an approved approval can be released",
+        );
+    }
+    let held = match jarvis_storage::read_approval_arguments(state.database(), approval_id).await {
+        Ok(Some(text)) => serde_json::from_str::<serde_json::Value>(&text).ok(),
+        _ => None,
+    };
+    let Some(arguments) = held else {
+        return error_response(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the approval no longer holds its arguments, so the call has already run or cannot be released here",
+        );
+    };
+    resume_core(state, &approval.correlation_id().to_string(), arguments).await
+}
+
+/// `POST /api/v1/approvals/{id}/resume`
+///
+/// Finishes an approved call whose release did not happen — the daemon died between the decision and the
+/// release, or the client never asked for it. It takes **no body**: the arguments are the ones the daemon held.
+async fn resume_approval(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
+    release_approved_call(&state, &id).await
 }
 
 /// Continues a run that parked on a call whose approval was just refused or withdrawn.
@@ -792,8 +877,26 @@ async fn list_approvals(State(state): State<GatewayState>) -> Response {
         }
     };
 
-    let mut approvals = Vec::with_capacity(pending.len());
-    for request in &pending {
+    // Approved-but-unrun approvals are listed too: a person who approved and whose daemon then died has no other
+    // way to learn that the call never ran.
+    let unreleased = match jarvis_storage::read_workspace_unreleased_approvals(
+        state.database(),
+        identity.workspace_id(),
+    )
+    .await
+    {
+        Ok(unreleased) => unreleased,
+        Err(error) => {
+            tracing::warn!(%error, "the approved, unreleased approvals could not be read");
+            Vec::new()
+        }
+    };
+    let mut approvals = Vec::with_capacity(pending.len() + unreleased.len());
+    for (request, state_name) in pending
+        .iter()
+        .map(|request| (request, "pending"))
+        .chain(unreleased.iter().map(|request| (request, "approved")))
+    {
         let id = request.id().to_string();
         // A stored payload that is not JSON is treated as absent rather than failing the list: one bad row
         // must not hide every other pending approval, and an approval with no payload is not decidable from a
@@ -804,6 +907,7 @@ async fn list_approvals(State(state): State<GatewayState>) -> Response {
         };
         approvals.push(jarvis_protocol::PendingApprovalReply {
             approval_id: id,
+            state: state_name.to_owned(),
             run_id: request.run_id().to_string(),
             call_id: request.correlation_id().to_string(),
             tool: request.tool().to_owned(),
@@ -3204,6 +3308,176 @@ mod tests {
         );
     }
 
+    /// Waits for a recording adapter to have run, because the daemon releases an approved call in a task.
+    async fn wait_for_calls(
+        adapter: &crate::approval_fixture::RecordingApprovalAdapter,
+        expected: usize,
+    ) {
+        for _ in 0..100 {
+            if adapter.calls() >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// **Approving with `resume` has the daemon release the call, from the arguments it held, exactly once.**
+    ///
+    /// This is the flow the CLI uses, and the point of it is what the client does *not* do: it sends no payload.
+    /// What runs is what was held when the call was admitted and shown to the person, so there is no second
+    /// copy of the arguments for a client to get wrong, and a crash between decision and release cannot lose
+    /// them. The adapter's counter is the assertion, and the held arguments being gone afterwards is the other.
+    #[tokio::test]
+    async fn approving_with_resume_releases_the_held_call_exactly_once() {
+        let adapter =
+            std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let (app, presented, _profile, approval_id, nonce, database) =
+            approval_router_with(adapter.clone()).await;
+
+        let decided = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce, "resume": true }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(decided.status(), StatusCode::OK);
+        wait_for_calls(&adapter, 1).await;
+        assert_eq!(adapter.calls(), 1, "the daemon must have released the call");
+
+        // Released a second time, the call is already done: refused, and the effect is not repeated.
+        let again = app
+            .oneshot(post_json(
+                &format!("/api/v1/approvals/{approval_id}/resume"),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            again.status(),
+            StatusCode::CONFLICT,
+            "{}",
+            body_text(again).await
+        );
+        assert_eq!(
+            adapter.calls(),
+            1,
+            "a second release must not run the tool again"
+        );
+        assert_eq!(
+            jarvis_storage::read_approval_arguments(&database, &approval_id)
+                .await
+                .unwrap_or_else(|error| panic!("read the held arguments: {error}")),
+            None,
+            "an executed call's held arguments must be gone"
+        );
+    }
+
+    /// A decision without `resume` releases nothing, and the approval then still holds what it needs for
+    /// `POST /approvals/{id}/resume` — the recovery path for a daemon that died between the two steps.
+    #[tokio::test]
+    async fn an_approved_call_can_be_finished_later_without_resending_its_arguments() {
+        let adapter =
+            std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let (app, presented, _profile, approval_id, nonce, _database) =
+            approval_router_with(adapter.clone()).await;
+
+        // Not yet approved: there is nothing to release.
+        let early = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/approvals/{approval_id}/resume"),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            early.status(),
+            StatusCode::CONFLICT,
+            "{}",
+            body_text(early).await
+        );
+
+        let decided = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(decided.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            adapter.calls(),
+            0,
+            "a decision without `resume` must not run the tool"
+        );
+
+        // The person who approved can see the call never ran, and what would finish it.
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/approvals", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let listed: jarvis_protocol::ApprovalListReply =
+            serde_json::from_str(&body_text(listed).await)
+                .unwrap_or_else(|error| panic!("decode the list: {error}"));
+        assert_eq!(listed.total, 1);
+        assert_eq!(listed.approvals[0].state, "approved");
+        assert_eq!(listed.approvals[0].approval_id, approval_id);
+
+        let finished = app
+            .oneshot(post_json(
+                &format!("/api/v1/approvals/{approval_id}/resume"),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            finished.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(finished).await
+        );
+        assert_eq!(adapter.calls(), 1);
+    }
+
+    /// A denied approval cannot be released, whatever is asked.
+    #[tokio::test]
+    async fn a_denied_approval_cannot_be_released() {
+        let adapter =
+            std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let (app, presented, _profile, approval_id, nonce, _database) =
+            approval_router_with(adapter.clone()).await;
+        let denied = app
+            .clone()
+            .oneshot(decision_request(
+                &presented,
+                &approval_id,
+                &serde_json::json!({ "decision": "deny", "nonce": nonce, "resume": true }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(denied.status(), StatusCode::OK);
+        let release = app
+            .oneshot(post_json(
+                &format!("/api/v1/approvals/{approval_id}/resume"),
+                &presented,
+                "{}",
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(release.status(), StatusCode::CONFLICT);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(adapter.calls(), 0, "a denial must never run the tool");
+    }
     /// A resume for an identifier that is not a call is a `404`.
     #[tokio::test]
     async fn a_resume_for_an_unknown_call_is_not_found() {

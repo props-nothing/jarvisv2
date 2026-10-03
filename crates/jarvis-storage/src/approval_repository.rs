@@ -217,7 +217,8 @@ pub async fn record_decision(
     let result = sqlx::query(
         "UPDATE approvals SET \
             state = ?2, decision_channel = ?3, decision_strength = ?4, decided_by = ?5, \
-            occurred_at = ?6, nonce_hash = ?7, arguments_json = NULL \
+            occurred_at = ?6, nonce_hash = ?7, \
+            arguments_json = CASE WHEN ?2 = 'approved' THEN arguments_json ELSE NULL END \
          WHERE id = ?1 AND state = 'pending'",
     )
     .bind(id)
@@ -328,6 +329,29 @@ pub async fn attach_approval_arguments(
     Ok(result.rows_affected() == 1)
 }
 
+/// Clears the arguments an approval is holding, once the call they belong to has run.
+///
+/// An **approved** approval keeps its arguments past the decision, so a daemon that died between the decision and
+/// the release can still finish the call. They are cleared when the call executes, and at once by a denial.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the write fails.
+pub async fn clear_approval_arguments(
+    database: &SqliteDatabase,
+    id: &str,
+) -> Result<(), DatabaseError> {
+    sqlx::query("UPDATE approvals SET arguments_json = NULL WHERE id = ?1")
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "clear an approval's arguments",
+            source,
+        })?;
+    Ok(())
+}
+
 /// Reads the arguments a pending approval holds, if it holds any.
 ///
 /// # Errors
@@ -386,6 +410,36 @@ pub async fn read_workspace_pending_approvals(
         .into_iter()
         .filter(|request| request.state_at(now) == ApprovalState::Pending)
         .collect())
+}
+
+/// Reads a workspace's **approved** approvals whose call has not run yet, newest first.
+///
+/// An approved approval keeps its arguments until the call executes, so "approved and still holding arguments" is
+/// exactly "released by a person but not yet run" — the state a daemon that died between the decision and the
+/// release leaves behind, and which `jarvis approvals resume` finishes.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::StoredApprovalInvalid`] when a stored row cannot be decoded.
+pub async fn read_workspace_unreleased_approvals(
+    database: &SqliteDatabase,
+    workspace_id: &str,
+) -> Result<Vec<ApprovalRequest>, DatabaseError> {
+    let rows = sqlx::query(
+        "SELECT id, workspace_id, run_id, actor_id, tool, tool_version, intent_hash, preview, \
+                risk_level, required_strength, nonce_hash, state, decision_channel, \
+                decision_strength, decided_by, correlation_id, created_at, expires_at, occurred_at \
+         FROM approvals WHERE workspace_id = ?1 AND state = 'approved' AND arguments_json IS NOT NULL \
+         ORDER BY created_at DESC, id ASC",
+    )
+    .bind(workspace_id)
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read a workspace's unreleased approvals",
+        source,
+    })?;
+    rows.iter().map(decode_approval).collect()
 }
 
 /// Reads the pending approvals for a run, evaluated against a clock.

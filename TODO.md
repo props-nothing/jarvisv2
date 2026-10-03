@@ -2484,8 +2484,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     id instead of "stalled"; docs (`getting-started.md` was also stale about what exists).
   - **Limits:** an expired pending approval keeps its payload until a retention sweep exists; a declined call's
     `tool_calls` row stays `requested`; `approve` resumes the call from the arguments the CLI was shown, so a daemon
-    restart *between* the decision and the resume leaves the call approved but not run (re-run `approve` is refused
-    because it is decided — a `resume`-only verb is the follow-up); SQLite only (no Postgres `approvals` migration
+    restart *between* the decision and the resume left the call approved but not run (closed by `P3-030`); SQLite only (no Postgres `approvals` migration
     exists yet).
 
 ## P3-029: The model can run code, in a disposable container
@@ -2506,6 +2505,20 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     or out and no state between runs; limits (30 s, 64 processes, 256 MiB) are constants; a program too large for the
     8 KiB approval payload cannot be approved from the CLI; `jarvis.code.run` only exists when an image is configured,
     pulled, and a runtime is reachable.
+
+## P3-030: An approved call survives a daemon restart
+
+- [x] `P3-030` Close the limit `P3-028` recorded: a daemon that died between a decision and the release left a call that
+  was approved, never run, and impossible to finish.
+  - Approved approvals keep their arguments until the call runs (denials clear them at once); the decision route takes
+    an opt-in `resume: true` and releases the call from the held arguments; `POST /approvals/{id}/resume` and
+    `jarvis approvals resume ID` finish one that was not released; `GET /approvals` lists `approved` ones. The CLI no
+    longer re-sends any payload. Amends [ADR-0130](docs/adr/0130-a-pending-approval-holds-what-it-is-waiting-on.md).
+  - **Live:** approve, kill the daemon, restart, `list` shows approved-not-run, `resume` fetches the page, run completes.
+  - Tests: 3 gateway tests (release exactly once and arguments cleared; finish later without re-sending; a denial can
+    never be released), 2 storage tests (approved keeps, denied clears).
+  - **Limits:** nothing releases an approved call *automatically* at startup (a person runs `resume`); an approved
+    approval whose call is never released keeps its payload until a retention sweep exists.
 
 ## P4: Memory And Context
 

@@ -135,9 +135,12 @@ fn approval_decision_path(approval_id: &str) -> Result<String, RunPathError> {
     ))
 }
 
-/// Builds the resume path for one held call, validating the identifier first.
-fn call_resume_path(call_id: &str) -> Result<String, RunPathError> {
-    Ok(format!("/api/v1/calls/{}/resume", path_segment(call_id)?))
+/// Builds the release path for one approval, validating the identifier first.
+fn approval_resume_path(approval_id: &str) -> Result<String, RunPathError> {
+    Ok(format!(
+        "{APPROVALS_PATH}/{}/resume",
+        path_segment(approval_id)?
+    ))
 }
 
 /// Time allowed to establish a connection to a loopback daemon.
@@ -379,25 +382,15 @@ impl ApiClient {
         self.send_json(reqwest::Method::POST, &path, body).await
     }
 
-    /// Resumes a held call after its approval was decided, supplying the arguments the approval bound.
-    ///
-    /// The daemon recomputes the intent from these arguments, so a wrong payload is refused rather than run.
+    /// Releases an approved call from the arguments the daemon held, for one whose release did not happen.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::Refused`] when the call is unknown, was not approved, or the arguments differ.
-    pub async fn resume_call(
-        &self,
-        call_id: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<serde_json::Value, ApiError> {
-        let path = call_resume_path(call_id)?;
-        self.send_json(
-            reqwest::Method::POST,
-            &path,
-            &serde_json::json!({ "arguments": arguments }),
-        )
-        .await
+    /// Returns [`ApiError::Refused`] when the approval is unknown, not approved, or no longer holds its arguments.
+    pub async fn resume_approval(&self, approval_id: &str) -> Result<serde_json::Value, ApiError> {
+        let path = approval_resume_path(approval_id)?;
+        self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
+            .await
     }
 
     /// Lists every registered tool with the authorization posture in force for it.

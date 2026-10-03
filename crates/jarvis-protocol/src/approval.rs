@@ -53,6 +53,12 @@ pub struct ApprovalDecisionBody {
     /// rather than a decision about it — and "a denial is the safe outcome" is exactly the argument that
     /// would make a forged one indistinguishable from an ordinary refusal.
     pub nonce: String,
+    /// Whether the daemon should release the approved call as part of the decision, from the arguments it held.
+    ///
+    /// Opt-in and defaulting to `false`, because clients that predate it decide and then resume the call
+    /// themselves, and a resume that already happened is refused. Ignored for a denial.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 /// Response body for `POST /api/v1/approvals/{id}/decision`.
@@ -91,6 +97,12 @@ pub struct ApprovalReply {
 pub struct PendingApprovalReply {
     /// The approval's identifier, which a decision names.
     pub approval_id: String,
+    /// `pending` while a person has yet to decide it, or `approved` when they have and the call has not run.
+    ///
+    /// An `approved` entry is what a daemon that died between the decision and the release leaves behind; it is
+    /// finished with `POST /approvals/{id}/resume`.
+    #[serde(default = "pending_state")]
+    pub state: String,
     /// The run that is waiting on it.
     pub run_id: String,
     /// The held call, which is what a resume names.
@@ -124,4 +136,9 @@ pub struct ApprovalListReply {
     pub total: usize,
     /// The pending approvals, newest first.
     pub approvals: Vec<PendingApprovalReply>,
+}
+
+/// The default for [`PendingApprovalReply::state`], so a reply from a daemon that predates the field decodes.
+fn pending_state() -> String {
+    "pending".to_owned()
 }

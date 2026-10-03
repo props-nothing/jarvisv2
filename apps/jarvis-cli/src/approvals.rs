@@ -43,6 +43,7 @@ pub async fn run(client: &ApiClient, paths: &AppPaths, arguments: &[String]) -> 
         Some("list") | None => list(client, json).await,
         Some("approve") => decide(client, paths, arguments, ApprovalDecisionRequest::Approve).await,
         Some("deny") => decide(client, paths, arguments, ApprovalDecisionRequest::Deny).await,
+        Some("resume") => resume(client, arguments).await,
         Some(other) => {
             eprintln!("jarvis: unknown approvals command {other:?}");
             eprintln!("{}", usage());
@@ -53,7 +54,7 @@ pub async fn run(client: &ApiClient, paths: &AppPaths, arguments: &[String]) -> 
 
 /// The usage line for this group.
 pub(crate) const fn usage() -> &'static str {
-    "usage: jarvis approvals <list|approve|deny> [...]\n       jarvis approvals list [--json]\n       jarvis approvals approve [APPROVAL_ID] [--yes]\n       jarvis approvals deny [APPROVAL_ID]"
+    "usage: jarvis approvals <list|approve|deny|resume> [...]\n       jarvis approvals list [--json]\n       jarvis approvals approve [APPROVAL_ID] [--yes]\n       jarvis approvals deny [APPROVAL_ID]\n       jarvis approvals resume APPROVAL_ID"
 }
 
 /// `jarvis approvals list`
@@ -83,17 +84,23 @@ fn render_list(reply: &ApprovalListReply) {
         println!("nothing is waiting for approval");
         return;
     }
-    println!("{} approval(s) waiting", reply.total);
+    println!("{} approval(s) listed", reply.total);
     for approval in &reply.approvals {
         println!(
-            "  {}  risk {}  {} {}  expires {}",
+            "  {}  {}  risk {}  {} {}",
             approval.approval_id,
+            approval.state,
             approval.risk_level,
             approval.tool,
             approval.tool_version,
-            approval.expires_at
         );
         println!("      {}", describe_arguments(approval));
+        if approval.state == "approved" {
+            println!(
+                "      approved, but the call has not run: `jarvis approvals resume {}`",
+                approval.approval_id
+            );
+        }
     }
 }
 
@@ -143,7 +150,21 @@ async fn decide(
         .iter()
         .skip(2)
         .find(|argument| !argument.starts_with("--") && !is_flag_value(arguments, argument));
-    let approval = match select(&pending, requested.map(String::as_str)) {
+    // Only an approval still waiting for a person can be decided; an `approved` one is finished with `resume`.
+    let waiting = ApprovalListReply {
+        total: pending
+            .approvals
+            .iter()
+            .filter(|approval| approval.state == "pending")
+            .count(),
+        approvals: pending
+            .approvals
+            .iter()
+            .filter(|approval| approval.state == "pending")
+            .cloned()
+            .collect(),
+    };
+    let approval = match select(&waiting, requested.map(String::as_str)) {
         Ok(approval) => approval,
         Err(message) => {
             eprintln!("jarvis: {message}");
@@ -180,7 +201,13 @@ async fn decide(
             return ExitStatus::Rejected;
         }
     };
-    let body = ApprovalDecisionBody { decision, nonce };
+    // Approving asks the daemon to release the call too, from the arguments it holds: the CLI never re-sends a
+    // payload, so what runs is what was shown and approved, and a crash between the two steps cannot lose it.
+    let body = ApprovalDecisionBody {
+        decision,
+        nonce,
+        resume: approving,
+    };
     let decided = match client.decide_approval(&approval.approval_id, &body).await {
         Ok(decided) => decided,
         Err(error) => return report(&error),
@@ -196,16 +223,27 @@ async fn decide(
         return crate::chat::follow_run(client, &approval.run_id, &approval.approval_id).await;
     }
 
-    // The decision released the call; resuming it runs the effect once and lets the parked run answer. The
-    // arguments are sent from here because the daemon recomputes the intent from them, so a payload that is not
-    // the one that was approved is refused rather than run.
-    let Some(arguments_value) = approval.arguments.as_ref() else {
-        return ExitStatus::Internal;
-    };
-    if let Err(error) = client.resume_call(&approval.call_id, arguments_value).await {
-        return report(&error);
-    }
+    // The daemon is releasing the call now; following the run shows its answer.
     crate::chat::follow_run(client, &approval.run_id, &approval.approval_id).await
+}
+
+/// `jarvis approvals resume APPROVAL_ID`: finishes an approved call whose release did not happen.
+///
+/// For the daemon having died between a decision and the release. The approval keeps its arguments until the call
+/// has run, so this needs no payload from the client.
+async fn resume(client: &ApiClient, arguments: &[String]) -> ExitStatus {
+    let Some(id) = arguments.get(2).filter(|value| !value.starts_with("--")) else {
+        eprintln!("jarvis: approvals resume needs the approval identifier");
+        eprintln!("{}", usage());
+        return ExitStatus::Usage;
+    };
+    match client.resume_approval(id).await {
+        Ok(reply) => {
+            println!("{reply}");
+            ExitStatus::Ok
+        }
+        Err(error) => report(&error),
+    }
 }
 
 /// Picks the approval a verb applies to: the one named, or the only one pending.
@@ -297,6 +335,7 @@ mod tests {
     fn approval(id: &str, arguments: Option<serde_json::Value>) -> PendingApprovalReply {
         PendingApprovalReply {
             approval_id: id.to_owned(),
+            state: "pending".to_owned(),
             run_id: "run".to_owned(),
             call_id: "call".to_owned(),
             tool: "jarvis.web.fetch".to_owned(),

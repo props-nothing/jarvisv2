@@ -59,6 +59,26 @@ Items 1–4 are one gap and 5 is a defect the same walk through the product expo
 - Postgres has no `approvals` migration yet (its directory holds only the embeddings table), so this is SQLite-only
   like the table itself.
 
+## Amendment (2026-10-03, `P3-030`): arguments are kept until the call has run
+
+Decision 1 said a decision clears the arguments. That left one hole, recorded as a limit: the arguments were gone the
+moment a person approved, so a daemon that died between the decision and the release left a call that was approved,
+never run, and impossible to finish (the CLI had to re-send a payload it no longer had). The rule is now:
+
+- A **denial or cancellation** clears the arguments at once — there is no call to finish.
+- An **approval keeps them until the call has executed**, when the release clears them. "Approved and still holding
+  arguments" is therefore exactly "released by a person but not yet run".
+- `POST /api/v1/approvals/{id}/decision` takes an opt-in `resume: true`: the daemon releases the approved call itself,
+  in a task, from the arguments it held. The CLI uses it, so it never re-sends a payload and what runs is what was
+  shown. Clients that predate it keep deciding and then resuming themselves.
+- `POST /api/v1/approvals/{id}/resume` (no body) finishes an approved call whose release did not happen, and
+  `GET /api/v1/approvals` lists such approvals with `state: approved`. `jarvis approvals resume ID` is the CLI form.
+- Both release paths share one function with `POST /calls/{id}/resume`, and the intent digest recomputed from the held
+  arguments is still the last check.
+
+Verified live: approve over REST without `resume`, kill the daemon, restart, `jarvis approvals list` shows the call as
+approved-not-run, `jarvis approvals resume` fetches the page, and the run completes.
+
 ## Falsification
 
 - `a_run_waiting_on_approval_survives_a_restart` failed before the recovery change, with the daemon's own error.
