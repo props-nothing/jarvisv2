@@ -27,6 +27,7 @@ mod memory;
 mod retrieval;
 mod risk;
 mod secretbytes;
+mod skill;
 mod tool_outcome;
 
 pub use approval::{
@@ -56,7 +57,7 @@ pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessag
 pub use escalation::{EscalationSignal, InvalidEscalationSignal};
 pub use id::{
     ApprovalId, ClientId, CorrelationId, DaemonRunId, EntityId, IdGenerator, InvalidId,
-    InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SystemIdGenerator,
+    InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SkillId, SystemIdGenerator,
     WorkspaceId,
 };
 pub use isolation::{
@@ -98,6 +99,11 @@ pub use run_event::{
 pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};
 pub use session::{InvalidSessionField, MAX_SESSION_TITLE_CHARS, SessionChannel, SessionStatus};
+pub use skill::{
+    DropReason, InvalidSkill, MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_DROPPED_FIELD_NAME_CHARS,
+    MAX_SKILL_DROPPED_FIELDS, MAX_SKILL_STEP_CHARS, MAX_SKILL_STEPS, MAX_SKILL_VERSION_CHARS,
+    SkillDroppedField, SkillRevision, SkillRevisionParts, SkillState, SkillStep,
+};
 pub use testkit::{
     MAX_SCRATCH_REMOVAL_ATTEMPTS, SCRATCH_REMOVAL_INTERVAL, remove_scratch_dir, scratch_tag,
 };

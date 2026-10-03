@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -550,6 +550,39 @@ pub enum DatabaseError {
     StoredToolCallInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
+    },
+    /// No skill revision exists for the requested identifier.
+    #[error("no skill revision exists for the requested identifier")]
+    SkillRevisionNotFound,
+    /// A stored skill revision row contradicted the domain's own rules.
+    ///
+    /// A storage-integrity finding, as [`Self::StoredMemoryInvalid`] is for memories: a row written by
+    /// another build, restored from a backup, or edited outside JARVIS is reported rather than defaulted.
+    /// It matters more here than for a claim, because a defaulted provenance could attribute a
+    /// model-authored procedure to the user — the trust inversion `ADR-0117` §3 exists to prevent.
+    #[error("the stored skill revision has an invalid {field}")]
+    StoredSkillInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// A skill promotion was refused because the revision was not a proposal.
+    ///
+    /// Distinct from [`Self::SkillTransitionRefused`] because the cause and the remedy differ: this
+    /// one means a promotion already happened (or a concurrent writer won), so the caller should re-read
+    /// rather than retry — and `ADR-0043` requires not overwriting the approver a first decision named.
+    #[error("the skill revision was not promoted: {reason}")]
+    SkillPromotionRefused {
+        /// Why the promotion did not happen.
+        reason: &'static str,
+    },
+    /// A skill state transition was refused because the revision was not in the required state.
+    ///
+    /// A redundant transition is refused rather than reported as success, following the rule
+    /// `P3-006c` established: accepting one reads as a state change that did not happen.
+    #[error("the skill revision state transition was refused: {reason}")]
+    SkillTransitionRefused {
+        /// Why the transition was refused.
+        reason: &'static str,
     },
 }
 

@@ -23,6 +23,14 @@
 
 Runtime checkpoints and provider conversation IDs are not memory types. They are opaque execution bindings.
 
+**`Procedural` is a memory *type*, and a stored skill is a separate record (`ADR-0117`).** The two are
+related but not the same shape, and keeping them apart is deliberate: a claim carries confidence,
+decay, retrieval ranking, and a deduplication key, while a procedure carries ordered steps at declared
+tool versions, a promotion, and a supersession chain. Applying a claim's semantics to a procedure is
+meaningless — "how confident are you in this procedure" has no answer — and collapsing two different
+revision bodies onto one key would refuse the second as a duplicate. So a skill lives in its own table
+(`skill_revisions`) with its own lifecycle, and nothing here selects one.
+
 ## Canonical Record
 
 A durable memory record includes at least:

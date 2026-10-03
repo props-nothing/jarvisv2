@@ -16,6 +16,7 @@ mod session_repository;
 
 mod approval_repository;
 mod secret_store;
+mod skill_repository;
 mod tool_call_repository;
 mod workspace_repository;
 
@@ -72,6 +73,11 @@ pub use secret_store::{APPROVAL_NONCE_DIRECTORY, SecretStore, SecretStoreError};
 pub use session_repository::{
     API_SESSION_CHANNEL, NewSession, SessionTarget, StartRunInput, StartedRun, StoredSession,
     find_session, start_run,
+};
+pub use skill_repository::{
+    ToolValidator, archive_skill_revision, find_skill_revision, promote_skill_revision,
+    read_skill_revisions, read_usable_skill_revisions, read_workspace_skill_revisions,
+    record_skill_revision, restore_skill_revision, supersede_skill_revision,
 };
 pub use tool_call_repository::{
     CallBinding, CallOrigin, CallTarget, NewToolCall, StoredToolCall, admit_tool_call,

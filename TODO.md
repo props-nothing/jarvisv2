@@ -3007,14 +3007,93 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `ACCEPTANCE_REQUIRE_FIXTURE_PEER=1`, all four phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, and
       `cargo deny check` ok (advisories, bans, licenses, sources — eight `duplicate` warnings, all pre-existing
       and none an error).
-- [ ] `P4-011` Define the skill format and its lifecycle. **Record `ADR-0117` first** (accepted): a skill is a
-      procedure naming already-granted tools, loading authorizes nothing, a self-authored skill is `Derived`
-      context fenced by `ADR-0049`, and promotion is a durable approval that names its approver (`ADR-0043`).
-      Delivers the record shape (source, version, and the tools it names at that version), the `Proposed`
-      state for an agent-authored skill, the promotion decision, and replacement by declared supersession
-      (`ADR-0045`). Refuses any authority-bearing field, a preset approver, or a pre-approval. An external
-      skill format is readable only under `ADR-0117` §7, and **every dropped field is recorded** rather than
-      silently ignored (the `ADR-0022` rule for an accepted-then-ignored field).
+- [x] `P4-011` Define the skill format and its lifecycle. **`ADR-0117` was recorded first** (accepted): a
+      skill is a procedure naming already-granted tools, loading authorizes nothing, a self-authored skill is
+      `Derived` context fenced by `ADR-0049`, and promotion is a durable approval that names its approver
+      (`ADR-0043`).
+      **Recorded as its own slice because the gap is an unmade trust decision, not a missing feature.**
+      `requirements.md` lists `procedural` among the memory types and `ROADMAP.md` names "event-triggered
+      skills", and **nothing connected them** — no shape, no creation step, no statement of what a skill *is*.
+      The reason that matters: "skill" is the name two other designs in this class give to **text that is
+      loaded and then acted on**, injected beside the tool list with its effects gated by a pattern list or a
+      coarse approval. That step is incompatible with `AGENTS.md`'s boundary — *the model may request an
+      effect; deterministic Rust policy decides whether it may happen* — and a skill is a new route by which
+      an instruction reaches the model.
+      **Delivered:** `jarvis-core` gains `skill` (`SkillRevision`, `SkillStep`, `SkillState`, `DropReason`,
+      `SkillDroppedField`, `InvalidSkill`, the `MAX_SKILL_*` bounds) and `SkillId`; a migration
+      (`0010_skill_revisions.sql`) makes three of `ADR-0117`'s rules properties of a row; and
+      `jarvis-storage` gains `skill_repository` (record, find, three scoped reads, promote, archive, restore,
+      supersede). `CURRENT_SCHEMA_VERSION` moves 9 → 10.
+      **⭐⭐ AUTHORITY IS UNREPRESENTABLE, WHICH IS THE POINT OF THE WHOLE SLICE.** There is deliberately **no
+      field** for a grant, a scope, a pre-approved effect, or a chosen approver — no constructor accepts
+      authority and there is nowhere one could arrive. That is the `P3-006c` shape: the rule is enforced by
+      what the type can *express* rather than by a check every reader must remember. A skill is an `SkillId`,
+      a source, a version, a step list, and prose.
+      **⭐⭐ THE PROMOTION RULE HAS THREE ENFORCERS, AND THEY ARE NOT REDUNDANT.** `ADR-0117` §4 makes
+      promotion an approval. So (a) `SkillRevision::new` refuses a **model-authored** revision recorded
+      `Active`; (b) `promote_skill_revision` writes under `WHERE state = 'proposed'`, so a second promotion
+      affects zero rows and is *reported* rather than silently overwriting the approver a first decision named
+      (`ADR-0043`); and (c) the **schema** requires that an active model-authored row names its approver —
+      `CHECK (state <> 'active' OR source_kind <> 'model_inference' OR promoted_by_actor_id IS NOT NULL)`.
+      **(c) is the only layer that can state it.** A promoted revision legitimately decodes as `active`, so a
+      decode must bypass the construction check — which is why `SkillRevision::from_stored` exists — and the
+      gap that opens is closed in SQL, where a row that reached that state some other way is refused at write.
+      A test writes SQL directly to reach it, because a repository-mediated write cannot produce the row.
+      **⭐⭐ A FIXTURE PUT ITS DATABASE IN THE WRONG DIRECTORY AND EVERY TEST TOOK FIVE MINUTES.** The first
+      version wrote each test's database **directly into the system temp directory**, and one test took
+      **306 seconds**. The cause is not the code under test: `SqliteDatabase::open` calls
+      `prepare_private_directory` on the database's *parent*, so the fixture was re-securing `%TEMP%` — a
+      shared directory with many entries and a broad ACL — on every open. Moving the file into a private
+      subdirectory its own `Drop` removes brought sixteen tests from 763 s to 2.6 s. **It looked like a hang
+      rather than a slowdown, and the cost was in where the fixture put its file.** The approval fixture
+      already used a subdirectory, which is why it was fast; the new fixture did not copy that.
+      **⭐ A DECODE RE-APPLIES THE RULES, AND THE TOOL-IDENTIFIER RULE ARRIVES AS A PARAMETER.** A step names a
+      tool, and the rule for a valid identifier lives in `jarvis-tools`, which `jarvis-storage` may not depend
+      on (`repository-layout.md`: an adapter may depend on core and **not on another adapter**). So every
+      function that builds a `SkillStep` takes a `validate_tool` function — the rule keeps **one** home in the
+      crate that owns it rather than being restated as a second pattern here. It also means a decode
+      **re-applies** the rule: a row written by another build, restored from a backup, or hand-edited is
+      refused on read exactly as on write, asserted with the real validator so the failure is the rule rather
+      than a parse error. The **provenance equality** is re-applied the same way, and restated in SQL, because
+      a model inference that could claim authoritative trust would be a self-authored procedure read as the
+      user's own instruction.
+      **⭐ A DROPPED EXTERNAL FIELD IS RECORDED WITH A REASON.** `ADR-0117` §7 requires any field that would
+      grant authority, preselect an ungranted tool, or pre-approve an effect to be dropped **and the drop
+      recorded**, because a field accepted-then-ignored is worse than one never accepted — a reader of the
+      stored skill cannot otherwise tell the format's intent from this platform's behaviour. `DropReason`
+      carries the four authority-bearing categories plus `Unrepresented`, and `is_authority_bearing()`
+      partitions them so a reviewer can see how much of a document was refused.
+      **⭐ REPLACEMENT IS DECLARED, SO BOTH LEGS ARE THE CALLER'S.** `ADR-0117` §5 and `ADR-0045`: nothing
+      infers a supersession from comparing prose. The successor names what it replaced at insert time and
+      `supersede_skill_revision` writes the forward pointer — and it **checks the successor exists first**,
+      because a dangling `superseded_by` would make the chain unwalkable and the failure would only surface
+      when something tried to follow it.
+      **⭐ A STEP'S VERSION IS EVIDENCE, NOT A GRANT.** `SkillStep::tool_version` records the version a
+      revision was authored against, so "which version of the tool did this procedure address" is answerable
+      from the record (`ADR-0117` §5) rather than reconstructed from today's registry. Whether the actor's
+      *current* grant covers a step is decided when the step runs, never at load — a grant revoked between the
+      two must refuse the step, and only an execution-time check can see that.
+      **⭐ `procedural` MEMORIES AND SKILLS ARE SEPARATE TABLES, RECORDED AS A DEPARTURE.** A skill *could*
+      have been a `memories` row with a JSON body, since `procedural` is a valid `memory_type`. It is not,
+      because a skill is not a claim: a claim has confidence, decay, retrieval ranking, and a search key,
+      while a procedure has versioned steps, a promotion, and a supersession chain. Putting one in `memories`
+      would make every retrieval query carry a type predicate to skip the non-claims and would let a skill
+      silently acquire a claim's semantics — and collapsing two different revision bodies onto one
+      `search_key` would refuse the second as a duplicate.
+      Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` with the binaries
+      present (adds 20 core tests and 16 repository tests; `jarvis-core` at 262, `jarvis-storage` at 215),
+      `cargo deny check` ok — one `yoke-derive` version had to be updated because the advisory database began
+      reporting the pinned `0.8.3` as yanked, which is the database moving rather than this change.
+      **Limits, recorded rather than glossed:** **no external skill format is read yet.** The *mechanism* for
+      recording a drop exists and is tested, but no parser for any external document does — and adopting one
+      requires the research `.github/instructions/external-integrations.instructions.md` mandates, including
+      deciding which fields a real format carries and which of them are authority-bearing. So `P4-011`'s
+      "an external skill format is readable only under `ADR-0117` §7" is **unimplemented by choice**, and the
+      drop vocabulary is the seam a format would plug into. Also: there is **no creation surface** (no route
+      and no tool writes a skill, so a skill is reachable only from a test), which `P4-013` owns; `steps` and
+      `dropped_fields` are JSON columns with `json_valid` bounds rather than child tables, recorded in the
+      migration with the reasoning; and no `P4-012` retrieval selection exists, so nothing selects a skill by
+      relevance to a task.
 - [ ] `P4-012` Retrieve and use a skill: selection by relevance to the task, inclusion in the context envelope
       as derived content, and an execution path in which **every step is an ordinary tool request** through
       the full gateway. There is deliberately **no "skill execution" path**, so a step whose grant was revoked

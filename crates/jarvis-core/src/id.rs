@@ -216,7 +216,19 @@ typed_id!(
     /// make identity resolution a property of every claim rather than an auditable act of its own.
     EntityId
 );
-
+typed_id!(
+    /// Identifies one skill, or one revision of one skill.
+    ///
+    /// Distinct from [`MemoryId`]: a skill is a procedure rather than a claim, and `ADR-0117` keeps the
+    /// two representations separate so a skill never silently acquires the claim lifecycle's semantics
+    /// (retrieval ranking, confidence, decay) nor a claim acquires a procedure's (versioned steps, a
+    /// promotion).
+    /// The same type identifies a **skill** and a **revision of that skill**, which is why
+    /// [`crate::SkillRevision`] carries two of them. They are the same kind of value — an opaque
+    /// `UUIDv7` the platform issued — and a distinct `SkillRevisionId` would be a second type with no rule
+    /// of its own to enforce, which is the shape that grows a type system without growing a guarantee.
+    SkillId
+);
 #[cfg(test)]
 mod tests {
     use super::*;
