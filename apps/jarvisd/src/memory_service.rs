@@ -183,7 +183,16 @@ impl MemoryService {
     /// Loaded from the seeded local identity rather than taken from a request, which is the scope rule this
     /// module's doc explains. A failure is reported as storage, because an absent identity row means the
     /// database was not migrated rather than that the caller did something wrong.
-    async fn workspace(&self) -> Result<WorkspaceId, MemoryServiceError> {
+    /// The two readers below are `pub` because the **tool** surface needs them: a candidate a model submits has
+    /// no request to carry a workspace or an author, so both come from here exactly as they do for a remember.
+    /// Exposing them rather than duplicating them is what keeps one answer to "which workspace" and "who is
+    /// acting" across both surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage failure when the identity row cannot be read, which means the database was not
+    /// migrated rather than that a caller did something wrong.
+    pub async fn workspace(&self) -> Result<WorkspaceId, MemoryServiceError> {
         let identity = load_local_identity(&self.database).await?;
         identity
             .workspace_id()
@@ -196,8 +205,6 @@ impl MemoryService {
 
     /// Returns the seeded local user, read from the identity rather than supplied.
     ///
-    /// # Why this replaced a literal, and what the literal had already broken
-    ///
     /// This value used to be the string `"local-user"`, written at one call site, while every other write path
     /// in the daemon uses `LOCAL_USER_ID` — the identifier `0005` actually seeds into `users`. The two never
     /// matched. The consequence is not cosmetic: `confirm_by` refuses an approver equal to the claim's author,
@@ -209,9 +216,71 @@ impl MemoryService {
     /// not, and the check passes. Reading it from the identity is what makes the comparison meaningful, and it
     /// is why the value is derived here rather than accepted from the request — a caller able to name its own
     /// author could name one that differs from its approver and defeat the same guard from the other side.
-    async fn actor_id(&self) -> Result<String, MemoryServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage failure when the identity row cannot be read.
+    pub async fn actor_id(&self) -> Result<String, MemoryServiceError> {
         let identity = load_local_identity(&self.database).await?;
         Ok(identity.user_id().to_owned())
+    }
+
+    /// Runs the candidate pipeline over an already-built candidate and stores what it admitted.
+    ///
+    /// # Why this exists as one method rather than inside `remember`
+    ///
+    /// `P4-014` gives the model a **tool** to propose through, and a tool that ran its own pipeline would be a
+    /// second admission path. The repository's rule is that two paths disagree about what a claim means —
+    /// `ADR-0045` records a duplicate-versus-correction inference that already produced exactly that — so the
+    /// sequence lives once and both surfaces call it: `remember` builds a `RememberRequest`-shaped candidate
+    /// from a user's statement, and `memory_propose` builds an inference-shaped one from a model's arguments.
+    /// What differs between them is **what the candidate is**, and what does not differ is every stage applied
+    /// to it.
+    ///
+    /// # Why the caller passes resolved entity identifiers rather than `EntityRef`s
+    ///
+    /// Resolution is a **read of the store** and belongs with the rest of this layer's reads, so the candidate's
+    /// `proposed_entities` stays empty here and the resolved set is supplied to the pipeline. That ordering is
+    /// `MemoryCandidate::admit`'s documented requirement — entities before the key, because the key is derived
+    /// from the resolved entities and deriving it from the proposals would compare a different key than the one
+    /// the store holds.
+    ///
+    /// # Why the tombstone is answered `false`
+    ///
+    /// `record_memory` answers it, in the statement that is atomic with the insert, so a re-ingest of a deleted
+    /// claim is refused by the layer that can see the tombstone row. A value read here would be stale by the
+    /// time the insert ran, and `true` would refuse a claim that is not deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryServiceError::Refused`] when a stage refuses the candidate, carrying the rule that
+    /// refused it.
+    pub async fn admit_and_store(
+        &self,
+        candidate: MemoryCandidate,
+        entity_ids: &[String],
+        now: UtcTimestamp,
+    ) -> Result<Admitted, MemoryServiceError> {
+        let workspace = candidate.workspace_id;
+        let entities = self.resolve_entities(workspace, entity_ids).await?;
+        let context = jarvis_core::CandidateContext {
+            resolved_entities: &entities,
+            existing: None,
+            superseded_by: None,
+            tombstoned: false,
+        };
+        let admission =
+            candidate
+                .admit(&context)
+                .map_err(|refusal| MemoryServiceError::Refused {
+                    reason: refusal.as_str(),
+                    detail: refusal_detail(&refusal),
+                })?;
+        let stored = self.store(workspace, &admission, now).await?;
+        Ok(Admitted {
+            outcome: outcome_of(&admission, stored.wrote),
+            stored,
+        })
     }
 
     /// Lists the workspace's claims, newest first.
@@ -336,35 +405,13 @@ impl MemoryService {
             correlation_id: CorrelationId::new(),
         };
 
-        // Supersession is declared, so the candidate names the claim it corrects and the pipeline links the
-        // two. The `existing` context is deliberately **not** supplied: a remember is a *new* claim, and
-        // handing the pipeline a same-key neighbour would turn a duplicate into a correction — the inference
-        // `ADR-0045` refuses.
-        // The tombstone is answered by `record_memory` rather than here, and the context says `false` because
-        // this path has not read it — the storage check is the one that is atomic with the insert, so a
-        // re-ingest of a deleted claim is refused by the layer that can see the tombstone row. Supplying a
-        // guess would be worse than `false`: `true` would refuse a claim that is not deleted, and a value read
-        // here would still be stale by the time the insert ran.
+        // The pipeline runs once, in `admit_and_store`, so a remember and a model's `memory.propose` call are
+        // the same admission sequence over different candidates — see that method for what is shared and why.
         let now = UtcTimestamp::now(&SystemClock);
-        let context = jarvis_core::CandidateContext {
-            resolved_entities: &entities,
-            existing: None,
-            superseded_by: None,
-            tombstoned: false,
-        };
-        let admission =
-            candidate
-                .admit(&context)
-                .map_err(|refusal| MemoryServiceError::Refused {
-                    reason: refusal.as_str(),
-                    detail: refusal_detail(&refusal),
-                })?;
-        let stored = self.store(workspace, &admission, now).await?;
-        Ok(reply_of(
-            &stored.memory,
-            outcome_of(&admission, stored.wrote),
-            None,
-        ))
+        let admitted = self
+            .admit_and_store(candidate, &request.entity_ids, now)
+            .await?;
+        Ok(reply_of(&admitted.stored.memory, admitted.outcome, None))
     }
 
     /// Replaces a claim's text with a corrected version.
@@ -888,6 +935,21 @@ fn declared_supersession(admission: &MemoryAdmission) -> Option<MemoryId> {
     }
 }
 
+/// What an admission produced: the claim as the store holds it, and the service's name for what happened.
+///
+/// # Why the outcome and the claim travel together
+///
+/// Both callers need both: the HTTP surface builds a reply from them and the tool surface reports them as its
+/// output. Returning only the outcome would force the tool to name a claim it had not read, and returning only
+/// the claim would lose the difference between a creation and a re-statement — which is the difference
+/// `outcome_of` exists to state, because the pipeline answers `New` for a claim the unique index then refused.
+pub struct Admitted {
+    /// The stable name of what happened, corrected for whether anything was written.
+    pub outcome: String,
+    /// The claim as the store holds it, after the write.
+    pub stored: Stored,
+}
+
 /// Refuses a page larger than the bound.
 fn check_page(limit: u32) -> Result<(), MemoryServiceError> {
     if limit == 0 || limit > MAX_MEMORY_PAGE {
@@ -901,19 +963,21 @@ fn check_page(limit: u32) -> Result<(), MemoryServiceError> {
 
 /// What a store operation produced: the claim as the store holds it, and whether anything was written.
 ///
-/// # Why the two travel together
-///
 /// The pipeline's admission name and the fact of a write are different answers, and only the first was
 /// available to the reply. `MemoryAdmission::New` is what the pipeline decides when it is given no `existing`
 /// memory to compare against — which is every remember — so a duplicate is detected by the unique index
 /// **after** that decision. A reply built from the admission alone therefore reports "remembered" for a
 /// request that stored nothing, and the caller's status code and outcome would both be wrong in the same
 /// direction. Pairing them makes the divergence unrepresentable rather than merely documented.
-struct Stored {
+///
+/// `pub(crate)` because the tool surface reports the same pair as its output. Making it private would force
+/// `Admitted` to expose the claim through an accessor, which is one more thing to keep in step for no gain —
+/// and it is the *pair* that both callers need, so it travels as one value.
+pub(crate) struct Stored {
     /// The claim as the store holds it.
-    memory: StoredMemory,
+    pub memory: StoredMemory,
     /// Whether this operation wrote a row.
-    wrote: bool,
+    pub wrote: bool,
 }
 
 /// Returns the stable name of what an admission did, correcting for whether it actually wrote.

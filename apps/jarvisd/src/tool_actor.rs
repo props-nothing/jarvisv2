@@ -27,6 +27,12 @@ pub const FILES_READ_SCOPE: &str = "files.read";
 /// the two agree, because **two copies of a literal that must match is exactly the defect class this project
 /// keeps finding** — and the failure would be silent: every MCP call denied with `MissingScope`, reading as a
 /// policy problem rather than a typo.
+///
+/// `#[cfg(test)]` because production no longer names it: the actor's authority is derived from the composed
+/// tools' own declarations, so this literal's only remaining job is the correspondence check above. Keeping it
+/// in the shipped build would be a constant nothing reads — the shape this file's other `#[cfg(test)]` item
+/// exists to avoid.
+#[cfg(test)]
 pub const MCP_CALL_SCOPE: &str = "mcp.call";
 
 /// The identity and grants one tool call is made under.
@@ -144,6 +150,14 @@ impl ToolActor {
     /// configuration one — so the caller can fail the daemon at startup instead of granting a subset silently.
     /// Failing closed to a *partial* grant would be worse than refusing: a call would be denied for a missing
     /// scope and read as a policy problem rather than a malformed constant.
+    /// `#[cfg(test)]` because the HTTP and run paths derive their authority from the composed tools
+    /// (`for_composed_tools`), so nothing in the shipped build calls this. It survives as the fixture that
+    /// asserts the two grants are **distinct** — `workspace_reader` for `files.read` alone, this one for
+    /// `files.read` plus an outbound MCP grant — which is what makes "an actor grants what its caller needs"
+    /// checkable rather than asserted in prose. A public constructor with no production caller is how a surface
+    /// grows a method nothing uses, which is why this one is scoped to the tests rather than kept for a caller
+    /// that does not exist.
+    #[cfg(test)]
     #[must_use]
     pub fn workspace_and_mcp(
         workspace_id: impl Into<String>,
@@ -165,6 +179,69 @@ impl ToolActor {
             claimed_strength,
             policy_version: policy_version.into(),
         })
+    }
+
+    /// Describes the actor an **outbound HTTP tool call** is made under: the union of the grants the daemon's
+    /// own composed tools require.
+    ///
+    /// # Why this replaces a hand-written scope list, and what the list cost twice
+    ///
+    /// The HTTP surface serves whichever tools the daemon composed, and the actor must be able to call **any**
+    /// of them — the client addresses one, so the actor is the daemon's own authority to run its own surface.
+    /// Two defects came from writing that authority out by hand:
+    ///
+    /// 1. **`P4-014`'s tool was registered and dead.** `memory.propose` requires a scope the hand-written list
+    ///    did not include, so every call was denied with `MissingScope` — and `jarvis tools preview` reported
+    ///    `deny` for a tool the daemon was offering, which is worse than no preview because it sends an operator
+    ///    to change a policy that is already correct.
+    /// 2. **The scope had to be dropped again, immediately.** `mcp.call` was removed from the list on the
+    ///    reasoning that this path serves only *native* tools, and `phase_3_gate` failed within the same change:
+    ///    the surface does serve MCP tools, and a write tool over MCP paused with `403 missing_scope` instead of
+    ///    reaching its approval.
+    ///
+    /// Both are the same mistake — a second statement of what the adapters already declare — and the fix is the
+    /// one `ToolActor::remote` already uses on the inbound side: **derive it from the definitions.** A tool that
+    /// is composed is callable, and a tool that is not composed cannot be addressed, so the union is exactly the
+    /// daemon's authority over its own surface. No list to keep in step, and a new adapter is reachable the
+    /// moment it is registered.
+    ///
+    /// `files.read` is **added** rather than relied on to be present: the filesystem adapter is registered only
+    /// when an operator grants roots, so on a daemon with none the union would omit it and a policy override for
+    /// `jarvis.files.read` would be unreachable through this surface. A grant the daemon's surface may serve is
+    /// part of the surface's authority whether or not the adapter is currently composed.
+    #[must_use]
+    pub fn for_composed_tools(
+        workspace_id: impl Into<String>,
+        run_id: impl Into<String>,
+        channel: SessionChannel,
+        claimed_strength: AuthenticationStrength,
+        policy_version: impl Into<String>,
+        composed: &[jarvis_tools::ToolDefinition],
+    ) -> Self {
+        // Collected and rebuilt rather than unioned in place: `ScopeSet` exposes `iter` and `new` and no
+        // mutating union, which is deliberate — a set that could be widened after construction is a grant that
+        // can grow without the caller saying so. One rebuild says what the union is.
+        let mut scopes: Vec<Scope> = Self::required_scopes_for(composed)
+            .iter()
+            .cloned()
+            .collect();
+        // `files.read` is **added** rather than relied on to be present: the filesystem adapter is registered
+        // only when an operator grants roots, so on a daemon with none the union would omit it and a policy
+        // override for `jarvis.files.read` would be unreachable through this surface. A grant the daemon's
+        // surface may serve is part of the surface's authority whether or not the adapter is currently composed.
+        if let Ok(files) = Scope::new(FILES_READ_SCOPE)
+            && !scopes.contains(&files)
+        {
+            scopes.push(files);
+        }
+        Self {
+            workspace_id: workspace_id.into(),
+            run_id: run_id.into(),
+            scopes: ScopeSet::new(scopes),
+            channel,
+            claimed_strength,
+            policy_version: policy_version.into(),
+        }
     }
 
     /// Describes an actor with read access to a workspace, over a channel at a stated strength.
@@ -341,6 +418,75 @@ mod tests {
                 .iter()
                 .any(|scope| scope.resource() == "files" && scope.action() == "read"),
             "the actor must hold files.read and nothing else: {authority:?}"
+        );
+    }
+
+    /// **The authority an actor holds is derived from the tools that were composed, so a composed tool is
+    /// callable and an uncomposed one is not.**
+    ///
+    /// This is the rule that replaces a hand-written grant list, and the reason it had to be replaced is worth
+    /// stating because the list was wrong **twice in one slice**:
+    ///
+    /// 1. `P4-014` added `jarvis.memory.propose`, which requires `memory.propose`. The list did not name it, so
+    ///    the tool was registered, offered to a model, and refused for every call with `MissingScope`. Nothing
+    ///    catches that: `Dispatch::verify_covers` checks the opposite direction — a registered tool with no
+    ///    adapter — and the adapter's own tests pass because they call the adapter directly.
+    /// 2. Removing `mcp.call` from the list on the reasoning that this path served only *native* tools failed
+    ///    `phase_3_gate`: the surface **does** serve MCP tools, and a write tool over MCP paused with
+    ///    `403 missing_scope` instead of reaching its approval.
+    ///
+    /// Both are one mistake — a second statement of what the adapters already declare — and the derived form
+    /// cannot make it. The test asserts **both directions**, because "includes what it should" and "includes
+    /// nothing more" are separate claims and only the first is satisfied by granting everything.
+    #[test]
+    fn the_actor_authority_is_derived_from_the_composed_tools() {
+        let memory = crate::memory_propose::MemoryProposeTool::definition()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let actor = ToolActor::for_composed_tools(
+            "workspace-1",
+            "0198f000-0000-7000-8000-0000000000c3",
+            SessionChannel::Cli,
+            AuthenticationStrength::Credential,
+            "policy-1",
+            std::slice::from_ref(&memory),
+        );
+        let authority = actor.authority();
+        assert!(
+            authority
+                .scopes()
+                .iter()
+                .any(|scope| scope.resource() == "memory" && scope.action() == "propose"),
+            "a composed tool's scope must be held, or the tool is registered and dead: {authority:?}"
+        );
+        assert!(
+            authority
+                .scopes()
+                .iter()
+                .any(|scope| scope.resource() == "files" && scope.action() == "read"),
+            "and `files.read`, because the filesystem adapter is registered only when roots are granted — so \
+             the union alone would omit it and a policy override for it would be unreachable: {authority:?}"
+        );
+
+        // **The other direction: an uncomposed tool's scope is not granted.** Asserted separately, because
+        // "grants what the definitions require" is satisfied by granting the whole vocabulary, and an authority
+        // wider than the surface would authorize a call to a tool this daemon cannot run.
+        let with_mcp = ToolActor::for_composed_tools(
+            "workspace-1",
+            "0198f000-0000-7000-8000-0000000000c3",
+            SessionChannel::Cli,
+            AuthenticationStrength::Credential,
+            "policy-1",
+            &[],
+        );
+        assert!(
+            !with_mcp
+                .authority()
+                .scopes()
+                .iter()
+                .any(|scope| scope.resource() == "mcp"),
+            "with no MCP tool composed there is no outbound MCP grant: {:?}",
+            with_mcp.authority()
         );
     }
 }

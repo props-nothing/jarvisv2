@@ -302,6 +302,14 @@ fn report(operation: &str, error: &ApiError) -> ExitStatus {
                 "jarvis: no tool is registered — grant `daemon.tool_workspace_roots` or configure MCP \
                  servers in `mcp-servers.toml`"
             );
+            // The two conditions above were the **whole** answer until `P4-014`, and they are no longer: the
+            // memory-proposal tool is native and needs neither. A hint that lists only the old conditions sends
+            // an operator to configure roots for a tool that does not read files — and the tool they are looking
+            // for would still be missing, because the real cause is something else.
+            eprintln!(
+                "jarvis: the built-in memory tool `jarvis.memory.propose` needs neither, so it should be \
+                 present on any build; if it is absent the daemon was not composed with it"
+            );
         }
         other => eprintln!("jarvis: tools {operation} failed: {other}"),
     }

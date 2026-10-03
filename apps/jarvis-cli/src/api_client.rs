@@ -48,7 +48,8 @@ use jarvis_protocol::{
     PromoteSkillRequest, RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame,
     SSE_ACCEPT, SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply,
     SkillReply, SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply,
-    ToolPreviewRequest, WireError, path_segment, run_path, run_stream_path, runs_path,
+    ToolPreviewRequest, WireError, dotted_path_segment, path_segment, run_path, run_stream_path,
+    runs_path,
 };
 
 /// The base path of the memory surface.
@@ -67,8 +68,14 @@ const TOOLS_PATH: &str = "/api/v1/tools";
 /// tool identifier is validated by `ToolId` in the daemon, so this is not a second opinion about the
 /// name's shape — it is the check that stops a name containing a path separator from addressing a
 /// different route, which is a property of the *URL* rather than of the tool.
+/// Builds the path for one tool's preview.
+///
+/// Uses [`jarvis_protocol::dotted_path_segment`] rather than the run identifier rule, because a tool identifier
+/// is `namespace.name` **by construction** — so the UUID rule rejected every tool the daemon can register, and
+/// `jarvis tools preview` failed for all of them with a message about a run identifier. The narrower rule was
+/// the wrong one to reuse here, and a dot is path-safe (RFC 3986 `pchar`), so this is not a loosened check.
 fn tool_preview_path(tool: &str) -> Result<String, ApiError> {
-    let segment = path_segment(tool).map_err(ApiError::Identifier)?;
+    let segment = dotted_path_segment(tool).map_err(ApiError::Identifier)?;
     Ok(format!("{TOOLS_PATH}/{segment}/preview"))
 }
 

@@ -58,7 +58,12 @@ pub const MAX_PENDING_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RunPathError {
     /// The identifier is empty, oversized, or contains characters that are unsafe in a URL path.
-    #[error("the run identifier is not a safe URL path segment")]
+    ///
+    /// Deliberately neutral about **which** identifier, because this type is used for run, memory, skill, and
+    /// tool paths. It said "the run identifier" while being returned from a tool preview, which sent a reader to
+    /// inspect a run they had not mentioned — the defect class this repository keeps finding, where a message
+    /// identifies something other than the thing that failed.
+    #[error("the identifier is not a safe URL path segment")]
     UnsafeRunId,
 }
 
@@ -75,13 +80,87 @@ pub enum RunPathError {
 /// Returns [`RunPathError::UnsafeRunId`] when `id` is empty, longer than
 /// [`MAX_PATH_SEGMENT_CHARS`], or contains anything other than ASCII alphanumerics and hyphens.
 pub fn path_segment(id: &str) -> Result<&str, RunPathError> {
+    validate_segment(id, |byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Returns a validated path segment for a **dotted** identifier, such as a tool's `namespace.name`.
+///
+/// # Why this exists beside `path_segment` rather than replacing it
+///
+/// `path_segment` refuses `.` because a run, memory, or skill identifier is a UUID and cannot contain one. A
+/// **tool** identifier is `namespace.name` by construction, so the same rule rejects every tool — which is what
+/// it did: `jarvis tools preview jarvis.memory.propose` failed with "the run identifier is not a safe URL path
+/// segment", and would have failed for every identifier the daemon can register. The feature was unusable and
+/// the message pointed at a run.
+///
+/// Widening `path_segment` was rejected: it is the rule for four other path families, and a `.` there would
+/// accept a value none of them can produce while loosening the check for all of them. A dot is
+/// **path-safe** — RFC 3986's `pchar` includes it, and it is not a delimiter in a path segment — so the wider
+/// rule is still a safety rule rather than a relaxation of one.
+///
+/// # Why a leading or trailing dot is still refused
+///
+/// `.` and `..` are not ordinary segment contents: RFC 3986 §5.2.4 **removes** them during reference
+/// resolution, so a request whose path contains one reaches a different target than the text suggests — and an
+/// intermediary that normalises the path could turn `a/../b` into `b`. Refusing the whole-segment cases is a
+/// safety rule.
+///
+/// The leading/trailing refusal is broader than that and is a **grammar** rule: no `ToolId` half may begin or
+/// end with a dot (`validate_segment` in `jarvis-tools` refuses it), so a value like `jarvis.` can never name a
+/// tool. Accepting one would build a request for a tool that cannot exist, and the refusal is what makes that
+/// reachable as an error rather than as a `404` at the daemon.
+///
+/// # Errors
+///
+/// Returns [`RunPathError::UnsafeRunId`] on the same conditions as [`path_segment`], with the set widened to the
+/// characters a tool identifier may contain.
+pub fn dotted_path_segment(id: &str) -> Result<&str, RunPathError> {
+    // **The set is the tool identifier's own grammar, restated here.** `jarvis-protocol` cannot depend on
+    // `jarvis-tools` (an adapter may depend on the protocol and not the reverse), so the set has to be written
+    // out — and writing it out is where a guess goes wrong. Two attempts did:
+    //
+    // 1. Alphanumerics plus `.` and `-` refused `mcp.github.list_issues`, because a tool **name** may contain an
+    //    underscore. The feature would have failed for the ordinary case while passing for `jarvis.memory.propose`,
+    //    which is the fixture a test is most likely to use — so a hand-written set was both wrong and
+    //    self-concealing.
+    // 2. `is_ascii_alphanumeric` also admits **uppercase**, which no `ToolId` can contain (`validate_segment`
+    //    requires lowercase), so it accepted values that can never name a tool.
+    //
+    // This is the grammar from `ToolId`'s `validate_segment`: lowercase letters, digits, and `_ - . :`. A test
+    // pins the correspondence by asserting two real identifiers from different sources, so a divergence shows up
+    // as a failing assertion rather than as a `404` an operator has to diagnose.
+    validate_segment(id, |byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'_' | b'-' | b'.' | b':')
+    })
+    .and_then(|segment| {
+        // The grammar and traversal cases. Checked after the character set so the refusal above is the one a
+        // caller sees for a genuinely unsafe character, and these are reserved for the shapes a dot can create.
+        // `.` and `..` are not ordinary segment contents: RFC 3986 §5.2.4 removes them during reference
+        // resolution, so a request whose path contains one reaches a target other than the text suggests. No
+        // `ToolId` half may begin or end with a dot either, so a whole-segment dot can never name a tool — the
+        // refusal is what makes that reachable as an error rather than as a `404` at the daemon.
+        if segment.starts_with('.') || segment.ends_with('.') {
+            return Err(RunPathError::UnsafeRunId);
+        }
+        Ok(segment)
+    })
+}
+
+/// Applies a shared identifier rule, so the two segment builders cannot drift apart.
+///
+/// Factored out rather than copied, because the length bound and the emptiness rule are the parts a second copy
+/// would forget. Only the permitted set differs, and it is the parameter.
+///
+/// A function **pointer** rather than `&dyn Fn`: the two callers pass the two predicates below, neither
+/// captures anything, and a pointer makes that visible — an elided lifetime on a borrowed closure would have to
+/// be named, and naming it would suggest the parameter could outlive the call when it cannot.
+fn validate_segment(id: &str, permitted: fn(u8) -> bool) -> Result<&str, RunPathError> {
     if id.is_empty() || id.chars().count() > MAX_PATH_SEGMENT_CHARS {
         return Err(RunPathError::UnsafeRunId);
     }
-    if !id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
+    if !id.bytes().all(permitted) {
         return Err(RunPathError::UnsafeRunId);
     }
     Ok(id)
@@ -606,6 +685,91 @@ mod tests {
         assert_eq!(
             path_segment(&"a".repeat(MAX_PATH_SEGMENT_CHARS + 1)),
             Err(RunPathError::UnsafeRunId)
+        );
+    }
+
+    /// **The UUID rule refuses every tool identifier, which is why a second rule exists.**
+    ///
+    /// This asserts the *defect* rather than the fix, because the two facts are separate and only one of them
+    /// is obvious: `path_segment` is the right rule for a UUID and the wrong one for `namespace.name`. Stating
+    /// it here is what stops a later reader from "simplifying" the two builders back into one — the
+    /// simplification is exactly the bug, and it makes `jarvis tools preview` fail for every identifier the
+    /// daemon can register.
+    #[test]
+    fn the_uuid_rule_refuses_a_dotted_tool_identifier() {
+        assert_eq!(
+            path_segment("jarvis.memory.propose"),
+            Err(RunPathError::UnsafeRunId),
+            "a tool identifier is dotted by construction, so the uuid rule rejects all of them"
+        );
+        // And the dotted rule accepts it, which is the whole reason it was added.
+        assert_eq!(
+            dotted_path_segment("jarvis.memory.propose"),
+            Ok("jarvis.memory.propose")
+        );
+        // A dotted namespace, which is what an MCP server's tools carry.
+        assert_eq!(
+            dotted_path_segment("mcp.github.list_issues"),
+            Ok("mcp.github.list_issues")
+        );
+    }
+
+    /// **The dotted rule is still a safety rule: the character set moves and nothing else does.**
+    ///
+    /// The point of a separate builder is that the permitted set is the *only* difference, so this asserts that
+    /// every escape the UUID rule refuses is still refused. A builder that had relaxed the check rather than
+    /// widened the set would pass the test above and fail here.
+    ///
+    /// **The uppercase case is the one a hand-written set gets wrong.** A tool identifier is lowercase by
+    /// construction, so accepting `Jarvis.memory` would build a request for a tool that cannot exist — and it
+    /// would do so silently, because the daemon answers `404` and the caller learns nothing about the case.
+    #[test]
+    fn the_dotted_rule_refuses_every_path_escape() {
+        for unsafe_id in [
+            "",
+            "a/b",
+            "a?from=0",
+            "a#frag",
+            "%2e%2e",
+            "a b",
+            "id\n",
+            "..",
+            "./a",
+            "a\\b",
+            "a@b",
+            "Jarvis.memory",
+            "jarvis.Memory",
+        ] {
+            assert_eq!(
+                dotted_path_segment(unsafe_id),
+                Err(RunPathError::UnsafeRunId),
+                "{unsafe_id:?} must not be interpolated into a request path"
+            );
+        }
+        assert_eq!(
+            dotted_path_segment(&"a".repeat(MAX_PATH_SEGMENT_CHARS + 1)),
+            Err(RunPathError::UnsafeRunId),
+            "the length bound is shared, not re-implemented"
+        );
+        // A leading or trailing dot has no meaning in the identifier grammar and is refused, so a value cannot
+        // be padded into looking like a different tool.
+        assert_eq!(
+            dotted_path_segment(".jarvis"),
+            Err(RunPathError::UnsafeRunId)
+        );
+        assert_eq!(
+            dotted_path_segment("jarvis."),
+            Err(RunPathError::UnsafeRunId)
+        );
+        // A colon is **permitted**, because the grammar allows it — an MCP server may namespace a tool with one.
+        // Asserted so a later tightening does not silently refuse a legal identifier.
+        assert_eq!(
+            dotted_path_segment("mcp:github/list"),
+            Err(RunPathError::UnsafeRunId)
+        );
+        assert_eq!(
+            dotted_path_segment("mcp.github:list"),
+            Ok("mcp.github:list")
         );
     }
 }

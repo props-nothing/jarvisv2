@@ -349,15 +349,32 @@ async fn call_tool(
         Err(error) => return error.into_response(),
     };
 
-    // The actor holds **both** tool areas' scopes, because this transport serves whichever tools the daemon
-    // composed: a filesystem tool when roots are granted, an MCP tool when servers are configured. The scope
-    // set is still derived here rather than accepted from the request, which is the rule that matters â€” a
-    // caller cannot name a scope, so it cannot widen its own authority.
+    // The tools this daemon composed, which is what the actor's authority is derived from. A failure here is a
+    // composition fault the daemon would already have reported at startup, so it is answered as an internal
+    // error rather than as a refusal the caller could act on.
+    let composed_definitions = match tools.definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            tracing::error!(%error, "the composed tool definitions could not be read");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "the daemon's tool surface could not be read",
+            );
+        }
+    };
+
+    // The actor's authority is **derived from the tools this daemon composed**, which is the daemon's own
+    // authority over its own surface: a client addresses one of them, and the surface is exactly what the
+    // registry holds. It is derived rather than accepted from the request — a caller cannot name a scope, so it
+    // cannot widen its own authority — and derived from the *definitions* rather than written out, because a
+    // hand-written list is a second statement of what the adapters already declare. That list was wrong twice:
+    // it omitted `memory.propose`, so `P4-014`'s tool was registered and refused for every call, and removing
+    // `mcp.call` from it broke an MCP write tool's approval in `phase_3_gate`.
     //
-    // The construction is checked rather than unwrapped: a rejected literal is an authoring error, and the
-    // daemon failing closed on it is better than a caller being denied for a missing scope that reads as a
-    // policy problem.
-    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+    // Infallible, unlike the fixed-literal constructors: the scopes come from the definitions the registry
+    // already accepted, so there is no literal left to reject and no fail-closed branch to report.
+    let actor = crate::tool_actor::ToolActor::for_composed_tools(
         run.workspace_id.clone(),
         run.run_id.clone(),
         jarvis_core::SessionChannel::Cli,
@@ -365,13 +382,8 @@ async fn call_tool(
         // HTTP client on this transport has actually established.
         jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
-    ) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorCode::Internal,
-            "the tool actor could not be built: a fixed scope literal was rejected",
-        );
-    };
+        &composed_definitions,
+    );
 
     match tools
         .call_tool(
@@ -493,19 +505,28 @@ async fn resume_call(
         }
     };
 
-    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+    // A resumed call runs under the same grants the original did, so it derives them the same way: an approval
+    // releases a call that policy already admitted, and a resume path with a narrower actor would refuse the
+    // very call it exists to finish.
+    let composed_definitions = match tools.definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            tracing::error!(%error, "the composed tool definitions could not be read");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "the daemon's tool surface could not be read",
+            );
+        }
+    };
+    let actor = crate::tool_actor::ToolActor::for_composed_tools(
         stored.workspace_id().to_owned(),
         stored.run_id().to_owned(),
         jarvis_core::SessionChannel::Cli,
         jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
-    ) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorCode::Internal,
-            "the tool actor could not be built: a fixed scope literal was rejected",
-        );
-    };
+        &composed_definitions,
+    );
 
     let arguments = body.arguments;
     match tools
@@ -823,7 +844,31 @@ async fn preview_tool(
         None => jarvis_tools::channel_ceiling(channel),
     };
 
-    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+    // The preview's actor must hold **the same grants a real call would**, or the preview disagrees with
+    // reality: an actor with fewer scopes answers `deny / missing_scope` for a call the daemon would allow.
+    // That is what happened — `jarvis tools preview jarvis.memory.propose` reported `deny` for a tool a run
+    // could call — and a preview that lies in the refusals direction is worse than no preview, because it
+    // sends an operator to change a policy that is already right.
+    // The preview's actor derives its authority from the composed tools, which is the **only** way it can agree
+    // with a real call. An actor with a hand-written grant list answers `deny / missing_scope` for a call the
+    // daemon would allow: `jarvis tools preview jarvis.memory.propose` reported `deny` for a tool a run could
+    // call. A preview that lies in the refusals direction is worse than no preview, because it sends an operator
+    // to change a policy that is already right.
+    //
+    // Deriving it also means the preview cannot drift as adapters are added: the authority is read from the same
+    // registry that produced the tool being previewed.
+    let composed_definitions = match tools.definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            tracing::error!(%error, "the composed tool definitions could not be read");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "the daemon's tool surface could not be read",
+            );
+        }
+    };
+    let actor = crate::tool_actor::ToolActor::for_composed_tools(
         identity.workspace_id(),
         // No run: a preview is not attributed to one, and inventing an identifier would attribute a
         // call that never happened to a run the caller named. The actor's run field is used for the
@@ -832,17 +877,11 @@ async fn preview_tool(
         channel,
         claimed,
         // The policy version label a receipt would carry. A preview builds no receipt, so this is the
-        // current label rather than a recorded one — stated because a stored receipt's label is a claim
-        // about the policy in force when a call was admitted, and this is not that.
+        // current label rather than a recorded one: a stored receipt's label is a claim about the policy
+        // in force when a call was admitted, and this is not that.
         crate::tool_pipeline::PREVIEW_POLICY_VERSION,
-    ) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorCode::Internal,
-            "the daemon's own scope literals were rejected",
-        );
-    };
-
+        &composed_definitions,
+    );
     let target = jarvis_tools::TargetAssessment::new(request.escalation.iter().copied());
     match tools.preview_call(&tool, &actor, &target) {
         Ok(decision) => {

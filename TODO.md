@@ -3413,6 +3413,62 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       column-level `CHECK` mentioning `status`, and a table-level one needs the twelve-step rebuild that
       recreates four indexes and two self-referencing foreign keys — so the cross-column rule is enforced on
       the read path, which is the only enforcer; see `ADR-0124`.
+
+      **⭐ PART 3 — the model's submission path now exists, and building it exposed the reachability defect the
+      slice would otherwise have shipped.** `apps/jarvisd/src/memory_propose.rs` is the adapter:
+      `jarvis.memory.propose`, a `write` at risk 1, approval `auto`, scope `memory.propose`.
+      - **The arguments are narrower than `RememberRequest`, and every omission is load-bearing.**
+        `additionalProperties: false` refuses `source_kind`, `confidence`, and `supersedes` — each of which
+        exists on the HTTP request and each of which would defeat the boundary **through a field** rather than a
+        bug: a claim labelled `user_statement` at `confirmed` is a model's output recorded as something the
+        person said. The source is set in code, the confidence is `Unverified`, the locator is derived from the
+        correlation identity, and supersession is impossible.
+      - **Asserted through the pipeline's own schema validation, not the adapter's parser**, because the parser
+        never sees those fields — testing it alone would prove nothing.
+      - **Falsified:** switching the source to `UserStatement` failed the test, which reported the claim was
+        stored as **`remembered`** — a status only a confirmed user statement can have. The mutant is caught by
+        the outcome string, not by a provenance check.
+      - **A judged candidate is a completed call, not a failure.** An unresolved entity or a refused rule is
+        reported as `refused` with the rule's name, because telling a model the platform broke when the platform
+        judged its input produces a retry loop. `UnknownValue` — the *common* case for a model naming a subject
+        it only inferred — is in this arm rather than treated as an adapter fault.
+
+      **⭐⭐⭐ THE TOOL SHIPPED REGISTERED, OFFERED, AND DENIED — because the actor's authority was a hand-written
+      scope list.** `ToolActor` had `workspace_and_mcp` granting `files.read` + `mcp.call`; no constructor
+      granted `memory.propose`, so every call would have been refused `MissingScope`. Nothing catches this:
+      `Dispatch::verify_covers` checks the opposite direction (a registered tool with no adapter), and the
+      adapter's own tests pass because they call the adapter directly.
+      - **I then made the same mistake a second time within one change.** Adding `workspace_and_memory` with
+        `files.read` + `memory.propose` *replaced* `mcp.call` at the HTTP site, and `phase_3_gate` failed:
+        **`a write tool must pause for a human decision, got 403 missing_scope`**. I had reasoned that the
+        surface served only native tools — it serves MCP tools too, and I had not checked.
+      - **The fix is the pattern `ToolActor::remote` already used**: derive the authority from the **composed
+        tools' own declarations**. A tool that is composed is callable; a tool that is not cannot be addressed;
+        so the union *is* the daemon's authority over its own surface. No list, and a new adapter is reachable
+        the moment it is registered.
+      - **`workspace_and_memory` was then deleted**, because its only caller was the test I had just written.
+        `for_composed_tools` superseded it, and a public constructor nothing calls is the shape this file's own
+        comment warns about. `workspace_and_mcp` and `MCP_CALL_SCOPE` became `#[cfg(test)]` — the established
+        pattern — because they survive only as the fixture proving the grants are distinct.
+      - **And `jarvis tools preview` had never worked.** Its path used `path_segment`, the **run** identifier
+        rule, which permits only alphanumerics and hyphens — so it rejected **every** tool identifier, since
+        `namespace.name` contains dots, and the error named a *run*. Added `dotted_path_segment`, whose
+        permitted set is the tool grammar (`[a-z0-9_\-.:]`, lowercase only, which the first attempt got wrong in
+        both directions: it refused `list_issues` and accepted `Jarvis.memory`). `..` and the leading/trailing
+        dot are refused as path-traversal and grammar cases — the traversal one found by writing the
+        adversarial case into the test's name and watching it pass when it should have failed.
+      - **Why the preview mattered more than it looks:** it answered `deny / missing_scope` for a tool the daemon
+        was offering. A preview that lies in the refusals direction is worse than no preview, because it sends
+        an operator to change a policy that is already correct.
+      - **Verified live:** `jarvis tools list` → `jarvis.memory.propose … callable`; `tools preview` → `allow /
+        allowed`; a run reaches `outcome=succeeded` with the tool present. Both defects were found by running the
+        CLI against a real daemon, not by the suite.
+      - **Limits:** with one seeded identity and no entity-creation surface, no end-to-end propose through a live
+        model was possible — the adapter's behaviour is proven by its tests and the registration and preview by
+        the daemon. The tool is `auto` because the claim is stored `proposed` and excluded from retrieval at any
+        status; that reasoning is asserted beside the declaration, so changing the status rule forces a decision
+        about the approval.
+
 - [ ] `P4-015` Add session summarization as derived memory: a compressed summary of a session is stored as a
       `Derived` claim with provenance and a retention rule, and is never presented as user-authored fact.
 

@@ -1713,26 +1713,40 @@ async fn run_tool_round(
         requested.to_vec(),
     ));
 
-    let Some(actor) = crate::tool_actor::ToolActor::workspace_and_mcp(
+    // The actor's authority is derived from the tools the daemon composed, so a model's call is authorized
+    // exactly when the tool it named is part of this daemon's surface. That is what makes `P4-014`'s
+    // `jarvis.memory.propose` reachable: a hand-written grant list omitted `memory.propose`, so the tool was
+    // registered, offered to the model, and refused for every call with `MissingScope`. Deriving it also means a
+    // newly registered adapter is reachable the moment it is composed, rather than when somebody remembers to
+    // widen a list.
+    //
+    // A failure to read the definitions is a composition fault the daemon reports at startup, so it settles the
+    // run as a failure naming the surface rather than as an authorization refusal.
+    let composed_definitions = match tools.definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            return fail(
+                database,
+                run,
+                RunErrorCode::new("tool_unavailable").map_err(|_| {
+                    DatabaseError::InvalidRunRequest {
+                        field: "error_code",
+                    }
+                })?,
+                format!("the daemon's tool surface could not be read: {error}").as_str(),
+                correlation_id,
+            )
+            .await;
+        }
+    };
+    let actor = crate::tool_actor::ToolActor::for_composed_tools(
         run.workspace_id(),
         run.id(),
         SessionChannel::Cli,
         jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
-    ) else {
-        return fail(
-            database,
-            run,
-            RunErrorCode::new("tool_actor_invalid").map_err(|_| {
-                DatabaseError::InvalidRunRequest {
-                    field: "error_code",
-                }
-            })?,
-            "the daemon's fixed tool scope literals were rejected",
-            correlation_id,
-        )
-        .await;
-    };
+        &composed_definitions,
+    );
 
     // Each call is executed in order. A single held call parks the whole run: the effect did not happen,
     // so nothing is fed back, and the approval and resume routes complete it — which keeps the executor

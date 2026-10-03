@@ -8,6 +8,7 @@ mod gateway;
 mod health;
 mod mcp_host;
 mod mcp_serve;
+mod memory_propose;
 mod memory_service;
 mod run_service;
 mod singleton;
@@ -107,6 +108,17 @@ enum DaemonError {
         /// Why the grant was refused, which names the root and the reason.
         #[source]
         source: jarvis_tools::RootError,
+    },
+    /// The memory-proposal tool could not state its own contract.
+    ///
+    /// A startup fault rather than a call-time one: `P4-014`'s tool is a constant declaration, so a rejection
+    /// means an authoring mistake in this build. It fails startup for the reason `Dispatch::verify_covers`
+    /// does — a tool whose contract is wrong must not be offered to a model that would then call it.
+    #[error("the memory-proposal tool could not be defined")]
+    MemoryProposeTool {
+        /// Which constant was rejected, named by the variant.
+        #[source]
+        source: crate::memory_propose::ProposeToolError,
     },
     /// The configured workspace policy was self-contradictory.
     ///
@@ -585,18 +597,38 @@ async fn compose_tools(
 
     // The pipeline takes the adapters by value, so they are cloned out of the host. Each clone shares the
     // host's connection through the adapter's own `Arc`, which is why the host can still close them.
-    let additional: Vec<(
+    //
+    // **The memory adapter is pushed first, and it is not an MCP server.** `P4-014` requires that "the model may
+    // submit memory candidates", and no tool touched memory before this one — so the model had no way to
+    // propose anything. It is a native JARVIS tool rather than a discovered external one because what it writes
+    // is a *canonical claim*: a memory belongs to this platform rather than to a provider, and routing it
+    // through an MCP server would put the store behind a transport that exists to reach things it does not own.
+    //
+    // First rather than last so the native tool cannot be shadowed by an MCP server that happens to claim the
+    // same identifier: the registry refuses a collision either way, but the order makes which one is "already
+    // present" deterministic instead of dependent on discovery.
+    let mut additional: Vec<(
         Vec<jarvis_tools::ToolDefinition>,
         Arc<dyn jarvis_tools::ToolExecutor>,
-    )> = mcp
-        .as_ref()
-        .map(|host| {
-            host.adapters
-                .iter()
-                .map(|(definitions, adapter)| (definitions.clone(), Arc::clone(adapter)))
-                .collect()
-        })
-        .unwrap_or_default();
+    )> = vec![(
+        vec![
+            crate::memory_propose::MemoryProposeTool::definition()
+                .map_err(|source| DaemonError::MemoryProposeTool { source })?,
+        ],
+        Arc::new(crate::memory_propose::MemoryProposeTool::new(Arc::clone(
+            &database,
+        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )];
+    additional.extend(
+        mcp.as_ref()
+            .map(|host| {
+                host.adapters
+                    .iter()
+                    .map(|(definitions, adapter)| (definitions.clone(), Arc::clone(adapter)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
 
     let tools = compose_tool_pipeline(config, database, additional, paths)?;
     Ok((mcp, tools))
