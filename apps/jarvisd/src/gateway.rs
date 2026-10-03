@@ -122,10 +122,74 @@ impl GatewayState {
         self.tools.as_ref()
     }
 
+    /// Whether runs are driven at all. A scheduler over a daemon with no executor would start runs nothing runs.
+    #[must_use]
+    pub(crate) const fn drives_runs(&self) -> bool {
+        self.executor.is_some()
+    }
+
+    /// Starts a run and drives it to a terminal state on its own task.
+    ///
+    /// The one way a run begins, whoever asked: the REST route and the scheduler both come through here, so a
+    /// scheduled run is an ordinary run with every guarantee an ordinary run has — the same policy, the same
+    /// approvals, the same audit. There is no second, privileged way to start work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the run service's error when the request is refused.
+    pub(crate) async fn start_and_drive(
+        &self,
+        request: &StartRunRequest,
+    ) -> Result<jarvis_protocol::RunReply, crate::run_service::RunServiceError> {
+        let reply = self.runs.start(request).await?;
+        self.drive(&reply.run_id);
+        Ok(reply)
+    }
+
+    /// Drives a run on its own task, so the caller is not held open for a whole model call.
+    ///
+    /// The task is deliberately not awaited and its failure is logged rather than returned: the run is already
+    /// durably recorded, so a task that fails leaves a run that is visibly unfinished rather than a response that
+    /// claims a start it did not make. With no executor composed there is nothing to drive.
+    pub(crate) fn drive(&self, run_id: &str) {
+        let Some(executor) = &self.executor else {
+            return;
+        };
+        let database = Arc::clone(&self.database);
+        let executor = Arc::clone(executor);
+        // The composed tool pipeline, when one exists, so the run is an agent loop rather than a single model
+        // call. `None` for a profile with no tool surface, in which case the run answers without tools.
+        let tools = self.tools.clone();
+        let run_id = run_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = crate::executor::execute_run_with_tools(
+                &database,
+                executor.model(),
+                executor.model_id(),
+                tools.as_ref(),
+                &run_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    run_id,
+                    error = %error,
+                    "the run executor could not persist its progress"
+                );
+            }
+        });
+    }
+
     /// Returns the database the gateway reads through.
     #[must_use]
     pub fn database(&self) -> &SqliteDatabase {
         &self.database
+    }
+
+    /// Returns a shared handle to the database, for code that must hold one across a task.
+    #[must_use]
+    pub(crate) fn database_handle(&self) -> Arc<SqliteDatabase> {
+        Arc::clone(&self.database)
     }
 
     /// Returns the memory surface.
@@ -170,7 +234,26 @@ impl GatewayState {
 /// exactly that way.
 pub fn router(state: GatewayState) -> Router {
     let api = Router::new()
-        .route("/runs", post(start_run))
+        .route(
+            "/runs",
+            post(start_run).get(crate::schedule_service::list_runs),
+        )
+        .route(
+            "/schedules",
+            post(crate::schedule_service::create).get(crate::schedule_service::list),
+        )
+        .route(
+            "/schedules/{id}",
+            axum::routing::delete(crate::schedule_service::remove),
+        )
+        .route(
+            "/schedules/{id}/pause",
+            post(crate::schedule_service::pause),
+        )
+        .route(
+            "/schedules/{id}/resume",
+            post(crate::schedule_service::resume),
+        )
         .route("/runs/{id}", get(read_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
@@ -284,44 +367,11 @@ async fn start_run(
     State(state): State<GatewayState>,
     Json(request): Json<StartRunRequest>,
 ) -> Response {
-    match state.runs.start(&request).await {
-        Ok(reply) => {
-            // The run is driven on its own task so the response is not held open for the whole
-            // model call. The client learns the run identifier immediately and follows the stream,
-            // which is what makes the API usable for a long answer.
-            //
-            // The task is deliberately not awaited here and its failure is logged rather than
-            // returned: the run is already durably recorded, so a task that fails leaves a run
-            // that is visibly unfinished rather than a response that claims a start it did not
-            // make.
-            if let Some(executor) = &state.executor {
-                let database = Arc::clone(&state.database);
-                let executor = Arc::clone(executor);
-                // The composed tool pipeline, when one exists, so the run is an agent loop rather than a
-                // single model call. `None` for a profile with no tool surface, in which case the run
-                // answers without tools — the behavior every run had before tools were wired here.
-                let tools = state.tools.clone();
-                let run_id = reply.run_id.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = crate::executor::execute_run_with_tools(
-                        &database,
-                        executor.model(),
-                        executor.model_id(),
-                        tools.as_ref(),
-                        &run_id,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            run_id,
-                            error = %error,
-                            "the run executor could not persist its progress"
-                        );
-                    }
-                });
-            }
-            (StatusCode::CREATED, Json(reply)).into_response()
-        }
+    // The run is driven on its own task so the response is not held open for the whole model call: the client
+    // learns the run identifier immediately and follows the stream, which is what makes the API usable for a long
+    // answer.
+    match state.start_and_drive(&request).await {
+        Ok(reply) => (StatusCode::CREATED, Json(reply)).into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -1528,7 +1578,7 @@ pub struct MemoryPageQuery {
 /// # Errors
 ///
 /// Returns a message naming the parameter that could not be read.
-fn parse_limit(raw: Option<&str>, default: u32) -> Result<u32, &'static str> {
+pub(crate) fn parse_limit(raw: Option<&str>, default: u32) -> Result<u32, &'static str> {
     let Some(raw) = raw else {
         return Ok(default);
     };

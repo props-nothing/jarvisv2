@@ -6870,6 +6870,22 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 
 ## P6: Events And Workflows
 
+- [x] `P6-011` **A first useful slice of proactivity: scheduled tasks** (added; does not close the Phase 6 gate).
+  `jarvis schedule add "<objective>" --every 6h | --at <UTC instant>`, `list|pause|resume|remove`, and `jarvis runs` to
+  read what a task said. A schedule is a request to start an **ordinary** run, so it has no authority an interactive run
+  lacks: an unattended task that wants a held tool parks for a person. At most once (guarded claim before start), no
+  backlog replay (next fire from now), no pile-up (a fire is skipped and counted while the previous run is still going),
+  one session per recurring task. [ADR-0132](docs/adr/0132-a-schedule-is-a-request-to-start-an-ordinary-run.md); migration
+  `0014`, schema version 14; `jarvis-core::schedule`, `jarvis-storage::schedule_repository`, `apps/jarvisd/src/schedule_service.rs`.
+  - **Live:** two tasks every minute against a real model; the arithmetic task ran each time, the fetch task parked once,
+    was skipped once, and left exactly one approval pending.
+  - Tests: 6 domain, 10 storage (including claim-by-exactly-one-pass, backlog skip, restart), 8 daemon (real routes + real
+    scheduler pass), 6 CLI.
+  - **Limits (each is its own `P6` item, none is approximated):** no wall-clock cadence ("daily at 08:00") until time
+    zones and DST are done properly (`P6-003`); no push notification when a task needs you (`P6-007`); no event-triggered
+    runs (`P6-001`/`P6-002`); a fire lost to a crash between claim and start is not retried (at most once, by design);
+    SQLite only.
+
 - [ ] `P6-001` Define event envelope, source identity, schema version, causation/correlation IDs, dedupe key, visibility, and sensitivity.
 - [ ] `P6-002` Implement transactional outbox/inbox, leasing, retry schedule, dead letters, and replay tooling.
 - [ ] `P6-003` Implement timezone-aware schedules and deterministic next-run calculation across daylight-saving transitions.

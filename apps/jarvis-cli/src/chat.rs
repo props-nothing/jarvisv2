@@ -36,10 +36,11 @@
 //! Answer text goes to stdout while progress goes to stderr so `jarvis ask ... > answer.txt`
 //! captures the answer rather than a transcript of the run.
 
-use std::io::{BufRead, Write};
+use std::io::{IsTerminal, Write};
 
 use jarvis_core::ErrorCode;
 use jarvis_protocol::{RunReply, RunStreamFrame, StreamReading, output_text, state_name};
+use jarvis_storage::AppPaths;
 
 use crate::api_client::{ApiClient, ApiError};
 use crate::output::ExitStatus;
@@ -68,8 +69,10 @@ const CHAT_EXIT: [&str; 2] = [":quit", ":exit"];
 /// The HTTP transport is separately enabled and its port is configuration, so the CLI reads the
 /// same profile configuration the daemon does and targets whatever the daemon was told to bind. A
 /// hard-coded port would work on a default install and silently target nothing on a configured one.
-pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
-    start_and_render(client, objective, None).await.status
+pub(crate) async fn drive(client: &ApiClient, paths: &AppPaths, objective: &str) -> ExitStatus {
+    start_and_render(client, paths, objective, None)
+        .await
+        .status
 }
 
 /// Runs an interactive conversation, one turn per line of standard input.
@@ -86,7 +89,7 @@ pub(crate) async fn drive(client: &ApiClient, objective: &str) -> ExitStatus {
 /// a cancelled request. Ending the loop would discard the session, so the failure is reported and the
 /// next line is read. A failure of the **session** is different — a closed or foreign session cannot
 /// accept another turn — and that ends the loop, because every later turn would fail the same way.
-pub(crate) async fn converse(client: &ApiClient) -> ExitStatus {
+pub(crate) async fn converse(client: &ApiClient, paths: &AppPaths) -> ExitStatus {
     eprintln!(
         "jarvis: chatting with {}. End a turn with a blank line, or type :quit.",
         client.host()
@@ -95,8 +98,6 @@ pub(crate) async fn converse(client: &ApiClient) -> ExitStatus {
         "jarvis: the daemon stores this conversation; the session identifier is printed below."
     );
 
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
     let mut session_id: Option<String> = None;
     let mut turns = 0_u32;
     // The last turn's failure, carried out of the loop so a script can see that something in the
@@ -107,11 +108,14 @@ pub(crate) async fn converse(client: &ApiClient) -> ExitStatus {
         eprint!("jarvis> ");
         let _ = std::io::stderr().flush();
 
-        let Some(Ok(line)) = lines.next() else {
+        // One line at a time, taking the input lock only for the read: an approval prompt in the middle of a
+        // turn reads from the same input, and a lock held across the whole conversation would deadlock it.
+        let mut line = String::new();
+        if !matches!(std::io::stdin().read_line(&mut line), Ok(count) if count > 0) {
             // Input ended, or could not be read. Neither is an error worth a stack of diagnostics, and
             // ending quietly is what a user expects from a closed pipe or a typed control-D.
             break;
-        };
+        }
         let turn = line.trim();
         if turn.is_empty() {
             continue;
@@ -130,7 +134,7 @@ pub(crate) async fn converse(client: &ApiClient) -> ExitStatus {
             continue;
         }
 
-        let outcome = start_and_render(client, turn, session_id.as_deref()).await;
+        let outcome = start_and_render(client, paths, turn, session_id.as_deref()).await;
         // The session is remembered from the daemon's reply, not from a value the client chose, so a
         // daemon that started a different session than requested cannot leave the client addressing
         // one that does not exist.
@@ -172,6 +176,7 @@ struct TurnOutcome {
 /// Starts a run in a session and renders its stream.
 async fn start_and_render(
     client: &ApiClient,
+    paths: &AppPaths,
     objective: &str,
     session_id: Option<&str>,
 ) -> TurnOutcome {
@@ -212,10 +217,16 @@ async fn start_and_render(
         }
     };
 
+    let mut status = consume_turn(client, &reply, &mut stream, None).await;
+    // At a terminal, a run that needs a person is not the end of the turn: the person is asked right here and the
+    // run carries on. Without one, the exit status and the `approvals` verbs are the interface.
+    if status == ExitStatus::AwaitingApproval && std::io::stdin().is_terminal() {
+        status = crate::approvals::attend(client, paths, &reply.run_id).await;
+    }
     TurnOutcome {
         session_id: Some(reply.session_id.clone()),
         session_rejected: false,
-        status: consume_turn(client, &reply, &mut stream, None).await,
+        status,
     }
 }
 

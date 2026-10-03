@@ -163,6 +163,21 @@ code_sandbox_interpreter = ["node", "-e"]      # the snippet is appended as the 
 `jarvis tools list`. Each snippet runs in a throwaway container with no network, a read-only filesystem, and 30
 seconds, and **every run waits for your approval** — you read the code first. See `ADR-0131`.
 
+### Tasks that run while you are away
+
+```powershell
+jarvis schedule add "Summarise what changed in my notes folder." --every 24h
+jarvis schedule add "Remind me to renew the domain." --at 2026-12-01T09:00:00Z
+jarvis schedule list
+jarvis runs                     # what each run answered; --full for the whole answer
+jarvis schedule pause 01a1      # an identifier prefix is enough when it is unambiguous
+```
+
+A scheduled task is an ordinary run started later, so it has **no extra authority**: if it wants a tool that needs your
+approval it waits, and `jarvis approvals list` shows it. A task is skipped (and the skip counted) while its previous run is
+still waiting on you, and a machine that was off owes one fire, not a backlog. There is no "daily at 08:00" yet: it needs
+time-zone and daylight-saving handling (`P6-003`) and is not approximated. See `ADR-0132`.
+
 ### Chatting (multi-turn)
 
 `jarvis chat` needs the same configuration as `ask`:

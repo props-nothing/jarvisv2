@@ -6,6 +6,7 @@ mod frame;
 mod memory_api;
 mod rest;
 mod run_api;
+mod schedule_api;
 mod session;
 mod skill_api;
 mod tool_api;
@@ -36,6 +37,9 @@ pub use run_api::{
     MAX_PENDING_BYTES, RunPathError, RunStreamDecoder, RunStreamError, RunStreamFrame, SSE_ACCEPT,
     StreamReading, dotted_path_segment, output_text, path_segment, run_path, run_stream_path,
     runs_path, state_name,
+};
+pub use schedule_api::{
+    CreateScheduleRequest, RunListReply, RunSummaryReply, ScheduleListReply, ScheduleReply,
 };
 pub use session::{
     AdmittedClient, ClientContext, ClientSession, HANDSHAKE_TIMEOUT, MAX_REQUESTS_PER_CONNECTION,

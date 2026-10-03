@@ -2145,7 +2145,7 @@ async fn complete(
 /// Read back rather than threaded through the loop, so the stored transcript and the stored events
 /// cannot disagree: the message is built from the event that a client already receives, not from a
 /// second copy of the text held in memory.
-async fn last_answer(
+pub(crate) async fn last_answer(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
 ) -> Result<Option<String>, DatabaseError> {

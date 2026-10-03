@@ -409,6 +409,36 @@ pub async fn find_run(database: &SqliteDatabase, id: &str) -> Result<StoredRun, 
     decode_run(&row)
 }
 
+/// Reads a workspace's most recent runs, newest first.
+///
+/// Ordered by the run's **identifier**, which is a `UUIDv7` and therefore time-ordered, rather than by the
+/// `started_at` text: `jarvis_core::UtcTimestamp`'s text form is not lexicographically sortable.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the read or a row's decode fails.
+pub async fn read_recent_runs(
+    database: &SqliteDatabase,
+    workspace_id: &str,
+    limit: u32,
+) -> Result<Vec<StoredRun>, DatabaseError> {
+    let rows = sqlx::query(
+        "SELECT id, session_id, workspace_id, objective, state, version, \
+                cancellation_requested_at, terminal_outcome, completed_at, error_code, \
+                started_at \
+         FROM agent_runs WHERE workspace_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )
+    .bind(workspace_id)
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read recent runs",
+        source,
+    })?;
+    rows.iter().map(decode_run).collect()
+}
+
 /// Advances one run through the state machine.
 ///
 /// # Errors

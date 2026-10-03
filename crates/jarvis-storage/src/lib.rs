@@ -16,6 +16,7 @@ mod session_repository;
 mod summary_repository;
 
 mod approval_repository;
+mod schedule_repository;
 mod secret_store;
 mod skill_repository;
 mod tool_call_repository;
@@ -72,7 +73,12 @@ pub use run_event_repository::{
 };
 pub use run_repository::{
     INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition, create_run,
-    find_run, recover_interrupted_runs, request_run_cancellation, settle_run, transition_run,
+    find_run, read_recent_runs, recover_interrupted_runs, request_run_cancellation, settle_run,
+    transition_run,
+};
+pub use schedule_repository::{
+    StoredSchedule, claim_due_schedules, create_schedule, delete_schedule, find_schedule,
+    list_schedules, record_schedule_run, record_schedule_skip, set_schedule_enabled,
 };
 pub use secret_store::{APPROVAL_NONCE_DIRECTORY, SecretStore, SecretStoreError};
 pub use session_repository::{

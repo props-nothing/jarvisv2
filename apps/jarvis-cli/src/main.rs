@@ -16,6 +16,7 @@ mod connector;
 mod entity;
 mod memory;
 mod output;
+mod schedule;
 mod skills;
 mod tools;
 
@@ -60,6 +61,10 @@ async fn main() -> ExitCode {
         // `approvals` is how a person releases or refuses an action a tool call was held on: without it a held
         // call parked its run and nothing in the shipped product could finish the conversation.
         Some("approvals") => approvals_command(&arguments).await,
+        // `schedule` and `runs` are the proactive half of the product: tasks that run while you are away, and
+        // where you read what they said.
+        Some("schedule") => schedule_command(&arguments, false).await,
+        Some("runs") => schedule_command(&arguments, true).await,
         // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
         // stored procedure, which before this verb group was reachable only from a test.
         Some("skills") => skills_command(&arguments).await,
@@ -80,7 +85,9 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <status|health|ask|chat|logs|memory|tools|approvals|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny> [...]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
+    "usage: jarvis <status|health|ask|chat|logs|memory|tools|approvals|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+       jarvis schedule <add|list|pause|resume|remove> [...]
+       jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
@@ -137,6 +144,24 @@ async fn tools_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     tools::run(&client, arguments).await
+}
+
+/// Runs one `jarvis schedule` or `jarvis runs` verb over the daemon's HTTP API.
+async fn schedule_command(arguments: &[String], runs: bool) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    if runs {
+        schedule::run_runs(&client, arguments).await
+    } else {
+        schedule::run_schedule(&client, arguments).await
+    }
 }
 
 /// Runs one `jarvis approvals` verb over the daemon's HTTP API.
@@ -513,11 +538,15 @@ async fn ask(arguments: &[String]) -> ExitStatus {
         return ExitStatus::Usage;
     };
 
+    let paths = match resolve_paths(&root) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
     let client = match run_client(&root) {
         Ok(client) => client,
         Err(status) => return status,
     };
-    chat::drive(&client, &objective).await
+    chat::drive(&client, &paths, &objective).await
 }
 
 /// Runs an interactive conversation against the daemon's API.
@@ -533,11 +562,15 @@ async fn chat(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
 
+    let paths = match resolve_paths(&root) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
     let client = match run_client(&root) {
         Ok(client) => client,
         Err(status) => return status,
     };
-    chat::converse(&client).await
+    chat::converse(&client, &paths).await
 }
 
 /// Builds an authenticated client for this profile's daemon.

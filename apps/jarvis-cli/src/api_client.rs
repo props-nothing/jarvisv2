@@ -43,14 +43,15 @@ use jarvis_core::LoopbackHost;
 
 use jarvis_protocol::{
     AddAliasRequest, ApprovalDecisionBody, ApprovalListReply, ApprovalReply, ConfirmMemoryRequest,
-    CorrectMemoryRequest, CreateEntityRequest, CreateSkillRequest, DeletionReceipt,
-    EntityDetailReply, EntityListReply, EntityLookupReply, ForgetMemoryRequest, ForgetSkillRequest,
-    JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply,
-    MemorySearchReply, MemorySearchRequest, MergeEntityRequest, PromoteSkillRequest,
-    RememberRequest, RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT,
-    SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply, SkillReply,
-    SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest,
-    WireError, dotted_path_segment, path_segment, run_path, run_stream_path, runs_path,
+    CorrectMemoryRequest, CreateEntityRequest, CreateScheduleRequest, CreateSkillRequest,
+    DeletionReceipt, EntityDetailReply, EntityListReply, EntityLookupReply, ForgetMemoryRequest,
+    ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply,
+    MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest, MergeEntityRequest,
+    PromoteSkillRequest, RememberRequest, RunListReply, RunPathError, RunReply, RunStreamDecoder,
+    RunStreamFrame, SSE_ACCEPT, ScheduleListReply, ScheduleReply, SkillDeletionReceipt,
+    SkillDetailReply, SkillExportReply, SkillListReply, SkillReply, SkillTransitionRequest,
+    StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError,
+    dotted_path_segment, path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -121,6 +122,9 @@ const SKILLS_PATH: &str = "/api/v1/skills";
 fn skill_path(revision_id: &str) -> Result<String, RunPathError> {
     Ok(format!("{SKILLS_PATH}/{}", path_segment(revision_id)?))
 }
+
+/// The scheduled-task collection's path.
+const SCHEDULES_PATH: &str = "/api/v1/schedules";
 
 /// The approval collection's path.
 const APPROVALS_PATH: &str = "/api/v1/approvals";
@@ -391,6 +395,71 @@ impl ApiClient {
         let path = approval_resume_path(approval_id)?;
         self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
             .await
+    }
+
+    /// Creates a scheduled task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` naming the rule a cadence or objective broke.
+    pub async fn create_schedule(
+        &self,
+        request: &CreateScheduleRequest,
+    ) -> Result<ScheduleReply, ApiError> {
+        self.send_json(reqwest::Method::POST, SCHEDULES_PATH, request)
+            .await
+    }
+
+    /// Lists the workspace's scheduled tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the transport fails or the daemon refuses.
+    pub async fn list_schedules(&self) -> Result<ScheduleListReply, ApiError> {
+        self.get_json(SCHEDULES_PATH).await
+    }
+
+    /// Pauses or resumes a scheduled task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] when the task is unknown, or a finished one-off is resumed.
+    pub async fn set_schedule_enabled(
+        &self,
+        schedule_id: &str,
+        enabled: bool,
+    ) -> Result<ScheduleReply, ApiError> {
+        let verb = if enabled { "resume" } else { "pause" };
+        let path = format!("{SCHEDULES_PATH}/{}/{verb}", path_segment(schedule_id)?);
+        self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
+            .await
+    }
+
+    /// Removes a scheduled task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when there is no such task.
+    pub async fn remove_schedule(&self, schedule_id: &str) -> Result<(), ApiError> {
+        let path = format!("{SCHEDULES_PATH}/{}", path_segment(schedule_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::DELETE, &path)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Lists the most recent runs with what each answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` for a limit outside 1 to 50.
+    pub async fn list_runs(&self, limit: u32) -> Result<RunListReply, ApiError> {
+        self.get_json(&format!("/api/v1/runs?limit={limit}")).await
     }
 
     /// Lists every registered tool with the authorization posture in force for it.

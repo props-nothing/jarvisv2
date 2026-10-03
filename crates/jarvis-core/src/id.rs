@@ -201,6 +201,10 @@ typed_id!(
     ApprovalId
 );
 typed_id!(
+    /// Identifies one scheduled task.
+    ScheduleId
+);
+typed_id!(
     /// Identifies one durable memory record.
     ///
     /// Distinct from every other identifier: a memory outlives the run that produced it and the

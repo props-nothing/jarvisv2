@@ -26,7 +26,7 @@
 //! It never names an approver — the daemon records its own identity (`jarvis_protocol::ApprovalDecisionBody`
 //! has no field for one) — and it never judges whether an approval is acceptable. It shows, asks, and relays.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 
 use jarvis_protocol::{
     ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalListReply, PendingApprovalReply,
@@ -194,6 +194,17 @@ async fn decide(
         return ExitStatus::Rejected;
     }
 
+    apply(client, paths, approval, decision).await
+}
+
+/// Records a decision the person has already made, then follows the run to its next stopping point.
+async fn apply(
+    client: &ApiClient,
+    paths: &AppPaths,
+    approval: &PendingApprovalReply,
+    decision: ApprovalDecisionRequest,
+) -> ExitStatus {
+    let approving = decision == ApprovalDecisionRequest::Approve;
     let nonce = match read_nonce(paths, &approval.approval_id) {
         Ok(nonce) => nonce,
         Err(message) => {
@@ -218,13 +229,68 @@ async fn decide(
         decided.outcome.as_deref().unwrap_or("decided"),
         decided.state
     );
-    if !approving {
-        // The daemon tells the parked run it was refused, so the run answers instead of waiting forever.
-        return crate::chat::follow_run(client, &approval.run_id, &approval.approval_id).await;
-    }
-
-    // The daemon is releasing the call now; following the run shows its answer.
+    // A refusal is told to the parked run by the daemon, so the run answers instead of waiting forever; an
+    // approval is released by the daemon too. Either way, following the run shows what happens next.
     crate::chat::follow_run(client, &approval.run_id, &approval.approval_id).await
+}
+
+/// Asks the person, at the terminal, about every action a run is waiting on, until the run settles.
+///
+/// This is what makes a conversation feel like one: the agent says it wants to do something, you read it, you
+/// answer, it carries on — without leaving the prompt to run a second command. Each action is shown with its
+/// exact arguments and **defaults to refusal**: only `y` approves, and an answer that is anything else, including
+/// an empty line, tells the run that you declined. A later action the run asks for is asked about in turn.
+///
+/// Called only when standard input is a terminal; a script gets the exit status and the `approvals` verbs.
+pub(crate) async fn attend(client: &ApiClient, paths: &AppPaths, run_id: &str) -> ExitStatus {
+    loop {
+        let pending = match client.list_approvals().await {
+            Ok(reply) => reply,
+            Err(error) => return report(&error),
+        };
+        let Some(approval) = pending
+            .approvals
+            .iter()
+            .find(|approval| approval.run_id == run_id && approval.state == "pending")
+        else {
+            eprintln!("jarvis: nothing is waiting for approval on this run any more");
+            return ExitStatus::Ok;
+        };
+        let decision = if approval.arguments.is_none() {
+            eprintln!(
+                "jarvis: {} was held without its arguments, so it cannot be shown to you and is declined",
+                approval.tool
+            );
+            ApprovalDecisionRequest::Deny
+        } else {
+            eprintln!(
+                "\njarvis wants to run {} (risk {}):\n  {}",
+                approval.tool,
+                approval.risk_level,
+                describe_arguments(approval)
+            );
+            if prompt_yes_no("allow it? [y/N] ") {
+                ApprovalDecisionRequest::Approve
+            } else {
+                ApprovalDecisionRequest::Deny
+            }
+        };
+        let status = apply(client, paths, approval, decision).await;
+        if status != ExitStatus::AwaitingApproval {
+            return status;
+        }
+    }
+}
+
+/// Asks a yes/no question on standard error and reads the answer from standard input; only `y`/`yes` is yes.
+fn prompt_yes_no(question: &str) -> bool {
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// `jarvis approvals resume APPROVAL_ID`: finishes an approved call whose release did not happen.
@@ -287,13 +353,7 @@ fn confirmed(arguments: &[String]) -> bool {
         eprintln!("jarvis: approving needs a terminal to confirm at, or --yes");
         return false;
     }
-    eprint!("approve? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    prompt_yes_no("approve? [y/N] ")
 }
 
 /// Reads the nonce the daemon delivered for an approval.

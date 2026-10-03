@@ -26,6 +26,7 @@ mod isolation;
 mod memory;
 mod retrieval;
 mod risk;
+mod schedule;
 mod secretbytes;
 mod skill;
 mod summary;
@@ -58,8 +59,8 @@ pub use error::{DomainError, ErrorCode, SafeMessage, UnsafeMessage, UnsafeMessag
 pub use escalation::{EscalationSignal, InvalidEscalationSignal};
 pub use id::{
     ApprovalId, ClientId, CorrelationId, DaemonRunId, EntityId, IdGenerator, InvalidId,
-    InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, SessionId, SkillId, SystemIdGenerator,
-    WorkspaceId,
+    InvalidIdReason, MemoryId, ProfileId, RequestId, RunId, ScheduleId, SessionId, SkillId,
+    SystemIdGenerator, WorkspaceId,
 };
 pub use isolation::{
     FENCE_CLOSE, FENCE_OPEN, FENCE_TOKEN, IsolatedText, IsolationError, MAX_ISOLATED_CHARS,
@@ -96,6 +97,10 @@ pub use run::{
 pub use run_event::{
     EventSummary, InvalidRunEvent, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_SUMMARY_CHARS,
     MAX_REPLAY_EVENTS, ReplayRequest, RunEventKind, RunEventPayload, RunEventSequence,
+};
+pub use schedule::{
+    Cadence, InvalidSchedule, MAX_INTERVAL_SECONDS, MAX_SCHEDULE_OBJECTIVE_CHARS,
+    MAX_SCHEDULES_PER_WORKSPACE, MIN_INTERVAL_SECONDS, parse_interval, validate_objective,
 };
 pub use secret::{SecretRef, SecretRefValidationError};
 pub use sensitivity::{InvalidSensitivity, Sensitivity};

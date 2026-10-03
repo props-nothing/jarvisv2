@@ -144,3 +144,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0129](0129-a-fetch-is-checked-on-the-address-it-connects-to.md) | A fetch is checked on the address it connects to, and a model-chosen URL is held for a person by default | Accepted |
 | [0130](0130-a-pending-approval-holds-what-it-is-waiting-on.md) | A pending approval holds what it is waiting on, so a person can decide it (amends 0013) | Accepted |
 | [0131](0131-model-authored-code-runs-in-a-disposable-container.md) | Model-authored code runs in a disposable container, and is always held for a person | Accepted |
+| [0132](0132-a-schedule-is-a-request-to-start-an-ordinary-run.md) | A schedule is a request to start an ordinary run, fired at most once and never piled up | Accepted |

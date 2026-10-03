@@ -13,6 +13,7 @@ mod mcp_serve;
 mod memory_propose;
 mod memory_service;
 mod run_service;
+mod schedule_service;
 mod singleton;
 mod skill_service;
 mod sse;
@@ -935,6 +936,9 @@ struct HttpTransport {
     port: u16,
     shutdown: tokio::sync::oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
+    /// The scheduler, when the daemon drives runs. It shares the transport's lifetime: a daemon that is shutting
+    /// down must not start a run, and a scheduler outliving its listener would fire into a daemon nobody can reach.
+    scheduler: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HttpTransport {
@@ -974,6 +978,11 @@ impl HttpTransport {
         if let Some(tools) = tools {
             state = state.with_tools(tools);
         }
+        // Scheduled tasks fire through the same state the routes use, so a scheduled run is an ordinary run. Only
+        // when runs are driven at all: a scheduler over a daemon with no executor would start runs nothing runs.
+        let scheduler = state
+            .drives_runs()
+            .then(|| schedule_service::spawn(state.clone()));
         let app = gateway::router(state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (stopped_tx, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -993,6 +1002,7 @@ impl HttpTransport {
                 port,
                 shutdown,
                 handle,
+                scheduler,
             },
             stopped,
         ))
@@ -1009,6 +1019,10 @@ impl HttpTransport {
     /// looks to a client like a lost event, leaving it to decide whether to resume from its last
     /// sequence or discard its position.
     async fn shutdown(self) {
+        // The scheduler first: nothing new may start while the listener drains.
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.abort();
+        }
         let _ = self.shutdown.send(());
         let _ = self.handle.await;
     }

@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -401,6 +401,21 @@ pub enum DatabaseError {
     /// would attribute a decision to a person through a channel they never used.
     #[error("the stored approval has an invalid {field}")]
     StoredApprovalInvalid {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// No scheduled task exists for the requested identifier in this workspace.
+    #[error("no scheduled task exists for the requested identifier")]
+    ScheduleNotFound,
+    /// The workspace already holds the most scheduled tasks it may.
+    #[error("this workspace already holds the maximum number of scheduled tasks")]
+    ScheduleLimit,
+    /// A finished one-off cannot be resumed: its moment has passed.
+    #[error("a one-off task that has already fired cannot be resumed")]
+    ScheduleFinished,
+    /// A stored schedule row contradicts the domain's rules (another build, a backup, a hand edit).
+    #[error("the stored schedule has an invalid {field}")]
+    StoredScheduleInvalid {
         /// Stable field name without the offending value.
         field: &'static str,
     },
