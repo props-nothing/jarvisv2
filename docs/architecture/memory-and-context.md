@@ -132,6 +132,20 @@ Canonical entity kinds begin with person, organization, project, document, accou
 
 Resolution uses verified provider IDs, exact identifiers, user confirmation, and probabilistic matches. Ambiguous aliases remain separate candidates. Never merge solely because embeddings are similar. A merge operation is auditable and reversible.
 
+**Reachable by an operator since `P4-016`, and a lookup answers with candidates** (`ADR-0126`). The surface that
+creates, lists, and looks up an entity is what makes a remember possible at all — every claim names a subject, and
+until it existed there was no way to obtain one, which is the limit `P4-008` recorded. A lookup therefore returns
+**every** match with the aliases that produced it and whether each is verified: "remain separate candidates" is a
+rule about what a resolver may conclude, and a reply holding one entity would turn a guess into an identity that
+every later claim would inherit.
+
+**Identity is not trust, and the two predicates are different sets.** The schema permits a `confirmed` alias only
+from `user_statement` or `user_correction`, while `MemorySourceKind::permitted_trust()` is `Authoritative` for
+those **and** for `provider_record`. Trust asks "may this content instruct"; identity asks "who established this".
+A guard written as the trust comparison therefore accepts a provider record where the schema refuses it, and the
+caller's error surfaces as a database failure — which is why `is_user_stated()` exists as its own predicate rather
+than being inferred from the trust level.
+
 ## Retrieval
 
 Retrieval has two stages.

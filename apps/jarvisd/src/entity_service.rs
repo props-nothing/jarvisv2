@@ -98,7 +98,9 @@ impl std::fmt::Display for EntityServiceError {
                 write!(formatter, "page {requested} exceeds {maximum}")
             }
             Self::NotFound => formatter.write_str("no such entity"),
-            Self::Refused { reason, .. } => write!(formatter, "refused: {reason}"),
+            // The stable name **and** the sentence, because a log line is where an operator correlates a
+            // refusal with the rule that produced it, and the sentence alone reads as prose with no handle.
+            Self::Refused { reason, detail } => write!(formatter, "refused {reason}: {detail}"),
         }
     }
 }
@@ -118,15 +120,6 @@ impl EntityServiceError {
             Self::NotFound => "no entity exists for the requested identifier".to_owned(),
             Self::Refused { detail, .. } => detail.clone(),
             Self::Storage(_) => "the entity store is unavailable".to_owned(),
-        }
-    }
-
-    /// Returns the stable name of the refusal, for a caller that branches on it.
-    #[must_use]
-    pub const fn reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Refused { reason, .. } => Some(*reason),
-            _ => None,
         }
     }
 }

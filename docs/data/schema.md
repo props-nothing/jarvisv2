@@ -170,7 +170,13 @@ Memory, embedding model/version/dimensions, input hash, vector/blob, created tim
 
 ### `entities`
 
-Workspace, kind, canonical label, normalized attributes, confidence/status, timestamps, version.
+Workspace, kind, canonical label, normalized attributes, confidence/status, timestamps, version. Reachable by an operator since `P4-016`; see [ADR-0126](../adr/0126-an-entity-is-its-own-surface.md).
+
+Three rules here are enforced in more than one place, and each for a stated reason:
+
+- **`status <> 'merged' OR merged_into IS NOT NULL`** — the schema's, because a merge whose target is absent would be unreadable. `merge_entities` additionally refuses a *chain* (a target that is itself merged), which keeps resolution at exactly one hop.
+- **A verified alias comes only from a user statement or correction** — the schema's `CHECK`, restated by `entity_service` so the refusal names the rule rather than a table. This is also where `MemorySourceKind::is_user_stated()` exists: the nearest domain predicate, `permitted_trust() == Authoritative`, **admits `provider_record`** and would have let the check reach the database instead.
+- **A listing excludes merged and archived entities** — the read's job, because `StoredEntity::is_usable` is the rule for whether a name may be a subject: a merged entity's claims belong to its winner and an archived one's to nobody. `find_entity` deliberately returns any status, so a caller diagnosing a merge can still read the loser.
 
 ### `entity_aliases`
 

@@ -627,6 +627,21 @@ async fn a_correction_supersedes_the_old_claim() {
         vec!["Prefers light roast coffee"],
         "only the correction may be current"
     );
+
+    // **Both rows appear, including the superseded one**, and this is the assertion that was MISSING. The read
+    // used to be tested only through `is_current_truth`, so narrowing its filter from `status <> 'deleted'` to
+    // `status = 'active'` dropped the superseded claim from it and **no test failed** — the audit trail this
+    // slice exists to preserve was readable by nothing. The bug was introduced by a global string replacement
+    // during a mutation experiment and found by the test below only because it counted rows. Counted here too,
+    // so the audit requirement is asserted where the query lives rather than only in the correction's own test.
+    let statuses: Vec<&str> = all
+        .iter()
+        .map(|memory| memory.record().status().as_str())
+        .collect();
+    assert!(
+        statuses.contains(&"archived"),
+        "the superseded claim must remain readable — an audit trail nobody can read is not one: {statuses:?}"
+    );
 }
 
 /// **A correction trail cannot be rewritten: a second, different replacement is refused.**

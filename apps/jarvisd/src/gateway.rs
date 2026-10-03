@@ -5251,6 +5251,108 @@ mod tests {
         );
     }
 
+    /// **A verified name plus a guess is not an identity, and the list leaves a merged entity out.**
+    ///
+    /// Two rules that were **untested** until this test, both found by asking what each could be broken into:
+    ///
+    /// 1. The alias lookup's verdict is the **conjunction** over the aliases that matched one entity. One entity
+    ///    holding a verified email *and* a probabilistic one for the same value must report `verified: false`,
+    ///    because the caller is asking whether this name denotes this entity and one of the matching names is a
+    ///    guess. A disjunction would call it an identity.
+    /// 2. A listing excludes merged entities. A merged name denotes nothing — its claims belong to the winner —
+    ///    so offering it as a subject would let a caller attach a new claim to a name that has been retired.
+    #[tokio::test]
+    async fn a_guess_among_verified_names_and_a_merged_entity_are_both_excluded() {
+        let (app, presented, _profile) = test_router().await;
+        let entity = create_entity_via(&app, &presented, "Ada Lovelace", "person").await;
+
+        // One **verified** alias and one **probabilistic** alias for the same value, on the same entity. The
+        // probabilistic insert is allowed by the partial unique index, which keys only on verified rows — and
+        // that is what makes the conjunction testable at all.
+        for (verification, source, confidence) in [
+            ("confirmed", "user_statement", "confirmed"),
+            ("probabilistic", "user_statement", "likely"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    &format!("/api/v1/entities/{entity}/aliases"),
+                    &presented,
+                    &format!(
+                        r#"{{"alias_kind":"email","alias_value":"ada@example.com",
+                            "verification":"{verification}","source_kind":"{source}",
+                            "confidence":"{confidence}"}}"#
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{}",
+                body_text(response).await
+            );
+        }
+
+        let lookup = app
+            .clone()
+            .oneshot(get_request(
+                "/api/v1/entities/lookup?alias_kind=email&alias_value=ada@example.com",
+                Some(&presented),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(lookup).await;
+        let reply: jarvis_protocol::EntityLookupReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        assert_eq!(reply.returned, 1, "one entity, not two entries: {body}");
+        assert_eq!(
+            reply.matches[0].matched_aliases.len(),
+            2,
+            "both aliases belong to the one candidate: {body}"
+        );
+        assert!(
+            !reply.matches[0].verified,
+            "a verified name beside a guess is not an identity: {body}"
+        );
+
+        // And the listing's status filter: a merged entity is not a subject.
+        let other = create_entity_via(&app, &presented, "A. Lovelace", "person").await;
+        let merged = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/entities/{other}/merge"),
+                &presented,
+                &format!(r#"{{"target_id":"{entity}"}}"#),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            merged.status(),
+            StatusCode::OK,
+            "{}",
+            body_text(merged).await
+        );
+
+        let listed = app
+            .oneshot(get_request("/api/v1/entities", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let body = body_text(listed).await;
+        let reply: jarvis_protocol::EntityListReply =
+            serde_json::from_str(&body).unwrap_or_else(|error| panic!("decode {body}: {error}"));
+        let ids: Vec<&str> = reply
+            .entities
+            .iter()
+            .map(|entity| entity.entity_id.as_str())
+            .collect();
+        assert!(ids.contains(&entity.as_str()), "the winner stays: {body}");
+        assert!(
+            !ids.contains(&other.as_str()),
+            "a merged entity must not be offered as a subject: {body}"
+        );
+    }
+
     /// **A lookup with no selector is refused rather than answered with the whole workspace.**
     ///
     /// The default matters: an empty query could reasonably mean "everything", which is `GET /entities`, or

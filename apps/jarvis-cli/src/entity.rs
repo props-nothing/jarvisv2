@@ -26,6 +26,11 @@ use jarvis_protocol::{
     AddAliasRequest, CreateEntityRequest, EntityAliasReply, EntityDetailReply, EntityListReply,
     EntityLookupReply, EntityReply, MergeEntityRequest,
 };
+// Imported at module scope rather than inside the test module, because the `candidate` helper below is a
+// `#[cfg(test)]` **function** in this module and a type in its signature resolves here rather than in the
+// module that calls it.
+#[cfg(test)]
+use jarvis_protocol::EntityMatchReply;
 
 /// Maximum entities one listing asks for.
 ///
@@ -396,7 +401,6 @@ fn candidate(entity: EntityReply, verified: bool) -> EntityMatchReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jarvis_protocol::EntityMatchReply;
 
     fn args(values: &[&str]) -> Vec<String> {
         std::iter::once("entity")

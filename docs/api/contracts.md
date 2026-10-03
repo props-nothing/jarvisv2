@@ -364,6 +364,43 @@ inference, so the person confirming **is** the person whose statement produced t
 identity the two are always the same value. What holds instead is that the approver is never client-supplied —
 see `ADR-0124`.
 
+### Entities
+
+`P4-016`. An entity is what a memory is **about**, and this is the surface that makes a remember possible at
+all: every claim must name a subject, and until this slice existed there was no way to obtain one. See
+`ADR-0126`.
+
+| Route | Verb | What it answers |
+| --- | --- | --- |
+| `/api/v1/entities` | `GET` | the workspace's **usable** entities — merged and archived excluded |
+| `/api/v1/entities` | `POST` | creates one, returning the identifier a remember names |
+| `/api/v1/entities/lookup` | `GET` | every entity a **label** or an **alias** denotes, with the evidence |
+| `/api/v1/entities/{id}` | `GET` | one entity with its aliases, and how many claims link to it |
+| `/api/v1/entities/{id}/aliases` | `POST` | attaches a name to it |
+| `/api/v1/entities/{id}/merge` | `POST` | merges it **into** the identifier in the body |
+
+**A lookup returns candidates, never one row.** The architecture's rule is that ambiguous aliases "remain
+separate candidates", so a reply whose `matches` held one entry would turn a guess into an identity and every
+later claim would inherit it. Each match carries the aliases that produced it and a `verified` flag, and the flag
+is the **conjunction** over those aliases: an entity holding a verified name *and* a probabilistic one for the
+same value is not verified.
+
+**A lookup with no selector is `400`, not an empty workspace.** `?label=` and `?alias_kind=`/`?alias_value=` are
+the two selectors; neither means `GET /entities`, so the absent case is refused rather than defaulted. Half an
+alias is refused for the same reason — an empty kind searches every kind and an empty value matches nothing.
+
+**`verification` and `source_kind` are both request fields, and the schema's cross-field rule is restated as a
+`422`.** A `confirmed` alias must come from `user_statement` or `user_correction`; a `probabilistic` one cannot
+be held as `confirmed`. The refusal names the rule, because the constraint it mirrors names a table.
+
+**The merge's direction is in words.** The path names the entity merged **away** and the body names the one kept,
+and the reply is the winner — its `merged_into`-pointing loser is reachable by `GET /entities/{id}`, so a
+reversal is visible in the receipt rather than only in the database. Each reply carries `linked_memories`,
+because a merge moves no links and an operator needs to know which side is used.
+
+**No deletion.** `merge` is the only operation that retires an entity, and an entity created in error stays
+listed until it is merged into another. Recorded as a limit in `ADR-0126` rather than left as an omission.
+
 
 ## Skill Control Plane (`P4-013` — implemented)
 

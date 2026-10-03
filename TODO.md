@@ -3557,14 +3557,68 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         component. The summary route is HTTP-only — no CLI verb, matching `P4-014`'s tool, because both need an
         entity identifier the CLI has no way to obtain.
 
-- [ ] `P4-016` Add the entity surface: an operator can create, list, and look up the entities a memory is
+- [x] `P4-016` Add the entity surface: an operator can create, list, and look up the entities a memory is
       `about`, and attach an alias to one so a later lookup resolves by name rather than by identifier.
       **The gap three slices recorded.** `P4-008`'s note is that "**No entity-creation surface exists**, so a
       remember is still unreachable by a user of the shipped product"; `P4-014` and `P4-015` each record the
       same limit from a different direction. The measurement behind this slice: seven entity-repository
       functions had **no production caller at all** — `merge_entities`, `record_alias`, `resolve_alias`,
-      `read_alias_candidates`, `read_entity_memories`, `record_relation`, `read_subject_relations` — and
-      `resolve_alias`/`read_alias_candidates` are exactly the "entity resolution" that note names as missing.
+      `read_alias_candidates`, `read_entity_memories`, `record_relation`, `read_subject_relations` — and the
+      last-named two are exactly the "entity resolution" that note names as missing.
+      **New:** `crates/jarvis-protocol/src/entity_api.rs` (13 DTOs), `apps/jarvisd/src/entity_service.rs`,
+      `apps/jarvis-cli/src/entity.rs` (**3 tests**), 5 routes with **6 route tests**, 4 storage reads and one
+      counter. `ADR-0126`.
+      - **Its own surface, not a sub-resource of `memory`.** An entity is not a memory: different lifecycle
+        (created, aliased, merged versus proposed, confirmed, corrected, forgotten), different owner (the
+        operator's vocabulary, not the model's), and a different role — it is what a claim is *about*. As a
+        sub-resource it would put "create the subject" behind the verb that requires one, which **is** the
+        recorded ordering problem.
+      - **A lookup returns every candidate with its evidence, and the CLI renderer is where that rule could be
+        undone.** `resolve_alias` documents it — "ambiguous aliases remain separate candidates" — so the reply
+        is a list and each match says whether it was `verified`. A client printing `matches[0]` would present a
+        guess as an identity at the last step, so the renderer has its own test and the daemon exposes **one**
+        route for both lookup kinds rather than two that could diverge.
+      - **The verdict is the conjunction**: an entity holding a verified name *and* a probabilistic one for the
+        same value is not verified, because the question is whether this name denotes this entity and one of the
+        matching names is a guess.
+      - **⭐⭐⭐ The schema's rule and the nearest domain predicate were DIFFERENT SETS, one line apart from being
+        treated as one.** `0009` permits a `confirmed` alias only from `user_statement`/`user_correction`, while
+        `MemorySourceKind::permitted_trust()` returns `Authoritative` for those **and** `provider_record`. Trust
+        asks "may this content instruct"; identity asks "who established this". Added
+        `MemorySourceKind::is_user_stated()`, and **falsified the mistake**: substituting the trust predicate
+        into the guard fails the route test with `503` where `422` is required — the caller's error surfacing as
+        "the database is unavailable", sending an operator to debug the wrong thing.
+      - **Five rules falsified**, each in the binary a developer runs: the verification conjunction (→
+        disjunction); the listing's `status = 'active'` filter (→ `<> 'deleted'`, which re-listed a merged
+        entity); the alias-source guard substituted with the trust predicate; the same guard disabled entirely
+        (**the complement direction** — a guard that never fires must also fail a test); and
+        `is_verified_alias`'s probabilistic arm (→ `true`, caught by two tests).
+      - **⭐⭐ A mutation experiment corrupted three unrelated queries, and only a row count caught it.** The
+        restore step used a **global** string replace, so `status <> 'deleted'` → `status = 'active'` was applied
+        to `read_workspace_memories`, `read_entity_memories`, and `read_subject_relations` as well — silently
+        narrowing each. `a_correction_supersedes_the_old_claim` failed because it **counted rows**; every other
+        memory test passed, because they assert on `is_current_truth` and a narrowed filter drops exactly the
+        rows those assertions ignore. The three queries were restored and an assertion was added beside the read:
+        *the superseded claim must remain readable — an audit trail nobody can read is not one*. Re-applying the
+        exact mutation then failed that assertion, so the detector is proven rather than assumed.
+        **Generalise: a mutation restore must be scoped to its occurrence, and a read's filter needs a test that
+        counts what it excludes.**
+      - **⭐ `parse_summary_limit` became `parse_limit(raw, default)`** because there are now three listing bounds
+        (200, 128, 50); three parsers would be three places for a bound to be wrong.
+      - **Verified live** through the CLI against a real daemon (`database_schema=12`): `entity create "Ada
+        Lovelace" --kind person --confidence confirmed` → an identifier; **`memory remember "Prefers morning
+        meetings" --type preference --source user_statement --entity <id>` → `status active`**, which is the
+        recorded gap closed; `entity alias … --verification confirmed --source user_statement` → attached;
+        `entity lookup --alias-kind email` → `verified … matched alias`; `entity merge <other> --into <id>` →
+        the winner, after which `entity list` no longer offers the loser; and
+        `--verification confirmed --source provider_record` → `422` naming the remedy, exit `4` (`Denied`).
+      - **Limits, recorded rather than glossed:** a label lookup is **exact** (case-insensitive, whole-label) and
+        not a text search, because a fuzzy match would turn a guess into an identity — a caller wanting partial
+        names has no surface yet; there is **no entity deletion**, so `merge` is the only way to retire one and an
+        entity created in error stays listed until merged; `entity_relations` is still unreachable
+        (`record_relation`, `read_subject_relations`), because a relation is a claim *between* entities and needs
+        a surface of its own; and the CLI's argument parsing has one unit test per helper rather than an
+        end-to-end one per verb.
 
 ## P5: Connectors
 
