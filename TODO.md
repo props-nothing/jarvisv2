@@ -2594,6 +2594,29 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **Limits:** a terminal view, not yet the heads-up display the product is aiming at (no browser or overlay surface);
     no keypress approvals; no per-run event detail.
 
+### P3-036: Visual presence — the heads-up display (`jarvis hud`)
+
+- [x] The daemon serves a static display at `/hud` (`apps/jarvisd/src/hud.rs`, `ADR-0135`): an orb that is idle, working,
+  or amber and pulsing when something **needs you**, plus waiting-for-you (with the exact approve command and a copy
+  button), working (with **Stop** per run and **Stop everything**), scheduled and recent. `jarvis hud` opens it with the
+  credential in the URL fragment, which the page moves to session storage and removes from the address bar. No
+  dependency, no build step.
+  - Tests: public assets are exactly two `GET` paths and nothing else became public (route test, both sides, including a
+    `POST` and sibling paths), the script never inserts markup / inline script / query credential, the fragment form.
+  - **Live in a browser:** the page rendered the parked code approval and its run, Stop cancelled the run and the
+    approval vanished, the orb returned to idle; a reload kept working from session storage.
+  - **Limits:** it cannot approve (the decision code is a private file, by design); polling every 1.5 s rather than a
+    push stream; one workspace; no per-run event detail yet.
+- [x] **Upgraded to a full console** (same slice): animated canvas orb whose waveform follows the mic or the spoken
+  answer, a streaming conversation over the run's SSE (tool chips, safe markdown, session kept across turns), the four
+  panels, keyboard shortcuts (`/`, `M`, `Esc`), `/hud.css` with `style-src 'self'` and a microphone-only
+  `Permissions-Policy`. **Voice (first slice of `P8-010`, browser-native):** push-to-talk, wake word "Jarvis", spoken
+  answers, interruption, and the hands-free kill switch ("Jarvis, stop"). Tests: no markup insertion, no outside
+  origin, no `MediaRecorder`, no inline style. **Live:** a streamed answer with tool chips and two parallel sub-agents
+  visible in the panels; the stale-cursor and raw-markdown-in-panel defects found by looking at it were fixed.
+  - **Limits:** the microphone path could not be exercised here (no audio device); browser recognition may use the
+    vendor's cloud (Chrome/Edge); no file attach; no spoken approval; Firefox has no speech recognition.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS</title>
+<link rel="stylesheet" href="/hud.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span class="logo">J.A.R.V.I.S</span><span class="sub">personal agent console</span></div>
+    <div class="pills">
+      <span class="pill" id="pill-link"><i></i><span>connecting</span></span>
+      <span class="pill" id="pill-work"><i></i><span>0 working</span></span>
+      <span class="pill" id="pill-wait"><i></i><span>0 waiting</span></span>
+    </div>
+    <div class="spacer"></div>
+    <span id="clock" aria-hidden="true"></span>
+    <button id="stop" class="danger" hidden title="Cancel everything that is running or waiting">Stop everything</button>
+  </header>
+
+  <div id="message" role="status"></div>
+
+  <div id="layout">
+    <section id="stage">
+      <div id="orbwrap">
+        <canvas id="orb" aria-hidden="true"></canvas>
+        <div id="caption">idle</div>
+      </div>
+
+      <div id="chat" aria-live="polite"></div>
+
+      <form id="composer" autocomplete="off">
+        <button type="button" id="mic" title="Talk (M)" aria-label="Talk">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z" fill="currentColor"/></svg>
+        </button>
+        <input id="input" type="text" placeholder="Ask JARVIS anything  ( / )" maxlength="3000" aria-label="Message">
+        <button type="submit" id="send">Send</button>
+      </form>
+      <div id="toggles">
+        <label><input type="checkbox" id="speak"> Speak answers</label>
+        <label><input type="checkbox" id="wake"> Wake word &ldquo;Jarvis&rdquo;</label>
+        <span id="hint"></span>
+      </div>
+    </section>
+
+    <aside id="dock">
+      <section><h2>Waiting for you</h2><div id="waiting"></div></section>
+      <section><h2>Working</h2><div id="working"></div></section>
+      <section><h2>Scheduled</h2><div id="scheduled"></div></section>
+      <section><h2>Recent</h2><div id="recent"></div></section>
+      <p class="note">Approving happens where the decision code is delivered (your terminal): the command is shown above. This console can talk, watch and stop work, not approve it.</p>
+    </aside>
+  </div>
+</div>
+<script src="/hud.js"></script>
+</body>
+</html>

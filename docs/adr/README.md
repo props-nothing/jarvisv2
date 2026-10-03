@@ -147,3 +147,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0132](0132-a-schedule-is-a-request-to-start-an-ordinary-run.md) | A schedule is a request to start an ordinary run, fired at most once and never piled up | Accepted |
 | [0133](0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md) | Approval is for what can hurt, and the owner can decide once (amends 0129, 0131) | Accepted |
 | [0134](0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md) | A sub-agent is an ordinary run, one level deep | Accepted |
+| [0135](0135-the-heads-up-display-is-a-static-page-it-can-watch-and-stop-not-approve.md) | The heads-up display is a static page the daemon serves; it can watch and stop, not approve | Accepted |

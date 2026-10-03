@@ -293,6 +293,11 @@ pub fn router(state: GatewayState) -> Router {
         .route("/skills/{id}/enable", post(enable_skill));
 
     Router::new()
+        // The heads-up display's two static assets: no data, no secret, served without the credential
+        // (`crate::hud::is_public_asset` is the one place that says so).
+        .route(crate::hud::PAGE_PATH, get(crate::hud::page))
+        .route(crate::hud::SCRIPT_PATH, get(crate::hud::script))
+        .route(crate::hud::STYLE_PATH, get(crate::hud::style))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .nest("/api/v1", api)
@@ -303,6 +308,10 @@ pub fn router(state: GatewayState) -> Router {
 
 /// Rejects any request that does not present the profile credential.
 async fn authenticate(State(state): State<GatewayState>, request: Request, next: Next) -> Response {
+    // The two static display assets carry nothing to protect; the data they show is fetched with the credential.
+    if crate::hud::is_public_asset(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
     let Some(presented) = bearer_token(request.headers()) else {
         return unauthorized("the request did not present a bearer credential");
     };
@@ -2187,6 +2196,71 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("read response body: {error}"));
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// **The display's two static assets are public, and nothing else became public with them.**
+    ///
+    /// Asserted from both sides: the page and script are served with no credential, carry a content-security
+    /// policy and no cache, and **contain no data** (the credential is not in them); while a sibling path, a `POST`
+    /// to the same path, and the data API itself still refuse a request with no credential.
+    #[tokio::test]
+    async fn the_display_assets_are_public_and_nothing_else_is() {
+        let (app, presented, _profile) = test_router().await;
+        for path in ["/hud", "/hud.js", "/hud.css"] {
+            let response = app
+                .clone()
+                .oneshot(get_request(path, None))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let policy = response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path}: {policy}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let body = body_text(response).await;
+            assert!(
+                !body.contains(&presented),
+                "{path} must not contain the credential"
+            );
+        }
+        for path in [
+            "/hud/",
+            "/hudx",
+            "/api/v1/runs",
+            "/api/v1/approvals",
+            "/health/live",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get_request(path, None))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let posted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hud")
+                    .body(Body::empty())
+                    .unwrap_or_else(|error| panic!("build request: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(posted.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// **The falsification test for the authentication guard.** A valid credential succeeds and

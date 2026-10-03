@@ -48,7 +48,7 @@ const KEY_FILE_NAME: &str = "model.key";
 const OLLAMA_PLACEHOLDER_KEY: &str = "ollama";
 
 /// How long `start` waits for the daemon to listen.
-const START_WAIT: Duration = Duration::from_secs(20);
+const START_WAIT: Duration = Duration::from_secs(60);
 
 /// What `init` was asked for.
 #[derive(Debug, Default, Eq, PartialEq)]

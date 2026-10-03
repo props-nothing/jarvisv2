@@ -9,6 +9,7 @@ mod entity_service;
 mod executor;
 mod gateway;
 mod health;
+mod hud;
 mod mcp_host;
 mod mcp_serve;
 mod memory_propose;

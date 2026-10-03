@@ -195,6 +195,14 @@ Trust is yours to give per tool, never given by default, and never applies to a 
 
 ### Watching it work
 
+`jarvis hud` opens the JARVIS console in your browser: an animated orb (idle, working, listening, speaking, amber when
+something **needs you**), a streaming conversation with the assistant, the same lists as `jarvis watch`, and **Stop**
+buttons. Press the microphone (or `M`) to talk, turn on **Speak answers**, or enable the **wake word** and say
+"Jarvis, ..."; "Jarvis, stop" cancels everything running and Escape (or clicking the orb) silences it. Voice uses your
+browser's own speech support (Chrome or Edge); the browser's recognizer may send audio to its vendor's service. It can watch and stop
+work but not approve it (the decision code is delivered to a private file, so the display shows you the command).
+See `ADR-0135`.
+
 `jarvis watch` is a live screen of the work: what is **waiting for you** (with the exact approve/deny commands), what is
 **working** (runs and sub-agents, with ages and the cancel commands), what is **scheduled** next, and what just
 **finished**. `jarvis watch --once` prints it once.

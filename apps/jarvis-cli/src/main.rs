@@ -15,6 +15,7 @@ mod cancel;
 mod chat;
 mod connector;
 mod entity;
+mod hud;
 mod init;
 mod memory;
 mod output;
@@ -74,6 +75,7 @@ async fn main() -> ExitCode {
         },
         Some("cancel") => cancel_command(&arguments).await,
         Some("watch") => watch_command(&arguments).await,
+        Some("hud") => hud_command(&arguments),
         Some("approvals") => approvals_command(&arguments).await,
         // `schedule` and `runs` are the proactive half of the product: tasks that run while you are away, and
         // where you read what they said.
@@ -99,7 +101,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
@@ -176,6 +178,38 @@ async fn schedule_command(arguments: &[String], runs: bool) -> ExitStatus {
     } else {
         schedule::run_schedule(&client, arguments).await
     }
+}
+
+/// Runs `jarvis hud`: opens the heads-up display in the default browser.
+fn hud_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let paths = match resolve_paths(&root) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
+    let loaded = match ConfigStore::from_paths(&paths).load() {
+        Ok(loaded) => loaded,
+        Err(error) => return fail("configuration", &error),
+    };
+    if !loaded.config().daemon().http_enabled() {
+        eprintln!(
+            "jarvis: the HTTP API is off in this configuration, so there is nothing to display; run `jarvis init`"
+        );
+        return ExitStatus::Unavailable;
+    }
+    let credential = match load_credential(&paths) {
+        Ok(credential) => credential,
+        Err(status) => return status,
+    };
+    hud::open(
+        loaded.config().daemon().http_port(),
+        credential.expose(),
+        arguments.iter().any(|argument| argument == "--no-open"),
+    )
 }
 
 /// Runs `jarvis watch`, the live view of what the assistant is doing.
