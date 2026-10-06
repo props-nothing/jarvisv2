@@ -21,9 +21,12 @@ Measured against the four hallmarks of a real J.A.R.V.I.S.:
 | Voice | Browser-native push-to-talk, wake word, spoken answers, interruption (the microphone path is untested here; the browser's recognizer may use a vendor cloud). | Local (non-cloud) recognition and synthesis, then telephony and ElevenLabs (`P8`). |
 | Hands-free | Spoken "Jarvis, stop" cancels everything, and a spoken "yes"/"no" answers a waiting approval (`ADR-0136`). | Always-on local wake word and recognition so it works without the browser tab in front. |
 
-Order of work from here: (1) one real connector callable by the model (Gmail/Calendar read), because `jarvis-connectors`
-is 38k lines and nothing in `jarvisd` calls it, so `P5` is time-boxed to that single slice; (2) a file write/edit tool for
-granted folders; (3) local voice; (4) coding-agent runtimes; (5) model routing so sub-agents and background work can use a
+Order of work from here: (0) **onboarding and settings** (`docs/product/onboarding.md`, `P9-012` to `P9-019`): stop/restart,
+guided setup with key entry and a test call, `jarvis config` / `jarvis keys`, a Settings screen in the console, a real `doctor`,
+and a one-folder release, because a capable assistant that is hard to start and impossible to reconfigure is not yet a product;
+(1) one real connector callable by the model (Gmail/Calendar read), because `jarvis-connectors`
+is 38k lines and nothing in `jarvisd` calls it, so `P5` is time-boxed to that single slice; (2) ~~a file write/edit tool for
+granted folders~~ (done, `ADR-0137`) and ~~a natural voice~~ (done through ElevenLabs, `ADR-0138`); (3) local voice; (4) coding-agent runtimes; (5) model routing so sub-agents and background work can use a
 cheaper model; (6) the answer-quality harness (`P9-011`) moved forward, because every change needs a measure of whether
 the assistant got better; (7) archive the finished parts of `TODO.md`, which has outgrown being readable as a ledger.
 ## Phase 0: Architecture Baseline

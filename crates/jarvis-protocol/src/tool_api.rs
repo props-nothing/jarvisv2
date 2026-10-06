@@ -40,6 +40,10 @@ use serde::{Deserialize, Serialize};
 /// Carries the authorization facts `ToolSummary` omits, because this is the shape a person uses to
 /// decide whether a tool's posture is right — not the shape a model uses to choose a tool.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a wire shape: each flag is an independent fact a client reads by name"
+)]
 pub struct ToolReply {
     /// The canonical identifier, which is also the name a policy override addresses.
     pub id: String,

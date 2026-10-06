@@ -80,6 +80,8 @@ pub struct GatewayState {
     /// different from a pipeline with no roots, because the latter would offer a tool that fails every
     /// call (`docs/adr/0020-filesystem-confinement-is-a-handle.md`).
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+    /// The speech provider, when a key file is configured (`ADR-0138`). `None` means the page speaks with the browser's own voice.
+    speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
 }
 
 impl GatewayState {
@@ -95,6 +97,7 @@ impl GatewayState {
             credential,
             executor: None,
             tools: None,
+            speech: None,
         }
     }
 
@@ -110,6 +113,19 @@ impl GatewayState {
     pub fn with_tools(mut self, tools: Arc<crate::tool_pipeline::ToolPipeline>) -> Self {
         self.tools = Some(tools);
         self
+    }
+
+    /// Attaches the speech provider.
+    #[must_use]
+    pub fn with_speech(mut self, speech: Arc<jarvis_voice::ElevenLabsSpeech>) -> Self {
+        self.speech = Some(speech);
+        self
+    }
+
+    /// Returns the speech provider, when one is configured.
+    #[must_use]
+    pub fn speech(&self) -> Option<&Arc<jarvis_voice::ElevenLabsSpeech>> {
+        self.speech.as_ref()
     }
 
     /// Returns the tool pipeline, when one is configured.
@@ -254,6 +270,11 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
+        .route("/shutdown", post(crate::stop::request))
+        .route(
+            "/speech",
+            get(crate::speech_service::status).post(crate::speech_service::speak),
+        )
         .route("/tools", get(list_tools))
         .route("/tools/{tool}/calls", post(call_tool))
         .route("/tools/{tool}/preview", post(preview_tool))
@@ -2107,6 +2128,152 @@ mod tests {
         let presented = credential.expose().to_owned();
         let state = GatewayState::new(Arc::clone(&database), credential);
         (router(state), database, presented, profile)
+    }
+
+    /// A router whose speech provider is the one at `base` (a local fake in the tests that use it).
+    async fn test_router_with_speech(base: &str) -> (Router, String, TempProfile) {
+        let profile = TempProfile::new();
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate()
+            .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
+        let presented = credential.expose().to_owned();
+        let speech = jarvis_voice::ElevenLabsSpeech::new(
+            base,
+            jarvis_voice::DEFAULT_VOICE_ID,
+            jarvis_voice::DEFAULT_MODEL,
+            "sk_fixture_key_0123",
+        )
+        .unwrap_or_else(|error| panic!("speech fixture: {error}"));
+        let state = GatewayState::new(database, credential).with_speech(Arc::new(speech));
+        (router(state), presented, profile)
+    }
+
+    /// **The spoken voice sits behind the credential, says plainly when it is not configured, and never shows the key.**
+    #[tokio::test]
+    async fn speech_requires_the_credential_and_reports_when_it_is_not_configured() {
+        let (app, presented, _profile) = test_router().await;
+        let unauthenticated = app
+            .clone()
+            .oneshot(get_request("/api/v1/speech", None))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let status = app
+            .clone()
+            .oneshot(get_request("/api/v1/speech", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(status.status(), StatusCode::OK);
+        assert!(body_text(status).await.contains(r#""enabled":false"#));
+
+        let refused = app
+            .oneshot(post_json(
+                "/api/v1/speech",
+                &presented,
+                r#"{"text":"hello"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// **A configured voice returns the provider's audio, and the key stays on this side.**
+    #[tokio::test]
+    async fn speech_returns_provider_audio_and_does_not_leak_the_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"))
+        );
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buffer[..read]);
+                    if String::from_utf8_lossy(&received).contains(r#""model_id""#) {
+                        break;
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: audio/mpeg\r\ncontent-length: 9\r\nconnection: close\r\n\r\nMP3-bytes")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let (app, presented, _profile) = test_router_with_speech(&base).await;
+
+        let status = app
+            .clone()
+            .oneshot(get_request("/api/v1/speech", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let status = body_text(status).await;
+        assert!(status.contains(r#""enabled":true"#), "{status}");
+        assert!(
+            !status.contains("sk_fixture_key_0123"),
+            "the key must never be reported"
+        );
+
+        let spoken = app
+            .oneshot(post_json(
+                "/api/v1/speech",
+                &presented,
+                r#"{"text":"Good evening."}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(spoken.status(), StatusCode::OK);
+        assert_eq!(
+            spoken
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("audio/mpeg")
+        );
+        assert_eq!(body_text(spoken).await, "MP3-bytes");
+    }
+
+    /// **Stopping the daemon needs the credential.** Without it the request is refused (and nothing is woken).
+    #[tokio::test]
+    async fn a_stop_request_without_the_credential_is_refused() {
+        let (app, _presented, _profile) = test_router().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/shutdown")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap_or_else(|error| panic!("fixture request: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// With the credential the daemon answers that it is stopping (the wake-up itself is covered in `stop`).
+    #[tokio::test]
+    async fn a_stop_request_with_the_credential_is_accepted() {
+        let (app, presented, _profile) = test_router().await;
+        let response = app
+            .oneshot(post_json("/api/v1/shutdown", &presented, ""))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(body_text(response).await.contains(r#""stopping":true"#));
     }
 
     fn get_request(path: &str, credential: Option<&str>) -> Request<Body> {

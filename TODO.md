@@ -2487,6 +2487,22 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   - **Limits:** the head is a mask plus wire skull (no hair or shoulders); speech mouth motion is a synthetic envelope, not
     phoneme-driven; no settings editing in the console yet (policy and folders are still `config.toml` / `jarvis init`).
 
+### P3-040: A real voice (neural speech through the daemon)
+
+- [x] `ADR-0138`: `crates/jarvis-voice` (ElevenLabs text-to-speech adapter, verified against the live docs), `GET/POST
+  /api/v1/speech` behind the credential, `daemon.speech_api_key_ref` / `speech_voice_id` / `speech_model`, and
+  `jarvis init --elevenlabs` (key from `ELEVENLABS_API_KEY`) / `--voice-key-file` / `--voice-id` / `--voice-model`.
+- [x] The page plays the daemon's audio with the next sentence group made while one plays, interruption aborts it, the head's
+  jaw follows the real audio level, and the browser voice is the fallback, now ranked sensibly (Natural/Online first,
+  British male preferred, voices re-read as they load, no pitch hack) and honest when it only has a basic one.
+  - Tests: adapter contract tests against a local fake provider (request shape, key never in errors or `Debug`, status
+    mapping, bounds, malformed settings); route tests (401 without the credential, 404 when not configured, audio proxied,
+    key never reported); config validation; init rendering and flags.
+  - **Live:** the page path ran end to end with the speech endpoints mocked in the browser (violet speaking state, mouth open
+    with the audio, a new message aborting the in-flight request). **Not run against a real account: no key was available.**
+  - **Limits:** text spoken leaves the machine when a key is set; per-character cost with no cap yet; regional endpoints are
+    not configurable; speech to text is still the browser's.
+
 ## P4: Memory And Context
 
 - [x] `P4-001` Define memory types, provenance, confidence, validity, sensitivity, correction, supersession, and retention semantics.
@@ -6947,6 +6963,36 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P9-011` Add an answer-quality evaluation harness: labeled prompts with expected properties, run against
       a configured provider, asserting answer quality and regression over time. Distinct from the acceptance
       gates, which assert correctness of behavior rather than the quality of an answer.
+
+### P9-012 to P9-019: Onboarding, settings and distribution (spec: `docs/product/onboarding.md`)
+
+- [x] Review of the first-run path, the key and settings story, the lifecycle commands and the release path (this entry).
+- [x] `jarvis` with no arguments (or `jarvis launch`, or flags alone) sets up on the first run when a terminal is available, then
+  starts the daemon and opens the console; without a terminal it explains itself. `[profile.release]` added (thin LTO, one
+  codegen unit, stripped). `docs/user/quick-start.md` written; README and the developer guide link to it.
+- [x] `P9-012` `POST /api/v1/shutdown` (authenticated, graceful, wakes the same shutdown path a signal does) and `jarvis stop` /
+  `jarvis restart` that wait for the port to free. Also fixed: on Windows `jarvis start` made the daemon inherit the pipe a script
+  captures the output through, so `jarvis start | anything` never returned; the daemon is now started through `Start-Process`
+  with its process id tracked, and a daemon that dies at startup is reported in about a second. Live: stop 0.75 s, restart from
+  stopped and while running through a capturing pipe, a bad configuration reported in 1 s. Tests: 401 without the credential,
+  202 with it, the waiter wakes, stopping what is not running is not an error.
+- [ ] `P9-013` Guided brain and key setup: provider presets, a non-echoing key prompt (dependency decided in an ADR), key to a private
+  file, a real test call before saving, optional voice step; the same flow on first launch and in `jarvis init`.
+- [x] `P9-014` `jarvis config show|get|set|unset` and `jarvis keys status|set|remove|test`: one setting at a time, secrets never
+  printed or taken as arguments (environment variable, file or standard input), every change validated by the daemon's own
+  parser and refused without touching the file, `--json` on the reads. No new third-party dependency (the workspace's `toml`).
+  Tests: one change keeps the rest (folders, key file), invalid changes leave the file byte-identical, half a pair is refused,
+  a key lands in a private file and never in the configuration, malformed keys are refused without echoing them. Live: set a
+  model, kept the folder, refused a voice id without a key, `keys test model` against a real Ollama, `keys set voice --file`.
+  Limits: the file is rewritten from its parsed form, so hand-written comments are lost; the paste prompt echoes (hidden
+  input needs a dependency decision, `P9-013`); `keys test voice` needs a running daemon and a real key.
+- [ ] `P9-015` Settings view in the console (brain, keys, voice, folders, ask/trust) over `GET/PUT /api/v1/settings` that never returns a
+  secret and accepts a new one write-only; "restart to apply" using `P9-012`.
+- [ ] `P9-016` `jarvis doctor` that checks the model answers, the keys work, Docker for the code tool, the port, and a browser.
+- [ ] `P9-017` Release archive per platform with both binaries, checksums and a CI release job; `jarvis` locates `jarvisd` beside itself or
+  on `PATH`.
+- [ ] `P9-018` `jarvis service install|uninstall` really installs the per-user service (see `P9-003`).
+- [ ] `P9-019` Tauri shell with a tray icon over the same console (see `P9-001`).
 
 ## P10: Server And Multi-Device
 

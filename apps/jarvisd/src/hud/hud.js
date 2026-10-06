@@ -36,7 +36,7 @@
   var S = {
     session: sessionStorage.getItem("jarvis-session"),
     offline: true, needYou: 0, working: 0, thinking: 0,
-    listening: false, speaking: false, level: 0,
+    listening: false, speaking: false, level: 0, voiceLevel: 0,
     speak: localStorage.getItem("jarvis-speak") === "1",
     wake: false,
     pending: [], announced: null
@@ -297,53 +297,192 @@
   });
 
   // ---- voice: speaking -------------------------------------------------------------------------------------------
+  // Two voices. When the daemon has a speech provider configured (ADR-0138) the answer is spoken in that neural voice:
+  // the page asks the daemon for audio (the provider's key never leaves the daemon) and plays it, making the next
+  // sentence group while the current one plays. Otherwise, or if that fails, the browser's own synthesis is used,
+  // choosing the best voice it has. Either way the head's mouth follows what is actually being said.
   var synth = window.speechSynthesis;
+  var neural = { enabled: false, voice: "", warnedBasic: false };
+  var playing = { token: 0, element: null, controller: null, url: null, context: null, analyser: null, data: null };
+
   function plain(text) {
     return String(text).replace(/```[\s\S]*?```/g, " code omitted. ").replace(/[`*_#>]/g, "").replace(/\s+/g, " ").trim();
   }
+
+  // Browser voices: a "Natural" or "Online" voice (Edge ships good ones) beats a Google voice, which beats the legacy
+  // desktop voices that sound robotic; British male first, because that is the voice this assistant is meant to have.
+  function rankVoice(voice) {
+    if (!/^en/i.test(voice.lang)) return -1;
+    var score = 0;
+    if (/natural|neural|online/i.test(voice.name)) score += 100;
+    if (/Google/i.test(voice.name)) score += 30;
+    if (/en[-_]GB|UK|British/i.test(voice.name + " " + voice.lang)) score += 20;
+    if (/Ryan|George|Thomas|Daniel|Oliver|Guy|Davis|Andrew|Brian|Christopher|Eric|Male/i.test(voice.name)) score += 15;
+    return score;
+  }
   function pickVoice() {
     if (!synth) return null;
-    var voices = synth.getVoices().filter(function (voice) { return /^en/i.test(voice.lang); });
-    var preferred = /(UK English Male|Daniel|Ryan|George|Guy|Aria|Google US English)/i;
-    return voices.find(function (voice) { return preferred.test(voice.name); }) || voices[0] || null;
+    var best = null, top = -1;
+    synth.getVoices().forEach(function (voice) {
+      var score = rankVoice(voice);
+      if (score > top) { top = score; best = voice; }
+    });
+    if (best && top < 100 && !neural.warnedBasic) {
+      neural.warnedBasic = true;
+      say("This browser only has a basic voice. For a natural one: use Edge, or add an ElevenLabs key (see getting started).");
+    }
+    return best;
   }
-  function speak(text, after) {
-    if (!synth) { if (after) after(); return; }
-    interruptSpeech();
-    var sentences = plain(text).slice(0, 1800).match(/[^.!?]+[.!?]*/g) || [];
-    if (!sentences.length) return;
-    stopListening();
+
+  // Sentences grouped so the first group is short (it starts playing sooner) and later ones are longer (fewer requests).
+  function groups(text) {
+    var sentences = text.match(/[^.!?]+[.!?]*\s*/g) || [text];
+    var out = [], current = "";
+    sentences.forEach(function (sentence) {
+      var limit = out.length === 0 ? 140 : 500;
+      if (current && (current + sentence).length > limit) { out.push(current.trim()); current = ""; }
+      current += sentence;
+    });
+    if (current.trim()) out.push(current.trim());
+    return out;
+  }
+
+  function finishSpeaking(after) {
+    S.speaking = false;
+    resumeWake();
+    if (after) after();
+  }
+
+  function speakBrowser(text, after) {
+    if (!synth) { finishSpeaking(after); return; }
+    var sentences = text.slice(0, 1800).match(/[^.!?]+[.!?]*/g) || [];
+    if (!sentences.length) { S.speaking = false; return; }
     S.speaking = true;
+    var voice = pickVoice();
     sentences.forEach(function (sentence, index) {
       var utterance = new SpeechSynthesisUtterance(sentence.trim());
-      var voice = pickVoice();
-      if (voice) utterance.voice = voice;
-      utterance.rate = 1.04;
-      utterance.pitch = 0.92;
+      if (voice) { utterance.voice = voice; utterance.lang = voice.lang; }
+      utterance.rate = 1;
+      utterance.pitch = 1;
       if (index === sentences.length - 1) {
-        utterance.onend = utterance.onerror = function () {
-          S.speaking = false;
-          resumeWake();
-          if (after) after();
-        };
+        utterance.onend = utterance.onerror = function () { finishSpeaking(after); };
       }
       synth.speak(utterance);
     });
   }
+
+  function playBlob(blob, done) {
+    var url = URL.createObjectURL(blob);
+    var element = new Audio(url);
+    playing.element = element;
+    playing.url = url;
+    try {
+      var Context = window.AudioContext || window.webkitAudioContext;
+      if (!playing.context) playing.context = new Context();
+      playing.analyser = playing.context.createAnalyser();
+      playing.analyser.fftSize = 256;
+      playing.data = new Uint8Array(playing.analyser.fftSize);
+      var source = playing.context.createMediaElementSource(element);
+      source.connect(playing.analyser);
+      playing.analyser.connect(playing.context.destination);
+      if (playing.context.state === "suspended") playing.context.resume();
+    } catch (ignored) { playing.analyser = null; }
+    var ended = function (error) {
+      URL.revokeObjectURL(url);
+      if (playing.element === element) { playing.element = null; playing.url = null; }
+      done(error);
+    };
+    element.onended = function () { ended(null); };
+    element.onerror = function () { ended(new Error("playback")); };
+    var started = element.play();
+    if (started && started.catch) started.catch(function () { ended(new Error("playback")); });
+  }
+
+  function speakNeural(text, after) {
+    var turn = ++playing.token;
+    var parts = groups(text.slice(0, 4000));
+    if (!parts.length) { S.speaking = false; return; }
+    var controller = new AbortController();
+    playing.controller = controller;
+    S.speaking = true;
+    function request(part) {
+      return fetch("/api/v1/speech", {
+        method: "POST", cache: "no-store", signal: controller.signal,
+        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+        body: JSON.stringify({ text: part })
+      }).then(function (response) {
+        if (!response.ok) { var error = new Error(String(response.status)); error.status = response.status; throw error; }
+        return response.blob();
+      });
+    }
+    function fallback(from, error) {
+      if (turn !== playing.token) return;
+      if (error && error.status === 404) neural.enabled = false;
+      say("The neural voice is unavailable (" + ((error && error.status) || "no reply") + "), using the browser's voice.");
+      speakBrowser(parts.slice(from).join(" "), after);
+    }
+    function play(index, pending) {
+      pending.then(function (blob) {
+        if (turn !== playing.token) return;
+        var ahead = index + 1 < parts.length ? request(parts[index + 1]) : null;
+        if (ahead) ahead.catch(function () {});
+        playBlob(blob, function (error) {
+          if (turn !== playing.token) return;
+          if (error) { fallback(index + 1); return; }
+          if (ahead) play(index + 1, ahead); else finishSpeaking(after);
+        });
+      }, function (error) { fallback(index, error); });
+    }
+    play(0, request(parts[0]));
+  }
+
+  function speak(text, after) {
+    interruptSpeech();
+    var spoken = plain(text);
+    if (!spoken) return;
+    stopListening();
+    if (neural.enabled) speakNeural(spoken, after); else speakBrowser(spoken, after);
+  }
+
+  // How loud the voice is right now, from the audio actually playing; the head's mouth follows it.
+  function readVoiceLevel() {
+    var level = 0;
+    if (playing.analyser && playing.element && !playing.element.paused) {
+      playing.analyser.getByteTimeDomainData(playing.data);
+      var sum = 0;
+      for (var i = 0; i < playing.data.length; i += 1) { var v = (playing.data[i] - 128) / 128; sum += v * v; }
+      level = Math.min(1, Math.sqrt(sum / playing.data.length) * 5);
+    }
+    S.voiceLevel += (level - S.voiceLevel) * 0.5;
+  }
+
   // The "you can interrupt it" half of voice: the microphone, Escape, the orb, or a new message silences it at once.
   function interruptSpeech() {
     var was = S.speaking;
+    playing.token += 1;
+    if (playing.controller) { playing.controller.abort(); playing.controller = null; }
+    if (playing.element) { playing.element.pause(); playing.element = null; }
+    if (playing.url) { URL.revokeObjectURL(playing.url); playing.url = null; }
     if (synth && (synth.speaking || synth.pending)) synth.cancel();
     S.speaking = false;
     if (was) resumeWake();
   }
-  $("speak").checked = S.speak;
+  // Whether the daemon has a speech provider; asked once the credential is known.
+  function learnVoice() {
+    if (!token) return;
+    api("/speech").then(function (reply) {
+      neural.enabled = !!(reply && reply.enabled);
+      if (neural.enabled) neural.voice = reply.voice || "";
+      $("speak").disabled = !(neural.enabled || synth);
+    }, function () {});
+  }  $("speak").checked = S.speak;
   $("speak").addEventListener("change", function () {
     S.speak = $("speak").checked;
     localStorage.setItem("jarvis-speak", S.speak ? "1" : "0");
     if (!S.speak) interruptSpeech();
   });
   if (!synth) { $("speak").disabled = true; }
+  learnVoice();
 
   // ---- voice: listening (push-to-talk and wake word) -----------------------------------------------------------------
   var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -794,7 +933,7 @@
   function targetEnergy(mode, t) {
     switch (mode) {
       case "listening": return 0.28 + S.level * 1.1;
-      case "speaking": return 0.4 + 0.35 * Math.abs(Math.sin(t * 7.3) * Math.sin(t * 3.1));
+      case "speaking": return neural.enabled && S.voiceLevel > 0.01 ? 0.3 + S.voiceLevel * 0.9 : 0.4 + 0.35 * Math.abs(Math.sin(t * 7.3) * Math.sin(t * 3.1));
       case "working": return 0.45 + 0.12 * Math.sin(t * 2.2);
       case "waiting": return 0.42 + 0.16 * Math.sin(t * 5);
       case "offline": return 0.02;
@@ -946,7 +1085,12 @@
     // the head: a real face mesh, whose mouth follows the voice and whose eyes follow the pointer
     if (window.JarvisHead) {
       var mouth = 0;
-      if (mode === "speaking") mouth = 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
+      if (mode === "speaking") {
+        // the real audio level when the neural voice is playing; a synthetic syllable rhythm for the browser voice
+        mouth = neural.enabled && S.voiceLevel > 0.01
+          ? Math.min(1, S.voiceLevel * 1.6)
+          : 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
+      }
       JarvisHead.draw(ctx, cx, cy, R * 1.42, {
         rgb: current, energy: energy, mode: mode, mouth: mouth, look: gaze, t: t, calm: calm
       });
@@ -968,6 +1112,7 @@
     var target = palette[mode];
     for (var i = 0; i < 3; i += 1) current[i] += (target[i] - current[i]) * 0.08;
     readLevel();
+    readVoiceLevel();
     energy += (targetEnergy(mode, t) - energy) * 0.12;
     gaze[0] += (gazeAim[0] - gaze[0]) * 0.06;
     gaze[1] += (gazeAim[1] - gaze[1]) * 0.06;

@@ -60,10 +60,16 @@ struct InitRequest {
     code_image: Option<String>,
     code_interpreter: Option<String>,
     trust_code: bool,
+    /// A file holding the speech provider's key, used in place.
+    voice_key_file: Option<PathBuf>,
+    /// Take the speech key from the `ELEVENLABS_API_KEY` environment variable and keep it in a private file.
+    elevenlabs: bool,
+    voice_id: Option<String>,
+    voice_model: Option<String>,
     force: bool,
 }
 
-fn flag_value(arguments: &[String], flag: &str) -> Option<String> {
+pub(crate) fn flag_value(arguments: &[String], flag: &str) -> Option<String> {
     arguments
         .windows(2)
         .find(|pair| pair[0] == flag)
@@ -90,6 +96,10 @@ fn parse_init(arguments: &[String]) -> InitRequest {
         code_image: flag_value(arguments, "--code-image"),
         code_interpreter: flag_value(arguments, "--code-interpreter"),
         trust_code: arguments.iter().any(|argument| argument == "--trust-code"),
+        voice_key_file: flag_value(arguments, "--voice-key-file").map(PathBuf::from),
+        elevenlabs: arguments.iter().any(|argument| argument == "--elevenlabs"),
+        voice_id: flag_value(arguments, "--voice-id"),
+        voice_model: flag_value(arguments, "--voice-model"),
         force: arguments.iter().any(|argument| argument == "--force"),
     }
 }
@@ -218,6 +228,53 @@ fn code_setup(request: &InitRequest) -> Result<Option<CodeSetup>, String> {
     }))
 }
 
+/// The optional spoken voice: where the key is, and which voice and model to use.
+#[derive(Debug, Eq, PartialEq)]
+struct VoiceSetup {
+    key_file: PathBuf,
+    voice_id: Option<String>,
+    model: Option<String>,
+}
+
+/// The name of the speech key file `--elevenlabs` writes, beside the model key.
+const SPEECH_KEY_FILE_NAME: &str = "speech.key";
+
+/// Reads the voice flags. The key is a file and never a command-line value (it would sit in shell history): either
+/// `--voice-key-file PATH`, or `--elevenlabs` to take it from `ELEVENLABS_API_KEY` into a private file.
+fn voice_setup(request: &InitRequest, paths: &AppPaths) -> Result<Option<VoiceSetup>, String> {
+    let key_file = if let Some(path) = &request.voice_key_file {
+        if !path.is_absolute() || !path.is_file() {
+            return Err(
+                "--voice-key-file must be the absolute path of an existing file".to_owned(),
+            );
+        }
+        path.clone()
+    } else if request.elevenlabs {
+        let key = std::env::var("ELEVENLABS_API_KEY").unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err(
+                "--elevenlabs reads your key from the ELEVENLABS_API_KEY environment variable, which is not set"
+                    .to_owned(),
+            );
+        }
+        let path = paths.config().join(SPEECH_KEY_FILE_NAME);
+        write_secret(&path, key.trim())
+            .map_err(|error| format!("the speech key file could not be written: {error}"))?;
+        path
+    } else if request.voice_id.is_some() || request.voice_model.is_some() {
+        return Err(
+            "--voice-id and --voice-model need --elevenlabs or --voice-key-file".to_owned(),
+        );
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(VoiceSetup {
+        key_file,
+        voice_id: request.voice_id.clone(),
+        model: request.voice_model.clone(),
+    }))
+}
+
 /// Builds the configuration document `init` saves.
 fn render_config(
     model: &str,
@@ -225,6 +282,7 @@ fn render_config(
     key_file: &Path,
     workspaces: &[PathBuf],
     code: Option<&CodeSetup>,
+    voice: Option<&VoiceSetup>,
 ) -> Result<String, String> {
     let mut lines = vec![
         "schema_version = 1".to_owned(),
@@ -252,6 +310,18 @@ fn render_config(
             .map(|root| literal(&root.display().to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         lines.push(format!("tool_workspace_roots = [{}]", roots.join(", ")));
+    }
+    if let Some(voice) = voice {
+        lines.push(format!(
+            "speech_api_key_ref = {}",
+            literal(&voice.key_file.display().to_string())?
+        ));
+        if let Some(id) = &voice.voice_id {
+            lines.push(format!("speech_voice_id = {}", literal(id)?));
+        }
+        if let Some(model) = &voice.model {
+            lines.push(format!("speech_model = {}", literal(model)?));
+        }
     }
     if let Some(code) = code {
         lines.push(format!("code_sandbox_image = {}", literal(&code.image)?));
@@ -293,7 +363,14 @@ fn resolve_folders(named: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 /// What was written and what to do next.
-fn report(path: &Path, model: &str, base_url: &str, roots: &[PathBuf], code: Option<&CodeSetup>) {
+fn report(
+    path: &Path,
+    model: &str,
+    base_url: &str,
+    roots: &[PathBuf],
+    code: Option<&CodeSetup>,
+    voice: Option<&VoiceSetup>,
+) {
     println!("configured {}", path.display());
     println!("  model   {model}");
     println!("  server  {base_url}");
@@ -318,6 +395,15 @@ fn report(path: &Path, model: &str, base_url: &str, roots: &[PathBuf], code: Opt
             }
         );
     }
+    match voice {
+        Some(voice) => println!(
+            "  voice   ElevenLabs ({})",
+            voice.voice_id.as_deref().unwrap_or("default voice")
+        ),
+        None => println!(
+            "  voice   the browser's own (for a natural one: `jarvis init --force --elevenlabs`, with ELEVENLABS_API_KEY set)"
+        ),
+    }
     println!();
     println!("next:  jarvis start     # start the assistant in the background");
     println!("       jarvis chat      # talk to it");
@@ -334,6 +420,35 @@ fn explain_no_server() {
     );
 }
 
+/// The model key file. A hosted provider's key is the person's own file and never passes through this command; a
+/// local Ollama needs only a placeholder it ignores.
+fn model_key_file(
+    request: &InitRequest,
+    paths: &AppPaths,
+    local_ollama: bool,
+) -> Result<PathBuf, ExitStatus> {
+    match &request.api_key_file {
+        Some(path) => {
+            if !path.is_absolute() || !path.is_file() {
+                eprintln!("jarvis: --api-key-file must be the absolute path of an existing file");
+                return Err(ExitStatus::Usage);
+            }
+            Ok(path.clone())
+        }
+        None if local_ollama => {
+            let path = paths.config().join(KEY_FILE_NAME);
+            if let Err(error) = write_placeholder_key(&path) {
+                eprintln!("jarvis: the model key file could not be written: {error}");
+                return Err(ExitStatus::Internal);
+            }
+            Ok(path)
+        }
+        None => {
+            eprintln!("jarvis: a hosted provider needs --api-key-file, a file holding your key");
+            Err(ExitStatus::Usage)
+        }
+    }
+}
 /// `jarvis init`
 pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
     let request = parse_init(arguments);
@@ -377,31 +492,20 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         }
     };
 
-    // The key file. A hosted provider's key is the person's own file and never passes through this command.
-    let key_file = match &request.api_key_file {
-        Some(path) => {
-            if !path.is_absolute() || !path.is_file() {
-                eprintln!("jarvis: --api-key-file must be the absolute path of an existing file");
-                return ExitStatus::Usage;
-            }
-            path.clone()
-        }
-        None if local_ollama => {
-            let path = paths.config().join(KEY_FILE_NAME);
-            if let Err(error) = write_placeholder_key(&path) {
-                eprintln!("jarvis: the model key file could not be written: {error}");
-                return ExitStatus::Internal;
-            }
-            path
-        }
-        None => {
-            eprintln!("jarvis: a hosted provider needs --api-key-file, a file holding your key");
-            return ExitStatus::Usage;
-        }
+    let key_file = match model_key_file(&request, paths, local_ollama) {
+        Ok(path) => path,
+        Err(status) => return status,
     };
 
     let code = match code_setup(&request) {
         Ok(code) => code,
+        Err(message) => {
+            eprintln!("jarvis: {message}");
+            return ExitStatus::Usage;
+        }
+    };
+    let voice = match voice_setup(&request, paths) {
+        Ok(voice) => voice,
         Err(message) => {
             eprintln!("jarvis: {message}");
             return ExitStatus::Usage;
@@ -414,7 +518,14 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
             return ExitStatus::Rejected;
         }
     };
-    let document = match render_config(&model, &base_url, &key_file, &roots, code.as_ref()) {
+    let document = match render_config(
+        &model,
+        &base_url,
+        &key_file,
+        &roots,
+        code.as_ref(),
+        voice.as_ref(),
+    ) {
         Ok(document) => document,
         Err(message) => {
             eprintln!("jarvis: {message}");
@@ -435,23 +546,118 @@ pub async fn init(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         return ExitStatus::Internal;
     }
 
-    report(store.path(), &model, &base_url, &roots, code.as_ref());
+    report(
+        store.path(),
+        &model,
+        &base_url,
+        &roots,
+        code.as_ref(),
+        voice.as_ref(),
+    );
     ExitStatus::Ok
 }
 
 /// Windows canonical paths carry a `\\?\` prefix that a person never typed and a TOML reader should not see.
-fn strip_verbatim(path: PathBuf) -> PathBuf {
+pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
     let text = path.display().to_string();
     text.strip_prefix(r"\\?\").map_or(path, PathBuf::from)
 }
 
 fn write_placeholder_key(path: &Path) -> std::io::Result<()> {
+    write_secret(path, OLLAMA_PLACEHOLDER_KEY)
+}
+
+/// Writes a key to a file only its owner can read.
+pub(crate) fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, OLLAMA_PLACEHOLDER_KEY)?;
+    std::fs::write(path, contents)?;
     secure_private_file(PathKind::Config, path)
         .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// A daemon process this command started, which can be asked whether it has already exited.
+enum Daemon {
+    #[cfg(not(windows))]
+    Child(std::process::Child),
+    /// Started through PowerShell, so only its process id is known.
+    #[cfg(windows)]
+    Pid(u32),
+}
+
+impl Daemon {
+    fn has_exited(&mut self) -> bool {
+        match self {
+            #[cfg(not(windows))]
+            Self::Child(child) => matches!(child.try_wait(), Ok(Some(_))),
+            #[cfg(windows)]
+            Self::Pid(pid) => !windows_process_alive(*pid),
+        }
+    }
+}
+
+/// Starts the daemon in the background, with no handle shared with this process.
+///
+/// On Windows a child started directly inherits the pipe this command's output goes through, so a script that captures
+/// `jarvis start` would wait for the daemon to exit. The workspace forbids `unsafe`, which is what clearing that
+/// inheritance needs, so the daemon is started through PowerShell's `Start-Process` instead, which shares nothing.
+fn spawn_daemon(binary: &Path, root: Option<&str>) -> Result<Daemon, String> {
+    #[cfg(windows)]
+    {
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+        let arguments = root.map_or_else(String::new, |root| {
+            format!(" -ArgumentList @('--root',{})", quote(root))
+        });
+        let script = format!(
+            "(Start-Process -FilePath {} -WindowStyle Hidden -PassThru{arguments}).Id",
+            quote(&binary.display().to_string())
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| error.to_string())?;
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "PowerShell did not report a process id".to_owned())?;
+        Ok(Daemon::Pid(pid))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = std::process::Command::new(binary);
+        if let Some(root) = root {
+            command.args(["--root", root]);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+            .spawn()
+            .map(Daemon::Child)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Whether a process id is still running, asked of `tasklist` (no `unsafe` is needed).
+#[cfg(windows)]
+fn windows_process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
+}
+/// Whether a configuration already exists for this profile.
+pub fn is_configured(paths: &AppPaths) -> bool {
+    ConfigStore::from_paths(paths).path().exists()
+}
+
+/// Whether there is a terminal to ask questions on.
+pub fn can_ask() -> bool {
+    std::io::stdin().is_terminal()
 }
 
 /// `jarvis start`: starts the daemon in the background and waits until it is listening.
@@ -484,30 +690,13 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         eprintln!("jarvis: the daemon binary (jarvisd) was not found next to this program");
         return ExitStatus::Unavailable;
     };
-    let mut command = std::process::Command::new(binary);
-    if let Some(root) = flag_value(arguments, "--root") {
-        command.args(["--root", &root]);
-    }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // A background process: on Windows detached from this console so closing the terminal does not end it.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("jarvis: the daemon could not be started: {error}");
+    let mut daemon = match spawn_daemon(&binary, flag_value(arguments, "--root").as_deref()) {
+        Ok(daemon) => daemon,
+        Err(message) => {
+            eprintln!("jarvis: the daemon could not be started: {message}");
             return ExitStatus::Unavailable;
         }
     };
-
     let deadline = Instant::now() + START_WAIT;
     while Instant::now() < deadline {
         if TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
@@ -520,9 +709,9 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         }
         // The daemon exiting is the answer, and a far better one than waiting out the clock: it refuses to start
         // for a reason (a bad folder, a missing key) that `jarvisd` itself would have printed.
-        if let Ok(Some(status)) = child.try_wait() {
+        if daemon.has_exited() {
             eprintln!(
-                "jarvis: the daemon exited at startup ({status}). Run `jarvisd` in a terminal to see why."
+                "jarvis: the daemon exited at startup. Run `jarvisd` in a terminal to see why."
             );
             return ExitStatus::Unavailable;
         }
@@ -585,6 +774,7 @@ mod tests {
             Path::new("C:/Users/me/AppData/jarvis/model.key"),
             &[PathBuf::from("C:/Users/me/notes")],
             None,
+            None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
         let loaded = Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>())
@@ -608,8 +798,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("a code setup"));
         assert!(code.trusted);
-        let document = render_config("m", "http://h/v1", Path::new("C:/k"), &[], Some(&code))
-            .unwrap_or_else(|error| panic!("{error}"));
+        let document = render_config(
+            "m",
+            "http://h/v1",
+            Path::new("C:/k"),
+            &[],
+            Some(&code),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         let loaded = Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>())
             .unwrap_or_else(|error| panic!("{error}\n{document}"));
         assert_eq!(
@@ -623,8 +820,15 @@ mod tests {
         let code = code_setup(&plain)
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("a code setup"));
-        let document = render_config("m", "http://h/v1", Path::new("C:/k"), &[], Some(&code))
-            .unwrap_or_else(|error| panic!("{error}"));
+        let document = render_config(
+            "m",
+            "http://h/v1",
+            Path::new("C:/k"),
+            &[],
+            Some(&code),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert!(!document.contains("trust"), "{document}");
         assert_eq!(code.interpreter, ["sh", "-c"]);
     }
@@ -644,10 +848,11 @@ mod tests {
             Path::new(r"C:\Users\me\model.key"),
             &[],
             None,
+            None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(document.contains(r"'C:\Users\me\model.key'"), "{document}");
-        assert!(render_config("it's", "http://h/v1", Path::new("/k"), &[], None).is_err());
+        assert!(render_config("it's", "http://h/v1", Path::new("/k"), &[], None, None).is_err());
     }
 
     #[test]
@@ -657,5 +862,54 @@ mod tests {
             PathBuf::from(r"C:\a\b")
         );
         assert_eq!(strip_verbatim(PathBuf::from("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn a_voice_is_written_into_the_daemon_table_before_the_policy_table() {
+        let voice = VoiceSetup {
+            key_file: PathBuf::from("C:/keys/speech.key"),
+            voice_id: Some("abc123".to_owned()),
+            model: None,
+        };
+        let code = CodeSetup {
+            image: "node:22-alpine".to_owned(),
+            interpreter: vec!["node".to_owned(), "-e".to_owned()],
+            trusted: true,
+        };
+        let document = render_config(
+            "m",
+            "http://h/v1",
+            Path::new("C:/k"),
+            &[],
+            Some(&code),
+            Some(&voice),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(document.contains("speech_api_key_ref = 'C:/keys/speech.key'"));
+        assert!(document.contains("speech_voice_id = 'abc123'"));
+        assert!(!document.contains("speech_model"));
+        let voice_at = document.find("speech_api_key_ref").unwrap_or(usize::MAX);
+        let policy_at = document.find("[policy]").unwrap_or(0);
+        assert!(
+            voice_at < policy_at,
+            "a key after [policy] would land in the wrong table"
+        );
+        assert!(
+            Config::parse_with_environment(&document, std::iter::empty::<(&str, &str)>()).is_ok(),
+            "the daemon's own parser must accept it"
+        );
+    }
+
+    #[test]
+    fn voice_options_without_a_key_source_are_refused_and_the_key_is_never_a_flag() {
+        let paths =
+            AppPaths::from_root(&std::env::temp_dir()).unwrap_or_else(|error| panic!("{error}"));
+        let lone = parse_init(&words("--voice-id abc"));
+        assert!(voice_setup(&lone, &paths).is_err());
+        let relative = parse_init(&words("--voice-key-file relative.key"));
+        assert!(voice_setup(&relative, &paths).is_err());
+        assert!(voice_setup(&parse_init(&words("")), &paths).is_ok_and(|v| v.is_none()));
+        // There is deliberately no flag that takes the key itself: it would sit in shell history.
+        assert!(!parse_init(&words("--elevenlabs-key sk_x")).elevenlabs);
     }
 }

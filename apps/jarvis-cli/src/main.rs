@@ -17,9 +17,11 @@ mod connector;
 mod entity;
 mod hud;
 mod init;
+mod lifecycle;
 mod memory;
 mod output;
 mod schedule;
+mod settings;
 mod skills;
 mod tools;
 mod watch;
@@ -70,19 +72,27 @@ async fn main() -> ExitCode {
             Err(status) => status,
         },
         Some("start") => match resolve_paths(&arguments) {
+            Ok(paths) => start_and_open(&paths, &arguments),
+            Err(status) => status,
+        },
+        Some("config") => match resolve_paths(&arguments) {
+            Ok(paths) => settings::config(&paths, &arguments),
+            Err(status) => status,
+        },
+        Some("keys") => match resolve_paths(&arguments) {
             Ok(paths) => {
-                let status = init::start(&paths, &arguments);
-                // Starting JARVIS opens its console, the way launching an app opens its window; `--no-open` skips it.
-                // A browser that cannot be opened is reported by `hud_command` and does not make a started daemon a failure.
-                if status == ExitStatus::Ok
-                    && !arguments.iter().any(|argument| argument == "--no-open")
-                {
-                    let _ = hud_command(&arguments);
-                }
-                status
+                // Only `keys test voice` needs the daemon's credential, so it is not loaded (and complained about) otherwise.
+                let credential = arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "test" && pair[1] == "voice")
+                    .then(|| load_credential(&paths).ok().map(|c| c.expose().to_owned()))
+                    .flatten();
+                settings::keys(&paths, &arguments, credential).await
             }
             Err(status) => status,
         },
+        Some("stop") => stop_command(&arguments, false).await,
+        Some("restart") => stop_command(&arguments, true).await,
         Some("cancel") => cancel_command(&arguments).await,
         Some("watch") => watch_command(&arguments).await,
         Some("hud") => hud_command(&arguments),
@@ -97,12 +107,17 @@ async fn main() -> ExitCode {
         Some("connector") => connector::run(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
+        // No arguments (or `launch`) is the one command that gets a person to a working console: set up on the first
+        // run, then start, then open. Without a terminal to ask questions on it still just explains itself.
+        Some("--help" | "-h" | "help") => {
+            println!("{}", usage());
+            ExitStatus::Ok
+        }
+        // Flags alone (`jarvis --root DIR`, `jarvis --no-open`) are a launch with options.
+        Some("launch") | None => launch_command(&arguments).await,
+        Some(flag) if flag.starts_with("--") => launch_command(&arguments).await,
         Some(other) => {
             eprintln!("jarvis: unknown command {other:?}");
-            eprintln!("{}", usage());
-            ExitStatus::Usage
-        }
-        None => {
             eprintln!("{}", usage());
             ExitStatus::Usage
         }
@@ -110,8 +125,43 @@ async fn main() -> ExitCode {
     status.into()
 }
 
+/// Starts the daemon and opens the console, the way launching an app opens its window.
+///
+/// `--no-open` skips the window. A browser that cannot be opened is reported by `hud_command` and does not make a
+/// started daemon a failure.
+fn start_and_open(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
+    let status = init::start(paths, arguments);
+    if status == ExitStatus::Ok && !arguments.iter().any(|argument| argument == "--no-open") {
+        let _ = hud_command(arguments);
+    }
+    status
+}
+
+/// `jarvis` or `jarvis launch`: set up if this is the first run, then start and open the console.
+async fn launch_command(arguments: &[String]) -> ExitStatus {
+    let paths = match resolve_paths(arguments) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
+    if !init::is_configured(&paths) {
+        if !init::can_ask() {
+            eprintln!(
+                "jarvis: not set up yet, and there is no terminal to ask questions on; run `jarvis init` from a terminal"
+            );
+            eprintln!("{}", usage());
+            return ExitStatus::Usage;
+        }
+        println!("Welcome to JARVIS. A few questions, then it starts and opens in your browser.");
+        let status = init::init(&paths, &[]).await;
+        if status != ExitStatus::Ok {
+            return status;
+        }
+    }
+    start_and_open(&paths, arguments)
+}
+
 const fn usage() -> &'static str {
-    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
@@ -188,6 +238,39 @@ async fn schedule_command(arguments: &[String], runs: bool) -> ExitStatus {
     } else {
         schedule::run_schedule(&client, arguments).await
     }
+}
+
+/// `jarvis stop` ends the background daemon gracefully; `jarvis restart` stops it (if running) and starts it again.
+async fn stop_command(arguments: &[String], restart: bool) -> ExitStatus {
+    let paths = match resolve_paths(arguments) {
+        Ok(paths) => paths,
+        Err(status) => return status,
+    };
+    let loaded = match ConfigStore::from_paths(&paths).load() {
+        Ok(loaded) => loaded,
+        Err(error) => return fail("configuration", &error),
+    };
+    let port = loaded.config().daemon().http_port();
+    let credential = match load_credential(&paths) {
+        Ok(credential) => credential,
+        // Never started, so there is nothing running to stop.
+        Err(_) if !restart => {
+            println!("not running");
+            return ExitStatus::Ok;
+        }
+        Err(status) => return status,
+    };
+    match lifecycle::stop(port, credential.expose()).await {
+        Ok(lifecycle::Stopped::NotRunning) if !restart => println!("not running"),
+        Ok(lifecycle::Stopped::NotRunning) => {}
+        Ok(lifecycle::Stopped::Stopped) => println!("stopped"),
+        Err(status) => return status,
+    }
+    if restart {
+        // The console is usually already open in a tab, so a restart does not open another.
+        return init::start(&paths, arguments);
+    }
+    ExitStatus::Ok
 }
 
 /// Runs `jarvis hud`: opens the heads-up display in the default browser.

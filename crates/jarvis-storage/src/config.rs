@@ -198,6 +198,16 @@ pub struct DaemonConfig {
     /// snippet is one argument. The first element's name is also what the model is told the language is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     code_sandbox_interpreter: Vec<String>,
+    /// A **file** whose contents are the speech provider's API key, read once at startup; setting it turns on the
+    /// spoken voice (`ADR-0138`). Like [`Self::executor_api_key_ref`] it is a path, never the key, and absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_api_key_ref: Option<PathBuf>,
+    /// The provider's voice identifier, or `None` for the built-in default. Needs [`Self::speech_api_key_ref`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_voice_id: Option<String>,
+    /// The provider's speech model, or `None` for the built-in default. Needs [`Self::speech_api_key_ref`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_model: Option<String>,
 }
 
 fn default_http_port() -> u16 {
@@ -285,6 +295,24 @@ impl DaemonConfig {
     pub fn code_sandbox_interpreter(&self) -> &[String] {
         &self.code_sandbox_interpreter
     }
+
+    /// Returns the file holding the speech provider's key, when the spoken voice is configured.
+    #[must_use]
+    pub fn speech_api_key_ref(&self) -> Option<&Path> {
+        self.speech_api_key_ref.as_deref()
+    }
+
+    /// Returns the configured speech voice identifier, if any.
+    #[must_use]
+    pub fn speech_voice_id(&self) -> Option<&str> {
+        self.speech_voice_id.as_deref()
+    }
+
+    /// Returns the configured speech model, if any.
+    #[must_use]
+    pub fn speech_model(&self) -> Option<&str> {
+        self.speech_model.as_deref()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -305,6 +333,9 @@ impl Default for DaemonConfig {
             mcp_serve_port: None,
             code_sandbox_image: None,
             code_sandbox_interpreter: Vec::new(),
+            speech_api_key_ref: None,
+            speech_voice_id: None,
+            speech_model: None,
         }
     }
 }
@@ -597,8 +628,22 @@ impl Config {
             return Err(ConfigError::RelativeModelApiKeyRef);
         }
         self.validate_code_sandbox()?;
+        self.validate_speech()?;
         self.validate_policy()?;
         Ok(())
+    }
+
+    /// Validates the speech settings: the key file is an absolute path, and a voice or model without a key (a setting
+    /// with no consumer) is refused.
+    fn validate_speech(&self) -> Result<(), ConfigError> {
+        let daemon = &self.daemon;
+        match &daemon.speech_api_key_ref {
+            Some(path) if !path.is_absolute() => Err(ConfigError::InvalidSpeech),
+            None if daemon.speech_voice_id.is_some() || daemon.speech_model.is_some() => {
+                Err(ConfigError::InvalidSpeech)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Validates the code sandbox pair: both or neither, and each a usable value.
@@ -916,6 +961,12 @@ pub enum ConfigError {
          with nothing to run, or an interpreter with nowhere to run it, is a tool that would fail every call"
     )]
     IncompleteCodeSandbox,
+    /// The speech settings were unusable: a relative key path, or a voice or model with no key.
+    #[error(
+        "daemon.speech_api_key_ref must be an absolute path, and daemon.speech_voice_id and daemon.speech_model \
+         need it"
+    )]
+    InvalidSpeech,
     /// A code sandbox value was blank, oversized, contained a control character, or the image had whitespace.
     #[error(
         "daemon.code_sandbox_image must be an image reference with no whitespace, and \
@@ -1088,6 +1139,9 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "mcp_serve_port",
                 "code_sandbox_image",
                 "code_sandbox_interpreter",
+                "speech_api_key_ref",
+                "speech_voice_id",
+                "speech_model",
             ],
             &mut unknown,
         );
@@ -2066,6 +2120,41 @@ shutdown_timeout_seconds = 20
         assert_eq!(
             store.save(&Config::default()),
             Err(ConfigError::SymbolicLink)
+        );
+    }
+
+    /// The spoken voice needs an absolute key file, and a voice or model alone is a setting with no consumer.
+    #[test]
+    fn speech_needs_an_absolute_key_file_and_its_options_need_the_key() {
+        let key = if cfg!(windows) {
+            "C:/keys/speech.key"
+        } else {
+            "/keys/speech.key"
+        };
+        let parse = |extra: &str| {
+            Config::parse_with_environment(
+                &V1_CONFIG.replace("[daemon]", &format!("[daemon]\n{extra}")),
+                Vec::<(String, String)>::new(),
+            )
+        };
+        let loaded = parse(&format!(
+            "speech_api_key_ref = \"{key}\"\nspeech_voice_id = \"abc\"\nspeech_model = \"m\""
+        ))
+        .unwrap_or_else(|error| panic!("valid speech settings: {error}"));
+        assert_eq!(loaded.config().daemon().speech_voice_id(), Some("abc"));
+        assert_eq!(loaded.config().daemon().speech_model(), Some("m"));
+        assert!(loaded.config().daemon().speech_api_key_ref().is_some());
+
+        assert!(parse("speech_api_key_ref = \"speech.key\"").is_err());
+        assert!(parse("speech_voice_id = \"abc\"").is_err());
+        assert!(parse("speech_model = \"m\"").is_err());
+        assert!(
+            parse("")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .config()
+                .daemon()
+                .speech_api_key_ref()
+                .is_none()
         );
     }
 

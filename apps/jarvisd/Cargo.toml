@@ -40,6 +40,7 @@ jarvis-storage.workspace = true
 jarvis-tools.workspace = true
 # The web fetch tool is composed here for the same reason the filesystem and memory tools are: an adapter is only
 # reachable from a binary that chose to construct one.
+jarvis-voice.workspace = true
 jarvis-web.workspace = true
 # The code-running tool drives the container backend; confinement itself stays in that crate.
 jarvis-sandbox.workspace = true

@@ -36,11 +36,16 @@ are done.
 
 The next implementation task is the first unchecked item in [TODO.md](../../TODO.md).
 
+> Changing a setting or key later: `jarvis config` and `jarvis keys` (see the quick start); `init --force` is no longer needed for that.
+>
+> Using JARVIS rather than building it? Start with the [quick start](../user/quick-start.md). This document is for contributors.
+
 ## Run It Locally
 
 ### First run: `jarvis init`, `jarvis start`
 
 ```text
+jarvis           # first run: setup questions, then starts and opens the console (the rest of this section is the same steps one at a time)
 jarvis init      # finds your local Ollama, asks which model and which folder, writes the configuration
 jarvis start     # starts the daemon in the background and waits until it answers
 jarvis chat
@@ -214,6 +219,14 @@ same lists as `jarvis watch`, **Can do** (every tool and whether it runs, asks f
 "Jarvis, ..."; "Jarvis, stop" cancels everything running and Escape (or clicking the orb) silences it. Voice uses your
 browser's own speech support (Chrome or Edge); the browser's recognizer may send audio to its vendor's service. When something needs a yes or no, it appears with **Approve** and **Deny** buttons, and with spoken answers on it asks out
 loud and listens for "yes" or "no". See `ADR-0135` and `ADR-0136`.
+
+#### A natural voice
+
+Out of the box the console speaks with your browser's own voice, which can sound robotic (Edge has good "Natural" ones).
+For a proper neural voice, use ElevenLabs: put your key in the `ELEVENLABS_API_KEY` environment variable and run
+`jarvis init --force --elevenlabs` (add `--voice-id ID` for another voice, `--voice-model ID` for another model), then
+`jarvis start`. The key is kept in a private file read only by the daemon, never by the browser; what JARVIS says is sent to
+ElevenLabs to be spoken. If it is unavailable, the browser voice takes over. See `ADR-0138`.
 
 `jarvis watch` is a live screen of the work: what is **waiting for you**, what is
 **working** (runs and sub-agents, with ages and the cancel commands), what is **scheduled** next, and what just

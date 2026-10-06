@@ -20,8 +20,8 @@
 //!
 //! # Content security
 //!
-//! Every response carries a policy that permits only this origin's script and style, no framing, no base URI and no
-//! form posts, and the script inserts daemon-supplied text with `textContent` only (a run's objective and answer are
+//! Every response carries a policy that permits only this origin's script and style, audio only from a `blob:` the page
+//! made from the daemon's own speech response, no framing, no base URI and no form posts, and the script inserts daemon-supplied text with `textContent` only (a run's objective and answer are
 //! model output). Tests refuse markup insertion, inline script or style, and any outside origin.
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -49,7 +49,7 @@ pub const STYLE_PATH: &str = "/hud.css";
 
 /// The policy sent with every response of this module.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-connect-src 'self'; media-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+connect-src 'self'; media-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// The browser features the page may use: the microphone (voice input) and nothing else.
 const PERMISSIONS_POLICY: &str = "microphone=(self), camera=(), geolocation=(), payment=(), usb=()";
@@ -197,7 +197,7 @@ mod tests {
         let end = HEAD[start..]
             .find("};")
             .unwrap_or_else(|| panic!("the mesh is not terminated"));
-        let mesh: serde_json::Value = serde_json::from_str(&HEAD[start..start + end + 1])
+        let mesh: serde_json::Value = serde_json::from_str(&HEAD[start..=start + end])
             .unwrap_or_else(|error| panic!("the mesh is not valid JSON: {error}"));
         let vertices = mesh["v"].as_array().map_or(0, Vec::len);
         let indices: Vec<u64> = mesh["f"]
@@ -208,6 +208,27 @@ mod tests {
         assert_eq!(indices.len(), 898 * 3);
         assert!(indices.iter().all(|&index| index < 468));
         assert!(HEAD.contains("Apache License 2.0") && HEAD.contains("MediaPipe Authors"));
+    }
+
+    /// Audio may only come from a `blob:` the page makes itself, and nothing else in the policy is widened to allow it.
+    #[test]
+    fn the_policy_allows_blob_audio_and_no_outside_source() {
+        assert!(CONTENT_SECURITY_POLICY.contains("media-src blob:;"));
+        for loosened in [
+            "*",
+            "http:",
+            "https:",
+            "data:",
+            "unsafe-inline",
+            "unsafe-eval",
+        ] {
+            assert!(
+                !CONTENT_SECURITY_POLICY.contains(loosened),
+                "the policy must not contain {loosened}"
+            );
+        }
+        assert!(CONTENT_SECURITY_POLICY.contains("default-src 'none'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
     }
 
     #[test]

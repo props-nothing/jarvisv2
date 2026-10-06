@@ -102,6 +102,10 @@ pub const PREVIEW_POLICY_VERSION: &str = "preview";
 /// the gateway maps between them. Keeping the two apart is the rule `rest.rs` states, so a change here
 /// does not silently change a client-visible contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "an inventory row: each flag is an independent fact reported by name"
+)]
 pub struct PolicyInventoryEntry {
     /// The canonical identifier, which is also the name a policy override addresses.
     pub id: String,

@@ -178,3 +178,36 @@ Cheapest discriminator for the central design: run a local fixture that sends an
 | --- | --- | --- | --- |
 | 2026-09-20 | current hosted docs, OpenAPI/AsyncAPI links | Initial architecture verification; no implementation claim | GitHub Copilot |
 | 2026-09-21 | `llms.txt` index, Speech Engine + Twilio custom-LLM page, conversation-flow page | Added Speech Engine transport (WS, μ-law, signed URL, shared secret) and turn-taking settings; recorded that the turn model is proprietary and the eager-response behaviour commits replies early | GitHub Copilot |
+
+## Text to speech for the console voice (added 2026-10-06, `ADR-0138`)
+
+Scope: the one-way `text -> audio` call used by `crates/jarvis-voice` so the browser console can speak in a neural voice.
+Speech to text, agents, telephony and the Custom LLM paths above are unchanged and out of scope here.
+
+Sources (accessed 2026-10-06): `https://elevenlabs.io/docs/llms.txt`;
+`https://elevenlabs.io/docs/api-reference/text-to-speech/stream.md` and `.../convert.md`;
+`https://elevenlabs.io/docs/api-reference/authentication.md`; `https://elevenlabs.io/docs/overview/models.md`;
+`https://elevenlabs.io/docs/eleven-api/quickstart.md`.
+
+Verified:
+
+- `POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream`, JSON body `{ "text": string (required),
+  "model_id": string (optional, default `eleven_multilingual_v2`), "voice_settings": {...} (optional) }`; the response is
+  the audio. `output_format` is a query parameter whose default `mp3_44100_128` is available on every tier. Regional servers
+  exist (`api.us.`, `api.eu.residency.`, `api.in.residency.`, `api.sg.residency.elevenlabs.io`).
+- Auth is an `xi-api-key` header. The docs say the key is a secret that must not be exposed in client-side code (browsers,
+  apps); single-use tokens exist for some endpoints but are not used here.
+- Models listed for text to speech: `eleven_v4` (10,000 characters), `eleven_v4_turbo` (about 100 ms, expressive,
+  real time), `eleven_v3`, `eleven_v3_conversational`, `eleven_multilingual_v2` (10,000), `eleven_flash_v2_5`
+  (about 75 ms, 40,000). A 422 carries `detail` validation errors.
+- The quickstart's example voice is "George" (`JBFqnCBsd6RMkjVDRZzb`).
+
+JARVIS decisions: the daemon holds the key (read from a file named by `daemon.speech_api_key_ref`, like the model key) and
+exposes `POST /api/v1/speech` behind the local credential, so no browser sees it; default model `eleven_v4_turbo`, default
+voice George, both overridable; no `voice_settings` sent (the voice's stored settings apply); text capped at 1,500
+characters per request and audio at 8 MiB; 401/403 map to "key rejected", 402/429 to "over limit", all other statuses
+to a generic provider failure, and no error carries the key or the provider's body.
+
+Unresolved: regional (residency) endpoints are not configurable yet; live behaviour against a real account (latency,
+the `eleven_v4_turbo` model id on a given plan) is unverified until a key is supplied: the adapter is covered by contract
+tests against a local fake provider only.

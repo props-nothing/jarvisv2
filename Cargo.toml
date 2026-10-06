@@ -14,6 +14,7 @@ members = [
     "crates/jarvis-sandbox",
     "crates/jarvis-storage",
     "crates/jarvis-tools",
+    "crates/jarvis-voice",
     "crates/jarvis-web",
     "tests/e2e",
 ]
@@ -70,6 +71,7 @@ jarvis-protocol = { path = "crates/jarvis-protocol", version = "0.1.0" }
 jarvis-sandbox = { path = "crates/jarvis-sandbox", version = "0.1.0" }
 jarvis-storage = { path = "crates/jarvis-storage", version = "0.1.0" }
 jarvis-tools = { path = "crates/jarvis-tools", version = "0.1.0" }
+jarvis-voice = { path = "crates/jarvis-voice", version = "0.1.0" }
 jarvis-web = { path = "crates/jarvis-web", version = "0.1.0" }
 # Pinned exactly, and with NO features enabled. The default feature set is
 # `resolve-http` + `resolve-file` + a TLS provider + `idna`, which makes a `$ref` a
@@ -132,6 +134,13 @@ toml = "1.1.6"
 tracing = { version = "=0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std"] }
 uuid = { version = "1.26.1", features = ["v7"] }
+
+# A shipped build is small and fast: thin link-time optimisation, one codegen unit, and symbols stripped. Panics still
+# unwind (not `abort`), so a panic in one task does not take the whole daemon down.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [workspace.lints.rust]
 missing_docs = "warn"

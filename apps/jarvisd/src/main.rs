@@ -18,7 +18,9 @@ mod run_service;
 mod schedule_service;
 mod singleton;
 mod skill_service;
+mod speech_service;
 mod sse;
+mod stop;
 mod tool_actor;
 mod tool_pipeline;
 
@@ -108,6 +110,9 @@ enum DaemonError {
     /// rather than about the file the operator supplied.
     #[error("the model provider API key file is empty")]
     ModelApiKeyEmpty,
+    /// The speech key file could not be read, was blank, or the speech settings were refused.
+    #[error("the speech provider could not be set up: {0}")]
+    Speech(String),
     #[error("a tool workspace root could not be granted")]
     ToolWorkspaceRoots {
         /// Why the grant was refused, which names the root and the reason.
@@ -255,7 +260,14 @@ async fn main() -> ExitCode {
         Invocation::Run { root } => root,
     };
 
-    match run(build, root, shutdown_signal()).await {
+    // An operating-system signal or a stop requested over the API (`jarvis stop`) ends the daemon the same way.
+    let shutdown = async {
+        tokio::select! {
+            result = shutdown_signal() => result,
+            () = stop::requested() => Ok(()),
+        }
+    };
+    match run(build, root, shutdown).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("jarvisd startup failed: {error}");
@@ -279,6 +291,8 @@ struct Running {
     /// The composed tool pipeline, resolved at start for the same reason: an unusable workspace
     /// grant must fail the daemon rather than the first tool call.
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+    /// The speech provider, resolved at start so a missing key file fails the daemon rather than the first sentence.
+    speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
     /// The connected MCP host, held so its connections stay open and can be closed on shutdown.
     ///
     /// Held **beside** the pipeline rather than inside it because the two have different lifetimes: the
@@ -448,6 +462,7 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
     // function because the live provider adds a file read and a credential, and `start` was already at the
     // length where clippy's `too_many_lines` signals a function carrying a second responsibility.
     let executor = compose_executor(loaded_config.config().daemon())?;
+    let speech = compose_speech(loaded_config.config().daemon())?;
 
     // The tool pipeline and MCP host are composed HERE, for the same reason the executor is: an unusable
     // workspace grant must stop the daemon at startup rather than be discovered by the first tool call.
@@ -487,6 +502,7 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         mcp_stop,
         executor,
         tools,
+        speech,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
@@ -538,6 +554,31 @@ fn compose_model_provider(
     Ok(Some(executor::ModelProviderConfig::new(
         base_url, model, key,
     )))
+}
+
+/// Builds the speech provider, when a key file is configured.
+///
+/// The key is read once here and goes straight into the adapter, whose `Debug` redacts it; it is in no log line or
+/// error. A missing or blank file stops the daemon at startup (the same policy as the model key), so a configured
+/// voice that cannot speak is found at once and not on the first sentence.
+fn compose_speech(
+    daemon: &jarvis_storage::DaemonConfig,
+) -> Result<Option<Arc<jarvis_voice::ElevenLabsSpeech>>, DaemonError> {
+    let Some(key_ref) = daemon.speech_api_key_ref() else {
+        return Ok(None);
+    };
+    let key = fs::read_to_string(key_ref)
+        .map_err(|_| DaemonError::Speech("the key file could not be read".to_owned()))?;
+    let speech = jarvis_voice::ElevenLabsSpeech::new(
+        jarvis_voice::ELEVENLABS_BASE_URL,
+        daemon
+            .speech_voice_id()
+            .unwrap_or(jarvis_voice::DEFAULT_VOICE_ID),
+        daemon.speech_model().unwrap_or(jarvis_voice::DEFAULT_MODEL),
+        &key,
+    )
+    .map_err(|error| DaemonError::Speech(error.to_string()))?;
+    Ok(Some(Arc::new(speech)))
 }
 
 /// Builds the run executor from the daemon configuration.
@@ -1002,6 +1043,7 @@ impl HttpTransport {
         credential: jarvis_core::ClientCredential,
         executor: Option<Arc<executor::Executor>>,
         tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+        speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
         _paths: &AppPaths,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
@@ -1017,6 +1059,9 @@ impl HttpTransport {
         }
         if let Some(tools) = tools {
             state = state.with_tools(tools);
+        }
+        if let Some(speech) = speech {
+            state = state.with_speech(speech);
         }
         // Scheduled tasks fire through the same state the routes use, so a scheduled run is an ordinary run. Only
         // when runs are driven at all: a scheduler over a daemon with no executor would start runs nothing runs.
@@ -1197,6 +1242,7 @@ where
         http_port,
         executor,
         tools,
+        speech,
         mcp,
         serving_mcp,
         mcp_stop,
@@ -1233,6 +1279,7 @@ where
                 credential.clone(),
                 executor,
                 tools,
+                speech,
                 &paths,
             )
             .await?;
