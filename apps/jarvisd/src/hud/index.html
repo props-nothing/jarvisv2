@@ -35,6 +35,13 @@
     </section>
 
     <aside id="side">
+      <div id="chathead">
+        <span class="title">Conversation</span>
+        <span class="spacer"></span>
+        <button type="button" id="chats-btn" title="Earlier conversations">History</button>
+        <button type="button" id="new-chat" title="Start a new conversation (N, or say &ldquo;new chat&rdquo;)">New chat</button>
+      </div>
+      <div id="chats" hidden></div>
       <div id="chat" aria-live="polite"></div>
       <form id="composer" autocomplete="off">
         <button type="button" id="mic" title="Talk (M)" aria-label="Talk">

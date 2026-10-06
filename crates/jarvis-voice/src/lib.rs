@@ -15,6 +15,8 @@ pub const MAX_TEXT_CHARS: usize = 1_500;
 
 /// The most audio bytes accepted back for one request, so a misbehaving endpoint cannot fill memory.
 pub const MAX_AUDIO_BYTES: usize = 8 * 1024 * 1024;
+/// The most of the preceding sentence sent for continuity: the provider needs the tone of the last words, not the paragraph.
+pub const MAX_PREVIOUS_CHARS: usize = 300;
 
 /// The provider endpoint used unless a test or a regional deployment names another.
 pub const ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io";
@@ -165,12 +167,42 @@ impl ElevenLabsSpeech {
         &self.model_id
     }
 
-    /// Turns text into audio.
+    /// Turns text into audio, all of it, before returning.
     ///
     /// # Errors
     ///
     /// Returns a [`SpeechError`]: bad text, an unreachable or refusing provider, or unusable audio.
     pub async fn synthesize(&self, text: &str) -> Result<SpeechAudio, SpeechError> {
+        let mut stream = self.open(text, None).await?;
+        let mut audio: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await? {
+            audio.extend_from_slice(&chunk);
+        }
+        if audio.is_empty() {
+            return Err(SpeechError::BadAudio);
+        }
+        Ok(SpeechAudio {
+            bytes: Bytes::from(audio),
+        })
+    }
+
+    /// Starts synthesis and returns once the provider has accepted it, with the audio still arriving.
+    ///
+    /// The provider's `/stream` endpoint sends audio as it is generated, so the first chunk can be played long before the last
+    /// exists; that is the difference between waiting for a sentence to be made and hearing it begin (about 0.2 s against about
+    /// 0.6 s for a short sentence on `eleven_v4_turbo`, measured). `previous_text` is the sentence spoken just before, which the
+    /// provider uses to keep the voice's intonation continuous across separate requests. It is left out for the `eleven_v3`
+    /// models, which refuse it (a 400 `unsupported_model`, verified), and trimmed to the last [`MAX_PREVIOUS_CHARS`] characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SpeechError`] for bad text or when the provider does not accept the request. A failure after this returns is
+    /// reported by [`SpeechStream::next_chunk`].
+    pub async fn open(
+        &self,
+        text: &str,
+        previous_text: Option<&str>,
+    ) -> Result<SpeechStream, SpeechError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(SpeechError::EmptyText);
@@ -182,8 +214,17 @@ impl ElevenLabsSpeech {
             "{}/v1/text-to-speech/{}/stream",
             self.base_url, self.voice_id
         );
-        let body = serde_json::json!({ "text": text, "model_id": self.model_id });
-        let mut response = self
+        let mut body = serde_json::json!({ "text": text, "model_id": self.model_id });
+        if let Some(previous) = previous_text
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && !self.model_id.starts_with("eleven_v3")
+        {
+            let skip = previous.chars().count().saturating_sub(MAX_PREVIOUS_CHARS);
+            body["previous_text"] =
+                serde_json::Value::String(previous.chars().skip(skip).collect());
+        }
+        let response = self
             .client
             .post(url)
             .header("xi-api-key", &self.key.0)
@@ -200,23 +241,49 @@ impl ElevenLabsSpeech {
                 other => SpeechError::Provider(other),
             });
         }
-        let mut audio: Vec<u8> = Vec::new();
-        while let Some(chunk) = response
+        Ok(SpeechStream {
+            response,
+            received: 0,
+        })
+    }
+}
+
+/// Audio on its way from the provider.
+#[derive(Debug)]
+pub struct SpeechStream {
+    response: reqwest::Response,
+    received: usize,
+}
+
+impl SpeechStream {
+    /// The next piece of audio, or `None` when the provider has finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpeechError::Unreachable`] when the connection fails part-way, and [`SpeechError::BadAudio`] when the audio
+    /// would exceed [`MAX_AUDIO_BYTES`], which ends the stream rather than letting it grow without bound.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, SpeechError> {
+        match self
+            .response
             .chunk()
             .await
             .map_err(|_| SpeechError::Unreachable)?
         {
-            if audio.len() + chunk.len() > MAX_AUDIO_BYTES {
-                return Err(SpeechError::BadAudio);
+            None => Ok(None),
+            Some(chunk) => {
+                self.received += chunk.len();
+                if self.received > MAX_AUDIO_BYTES {
+                    return Err(SpeechError::BadAudio);
+                }
+                Ok(Some(chunk))
             }
-            audio.extend_from_slice(&chunk);
         }
-        if audio.is_empty() {
-            return Err(SpeechError::BadAudio);
-        }
-        Ok(SpeechAudio {
-            bytes: Bytes::from(audio),
-        })
+    }
+
+    /// The MIME type of the audio.
+    #[must_use]
+    pub const fn content_type(&self) -> &'static str {
+        "audio/mpeg"
     }
 }
 

@@ -20,7 +20,7 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 | --- | --- | --- |
 | Voice key (ElevenLabs) | none | **Opt-in.** The console speaks with your browser's own voice. A key gives a natural voice; what JARVIS says is then sent to ElevenLabs to be spoken (`ADR-0138`). |
 | `speech_voice_id` | George (`JBFqnCBsd6RMkjVDRZzb`) | The built-in voice. Only used once a voice key is set. |
-| `speech_model` | `eleven_v4_turbo` | The built-in model. Only used once a voice key is set. |
+| `speech_model` | `eleven_v4_turbo` | The built-in model. Only used once a voice key is set. `eleven_v4_turbo` and `eleven_flash_v2_5` are real-time models; `eleven_v3` sounds richer but is about 2.4 times slower, so JARVIS starts speaking noticeably later with it. |
 
 ## Folders & code
 

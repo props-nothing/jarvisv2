@@ -209,5 +209,53 @@ characters per request and audio at 8 MiB; 401/403 map to "key rejected", 402/42
 to a generic provider failure, and no error carries the key or the provider's body.
 
 Unresolved: regional (residency) endpoints are not configurable yet; live behaviour against a real account (latency,
-the `eleven_v4_turbo` model id on a given plan) is unverified until a key is supplied: the adapter is covered by contract
-tests against a local fake provider only.
+the `eleven_v4_turbo` model id on a given plan) was unverified when this was written; it has since been checked against a real account (see the review below).
+
+### Streaming and latency review (added 2026-10-06, after a live account was available)
+
+Prompted by two symptoms in the console: the face was "speaking" before any sound, and the text appeared well before the voice.
+Sources (accessed 2026-10-06): `https://elevenlabs.io/docs/eleven-api/concepts/latency.md`,
+`https://elevenlabs.io/docs/eleven-api/guides/how-to/best-practices/latency-optimization.md`,
+`https://elevenlabs.io/docs/overview/models.md`, `https://elevenlabs.io/docs/api-reference/text-to-speech/stream.md`.
+(`.../concepts/audio-streaming` timed out and was not read; the streaming facts below come from the other four and from measurement.)
+
+Facts from the documentation:
+
+- Three TTS transports: the regular endpoint (one complete file), the **streaming** endpoint (`/stream`, audio returned
+  progressively, "recommended for cases where the input text is available up-front"), and the **WebSocket** endpoint
+  (bidirectional, for text that is still being produced, such as LLM output; `auto_mode` removes chunk-schedule management).
+- Streaming does not shorten model inference; it shortens time to first audio, because playback can start at the first chunk.
+- Model latency: `eleven_flash_v2_5` about 75 ms, `eleven_v4_turbo` about 100 ms ("most emotive, real-time"),
+  `eleven_v3_conversational` about 280 ms, **`eleven_v3` is the quality model and is not a real-time model**: "there is no way to
+  get Eleven v3 quality at Flash speeds". Professional voice clones are slower than default, synthetic and instant-clone voices.
+- `previous_text` / `next_text` / `previous_request_ids` carry intonation across separate requests (`previous_request_ids`:
+  at most three). `output_format` defaults to `mp3_44100_128`; `optimize_streaming_latency` is deprecated.
+
+Measured against the real account on 2026-10-06 (this machine, voice "Jarvis", a *generated* voice, a 70-character sentence,
+two runs each; time to first byte / total):
+
+| model | first byte | complete |
+| --- | --- | --- |
+| `eleven_v3` | 0.56 to 0.63 s | about 1.5 s |
+| `eleven_v4_turbo` | 0.18 to 0.21 s | 0.61 to 0.65 s |
+| `eleven_v3_conversational` | 0.22 s (3.0 s on a cold first call) | 0.8 s |
+| `eleven_flash_v2_5` | 0.19 to 0.20 s | 0.29 to 0.31 s |
+
+- `previous_text` is accepted by `eleven_v4_turbo` and **refused by `eleven_v3`** with HTTP 400 `unsupported_model`
+  ("Providing previous_text or next_text is not yet supported with the 'eleven_v3' model").
+
+What this found in JARVIS (all fixed, `ADR-0138` amended):
+
+1. The daemon called `/stream` but **collected the whole response** before answering, so the endpoint's one advantage was lost
+   and the browser waited for the full synthesis of each group. It now passes chunks through as they arrive (`SpeechStream`).
+2. The page spoke only **after the whole answer was written**, in groups of up to 140 then 500 characters, and held
+   `S.speaking` true from the moment it asked for audio. It now speaks each sentence as soon as it is complete, plays the audio
+   progressively (Media Source, with a whole-blob fallback), keeps the next two pieces loading, and the face is "speaking" only
+   while sound is playing (it reads "preparing voice" while it waits).
+3. Setting the model to `eleven_v3` (a guess made while chasing a stale-tab problem) made speech about 2.4 times slower for no
+   reason; `eleven_v4_turbo` is the right default and the setting was put back.
+
+Adopted: HTTP streaming per sentence with `previous_text` for continuity (omitted for `eleven_v3*`). Not adopted yet: the
+WebSocket input-streaming endpoint, which would let the voice start from the first few words and keep one voice context for
+the whole answer. It needs a WebSocket client dependency and its own contract tests; with measured first-sentence latency of
+about 0.4 s end to end it is not the bottleneck, so it stays a candidate (`P3-040`).

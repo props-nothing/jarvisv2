@@ -34,9 +34,9 @@
 
   // ---- state --------------------------------------------------------------------------------------------------
   var S = {
-    session: sessionStorage.getItem("jarvis-session"),
+    session: null,
     offline: true, needYou: 0, working: 0, thinking: 0,
-    listening: false, speaking: false, level: 0, voiceLevel: 0,
+    listening: false, speaking: false, voiceBusy: false, preparing: false, voiceKind: "browser", level: 0, voiceLevel: 0,
     speak: localStorage.getItem("jarvis-speak") === "1",
     wake: false,
     pending: [], announced: null
@@ -110,13 +110,39 @@
 
   // ---- chat ---------------------------------------------------------------------------------------------------
   var chat = $("chat");
-  var transcript = [];
-  try { transcript = JSON.parse(sessionStorage.getItem("jarvis-chat") || "[]"); } catch (ignored) { transcript = []; }
-
+  // Conversations are kept in this browser (not in a tab), so closing the page and coming back continues where you were, and an
+  // earlier conversation can be reopened. Each one remembers its daemon session, so reopening it carries on with the same context.
+  var CHATS_KEY = "jarvis-chats", CURRENT_KEY = "jarvis-chat-current", MAX_CHATS = 30;
+  var chats = [];
+  try { chats = JSON.parse(localStorage.getItem(CHATS_KEY) || "[]"); } catch (ignored) { chats = []; }
+  if (!Array.isArray(chats)) chats = [];
+  function newChatRecord() {
+    return { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), session: null, title: "", updated: Date.now(), transcript: [] };
+  }
+  var currentChat = chats.filter(function (item) { return item.id === localStorage.getItem(CURRENT_KEY); })[0] || chats[0] || null;
+  if (!currentChat) { currentChat = newChatRecord(); chats.unshift(currentChat); }
+  var transcript = currentChat.transcript || [];
+  S.session = currentChat.session || null;
+  function saveChats() {
+    try {
+      chats = chats.filter(function (item) { return item === currentChat || (item.transcript && item.transcript.length); })
+        .sort(function (a, b) { return b.updated - a.updated; }).slice(0, MAX_CHATS);
+      localStorage.setItem(CHATS_KEY, JSON.stringify(chats));
+      localStorage.setItem(CURRENT_KEY, currentChat.id);
+    } catch (ignored) { /* storage full or blocked: the conversation still works, it is just not kept */ }
+  }
   function remember(role, text) {
     transcript.push({ role: role, text: text });
     transcript = transcript.slice(-60);
-    sessionStorage.setItem("jarvis-chat", JSON.stringify(transcript));
+    currentChat.transcript = transcript;
+    if (role === "user" && !currentChat.title) currentChat.title = clip(text, 56);
+    currentChat.updated = Date.now();
+    saveChats();
+  }
+  function setSession(id) {
+    S.session = id;
+    currentChat.session = id;
+    saveChats();
   }
   function scroll() { chat.scrollTop = chat.scrollHeight; }
   function clearEmpty() {
@@ -146,8 +172,66 @@
     empty.appendChild(el("p", "", "Type, press the microphone (M), or enable the wake word and say \u201CJarvis, \u2026\u201D. Answer questions with yes or no; \u201CJarvis, stop\u201D cancels everything running."));
     chat.appendChild(empty);
   }
-  if (transcript.length === 0) renderEmpty();
-  else transcript.forEach(function (entry) { show(entry.role, entry.text); });
+  function renderChat() {
+    chat.replaceChildren();
+    if (transcript.length === 0) renderEmpty();
+    else transcript.forEach(function (entry) { show(entry.role, entry.text); });
+    scroll();
+  }
+  renderChat();
+
+  // ---- new chat, and the earlier ones ------------------------------------------------------------------------------
+  function switchChat(target) {
+    // The answer on screen belongs to the conversation that asked for it, so wait for it (or Stop) before moving away.
+    if (busy) { say("one moment: it is still answering. Press Stop to cut it short."); return false; }
+    interruptSpeech();
+    currentChat = target;
+    transcript = target.transcript || [];
+    S.session = target.session || null;
+    saveChats();
+    renderChat();
+    closeChats();
+    return true;
+  }
+  function newChat() {
+    // An empty conversation is already a new one.
+    if (!transcript.length) { closeChats(); $("input").focus(); return; }
+    var fresh = newChatRecord();
+    chats.unshift(fresh);
+    if (!switchChat(fresh)) { chats.shift(); return; }
+    feel("attentive", 1.4, "nod");
+    $("input").focus();
+  }
+  function closeChats() { $("chats").hidden = true; }
+  function renderChats() {
+    var host = $("chats");
+    host.replaceChildren();
+    var shown = chats.filter(function (item) { return item.transcript && item.transcript.length; });
+    if (!shown.length) host.appendChild(el("div", "none", "no earlier conversations"));
+    shown.forEach(function (item) {
+      var row = el("div", "chatrow" + (item === currentChat ? " on" : ""));
+      var open = el("button", "chatopen", item.title || "(untitled)");
+      open.addEventListener("click", function () { switchChat(item); });
+      row.appendChild(open);
+      row.appendChild(el("span", "dim", age(new Date(item.updated).toISOString())));
+      var drop = el("button", "chatdrop", "\u00D7");
+      drop.title = "Remove this conversation from this browser";
+      drop.addEventListener("click", function () {
+        if (item === currentChat) { if (busy) { say("one moment: it is still answering."); return; } }
+        chats = chats.filter(function (other) { return other !== item; });
+        if (item === currentChat) { var fresh = newChatRecord(); chats.unshift(fresh); currentChat = fresh; transcript = []; S.session = null; renderChat(); }
+        saveChats();
+        renderChats();
+      });
+      row.appendChild(drop);
+      host.appendChild(row);
+    });
+  }
+  $("new-chat").addEventListener("click", newChat);
+  $("chats-btn").addEventListener("click", function () {
+    var host = $("chats");
+    if (host.hidden) { renderChats(); host.hidden = false; } else closeChats();
+  });
 
   function pendingAnswer() {
     var view = bubble("jarvis", "jarvis");
@@ -208,7 +292,7 @@
 
   var TERMINAL = { run_completed: 1, run_failed: 1, run_cancelled: 1 };
 
-  async function follow(runId, view) {
+  async function follow(runId, view, talker) {
     var last = 0, finished = false, attempts = 0, finalText = null, failure = null;
     while (!finished && attempts < 4) {
       try {
@@ -231,7 +315,7 @@
             if (frame.id) last = Number(frame.id) || last;
             var payload = (frame.body && frame.body.payload) || {};
             var summary = (frame.body && frame.body.summary) || "";
-            if (frame.event === "output_delta") view.add(payload.text || "");
+            if (frame.event === "output_delta") { view.add(payload.text || ""); if (talker) feed(talker, payload.text || ""); }
             else if (frame.event === "output_completed") finalText = payload.text;
             else if (frame.event === "tool_requested") view.chip(summary || "using a tool");
             else if (frame.event === "approval_requested") view.chip("waiting for your approval", true);
@@ -249,6 +333,7 @@
     if (failure) {
       view.fail(failure === "stopped" ? "Stopped." : "That did not complete: " + failure);
       if (failure !== "stopped") feel("concerned", 3.5);
+      if (talker) interruptSpeech();
       return null;
     }
     return view.finish(finalText);
@@ -263,6 +348,8 @@
     show("user", text);
     remember("user", text);
     var view = pendingAnswer();
+    // With the neural voice, speech starts while the answer is still being written (see "the neural voice, streamed").
+    var talker = S.speak && neural.enabled ? neuralSession() : null;
     feel("attentive", 1.2, "nod");
     busy = true;
     S.thinking = 1;
@@ -275,17 +362,17 @@
       } catch (error) {
         // A conversation that no longer exists (a fresh profile, a cleared database) starts a new one rather than failing.
         if (error.status !== 404 || !S.session) throw error;
-        S.session = null;
-        sessionStorage.removeItem("jarvis-session");
+        setSession(null);
         delete body.session_id;
         reply = await api("/runs", "POST", body);
       }
-      S.session = reply.session_id;
-      sessionStorage.setItem("jarvis-session", S.session);
-      var answer = await follow(reply.run_id, view);
-      if (answer) react(answer);
-      if (answer && S.speak) speak(answer);
+      setSession(reply.session_id);
+      var answer = await follow(reply.run_id, view, talker);
+      if (answer) react(answer, !!talker);
+      if (talker) { if (answer) endFeed(talker, answer); else interruptSpeech(); }
+      else if (answer && S.speak) speak(answer);
     } catch (error) {
+      if (talker) interruptSpeech();
       view.fail(error.status === 401 ? "The daemon rejected the credential. Open this page with `jarvis hud`." : "Could not reach the assistant.");
     } finally {
       busy = false;
@@ -309,7 +396,7 @@
   // choosing the best voice it has. Either way the head's mouth follows what is actually being said.
   var synth = window.speechSynthesis;
   var neural = { enabled: false, voice: "", warnedBasic: false };
-  var playing = { token: 0, element: null, controller: null, url: null, context: null, analyser: null, data: null };
+  var playing = { token: 0, element: null, controller: null, session: null, context: null, analyser: null, data: null };
 
   function plain(text) {
     return String(text).replace(/```[\s\S]*?```/g, " code omitted. ").replace(/[`*_#>]/g, "").replace(/\s+/g, " ").trim();
@@ -363,13 +450,14 @@
     if (!synth) { finishSpeaking(after); return; }
     var sentences = text.slice(0, 1800).match(/[^.!?]+[.!?]*/g) || [];
     if (!sentences.length) { S.speaking = false; return; }
-    S.speaking = true;
+    S.voiceKind = "browser";
     var voice = pickVoice();
     sentences.forEach(function (sentence, index) {
       var utterance = new SpeechSynthesisUtterance(sentence.trim());
       if (voice) { utterance.voice = voice; utterance.lang = voice.lang; }
       utterance.rate = 1;
       utterance.pitch = 1;
+      if (index === 0) utterance.onstart = function () { S.speaking = true; };
       if (index === sentences.length - 1) {
         utterance.onend = utterance.onerror = function () { finishSpeaking(after); };
       }
@@ -377,11 +465,16 @@
     });
   }
 
-  function playBlob(blob, done) {
-    var url = URL.createObjectURL(blob);
-    var element = new Audio(url);
-    playing.element = element;
-    playing.url = url;
+  // ---- the neural voice, streamed ----------------------------------------------------------------------------------
+  // Speech starts while the answer is still being written, not after it: each sentence is sent to the daemon as soon as it is
+  // complete, the daemon streams the provider's audio straight back, and the page plays it as it arrives (Media Source), with
+  // the next sentence already on its way. So the first words are heard about a quarter of a second after the first sentence
+  // exists, instead of after the whole answer and the whole first group have been made. S.speaking is true only while sound is
+  // actually playing, so the face is not "speaking" while it is still waiting for its voice (S.preparing says that instead).
+  var HAS_MSE = !!(window.MediaSource && MediaSource.isTypeSupported && MediaSource.isTypeSupported("audio/mpeg"));
+  var MIN_PART = 25, MAX_PART = 1400, BATCH_CHARS = 160, GAP_GRACE_MS = 450, LOOKAHEAD = 2;
+
+  function attachAnalyser(element) {
     try {
       var Context = window.AudioContext || window.webkitAudioContext;
       if (!playing.context) playing.context = new Context();
@@ -393,55 +486,245 @@
       playing.analyser.connect(playing.context.destination);
       if (playing.context.state === "suspended") playing.context.resume();
     } catch (ignored) { playing.analyser = null; }
-    var ended = function (error) {
-      URL.revokeObjectURL(url);
-      if (playing.element === element) { playing.element = null; playing.url = null; }
-      done(error);
+  }
+
+  // Feeds a streaming response into an <audio> element, resolving once the first audio is buffered (so it can start at once).
+  function streamInto(response, element) {
+    return new Promise(function (resolve, reject) {
+      var source = new MediaSource();
+      var url = URL.createObjectURL(source);
+      var reader = response.body.getReader();
+      var buffer = null, queue = [], finished = false, started = false;
+      function pump() {
+        if (!buffer || buffer.updating) return;
+        if (queue.length) {
+          try { buffer.appendBuffer(queue.shift()); } catch (error) { fail(error); }
+          return;
+        }
+        if (finished && source.readyState === "open") { try { source.endOfStream(); } catch (ignored) { /* already ended */ } }
+      }
+      function fail(error) {
+        URL.revokeObjectURL(url);
+        if (!started) reject(error); else element.dispatchEvent(new Event("error"));
+      }
+      source.addEventListener("sourceopen", function () {
+        try {
+          buffer = source.addSourceBuffer("audio/mpeg");
+        } catch (error) { reject(error); return; }
+        buffer.addEventListener("updateend", function () {
+          if (!started) { started = true; resolve(url); }
+          pump();
+        });
+        (function read() {
+          reader.read().then(function (chunk) {
+            if (chunk.done) { finished = true; pump(); return; }
+            queue.push(chunk.value);
+            pump();
+            read();
+          }, fail);
+        })();
+      }, { once: true });
+      element.src = url;
+    });
+  }
+
+  // One request for one piece of speech; resolves with an element that is ready to play.
+  function openSpeech(session, item) {
+    var body = { text: item.text };
+    if (item.previous) body.previous_text = item.previous;
+    return fetch("/api/v1/speech", {
+      method: "POST", cache: "no-store", signal: session.controller.signal,
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (response) {
+      if (!response.ok) { var error = new Error(String(response.status)); error.status = response.status; throw error; }
+      var element = new Audio();
+      element.preload = "auto";
+      if (HAS_MSE && response.body && response.body.getReader) {
+        return streamInto(response, element).then(function (url) { return { element: element, url: url }; });
+      }
+      return response.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        element.src = url;
+        return { element: element, url: url };
+      });
+    });
+  }
+
+  function alive(session) { return session.turn === playing.token; }
+
+  function neuralSession(after) {
+    interruptSpeech();
+    stopListening();
+    var session = {
+      turn: playing.token, controller: new AbortController(), items: [], current: -1, playingItem: null,
+      fed: "", consumed: 0, ended: false, after: after, gap: null
     };
-    element.onended = function () { ended(null); };
-    element.onerror = function () { ended(new Error("playback")); };
+    playing.controller = session.controller;
+    playing.session = session;
+    S.voiceBusy = true;
+    S.preparing = true;
+    S.voiceKind = "neural";
+    return session;
+  }
+
+  function endSession(session) {
+    if (!alive(session)) return;
+    playing.session = null;
+    S.voiceBusy = false;
+    S.preparing = false;
+    S.speaking = false;
+    resumeWake();
+    if (session.after) session.after();
+  }
+
+  // The neural voice failed (key, quota, network, playback): say the rest with the browser's voice, so the answer is still heard.
+  function fallbackToBrowser(session, error, rest) {
+    if (!alive(session)) return;
+    if (error && error.status === 404) neural.enabled = false;
+    say("The neural voice is unavailable (" + ((error && error.status) || "no reply") + "), using the browser's voice.");
+    var after = session.after;
+    playing.token += 1;
+    session.controller.abort();
+    playing.session = null;
+    S.voiceBusy = false;
+    S.preparing = false;
+    S.voiceKind = "browser";
+    var text = plain(rest);
+    if (text) speakBrowser(text, after); else { S.speaking = false; if (after) after(); }
+  }
+
+  function remainingText(session, from) {
+    var parts = session.items.slice(from).map(function (item) { return item.text; });
+    parts.push(plain(session.fed.slice(session.consumed)));
+    return parts.join(" ");
+  }
+
+  // Keeps the next few pieces loading, and starts the next one playing when its turn comes.
+  function drive(session) {
+    if (!alive(session)) return;
+    var i;
+    for (i = Math.max(0, session.current + 1); i < session.items.length && i <= session.current + 1 + LOOKAHEAD; i += 1) {
+      (function (item, index) {
+        if (item.state !== "idle") return;
+        item.state = "loading";
+        openSpeech(session, item).then(function (handle) {
+          if (!alive(session)) { URL.revokeObjectURL(handle.url); return; }
+          item.handle = handle;
+          item.state = "ready";
+          drive(session);
+        }, function (error) {
+          if (!alive(session)) return;
+          // A first piece that never arrives is a failure to speak at all; later ones fall back from where they were.
+          item.state = "failed";
+          item.error = error;
+          drive(session);
+        });
+      })(session.items[i], i);
+    }
+    if (session.playingItem !== null) return;
+    var next = session.items[session.current + 1];
+    if (!next) {
+      if (session.ended) endSession(session);
+      return;
+    }
+    if (next.state === "failed") { fallbackToBrowser(session, next.error, remainingText(session, session.current + 1)); return; }
+    if (next.state !== "ready") return;
+    play(session, session.current + 1);
+  }
+
+  function play(session, index) {
+    var item = session.items[index];
+    var element = item.handle.element;
+    clearTimeout(session.gap);
+    session.current = index;
+    session.playingItem = index;
+    item.state = "playing";
+    playing.element = element;
+    attachAnalyser(element);
+    function done(error) {
+      URL.revokeObjectURL(item.handle.url);
+      if (playing.element === element) playing.element = null;
+      if (!alive(session)) return;
+      session.playingItem = null;
+      item.state = "done";
+      if (error) { fallbackToBrowser(session, null, remainingText(session, index + 1)); return; }
+      // A short silence between pieces is not "stopped speaking": the face holds its pose for a moment while the next arrives.
+      session.gap = setTimeout(function () {
+        if (!alive(session) || session.playingItem !== null) return;
+        S.speaking = false;
+        S.preparing = !session.ended || session.items.length > session.current + 1;
+      }, GAP_GRACE_MS);
+      drive(session);
+    }
+    element.onplaying = function () { if (alive(session)) { S.speaking = true; S.preparing = false; } };
+    element.onended = function () { done(null); };
+    element.onerror = function () { done(new Error("playback")); };
     var started = element.play();
-    if (started && started.catch) started.catch(function () { ended(new Error("playback")); });
+    if (started && started.catch) started.catch(function () { done(new Error("playback")); });
+  }
+
+  function enqueue(session, raw) {
+    var spoken = plain(raw);
+    if (!spoken) return;
+    // The face takes the feeling of what it is about to say (worry for an apology, pleasure for good news).
+    if (window.JarvisHead) JarvisHead.speakMood(JarvisHead.mood(spoken));
+    var pieces = spoken.length > MAX_PART ? groups(spoken) : [spoken];
+    pieces.forEach(function (piece) {
+      var last = session.items[session.items.length - 1];
+      session.items.push({ text: piece, previous: last ? last.text : "", state: "idle", handle: null, error: null });
+    });
+    drive(session);
+  }
+
+  // Text arrives as the answer is written. A sentence is spoken as soon as it is complete (a full stop followed by a space or
+  // a line break), unless it is inside a code block, which is not read out.
+  function feed(session, delta) {
+    if (!alive(session) || !delta) return;
+    session.fed += delta;
+    for (;;) {
+      var pending = session.fed.slice(session.consumed);
+      if ((pending.match(/```/g) || []).length % 2 === 1) return;
+      var match = /([.!?]+["')\]]*\s+|\n+)/.exec(pending);
+      if (!match) return;
+      var cut = match.index + match[0].length;
+      var candidate = pending.slice(0, cut);
+      var queuedAhead = session.items.length - 1 - session.current;
+      // Speak at once when nothing is waiting to be played; otherwise let a few sentences gather into one request.
+      if (plain(candidate).length < MIN_PART) {
+        var more = /([.!?]+["')\]]*\s+|\n+)/.exec(pending.slice(cut));
+        if (!more) return;
+        cut += more.index + more[0].length;
+        candidate = pending.slice(0, cut);
+      }
+      if (queuedAhead > 0 && plain(candidate).length < BATCH_CHARS) {
+        var next = /([.!?]+["')\]]*\s+|\n+)/.exec(pending.slice(cut));
+        if (!next) return;
+        cut += next.index + next[0].length;
+        candidate = pending.slice(0, cut);
+      }
+      session.consumed += cut;
+      enqueue(session, candidate);
+    }
+  }
+
+  // The answer is complete: speak whatever is left, and finish when it has been played.
+  function endFeed(session, finalText) {
+    if (!alive(session)) return;
+    var head = session.fed.slice(0, session.consumed);
+    var tail = typeof finalText === "string" && finalText.slice(0, session.consumed) === head
+      ? finalText.slice(session.consumed) : session.fed.slice(session.consumed);
+    session.fed = head + tail;
+    session.consumed = session.fed.length;
+    session.ended = true;
+    if (tail.trim()) enqueue(session, tail); else drive(session);
   }
 
   function speakNeural(text, after) {
-    var turn = ++playing.token;
-    var parts = groups(text.slice(0, 4000));
-    if (!parts.length) { S.speaking = false; return; }
-    var controller = new AbortController();
-    playing.controller = controller;
-    S.speaking = true;
-    function request(part) {
-      return fetch("/api/v1/speech", {
-        method: "POST", cache: "no-store", signal: controller.signal,
-        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-        body: JSON.stringify({ text: part })
-      }).then(function (response) {
-        if (!response.ok) { var error = new Error(String(response.status)); error.status = response.status; throw error; }
-        return response.blob();
-      });
-    }
-    function fallback(from, error) {
-      if (turn !== playing.token) return;
-      if (error && error.status === 404) neural.enabled = false;
-      say("The neural voice is unavailable (" + ((error && error.status) || "no reply") + "), using the browser's voice.");
-      speakBrowser(parts.slice(from).join(" "), after);
-    }
-    function play(index, pending) {
-      pending.then(function (blob) {
-        if (turn !== playing.token) return;
-        var ahead = index + 1 < parts.length ? request(parts[index + 1]) : null;
-        if (ahead) ahead.catch(function () {});
-        playBlob(blob, function (error) {
-          if (turn !== playing.token) return;
-          if (error) { fallback(index + 1); return; }
-          if (ahead) play(index + 1, ahead); else finishSpeaking(after);
-        });
-      }, function (error) { fallback(index, error); });
-    }
-    play(0, request(parts[0]));
+    var session = neuralSession(after);
+    feed(session, text.slice(0, 4000));
+    endFeed(session, null);
   }
-
   function speak(text, after) {
     interruptSpeech();
     var spoken = plain(text);
@@ -464,13 +747,19 @@
 
   // The "you can interrupt it" half of voice: the microphone, Escape, the orb, or a new message silences it at once.
   function interruptSpeech() {
-    var was = S.speaking;
+    var was = S.speaking || S.voiceBusy;
     playing.token += 1;
+    if (playing.session) {
+      clearTimeout(playing.session.gap);
+      playing.session.items.forEach(function (item) { if (item.handle) URL.revokeObjectURL(item.handle.url); });
+      playing.session = null;
+    }
     if (playing.controller) { playing.controller.abort(); playing.controller = null; }
-    if (playing.element) { playing.element.pause(); playing.element = null; }
-    if (playing.url) { URL.revokeObjectURL(playing.url); playing.url = null; }
+    if (playing.element) { playing.element.onended = playing.element.onerror = playing.element.onplaying = null; playing.element.pause(); playing.element = null; }
     if (synth && (synth.speaking || synth.pending)) synth.cancel();
     S.speaking = false;
+    S.voiceBusy = false;
+    S.preparing = false;
     if (was) resumeWake();
   }
   // Whether the daemon has a speech provider; asked once the credential is known.
@@ -530,10 +819,11 @@
     else if (gesture === "shake") JarvisHead.shake();
   }
   // An answer carries a feeling (sorry, glad, a question), which the face holds while it speaks and shows briefly if it does not.
-  function react(text) {
+  function react(text, streamed) {
     if (!window.JarvisHead) return;
     var mood = JarvisHead.mood(text);
-    JarvisHead.speakMood(mood);
+    // A streamed answer sets the mood sentence by sentence as it is spoken; this is for a voice that speaks it whole.
+    if (!streamed) JarvisHead.speakMood(mood);
     if (!S.speak) JarvisHead.emote(mood, 3);
     if (mood === "pleased" || mood === "amused") JarvisHead.nod();
   }
@@ -547,6 +837,7 @@
 
   // Answering a question: a plain yes or no is an answer, and only while something is actually waiting.
   var YES = /^(yes|yeah|yep|yup|sure|ok|okay|approve|approved|allow|confirm|proceed|go ahead|do it)( please| jarvis)?$/i;
+  var NEWCHAT = /^(new (chat|conversation|session)|start (a )?new (chat|conversation|session)|start over|clear (the )?chat)( please| jarvis)?$/i;
   var NO = /^(no|nope|nah|deny|denied|refuse|reject|don't|do not|don't do it)( please| jarvis)?$/i;
 
   // One click or one word: record the owner's answer and let the run carry on.
@@ -585,6 +876,7 @@
   function command(text) {
     var spoken = text.trim().replace(/[.!?]+$/, "");
     if (!spoken) return;
+    if (NEWCHAT.test(spoken)) { newChat(); return; }
     if (YES.test(spoken)) { answerPending(true); return; }
     if (NO.test(spoken)) { answerPending(false); return; }
     if (/^(stop|cancel|abort|kill)( that| it| everything| all| now)?$/i.test(spoken)) { say("stopping everything"); stopEverything(); return; }
@@ -702,10 +994,12 @@
     var typing = document.activeElement && document.activeElement.tagName === "INPUT" && document.activeElement.type === "text";
     if (event.key === "Escape") {
       if (!$("ops").hidden) { setOps(false); return; }
+      if (!$("chats").hidden) { closeChats(); return; }
       interruptSpeech(); if (recognizer && !S.wake) stopListening(); return;
     }
     if (typing) return;
     if (event.key === "o" || event.key === "O") { event.preventDefault(); setOps($("ops").hidden); }
+    else if (event.key === "n" || event.key === "N") { event.preventDefault(); newChat(); }
     else if (event.key === "/") { event.preventDefault(); $("input").focus(); }
     else if (event.key === "m" || event.key === "M") { event.preventDefault(); $("mic").click(); }
   });
@@ -1196,7 +1490,8 @@
     if (S.needYou > 0) return "waiting";
     if (S.listening) return "listening";
     if (S.speaking) return "speaking";
-    if (S.thinking || S.working > 0) return "working";
+    // Waiting for the voice is still working: the face only "speaks" while there is sound.
+    if (S.thinking || S.working > 0 || S.voiceBusy) return "working";
     return "idle";
   }
   var captions = {
@@ -1206,7 +1501,8 @@
   function paintHeader() {
     var mode = uiState();
     var caption = $("caption");
-    caption.textContent = captions[mode];
+    var preparing = S.voiceBusy && !S.speaking && !S.thinking && S.working === 0;
+    caption.textContent = preparing ? "preparing voice" : captions[mode];
     caption.className = mode === "waiting" ? "wait" : mode === "idle" || mode === "offline" ? "" : "live";
     var link = $("pill-link");
     link.className = "pill " + (S.offline ? "bad" : "on");
@@ -1463,7 +1759,8 @@
       var mouth = 0;
       if (mode === "speaking") {
         // the real audio level when the neural voice is playing; a synthetic syllable rhythm for the browser voice
-        mouth = neural.enabled && S.voiceLevel > 0.01
+        // The neural voice drives the mouth only from the sound actually playing; the synthetic rhythm is for the browser voice.
+        mouth = S.voiceKind === "neural"
           ? Math.min(1, S.voiceLevel * 1.6)
           : 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
       }

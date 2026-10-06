@@ -89,10 +89,10 @@ struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "jarvis-phase2-{label}-{}",
-            jarvis_core::scratch_tag()
-        ));
+        // Short on purpose: the daemon's socket lives under this root and macOS refuses a socket path over 103 bytes, while its
+        // temp directory is already about 50. The tail of the tag is the random part.
+        let tag = jarvis_core::scratch_tag();
+        let path = std::env::temp_dir().join(format!("ja2-{label}-{}", &tag[tag.len() - 12..]));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create root: {error}"));
         Self(path)
     }

@@ -77,7 +77,8 @@ default.
 - **The console** (opened for you; `jarvis hud` opens it again) is a face with a conversation beside it. The face is the page: it has a
   mind of its own (it looks about, changes expression, blinks, nods off after a long quiet) and reacts to what is happening: it
   listens, thinks, speaks with the voice, looks worried when something fails and pleased when you approve. Type or talk in the panel on
-  the right. Anything that needs a yes or no appears at the bottom left of the face, with Approve and Deny. **Ops** (or press `O`) opens
+  the right; **New chat** (or `N`, or say "new chat") starts a fresh conversation with none of the old context, and **History** reopens an
+  earlier one where you left off. Conversations are kept in your browser, so closing the page does not lose them. Anything that needs a yes or no appears at the bottom left of the face, with Approve and Deny. **Ops** (or press `O`) opens
   the operations page: what is running, scheduled and recent, and which tools it can use and which it asks about first. **Stop everything**
   is always in the header.
 - **Voice:** the microphone button (or `M`) to talk; turn on **Speak answers**; enable the **wake word** and say "Jarvis, ...".
@@ -91,6 +92,14 @@ default.
   makes it shape later answers, **Dismiss** forgets it. It asks because a web page it read could otherwise tell it what to remember.
 - **Approvals are a yes or no.** Anything it asks about appears with Approve and Deny; you can also say "yes" or "no", or use
   `jarvis approvals approve|deny`.
+
+## `jarvis` is not found?
+
+A built or unpacked JARVIS is a folder, and nothing puts that folder on your PATH, so a terminal says `jarvis: command not found`
+(or "not recognized"). Run it once by its path: `jarvis path install` from inside the folder (for example
+`.\target\release\jarvis.exe path install`). On Windows it adds the folder to your user PATH; on Linux and macOS it links `jarvis`
+and `jarvisd` into `~/.local/bin`. Open a new terminal and `jarvis` works anywhere. `jarvis path status` says whether it does, and
+`jarvis path uninstall` undoes it. `jarvis start` mentions this when it notices.
 
 ## Running it all the time, and on other machines
 

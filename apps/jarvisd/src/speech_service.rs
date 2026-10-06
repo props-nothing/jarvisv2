@@ -10,6 +10,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use jarvis_core::ErrorCode;
 use jarvis_voice::SpeechError;
 use serde::Deserialize;
@@ -22,6 +23,9 @@ use crate::gateway::{GatewayState, error_response};
 #[serde(deny_unknown_fields)]
 pub struct SpeakRequest {
     text: String,
+    /// The sentence spoken just before this one, so the voice carries on in the same tone. Optional.
+    #[serde(default)]
+    previous_text: Option<String>,
 }
 
 /// `GET /api/v1/speech`
@@ -53,14 +57,38 @@ pub async fn speak(
             "no speech provider is configured; set daemon.speech_api_key_ref",
         );
     };
-    match speech.synthesize(&request.text).await {
-        Ok(audio) => {
-            let mut response = (StatusCode::OK, audio.bytes().clone()).into_response();
-            let headers = response.headers_mut();
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(audio.content_type()),
+    // The provider is asked to stream, and the first chunk is awaited here, so a refusal is still an honest status code and
+    // a `200` always means audio is on its way. The rest is passed on as it arrives rather than collected, so the browser can
+    // start playing while the sentence is still being made.
+    let opened = match speech
+        .open(&request.text, request.previous_text.as_deref())
+        .await
+    {
+        Ok(mut stream) => match stream.next_chunk().await {
+            Ok(Some(first)) => Ok((stream, first)),
+            Ok(None) => Err(SpeechError::BadAudio),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    match opened {
+        Ok((stream, first)) => {
+            let content_type = stream.content_type();
+            let rest = futures_util::stream::unfold(stream, |mut stream| async move {
+                match stream.next_chunk().await {
+                    Ok(Some(chunk)) => Some((Ok::<_, std::io::Error>(chunk), stream)),
+                    Ok(None) => None,
+                    // Ends the response abnormally, which the browser sees as a failed read and falls back from.
+                    Err(error) => Some((Err(std::io::Error::other(error.to_string())), stream)),
+                }
+            });
+            let body = axum::body::Body::from_stream(
+                futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                    .chain(rest),
             );
+            let mut response = (StatusCode::OK, body).into_response();
+            let headers = response.headers_mut();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
             headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }

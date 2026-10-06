@@ -2499,7 +2499,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     mapping, bounds, malformed settings); route tests (401 without the credential, 404 when not configured, audio proxied,
     key never reported); config validation; init rendering and flags.
   - **Live:** the page path ran end to end with the speech endpoints mocked in the browser (violet speaking state, mouth open
-    with the audio, a new message aborting the in-flight request). **Not run against a real account: no key was available.**
+    with the audio, a new message aborting the in-flight request); later against a real account (below).
+- [x] Streamed speech (found by the user: the face "spoke" before any sound, and the voice lagged the text). The daemon passes
+  the provider's `/stream` chunks through instead of collecting them (`SpeechStream`); the page speaks each sentence as soon
+  as it is complete, plays progressively (Media Source, whole-blob fallback), keeps two pieces loading ahead, sends the previous
+  sentence as `previous_text` (not for `eleven_v3*`, which refuses it), and shows "speaking" only while sound plays ("preparing
+  voice" before). Measured live: first sentence complete at 2.6 s, request 2.64, first byte 2.92, playing 2.96, face "speaking"
+  3.03 s. `eleven_v3` (set by mistake while chasing a stale tab) was 2.4 times slower and was put back to `eleven_v4_turbo`.
+  Tests: first chunk available before the provider finishes; `previous_text` sent only to a model that accepts it, trimmed.
+  Not done: the WebSocket input-streaming endpoint (a candidate, not a bottleneck).
   - **Limits:** text spoken leaves the machine when a key is set; per-character cost with no cap yet; regional endpoints are
     not configurable; speech to text is still the browser's.
 
@@ -7056,8 +7064,17 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   offline, and to events (nod and smile on approve, shake on deny or stop, concern on failure). The head rig gained eye lids, a smile
   and frown, and independent inner/outer brows. The chat is a panel on the right; the dashboard moved to an Ops page (`O`); approvals
   and "remember?" cards sit in a tray at the bottom left of the face page. Checked live in the browser (idle, amused, concerned, the
-  approval tray with Approve and Deny). Not done: the face has no ears for the room (it does not turn toward a speaker), and the
+  approval tray with Approve and Deny). New chat (button, `N`, or "new chat" aloud) starts a conversation with no old context; History
+  reopens earlier ones with their daemon session; conversations persist in the browser across reloads. Live: a codeword told in one chat
+  was unknown in a new chat and remembered when the first was reopened. Not done: conversations are not stored on the daemon, so they
+  do not follow you to another browser; a conversation cannot be renamed. Not done: the face has no ears for the room (it does not turn toward a speaker), and the
   expressions are tuned by eye on one mesh, not tested.
+- [x] `P9-026` `jarvis path install|uninstall|status`: `jarvis hud` said "command not found" because nothing puts the folder on the PATH.
+  Windows: adds the folder to the user `Path` through PowerShell (the directory is quoted so it cannot leave the string; only the
+  user value is read or written; idempotent, tested). Linux and macOS: links both programs into `~/.local/bin` and says if that is not
+  on the PATH, never replacing a file that is not its own link. `jarvis start` prints a tip when the folder is not on the PATH.
+  Live on Windows: installed, second run reported "already", the user PATH holds the folder once. Not run on Linux or macOS (type-checked
+  for both). Not done: installers (`P9-017b`) should do this for you.
 - [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

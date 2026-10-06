@@ -90,9 +90,9 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.target }}" ]; then
-            scripts/package-release.sh "${{ matrix.label }}" "target/${{ matrix.target }}/release"
+            bash scripts/package-release.sh "${{ matrix.label }}" "target/${{ matrix.target }}/release"
           else
-            scripts/package-release.sh "${{ matrix.label }}"
+            bash scripts/package-release.sh "${{ matrix.label }}"
           fi
       - name: Smoke test the packaged programs
         # The archive is unpacked into an empty folder and the programs are asked for their version, which proves they start and

@@ -24,6 +24,7 @@ mod output;
 mod schedule;
 mod service_install;
 mod settings;
+mod shell_path;
 mod skills;
 mod tools;
 mod watch;
@@ -109,6 +110,8 @@ async fn main() -> ExitCode {
         Some("connector") => connector::run(&arguments),
         Some("doctor") => doctor(&arguments).await,
         Some("service") => service(&arguments),
+        // `path` puts `jarvis` on the search path, so the commands JARVIS suggests work from any terminal.
+        Some("path") => shell_path::run(&arguments),
         // No arguments (or `launch`) is the one command that gets a person to a working console: set up on the first
         // run, then start, then open. Without a terminal to ask questions on it still just explains itself.
         Some("--help" | "-h" | "help") => {
@@ -133,6 +136,11 @@ async fn main() -> ExitCode {
 /// started daemon a failure.
 fn start_and_open(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
     let status = init::start(paths, arguments);
+    if status == ExitStatus::Ok
+        && let Some(tip) = shell_path::hint()
+    {
+        println!("{tip}");
+    }
     if status == ExitStatus::Ok && !arguments.iter().any(|argument| argument == "--no-open") {
         let _ = hud_command(arguments);
     }
@@ -163,9 +171,9 @@ async fn launch_command(arguments: &[String]) -> ExitStatus {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|path|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
-       jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
+       jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]\n       jarvis path <install|uninstall|status>      # make `jarvis` work from any terminal"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.

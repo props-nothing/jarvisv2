@@ -175,3 +175,106 @@ fn malformed_settings_are_refused() {
         .is_err()
     );
 }
+
+/// Serves a chunked response whose second chunk is held back until told to go, so a test can look at what a caller has in hand
+/// while the provider is still "generating".
+async fn serve_in_two_parts() -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|error| panic!("bind: {error}"));
+    let address = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("address: {error}"));
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("accept: {error}"));
+        let mut buffer = [0_u8; 4096];
+        let mut received = Vec::new();
+        while !String::from_utf8_lossy(&received).contains("\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            received.extend_from_slice(&buffer[..read]);
+        }
+        // The body of the request follows the head; it is small, and reading what has arrived is enough for this server.
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: audio/mpeg\r\ntransfer-encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .await;
+        let _ = stream.flush().await;
+        let _ = wait.await;
+        let _ = stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await;
+        let _ = stream.shutdown().await;
+    });
+    (format!("http://{address}"), release)
+}
+
+/// **Audio is handed over as it arrives, not when it is complete.**
+///
+/// The point of the provider's `/stream` endpoint, and what the first version of this adapter threw away by collecting
+/// everything before returning. The provider here has sent one chunk and is holding the next: a caller that can read the first
+/// chunk now is streaming, and one that blocks until the end is not (this test would time out).
+#[tokio::test]
+async fn the_first_audio_is_available_before_the_provider_has_finished() {
+    let (base, release) = serve_in_two_parts().await;
+    let mut stream = speech(&base)
+        .open("hello", None)
+        .await
+        .unwrap_or_else(|error| panic!("open: {error}"));
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next_chunk())
+        .await
+        .unwrap_or_else(|_| panic!("the first chunk must not wait for the last"))
+        .unwrap_or_else(|error| panic!("first chunk: {error}"));
+    assert_eq!(first.as_deref(), Some(&b"first"[..]));
+    let _ = release.send(());
+    let second = stream
+        .next_chunk()
+        .await
+        .unwrap_or_else(|error| panic!("second chunk: {error}"));
+    assert_eq!(second.as_deref(), Some(&b"second"[..]));
+    assert!(matches!(stream.next_chunk().await, Ok(None)));
+}
+
+/// **The previous sentence is sent for continuity, trimmed, and never to a model that refuses it.**
+///
+/// Verified against the live API: `eleven_v4_turbo` accepts `previous_text`, and `eleven_v3` answers 400
+/// `unsupported_model`, so sending it there would turn a working voice into a failing one.
+#[tokio::test]
+async fn the_previous_sentence_is_sent_only_to_a_model_that_accepts_it() {
+    let long = format!("{}end of the last sentence.", "x".repeat(400));
+    for (model, sent) in [
+        ("eleven_v4_turbo", true),
+        ("eleven_v3", false),
+        ("eleven_v3_conversational", false),
+    ] {
+        let (base, request) = serve_once(200, b"audio".to_vec()).await;
+        let adapter = ElevenLabsSpeech::new(&base, DEFAULT_VOICE_ID, model, KEY)
+            .unwrap_or_else(|error| panic!("settings: {error}"));
+        let mut stream = adapter
+            .open("Next sentence.", Some(&long))
+            .await
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+        while let Ok(Some(_)) = stream.next_chunk().await {}
+        let request = request.await.unwrap_or_default();
+        assert_eq!(
+            request.contains("previous_text"),
+            sent,
+            "{model}: {request}"
+        );
+        if sent {
+            let start = request
+                .find(r#""previous_text":""#)
+                .map_or(0, |index| index + 17);
+            let value = request[start..].split('"').next().unwrap_or_default();
+            assert_eq!(
+                value.chars().count(),
+                MAX_PREVIOUS_CHARS,
+                "trimmed to the tail: {value}"
+            );
+            assert!(value.ends_with("end of the last sentence."));
+        }
+    }
+}
