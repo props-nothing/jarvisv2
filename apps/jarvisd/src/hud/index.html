@@ -17,26 +17,25 @@
     </div>
     <div class="spacer"></div>
     <span id="clock" aria-hidden="true"></span>
+    <button id="open-ops" title="Operations: what is waiting, running and scheduled, and what JARVIS can do (O)">Ops <b id="ops-count" hidden>0</b></button>
     <button id="open-settings" title="Models, keys, voice, folders and what it may do without asking">Settings</button>
     <button id="stop" class="danger" hidden title="Cancel everything that is running or waiting">Stop everything</button>
   </header>
 
   <div id="message" role="status"></div>
 
-  <div id="layout">
-    <aside class="dock" id="left">
-      <section class="frame"><h2>Waiting for you</h2><div id="waiting"></div><div id="remember"></div></section>
-      <section class="frame"><h2>Working</h2><div id="working"></div></section>
-    </aside>
-
+  <div id="main">
     <section id="stage">
-      <div id="orbwrap">
-        <canvas id="orb" aria-hidden="true"></canvas>
-        <div id="caption">standing by</div>
+      <canvas id="orb" aria-hidden="true"></canvas>
+      <div id="caption">standing by</div>
+      <div id="tray" aria-live="polite">
+        <div id="tray-waiting"></div>
+        <div id="tray-remember"></div>
       </div>
+    </section>
 
+    <aside id="side">
       <div id="chat" aria-live="polite"></div>
-
       <form id="composer" autocomplete="off">
         <button type="button" id="mic" title="Talk (M)" aria-label="Talk">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z" fill="currentColor"/></svg>
@@ -49,15 +48,33 @@
         <label><input type="checkbox" id="wake"> Wake word &ldquo;Jarvis&rdquo;</label>
         <span id="hint"></span>
       </div>
-    </section>
-
-    <aside class="dock" id="right">
-      <section class="frame"><h2>Telemetry</h2><div id="stats"></div></section>
-      <section class="frame"><h2>Scheduled</h2><div id="scheduled"></div></section>
-      <section class="frame"><h2>Can do</h2><div id="abilities"></div></section>
-<section class="frame"><h2>Recent</h2><div id="recent"></div></section>
-      <p class="note">Anything that needs a yes or no appears on the left: press Approve or Deny, or just say &ldquo;yes&rdquo; or &ldquo;no&rdquo;. The terminal works too: <code>jarvis approvals</code>.</p>
     </aside>
+  </div>
+</div>
+
+<div id="ops" class="overlay" hidden>
+  <div class="opsboard" role="dialog" aria-label="Operations">
+    <div class="opshead">
+      <h1>Operations</h1>
+      <span class="dim">What is waiting on you, what is running, and what JARVIS can do. <kbd>O</kbd> or <kbd>Esc</kbd> to return to the face.</span>
+      <span class="spacer"></span>
+      <button id="ops-close">Back to JARVIS</button>
+    </div>
+    <div class="opsgrid">
+      <div class="opscol">
+        <section class="frame"><h2>Waiting for you</h2><div id="waiting"></div><div id="remember"></div></section>
+        <section class="frame"><h2>Working</h2><div id="working"></div></section>
+        <section class="frame"><h2>Scheduled</h2><div id="scheduled"></div></section>
+      </div>
+      <div class="opscol">
+        <section class="frame"><h2>Recent</h2><div id="recent"></div></section>
+      </div>
+      <div class="opscol">
+        <section class="frame"><h2>Telemetry</h2><div id="stats"></div></section>
+        <section class="frame"><h2>Can do</h2><div id="abilities"></div></section>
+        <p class="note">Anything that needs a yes or no also appears on the face page, bottom left: press Approve or Deny, or just say &ldquo;yes&rdquo; or &ldquo;no&rdquo;. The terminal works too: <code>jarvis approvals</code>.</p>
+      </div>
+    </div>
   </div>
 </div>
 <div id="settings" class="overlay" hidden>

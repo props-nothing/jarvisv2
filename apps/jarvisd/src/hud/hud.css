@@ -48,11 +48,6 @@ button.danger:hover { border-color: var(--red); color: var(--red); background: r
 #message { padding: 0 24px; color: var(--amber); font: 12px var(--mono); }
 #message:not(:empty) { padding: 8px 24px; }
 
-#layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 330px minmax(0, 1fr) 330px; gap: 20px; padding: 16px 24px 20px; }
-
-.dock { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding: 2px; }
-.dock::-webkit-scrollbar, #chat::-webkit-scrollbar { width: 5px; }
-.dock::-webkit-scrollbar-thumb, #chat::-webkit-scrollbar-thumb { background: var(--line); }
 
 /* the framed panel: hairline border with bright corner brackets */
 .frame { position: relative; padding: 14px 16px 12px; border: 1px solid var(--line); background: var(--panel); backdrop-filter: blur(5px); }
@@ -87,14 +82,7 @@ code { font: 12px var(--mono); background: rgba(0, 0, 0, 0.4); border: 1px solid
 .stat b { font: 600 20px var(--mono); color: var(--text); text-shadow: 0 0 10px rgba(94, 227, 255, 0.5); }
 .stat.hot b { color: var(--amber); text-shadow: 0 0 10px rgba(255, 180, 84, 0.6); }
 
-#stage { min-height: 0; display: flex; flex-direction: column; position: relative; }
-#orbwrap { position: relative; flex: 1 1 0; min-height: 280px; }
-#orb { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
-#caption { position: absolute; left: 0; right: 0; bottom: 2px; text-align: center; font: 600 12px var(--mono); letter-spacing: 0.5em; text-transform: uppercase; color: var(--dim); text-shadow: 0 0 10px rgba(94, 227, 255, 0.4); pointer-events: none; }
-#caption.live { color: var(--cyan); } #caption.wait { color: var(--amber); text-shadow: 0 0 12px rgba(255, 180, 84, 0.6); }
 
-#chat { flex: 0 1 auto; max-height: 30%; min-height: 44px; overflow-y: auto; padding: 12px 6px 10px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth;
-  border-top: 1px solid var(--line); background: linear-gradient(to bottom, rgba(2, 10, 18, 0.0), rgba(2, 10, 18, 0.55)); }
 .empty { margin: auto; text-align: center; color: var(--dim); max-width: 560px; font: 12px var(--mono); letter-spacing: 0.04em; }
 .empty p { margin: 0; }
 .msg { max-width: 88%; padding: 9px 14px; border: 1px solid var(--line); animation: rise 0.2s ease; word-wrap: break-word; overflow-wrap: anywhere; }
@@ -113,6 +101,8 @@ pre code { background: none; border: none; padding: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .chip { font: 10px var(--mono); letter-spacing: 0.06em; padding: 1px 9px; border: 1px solid rgba(94, 227, 255, 0.4); color: var(--cyan); text-transform: uppercase; }
 .chip.wait { border-color: rgba(255, 180, 84, 0.55); color: var(--amber); }
+.chip.done { border-color: rgba(94, 255, 160, 0.55); color: #5effa0; }
+.chip.refused { border-color: rgba(255, 94, 94, 0.55); color: #ff5e5e; }
 
 #composer { display: flex; gap: 10px; padding: 10px 0 4px; }
 #input { flex: 1; min-width: 0; padding: 11px 14px; color: var(--text); background: rgba(2, 10, 20, 0.75); border: 1px solid var(--line); font: inherit; outline: none; clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px)); }
@@ -127,11 +117,6 @@ pre code { background: none; border: none; padding: 0; }
 #toggles input { accent-color: var(--cyan); }
 #hint { margin-left: auto; }
 
-@media (max-width: 1180px) { #layout { grid-template-columns: 280px minmax(0, 1fr); } #right { display: none; } }
-@media (max-width: 800px) {
-  body { overflow: auto; } #app { height: auto; min-height: 100%; }
-  #layout { grid-template-columns: 1fr; } #right { display: flex; } #stage { height: 86vh; order: -1; }
-}
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
 /* Settings */
@@ -164,3 +149,37 @@ pre code { background: none; border: none; padding: 0; }
 .perm .tname { font-size: 13px; } .perm .tid { font: 11px var(--mono); color: var(--dim); }
 .perm select { padding: 5px 8px; color: var(--text); background: rgba(2, 10, 20, 0.85); border: 1px solid var(--line); font: 12px var(--mono); }
 .sheet .foot .dim { margin-right: auto; align-self: center; font-size: 11px; }
+/* ---- the face is the page: it fills the stage, the chat is a panel on the right, everything else is on the Ops page ---------- */
+#main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(340px, 30vw, 460px); }
+#stage { position: relative; min-height: 0; overflow: hidden; }
+#orb { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+#caption { position: absolute; left: 0; right: 0; bottom: 18px; text-align: center; font: 600 12px var(--mono); letter-spacing: 0.5em; text-transform: uppercase; color: var(--dim); text-shadow: 0 0 10px rgba(94, 227, 255, 0.4); pointer-events: none; }
+#caption.live { color: var(--cyan); } #caption.wait { color: var(--amber); text-shadow: 0 0 12px rgba(255, 180, 84, 0.6); }
+
+/* what needs you stays on the face page, as a tray at the bottom left, so nothing waits out of sight */
+#tray { position: absolute; left: 20px; bottom: 44px; width: min(360px, calc(100% - 40px)); max-height: 60%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+#tray > div:empty { display: none; }
+#tray .item { padding: 12px 14px 10px; border: 1px solid rgba(255, 180, 84, 0.55); background: rgba(14, 12, 6, 0.82); backdrop-filter: blur(6px); box-shadow: 0 0 22px rgba(255, 180, 84, 0.18); animation: rise 0.25s ease; }
+#tray .item:first-child { border-top: 1px solid rgba(255, 180, 84, 0.55); padding-top: 12px; }
+
+#side { min-height: 0; display: flex; flex-direction: column; padding: 14px 16px 14px 14px; border-left: 1px solid var(--line); background: linear-gradient(to right, rgba(2, 10, 18, 0.35), rgba(2, 10, 18, 0.72)); backdrop-filter: blur(6px); }
+#chat { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 4px 6px 12px 2px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+#chat::-webkit-scrollbar { width: 5px; }
+#chat::-webkit-scrollbar-thumb { background: var(--line); }
+#side .msg { max-width: 96%; }
+
+/* Operations: the dashboard, one keypress away */
+#open-ops { display: inline-flex; align-items: center; gap: 8px; }
+#open-ops b { font: 600 11px var(--mono); min-width: 18px; padding: 0 5px; text-align: center; color: #1a1000; background: var(--amber); }
+.opsboard { width: min(1280px, 100%); border: 1px solid var(--line); background: rgba(3, 12, 22, 0.97); padding: 16px 20px 20px; }
+.opshead { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
+.opshead h1 { margin: 0; font: 700 16px var(--display); letter-spacing: 0.4em; text-transform: uppercase; color: #fff; text-shadow: 0 0 12px rgba(94, 227, 255, 0.7); }
+.opsgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.opscol { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); padding: 0 5px; color: var(--cyan); }
+
+@media (max-width: 960px) {
+  body { overflow: auto; } #app { height: auto; min-height: 100%; }
+  #main { grid-template-columns: 1fr; } #stage { height: 62vh; } #side { height: 70vh; border-left: 0; border-top: 1px solid var(--line); }
+  .opsgrid { grid-template-columns: 1fr; }
+}

@@ -246,7 +246,11 @@
       }
       if (!finished) attempts += 1;
     }
-    if (failure) { view.fail(failure === "stopped" ? "Stopped." : "That did not complete: " + failure); return null; }
+    if (failure) {
+      view.fail(failure === "stopped" ? "Stopped." : "That did not complete: " + failure);
+      if (failure !== "stopped") feel("concerned", 3.5);
+      return null;
+    }
     return view.finish(finalText);
   }
 
@@ -259,6 +263,7 @@
     show("user", text);
     remember("user", text);
     var view = pendingAnswer();
+    feel("attentive", 1.2, "nod");
     busy = true;
     S.thinking = 1;
     try {
@@ -278,6 +283,7 @@
       S.session = reply.session_id;
       sessionStorage.setItem("jarvis-session", S.session);
       var answer = await follow(reply.run_id, view);
+      if (answer) react(answer);
       if (answer && S.speak) speak(answer);
     } catch (error) {
       view.fail(error.status === 401 ? "The daemon rejected the credential. Open this page with `jarvis hud`." : "Could not reach the assistant.");
@@ -516,6 +522,28 @@
   }
 
   function say(hint) { $("hint").textContent = hint || ""; }
+  // Tell the face what just happened; it decides how to look about it. Absent when the face script did not load.
+  function feel(name, seconds, gesture) {
+    if (!window.JarvisHead) return;
+    if (name) JarvisHead.emote(name, seconds);
+    if (gesture === "nod") JarvisHead.nod();
+    else if (gesture === "shake") JarvisHead.shake();
+  }
+  // An answer carries a feeling (sorry, glad, a question), which the face holds while it speaks and shows briefly if it does not.
+  function react(text) {
+    if (!window.JarvisHead) return;
+    var mood = JarvisHead.mood(text);
+    JarvisHead.speakMood(mood);
+    if (!S.speak) JarvisHead.emote(mood, 3);
+    if (mood === "pleased" || mood === "amused") JarvisHead.nod();
+  }
+  // A line in the conversation itself, because the hint under the box is easy to miss and an answer you gave (a yes, a
+  // Keep) should visibly land. Kept in the transcript so it survives a reload.
+  function notice(text) {
+    show("system", text);
+    remember("system", text);
+    scroll();
+  }
 
   // Answering a question: a plain yes or no is an answer, and only while something is actually waiting.
   var YES = /^(yes|yeah|yep|yup|sure|ok|okay|approve|approved|allow|confirm|proceed|go ahead|do it)( please| jarvis)?$/i;
@@ -523,10 +551,24 @@
 
   // One click or one word: record the owner's answer and let the run carry on.
   function decide(approvalId, approve, via) {
+    var asked = S.pending.filter(function (approval) { return approval.approval_id === approvalId; })[0];
+    var what = asked && asked.tool ? asked.tool : "that";
     return api("/approvals/" + encodeURIComponent(approvalId) + "/decision", "POST",
       { decision: approve ? "approve" : "deny", resume: true, channel: via || "desktop" })
-      .then(function () { say(approve ? "approved" : "denied"); },
-            function (error) { say("could not record that (" + (error.status || "no reply") + ")"); })
+      .then(function () {
+        say(approve ? "approved" : "denied");
+        // Only when this was the one thing waiting, so a second pending question keeps its own chip.
+        if (S.pending.length <= 1) document.querySelectorAll(".chip.wait").forEach(function (chip) {
+          chip.textContent = approve ? "approved" : "denied";
+          chip.className = "chip " + (approve ? "done" : "refused");
+        });
+        notice(approve ? "Approved " + what + ". Carrying on." : "Denied " + what + ". It was not done.");
+        if (approve) feel("pleased", 2.2, "nod"); else feel("neutral", 1.8, "shake");
+      },
+      function (error) {
+        say("could not record that (" + (error.status || "no reply") + ")");
+        notice("Could not record that answer (" + (error.status || "no reply") + "). It is still waiting.");
+      })
       .then(refresh);
   }
 
@@ -644,6 +686,7 @@
   // ---- stopping ------------------------------------------------------------------------------------------------
   function stopEverything() {
     interruptSpeech();
+    feel("alert", 1.6, "shake");
     return api("/runs?limit=50").then(function (list) {
       return Promise.all(list.runs.filter(function (run) { return !run.outcome; }).map(function (run) {
         return api("/runs/" + encodeURIComponent(run.run_id) + "/cancel", "POST").catch(function () {});
@@ -657,11 +700,24 @@
 
   document.addEventListener("keydown", function (event) {
     var typing = document.activeElement && document.activeElement.tagName === "INPUT" && document.activeElement.type === "text";
-    if (event.key === "Escape") { interruptSpeech(); if (recognizer && !S.wake) stopListening(); return; }
+    if (event.key === "Escape") {
+      if (!$("ops").hidden) { setOps(false); return; }
+      interruptSpeech(); if (recognizer && !S.wake) stopListening(); return;
+    }
     if (typing) return;
-    if (event.key === "/") { event.preventDefault(); $("input").focus(); }
+    if (event.key === "o" || event.key === "O") { event.preventDefault(); setOps($("ops").hidden); }
+    else if (event.key === "/") { event.preventDefault(); $("input").focus(); }
     else if (event.key === "m" || event.key === "M") { event.preventDefault(); $("mic").click(); }
   });
+
+  // ---- the Ops page: everything that is not the face or the conversation --------------------------------------------
+  function setOps(open) {
+    $("ops").hidden = !open;
+    if (open) { abilitiesAt = 0; if (typeof refreshAbilities === "function") refreshAbilities(); }
+  }
+  $("open-ops").addEventListener("click", function () { setOps($("ops").hidden); });
+  $("ops-close").addEventListener("click", function () { setOps(false); });
+  $("ops").addEventListener("click", function (event) { if (event.target === $("ops")) setOps(false); });
 
   // ---- the side panels -----------------------------------------------------------------------------------------
   function age(iso) {
@@ -741,7 +797,7 @@
     S.pending = approvals;
     paintStats(runs, approvals, schedules);
 
-    fill("waiting", approvals.map(function (approval) {
+    function approvalCard(approval) {
       var item = el("div", "item");
       var row = el("div", "row");
       row.appendChild(el("span", "tag wait", "risk " + approval.risk_level));
@@ -750,7 +806,14 @@
       item.appendChild(el("div", "obj", clip(approval.arguments ? JSON.stringify(approval.arguments) : approval.preview, 400)));
       item.appendChild(answerButtons(approval.approval_id));
       return item;
-    }), "nothing needs you");
+    }
+    fill("waiting", approvals.map(approvalCard), "nothing needs you");
+    // The same questions sit on the face page too, so nothing waits on you out of sight.
+    $("tray-waiting").replaceChildren.apply($("tray-waiting"), approvals.map(approvalCard));
+    var needs = Math.max(approvals.length, parked.length);
+    var badge = $("ops-count");
+    badge.hidden = needs === 0;
+    badge.textContent = String(needs);
 
     fill("working", working.concat(parked).map(function (run) {
       var item = el("div", "item");
@@ -809,7 +872,17 @@
             ? api("/memories", "POST", { content: memory.content, memory_type: memory.memory_type, source_kind: "user_statement" })
             : null;
         })
-        .then(function () { proposalsAt = 0; refreshProposals(); }, function () { keep.disabled = false; drop.disabled = false; proposalsAt = 0; });
+        .then(function () {
+          notice(keepIt ? "Remembered: " + clip(memory.content, 140) : "Dismissed. I will not offer that again.");
+          if (keepIt) feel("pleased", 2.2, "nod");
+          proposalsAt = 0;
+          refreshProposals();
+        }, function (error) {
+          keep.disabled = false;
+          drop.disabled = false;
+          proposalsAt = 0;
+          notice("Could not " + (keepIt ? "keep" : "dismiss") + " that (" + (error.status || "no reply") + ").");
+        });
     }
     keep.addEventListener("click", function () { settle(true); });
     drop.addEventListener("click", function () { settle(false); });
@@ -829,9 +902,8 @@
         });
       }));
     }).then(function (cards) {
-      var host = $("remember");
-      host.replaceChildren();
-      cards.forEach(function (card) { host.appendChild(proposalCard(card)); });
+      $("remember").replaceChildren.apply($("remember"), cards.map(proposalCard));
+      $("tray-remember").replaceChildren.apply($("tray-remember"), cards.map(proposalCard));
       S.proposals = cards.length;
     }, function () { proposalsAt = 0; });
   }
@@ -1217,13 +1289,9 @@
   var current = palette.idle.slice();
   var energy = 0.12;
   var calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
-  // Where the pointer is, relative to the face, so the eyes and the head turn towards it.
-  var gaze = [0, 0], gazeAim = [0, 0];
-  window.addEventListener("pointermove", function (event) {
-    var box = canvas.getBoundingClientRect();
-    gazeAim[0] = Math.max(-1, Math.min(1, (event.clientX - (box.left + box.width / 2)) / (window.innerWidth * 0.45)));
-    gazeAim[1] = Math.max(-1, Math.min(1, -(event.clientY - (box.top + box.height / 2)) / (window.innerHeight * 0.45)));
-  });
+  // The face is not steered by the pointer. It has a mind of its own (head.js): it looks about, changes expression, blinks and
+  // reacts to what is happening. The console only tells it what happened (JarvisHead.emote, nod, shake, mood).
+
   var NAME = "J.A.R.V.I.S  \u2022  JUST A RATHER VERY INTELLIGENT SYSTEM  \u2022  ";
   var TAU = Math.PI * 2;
 
@@ -1390,7 +1458,7 @@
       ctx.stroke();
     }
 
-    // the head: a real face mesh, whose mouth follows the voice and whose eyes follow the pointer
+    // the head: a real face mesh, whose mouth follows the voice and whose eyes, brows and head move on their own
     if (window.JarvisHead) {
       var mouth = 0;
       if (mode === "speaking") {
@@ -1399,8 +1467,8 @@
           ? Math.min(1, S.voiceLevel * 1.6)
           : 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
       }
-      JarvisHead.draw(ctx, cx, cy, R * 1.42, {
-        rgb: current, energy: energy, mode: mode, mouth: mouth, look: gaze, t: t, calm: calm
+      JarvisHead.draw(ctx, cx, cy, R * 1.62, {
+        rgb: current, energy: energy, mode: mode, mouth: mouth, t: t, calm: calm
       });
     }
     // markers riding the outer rings
@@ -1422,8 +1490,6 @@
     readLevel();
     readVoiceLevel();
     energy += (targetEnergy(mode, t) - energy) * 0.12;
-    gaze[0] += (gazeAim[0] - gaze[0]) * 0.06;
-    gaze[1] += (gazeAim[1] - gaze[1]) * 0.06;
     draw(t, mode);
     requestAnimationFrame(frame);
   }
@@ -1434,4 +1500,6 @@
   refresh();
   setInterval(refresh, 1500);
   paintHeader();
+  // a greeting when the console opens: a smile and a nod, then it carries on with its own business
+  setTimeout(function () { feel("pleased", 2.4, "nod"); }, 900);
 })();

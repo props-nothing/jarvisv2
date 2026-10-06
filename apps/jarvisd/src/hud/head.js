@@ -54,6 +54,28 @@
   // The corners of the mouth are pinned part-way, so the lips shear rather than split.
   jaw[61] = Math.max(jaw[61], 0.3); jaw[291] = Math.max(jaw[291], 0.3);
 
+  // Expression weights, found from the geometry in the same way. The eyes squash and stretch about their own centres (which is
+  // what a lid does to a wire face), the corners of the mouth lift or drop with a smile or a frown, and the inner and outer ends
+  // of each brow move on their own, which is what tells worry from anger from a raised eyebrow.
+  function centre(ids) {
+    var c = [0, 0], k;
+    for (k = 0; k < ids.length; k += 1) { c[0] += BASE[ids[k] * 3]; c[1] += BASE[ids[k] * 3 + 1]; }
+    return [c[0] / ids.length, c[1] / ids.length];
+  }
+  var MOUTH_C = centre(LIPS_OUT), EYE_C = [centre(EYE_L), centre(EYE_R)];
+  var mouthW = new Float32Array(N), eyeW = new Float32Array(N), eyeSide = new Uint8Array(N);
+  var innerW = new Float32Array(N), sideW = new Float32Array(N);
+  for (i = 0; i < N; i += 1) {
+    var vx = BASE[i * 3], vy = BASE[i * 3 + 1], e;
+    mouthW[i] = smooth(0, 1, 1 - Math.hypot((vx - MOUTH_C[0]) / 5.4, (vy - MOUTH_C[1]) / 2.7));
+    for (e = 0; e < 2; e += 1) {
+      var w = smooth(0, 1, 1 - Math.hypot((vx - EYE_C[e][0]) / 2.5, (vy - EYE_C[e][1]) / 1.35));
+      if (w > eyeW[i]) { eyeW[i] = w; eyeSide[i] = e; }
+    }
+    innerW[i] = brow[i] * (1 - smooth(1.0, 3.4, Math.abs(vx)));
+    sideW[i] = brow[i] * (vx > 0 ? 1 : -1);
+  }
+
   var cur = new Float32Array(N * 3);   // deformed model space
   var sx = new Float32Array(N), sy = new Float32Array(N), sz = new Float32Array(N);
   var rx = new Float32Array(N), ry = new Float32Array(N);
@@ -97,8 +119,47 @@
   })();
 
   var frontFacing = 1;   // sign of the triangle normal that faces the viewer, found once from the rest pose
-  var pose = { yaw: 0, pitch: 0, roll: 0, jaw: 0, brow: 0, blink: 0, look: [0, 0] };
-  var blinkAt = 3, blinkUntil = 0;
+  var pose = { yaw: 0, pitch: 0, roll: 0, jaw: 0, blink: 0, eyeOpen: 1, look: [0, 0] };
+  // What the face is doing, as a handful of channels that ease towards whatever the mind below wants.
+  var expr = { brow: 0, inner: 0, asym: 0, smile: 0.05, open: 1, jaw: 0, yaw: 0, pitch: 0, roll: 0 };
+
+  // Expressions, as targets for those channels. brow lifts both brows, inner lifts (or, negative, drops) the inner ends (worry
+  // up, anger down), asym lifts one brow more than the other (a raised eyebrow), smile is a smile (or, negative, a frown), open is
+  // how wide the eyes are, jaw is how far the mouth hangs, and yaw/pitch/roll lean the head.
+  var EMO = {
+    neutral:   { brow: 0,     inner: 0,     asym: 0,    smile: 0.06,  open: 1,    jaw: 0,    yaw: 0,     pitch: 0,     roll: 0 },
+    pleasant:  { brow: 0.08,  inner: 0,     asym: 0,    smile: 0.28,  open: 0.96, jaw: 0,    yaw: 0,     pitch: -0.01,  roll: 0.01 },
+    attentive: { brow: 0.5,   inner: 0.15,  asym: 0,    smile: 0.12,  open: 1.16, jaw: 0,    yaw: 0,     pitch: -0.04,  roll: 0 },
+    curious:   { brow: 0.35,  inner: 0.1,   asym: 0.85, smile: 0.1,   open: 1.08, jaw: 0,    yaw: 0.08,  pitch: -0.02,  roll: 0.1 },
+    amused:    { brow: 0.3,   inner: -0.1,  asym: 0.3,  smile: 1,     open: 0.68, jaw: 0.03, yaw: -0.05, pitch: -0.03,  roll: -0.06 },
+    pleased:   { brow: 0.3,   inner: 0,     asym: 0,    smile: 0.72,  open: 0.84, jaw: 0,    yaw: 0,     pitch: -0.035, roll: 0.02 },
+    thinking:  { brow: 0.12,  inner: 0.3,   asym: 0.55, smile: -0.05, open: 0.84, jaw: 0,    yaw: 0.14,  pitch: 0.05,   roll: -0.04 },
+    focused:   { brow: -0.3,  inner: -0.45, asym: 0,    smile: -0.02, open: 0.74, jaw: 0,    yaw: 0,     pitch: 0.02,   roll: 0 },
+    alert:     { brow: 0.9,   inner: 0.25,  asym: 0,    smile: 0,     open: 1.3,  jaw: 0.04, yaw: 0,     pitch: -0.05,  roll: 0 },
+    surprised: { brow: 1,     inner: 0.3,   asym: 0,    smile: 0.05,  open: 1.45, jaw: 0.3,  yaw: 0,     pitch: -0.07,  roll: 0 },
+    concerned: { brow: 0.15,  inner: 0.95,  asym: 0,    smile: -0.6,  open: 0.94, jaw: 0,    yaw: 0,     pitch: 0.07,   roll: 0.05 },
+    sleepy:    { brow: -0.12, inner: 0,     asym: 0,    smile: 0.02,  open: 0.3,  jaw: 0,    yaw: 0,     pitch: 0.13,   roll: 0.02 }
+  };
+  var CHANNELS = ["brow", "inner", "asym", "smile", "open", "jaw", "yaw", "pitch", "roll"];
+
+  // The mind: nothing here follows the pointer. When nothing is happening the face lives on its own: it looks about, changes
+  // expression, blinks, sighs and nods off after a long quiet; when something is happening it reacts to that (listening,
+  // thinking, speaking, waiting on you), and the console can make it react to an event (emote, nod, shake).
+  var IDLE_MOODS = [["neutral", 5], ["pleasant", 3], ["curious", 2], ["thinking", 1.6], ["amused", 1.1], ["pleased", 1], ["focused", 0.8], ["attentive", 0.8]];
+  var mind = {
+    emotion: "neutral", until: 0, gazeAt: 0, gazeTo: [0, 0], look: [0, 0], jitterAt: 0, jitter: [0, 0],
+    blinkAt: 2.5, blinkFrom: -9, blinkLen: 0.17, lastT: 0, lastMode: "idle", quietFrom: 0,
+    override: null, requested: null, speakMood: "pleasant", nodFrom: -9, shakeFrom: -9, sighFrom: -9, nextSigh: 25,
+    beatAt: 0, kick: 0, lastMouth: 0
+  };
+  function pick(table) {
+    var total = 0, k;
+    for (k = 0; k < table.length; k += 1) total += table[k][1];
+    var r = Math.random() * total;
+    for (k = 0; k < table.length; k += 1) { r -= table[k][1]; if (r <= 0) return table[k][0]; }
+    return table[0][0];
+  }
+  function between(a, b) { return a + Math.random() * (b - a); }
 
   function rotate(px, py, pz, yaw, pitch, roll, out) {
     var cy = Math.cos(yaw), sy2 = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch), cr = Math.cos(roll), sr = Math.sin(roll);
@@ -121,7 +182,20 @@
         // the mouth also widens a little as it opens, which is what reads as speech rather than a hinge
         x *= 1 + 0.05 * open * w;
       }
-      y += brow[v] * pose.brow * 0.9;
+      y += brow[v] * expr.brow * 0.9 + innerW[v] * expr.inner * 1.1 + sideW[v] * expr.asym * 0.8;
+      // the eyes: squash or stretch about each eye's centre, which is a blink, a squint or wide eyes
+      var ew = eyeW[v];
+      if (ew > 0) {
+        var ec = EYE_C[eyeSide[v]];
+        y = ec[1] + (y - ec[1]) * (1 + (pose.eyeOpen - 1) * ew);
+      }
+      // the mouth: the corners lift with a smile and drop with a frown, and it widens a little with a smile
+      var mw = mouthW[v];
+      if (mw > 0) {
+        var corner = smooth(0.6, 3.4, Math.abs(x - MOUTH_C[0]));
+        y += expr.smile * (0.95 * corner - 0.12 * (1 - corner)) * mw;
+        x += (x - MOUTH_C[0]) * 0.07 * expr.smile * mw;
+      }
       cur[v * 3] = x; cur[v * 3 + 1] = y; cur[v * 3 + 2] = z;
     }
   }
@@ -168,45 +242,149 @@
     var ex = 0, ey = 0, k;
     for (k = 0; k < ids.length; k += 1) { ex += rx[ids[k]]; ey += ry[ids[k]]; }
     ex /= ids.length; ey /= ids.length;
-    var open = 1 - pose.blink;
-    var gx = pose.look[0] * scale * 0.5, gy = -pose.look[1] * scale * 0.3;
-    var r = scale * 1.7;
-    var g = ctx.createRadialGradient(ex + gx, ey + gy, 0, ex + gx, ey + gy, r);
-    g.addColorStop(0, "rgba(255,255,255," + (0.95 * open) + ")");
-    g.addColorStop(0.25, rgba(0.85 * open));
+    var open = Math.max(0, Math.min(1, pose.eyeOpen));
+    var gx = pose.look[0] * scale * 0.55, gy = -pose.look[1] * scale * 0.3;
+    // wider eyes glow larger and brighter, a squint or a blink flattens the glow, so the light reads as an eye and not a lamp
+    var r = scale * (1.35 + 0.5 * Math.min(1.4, pose.eyeOpen));
+    ctx.save();
+    ctx.translate(ex + gx, ey + gy);
+    ctx.scale(1, Math.max(0.1, Math.min(1.25, pose.eyeOpen)));
+    var g = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+    g.addColorStop(0, "rgba(255,255,255," + (0.95 * Math.min(1, open * 1.4)) + ")");
+    g.addColorStop(0.25, rgba(0.85 * Math.min(1, open * 1.4)));
     g.addColorStop(1, rgba(0));
     ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(ex + gx, ey + gy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
   }
 
-  // state: { rgb:[r,g,b], energy, mode, mouth (0..1), look:[x,y] (-1..1), t (seconds), calm (bool) }
+  // Runs once a frame: chooses what the face is feeling, eases every channel towards it, and moves the eyes and head.
+  function think(t, mode, state) {
+    var dt = Math.max(0.001, Math.min(0.1, t - mind.lastT));
+    mind.lastT = t;
+    var sway = state.calm ? 0 : 1;
+
+    // a request from the console (emote) starts now and runs for its duration
+    if (mind.requested) { mind.override = { name: mind.requested.name, until: t + mind.requested.seconds }; mind.requested = null; }
+    if (mode !== "idle") mind.quietFrom = t;
+    if (mode !== mind.lastMode) { mind.until = 0; mind.gazeAt = 0; mind.lastMode = mode; }
+
+    // 1. what it feels
+    var emotion = mind.emotion;
+    if (mind.override && t < mind.override.until) {
+      emotion = mind.override.name;
+    } else if (mode === "offline") {
+      emotion = "sleepy";
+    } else if (mode === "waiting") {
+      emotion = Math.floor(t / 3.2) % 2 ? "alert" : "curious";
+    } else if (mode === "listening") {
+      emotion = "attentive";
+    } else if (mode === "working") {
+      if (t >= mind.until) { emotion = Math.random() < 0.55 ? "thinking" : "focused"; mind.until = t + between(2.2, 4.5); } else emotion = mind.emotion;
+    } else if (mode === "speaking") {
+      emotion = mind.speakMood;
+    } else if (t >= mind.until) {
+      // standing by: drift between moods, and nod off after a long quiet
+      emotion = t - mind.quietFrom > 150 ? "sleepy" : pick(IDLE_MOODS);
+      mind.until = t + between(3.5, 8.5);
+    } else {
+      emotion = mind.emotion;
+    }
+    mind.emotion = emotion;
+
+    var target = EMO[emotion] || EMO.neutral;
+    var rate = 1 - Math.exp(-dt * 4.2);
+    var k;
+    for (k = 0; k < CHANNELS.length; k += 1) {
+      var key = CHANNELS[k], want = target[key];
+      if (key === "brow") want += mind.kick;
+      expr[key] += (want - expr[key]) * rate;
+    }
+    mind.kick *= Math.exp(-dt * 2.6);
+
+    // speaking: a beat of the voice lifts the brows and nods the head, so the face emphasises what is said
+    var mouth = Math.max(0, Math.min(1, state.mouth));
+    if (mode === "speaking" && mouth > 0.7 && mind.lastMouth < 0.4 && t > mind.beatAt) {
+      mind.beatAt = t + between(0.7, 1.4);
+      mind.kick = 0.35;
+      if (Math.random() < 0.3) mind.nodFrom = t;
+    }
+    mind.lastMouth = mouth;
+
+    // 2. where it looks: eyes first, in quick jumps, and the head follows a little behind
+    if (t >= mind.gazeAt) {
+      var to = mind.gazeTo, hold;
+      if (mode === "listening") { to = Math.random() < 0.8 ? [0, 0.02] : [between(-0.35, 0.35), between(-0.1, 0.2)]; hold = between(1.2, 3); }
+      else if (mode === "speaking") { to = Math.random() < 0.7 ? [0, 0] : [between(-0.7, 0.7), between(0.1, 0.45)]; hold = between(1.4, 3.2); }
+      else if (mode === "working") { to = [(Math.random() < 0.5 ? -1 : 1) * between(0.3, 0.8), between(0.15, 0.55)]; hold = between(0.9, 2.2); }
+      else if (mode === "waiting") { to = Math.random() < 0.5 ? [0, 0] : [-0.75, -0.45]; hold = between(1, 2.2); }
+      else if (mode === "offline") { to = [0, -0.3]; hold = 5; }
+      else {
+        var r = Math.random();
+        if (emotion === "sleepy") { to = [0, -0.35]; hold = between(3, 6); }
+        else if (r < 0.3) { to = [between(-0.05, 0.05), between(-0.05, 0.1)]; hold = between(1.5, 4); }
+        else if (r < 0.4) { to = [0.95, -0.1]; hold = between(0.8, 1.6); }
+        else { to = [between(-0.85, 0.85), between(-0.45, 0.55)]; hold = between(0.8, 3.2); }
+      }
+      if (Math.hypot(to[0] - mind.gazeTo[0], to[1] - mind.gazeTo[1]) > 0.7 && Math.random() < 0.45) mind.blinkAt = Math.min(mind.blinkAt, t + 0.08);
+      mind.gazeTo = to;
+      mind.gazeAt = t + hold;
+    }
+    if (t >= mind.jitterAt) { mind.jitter = [between(-0.03, 0.03), between(-0.03, 0.03)]; mind.jitterAt = t + between(0.25, 0.9); }
+    var glide = 1 - Math.exp(-dt * 16);
+    mind.look[0] += (mind.gazeTo[0] + mind.jitter[0] - mind.look[0]) * glide;
+    mind.look[1] += (mind.gazeTo[1] + mind.jitter[1] - mind.look[1]) * glide;
+    pose.look = mind.look;
+
+    // 3. blinks: irregular, sometimes two together, slow when sleepy
+    if (t >= mind.blinkAt) {
+      mind.blinkFrom = t;
+      mind.blinkLen = emotion === "sleepy" ? 0.4 : 0.17;
+      mind.blinkAt = t + (emotion === "sleepy" ? between(1.5, 3) : Math.random() < 0.15 ? 0.3 : between(2, 6));
+    }
+    var into = (t - mind.blinkFrom) / mind.blinkLen;
+    var blink = into >= 0 && into <= 1 ? Math.sin(Math.PI * into) : 0;
+    if (mode === "offline") blink = 1;
+    pose.blink = blink;
+    pose.eyeOpen = Math.max(0.1, expr.open * (1 - 0.92 * blink));
+
+    // 4. the head: a slow wander of its own, the lean of the emotion, a lean after the eyes, and any nod, shake or sigh
+    var wander = sway * (mode === "speaking" ? 1.4 : 1);
+    var yaw = expr.yaw + wander * (Math.sin(t * 0.31) * 0.09 + Math.sin(t * 0.77 + 1.3) * 0.045) + mind.look[0] * 0.3;
+    var pitch = expr.pitch + wander * (Math.sin(t * 0.23 + 1) * 0.03 + Math.sin(t * 0.61) * 0.015) - mind.look[1] * 0.14;
+    var roll = expr.roll + wander * (Math.sin(t * 0.29) * 0.025 + Math.sin(t * 0.83 + 2) * 0.012);
+    if (mode === "working") yaw += sway * Math.sin(t * 1.6) * 0.04;
+    if (mode === "idle" && t > mind.nextSigh) { mind.sighFrom = t; mind.nextSigh = t + between(25, 60); }
+    var sigh = (t - mind.sighFrom) / 2.2;
+    var sighing = sigh >= 0 && sigh <= 1 ? Math.sin(Math.PI * sigh) : 0;
+    pitch += sway * sighing * 0.07;
+    var nod = t - mind.nodFrom;
+    if (nod >= 0 && nod < 1.2) pitch += sway * 0.1 * Math.sin(nod * 13) * Math.exp(-nod * 3.2);
+    var shake = t - mind.shakeFrom;
+    if (shake >= 0 && shake < 1.2) yaw += sway * 0.16 * Math.sin(shake * 15) * Math.exp(-shake * 3);
+    var ease = 1 - Math.exp(-dt * 6);
+    pose.yaw += (yaw - pose.yaw) * ease;
+    pose.pitch += (pitch - pose.pitch) * ease;
+    pose.roll += (roll - pose.roll) * ease;
+    pose.jaw += (Math.max(mouth, expr.jaw + sighing * 0.1) - pose.jaw) * 0.45;
+
+    // breathing: a slow swell and a small rise and fall
+    var breath = sway * Math.sin(t * 1.45);
+    return { breath: 1 + breath * 0.006 * (mode === "offline" ? 0.3 : 1), bob: breath * 0.004 };
+  }
+
+  // state: { rgb:[r,g,b], energy, mode, mouth (0..1), t (seconds), calm (bool) }
   function draw(ctx, cx, cy, size, state) {
     var t = state.t, mode = state.mode, calm = state.calm;
     var rgb = state.rgb;
     function rgba(a) { return "rgba(" + Math.round(rgb[0]) + "," + Math.round(rgb[1]) + "," + Math.round(rgb[2]) + "," + Math.max(0, Math.min(1, a)) + ")"; }
     var dim = mode === "offline" ? 0.4 : 1;
+
+    // the mind decides the expression, the gaze, the blinks and the lean of the head
+    var live = think(t, mode, state);
+    cy += live.bob * size;
+    size *= live.breath;
     var scale = size / 24;
-
-    // expression and pose follow the state
-    var sway = calm ? 0 : 1;
-    var targetYaw = Math.sin(t * 0.37) * 0.3 * sway + state.look[0] * 0.5;
-    var targetPitch = Math.sin(t * 0.23 + 1) * 0.04 * sway - state.look[1] * 0.25;
-    var targetRoll = Math.sin(t * 0.29) * 0.025 * sway;
-    var targetBrow = 0;
-    if (mode === "listening") { targetPitch -= 0.08; targetBrow = 0.45; }
-    if (mode === "waiting") { targetRoll += 0.07; targetBrow = 1; }
-    if (mode === "working") { targetYaw += Math.sin(t * 1.6) * 0.12 * sway; }
-    if (mode === "offline") { targetYaw = 0; targetPitch = 0.1; targetRoll = 0; }
-    var ease = 0.08;
-    pose.yaw += (targetYaw - pose.yaw) * ease;
-    pose.pitch += (targetPitch - pose.pitch) * ease;
-    pose.roll += (targetRoll - pose.roll) * ease;
-    pose.brow += (targetBrow - pose.brow) * 0.1;
-    pose.jaw += (Math.max(0, Math.min(1, state.mouth)) - pose.jaw) * 0.45;
-    pose.look = state.look;
-    if (t > blinkAt) { blinkUntil = t + 0.14; blinkAt = t + 2.2 + Math.random() * 3.6; }
-    pose.blink = mode === "offline" ? 1 : (t < blinkUntil ? 1 : pose.blink * 0.7);
-
     deform();
     project(cx, cy, scale);
 
@@ -305,5 +483,26 @@
     ctx.restore();
   }
 
-  window.JarvisHead = { draw: draw, triangles: TRIS, vertices: N };
+  // How the console steers the face. None of these move it by hand: they say what just happened, and the mind reacts.
+  //   emote(name, seconds)  feel something for a while        nod() / shake()  yes / no
+  //   mood(text)            the feeling an answer carries      speakMood(name)  the mood to hold while speaking
+  function mood(text) {
+    var s = String(text || "").toLowerCase();
+    if (/\b(sorry|unable|cannot|can't|couldn't|could not|failed|error|unfortunately|problem|refused|denied)\b/.test(s)) return "concerned";
+    if (/\b(haha|funny|joke|lol|amusing)\b/.test(s)) return "amused";
+    if (/!|\b(great|glad|happy|love|awesome|nice|congrat|welcome|delighted|good evening|good morning|hello|done)\b/.test(s)) return "pleased";
+    if (/\?\s*$/.test(s)) return "curious";
+    if (/\b(perhaps|might|however|depends|consider|not sure|unclear)\b/.test(s)) return "thinking";
+    return "pleasant";
+  }
+  function emote(name, seconds) { if (EMO[name]) mind.requested = { name: name, seconds: seconds || 2.5 }; }
+  function nod() { mind.nodFrom = mind.lastT; }
+  function shake() { mind.shakeFrom = mind.lastT; }
+  function speakMood(name) { if (EMO[name]) mind.speakMood = name; }
+  function current() { return mind.emotion; }
+
+  window.JarvisHead = {
+    draw: draw, triangles: TRIS, vertices: N, emotions: Object.keys(EMO),
+    mood: mood, emote: emote, nod: nod, shake: shake, speakMood: speakMood, current: current
+  };
 })();

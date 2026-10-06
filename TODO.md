@@ -7046,6 +7046,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   text as the person's own statement (which retrieval reads), Dismiss forgets it. Live: asked to remember, the card appeared, Keep
   made it `active user_statement`, and a later answer in a new run followed it. Tests: two claims share one owner; an invented id is
   still refused with a 422; a proposal with no subject is still `Proposed`; an explicit empty `entity_ids` is still refused.
+  Feedback: an answer you give now lands in the conversation itself ("Approved jarvis.web.fetch. Carrying on.", "Remembered: ...",
+  "Denied ...", or a failure), and the "waiting for your approval" chip turns to "approved" or "denied"; before, only a hint under the
+  box changed. Checked live with a held `jarvis.web.fetch` and with Keep.
   Not done: keeping a proposal by voice ("Jarvis, keep that") or in one terminal step.
 - [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
