@@ -17,6 +17,7 @@
     </div>
     <div class="spacer"></div>
     <span id="clock" aria-hidden="true"></span>
+    <button id="open-settings" title="Models, keys, voice, folders and what it may do without asking">Settings</button>
     <button id="stop" class="danger" hidden title="Cancel everything that is running or waiting">Stop everything</button>
   </header>
 
@@ -59,7 +60,19 @@
     </aside>
   </div>
 </div>
-<script src="/head.js"></script>
+<div id="settings" class="overlay" hidden>
+  <div class="sheet frame" role="dialog" aria-label="Settings">
+    <h2>Settings</h2>
+    <div id="settings-tabs" class="tabs" role="tablist"></div>
+    <div id="settings-note" role="status"></div>
+    <div id="settings-body"></div>
+    <div class="foot">
+      <span class="dim" id="settings-hint">Changes apply after a restart.</span>
+      <button id="settings-restart" title="Stops JARVIS and starts it again with the saved settings">Restart to apply</button>
+      <button id="settings-close">Close</button>
+    </div>
+  </div>
+</div><script src="/head.js"></script>
 <script src="/hud.js"></script>
 </body>
 </html>

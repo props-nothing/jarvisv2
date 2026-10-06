@@ -811,6 +811,262 @@
     api("/tools").then(function (result) { renderAbilities(result.tools || []); }, function () { abilitiesAt = 0; });
   }
 
+  // ---- settings: five tabs, each saying what is set, what the default is, and why a setting is off -------------------------
+  // The same checks as `jarvis config` and `jarvis keys` (one code path in the daemon). A key is typed into a password field,
+  // sent once, and the field is cleared; the daemon never sends it back, only whether it is set.
+  var TABS = [
+    ["brain", "Brain", "Which model JARVIS thinks with, and the key for it."],
+    ["voice", "Voice", "How JARVIS sounds. Without a voice key it speaks with your browser's own voice."],
+    ["files", "Folders & code", "What JARVIS may touch. Both are off until you turn them on, so nothing is reachable by accident."],
+    ["permissions", "Permissions", "For each tool: let the rules decide, always ask, run without asking, or switch it off."],
+    ["advanced", "Advanced", "Ports. The defaults are right for almost everyone."]
+  ];
+  var sview = { reply: null, tools: [], tab: "brain" };
+  function settingsNote(text, bad) {
+    var note = $("settings-note");
+    note.textContent = text || "";
+    note.className = bad ? "bad" : "ok";
+  }
+  function failure(error) {
+    settingsNote("Could not do that (" + (error.status || "no reply") + ")", true);
+  }
+  function explain(error, fallback) {
+    // The daemon explains a refusal in its error body; show that rather than a status number.
+    return error && error.body ? error.body : fallback;
+  }
+  function putJson(path, method, body) {
+    var init = { method: method, cache: "no-store", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" } };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    return fetch("/api/v1" + path, init).then(function (response) {
+      if (response.ok) return response.json();
+      return response.json().catch(function () { return {}; }).then(function (reply) {
+        var error = new Error(String(response.status));
+        error.status = response.status;
+        error.body = reply && reply.message ? reply.message : null;
+        throw error;
+      });
+    });
+  }
+  function saved(what) {
+    settingsNote(what + " saved. Restart to apply.");
+    $("settings-restart").className = "hot";
+    loadSettings();
+  }
+  function valuesFor(kind, text) {
+    var t = text.trim();
+    if (kind === "folders") return t.split(";").map(function (part) { return part.trim(); }).filter(Boolean);
+    if (kind === "tools") return t.split(/[\s,]+/).filter(Boolean);
+    return [t];
+  }
+  function showFor(setting) {
+    if (setting.value === null || setting.value === undefined) return "";
+    // The daemon lists a list value with ", "; folders are shown separated by ";" and a command by plain spaces.
+    if (setting.kind === "folders") return String(setting.value).split(", ").join("; ");
+    if (setting.kind === "words") return String(setting.value).split(", ").join(" ");
+    return String(setting.value);
+  }
+  function byKey(name) {
+    return ((sview.reply && sview.reply.settings) || []).filter(function (s) { return s.key === name; })[0];
+  }
+  function stateBadge(setting) {
+    var set = setting.value !== null && setting.value !== undefined;
+    var atDefault = set && setting.default && String(setting.value) === String(setting.default);
+    return el("span", "badge " + (set && !atDefault ? "on" : "off"), atDefault ? "default" : set ? "set" : setting.default ? "default" : "off");
+  }
+  // One setting: its field, Save (and Unset when set), and either its help (when set) or what "unset" means (when not).
+  function settingRow(setting, label) {
+    var row = el("div", "set-row");
+    var name = el("span", "name", label || setting.key.replace(/^(daemon|policy)\./, ""));
+    name.appendChild(stateBadge(setting));
+    var field = el("input");
+    field.type = "text";
+    field.value = showFor(setting);
+    field.placeholder = setting.default ? "default: " + setting.default : (setting.example ? "e.g. " + setting.example : "(not set)");
+    var acts = el("div", "acts");
+    var save = el("button", "", "Save");
+    save.addEventListener("click", function () {
+      var values = valuesFor(setting.kind, field.value);
+      if (!values.length || !values[0]) { settingsNote("Enter a value, or use Unset.", true); return; }
+      putJson("/settings/" + encodeURIComponent(setting.key), "PUT", { values: values }).then(function () {
+        saved(setting.key);
+      }, function (error) { settingsNote(explain(error, "That value was refused."), true); });
+    });
+    acts.appendChild(save);
+    if (setting.value !== null && setting.value !== undefined) {
+      var unset = el("button", "", "Unset");
+      unset.addEventListener("click", function () {
+        putJson("/settings/" + encodeURIComponent(setting.key), "DELETE").then(function () { saved(setting.key + " removed;"); },
+          function (error) { settingsNote(explain(error, "That cannot be removed on its own."), true); });
+      });
+      acts.appendChild(unset);
+    }
+    row.appendChild(name);
+    row.appendChild(field);
+    row.appendChild(acts);
+    var set = setting.value !== null && setting.value !== undefined;
+    row.appendChild(el("span", "help", set ? setting.help : setting.unset_means));
+    return row;
+  }
+  function keyRow(which, label) {
+    var state = sview.reply && sview.reply.keys && sview.reply.keys[which] ? sview.reply.keys[which].state : "unknown";
+    var row = el("div", "set-row");
+    var name = el("span", "name", label);
+    name.appendChild(el("span", "badge " + (state === "set" ? "on" : "off"), state));
+    var field = el("input");
+    field.type = "password";
+    field.autocomplete = "off";
+    field.placeholder = state === "set" ? "set; paste a new key to replace it" : "paste a key";
+    var acts = el("div", "acts");
+    var save = el("button", "", "Save key");
+    save.addEventListener("click", function () {
+      var value = field.value;
+      field.value = "";
+      if (!value.trim()) { settingsNote("Paste a key first.", true); return; }
+      putJson("/settings/keys/" + which, "PUT", { key: value }).then(function () { saved(label); },
+        function (error) { settingsNote(explain(error, "That key was refused."), true); });
+    });
+    acts.appendChild(save);
+    if (which === "voice" && state === "set") {
+      var remove = el("button", "", "Remove");
+      remove.addEventListener("click", function () {
+        putJson("/settings/keys/voice", "DELETE").then(function () { saved("Voice key removed;"); },
+          function (error) { settingsNote(explain(error, "Could not remove it."), true); });
+      });
+      acts.appendChild(remove);
+    }
+    row.appendChild(name);
+    row.appendChild(field);
+    row.appendChild(acts);
+    row.appendChild(el("span", "help", which === "model"
+      ? "Stored in a private file on this machine and never shown again. Local Ollama needs no real key."
+      : "An ElevenLabs API key. Stored in a private file and never shown again; what JARVIS says is sent to ElevenLabs to be spoken."));
+    return row;
+  }
+  // Two settings that only make sense together are saved together.
+  function codeCard() {
+    var image = byKey("daemon.code_sandbox_image"), command = byKey("daemon.code_sandbox_interpreter");
+    var card = el("div", "card");
+    var title = el("h4", "", "Code sandbox");
+    title.appendChild(el("span", "badge " + (image && image.value ? "on" : "off"), image && image.value ? "on" : "off"));
+    card.appendChild(title);
+    card.appendChild(el("p", "lead", image && image.value ? "JARVIS can run code in a disposable container with no network."
+      : image.unset_means));
+    var row = el("div", "set-row");
+    row.appendChild(el("span", "name", "image"));
+    var imageField = el("input");
+    imageField.type = "text"; imageField.value = showFor(image); imageField.placeholder = "e.g. " + image.example;
+    row.appendChild(imageField);
+    row.appendChild(el("span"));
+    var row2 = el("div", "set-row");
+    row2.appendChild(el("span", "name", "command"));
+    var commandField = el("input");
+    commandField.type = "text"; commandField.value = showFor(command); commandField.placeholder = "e.g. " + command.example;
+    row2.appendChild(commandField);
+    var acts = el("div", "acts");
+    var save = el("button", "", "Save sandbox");
+    save.addEventListener("click", function () {
+      if (!imageField.value.trim() || !commandField.value.trim()) { settingsNote("Give both the image and the command.", true); return; }
+      putJson("/settings", "PUT", { changes: [
+        { key: "daemon.code_sandbox_image", values: [imageField.value.trim()] },
+        { key: "daemon.code_sandbox_interpreter", values: [commandField.value.trim()] }
+      ] }).then(function () { saved("Code sandbox"); }, function (error) { settingsNote(explain(error, "That was refused."), true); });
+    });
+    acts.appendChild(save);
+    if (image && image.value) {
+      var off = el("button", "", "Turn off");
+      off.addEventListener("click", function () {
+        putJson("/settings", "PUT", { changes: [
+          { key: "daemon.code_sandbox_image", values: null }, { key: "daemon.code_sandbox_interpreter", values: null }
+        ] }).then(function () { saved("Code sandbox turned off;"); }, function (error) { settingsNote(explain(error, "Could not turn it off."), true); });
+      });
+      acts.appendChild(off);
+    }
+    row2.appendChild(acts);
+    card.appendChild(row);
+    card.appendChild(row2);
+    return card;
+  }
+  var POSTURES = [["default", "Default (the rules decide)"], ["ask", "Always ask first"], ["trusted", "Run without asking"], ["off", "Off"]];
+  function permissionsPanel(into) {
+    var postures = (sview.reply && sview.reply.postures) || {};
+    if (!sview.tools.length) { into.appendChild(el("p", "lead", "No tools are available to configure yet.")); return; }
+    sview.tools.slice().sort(function (a, b) { return String(a.title).localeCompare(String(b.title)); }).forEach(function (tool) {
+      var row = el("div", "perm");
+      var label = el("div");
+      label.appendChild(el("div", "tname", tool.title || tool.id));
+      label.appendChild(el("div", "tid", tool.id + "  \u2022  risk " + tool.risk + (tool.asks_first ? "  \u2022  asks by default" : "  \u2022  runs by default")));
+      var select = el("select");
+      POSTURES.forEach(function (option) {
+        var node = el("option", "", option[1]);
+        node.value = option[0];
+        select.appendChild(node);
+      });
+      select.value = postures[tool.id] || "default";
+      select.addEventListener("change", function () {
+        putJson("/settings/tools/" + encodeURIComponent(tool.id), "PUT", { posture: select.value }).then(function () { saved(tool.title + ":"); },
+          function (error) { settingsNote(explain(error, "That was refused."), true); loadSettings(); });
+      });
+      row.appendChild(label);
+      row.appendChild(select);
+      into.appendChild(row);
+    });
+    into.appendChild(el("p", "lead", "Anything that talks to other people always asks, and nothing runs above the workspace ceiling, whatever is chosen here."));
+  }
+  function renderSettings() {
+    var tabs = $("settings-tabs"), body = $("settings-body");
+    tabs.replaceChildren();
+    body.replaceChildren();
+    TABS.forEach(function (tab) {
+      var button = el("button", sview.tab === tab[0] ? "on" : "", tab[1]);
+      button.addEventListener("click", function () { sview.tab = tab[0]; settingsNote(""); renderSettings(); });
+      tabs.appendChild(button);
+    });
+    var current = TABS.filter(function (tab) { return tab[0] === sview.tab; })[0];
+    body.appendChild(el("p", "lead", current[2]));
+    if (!sview.reply) return;
+    var settings = sview.reply.settings || [];
+    var inGroup = function (name) { return settings.filter(function (s) { return s.group === name && !/_api_key_ref$/.test(s.key); }); };
+    if (sview.tab === "brain") {
+      body.appendChild(keyRow("model", "Model key"));
+      inGroup("brain").forEach(function (s) { body.appendChild(settingRow(s)); });
+    } else if (sview.tab === "voice") {
+      var voiceKey = sview.reply.keys && sview.reply.keys.voice ? sview.reply.keys.voice.state : "";
+      body.appendChild(el("p", "lead", voiceKey === "set" ? "Using the ElevenLabs voice below (after a restart)." : "Using your browser's own voice. Add an ElevenLabs key for a natural one."));
+      body.appendChild(keyRow("voice", "Voice key"));
+      inGroup("voice").forEach(function (s) { body.appendChild(settingRow(s)); });
+    } else if (sview.tab === "files") {
+      inGroup("files").filter(function (s) { return !/code_sandbox/.test(s.key); }).forEach(function (s) { body.appendChild(settingRow(s, "folders")); });
+      if (byKey("daemon.code_sandbox_image")) body.appendChild(codeCard());
+    } else if (sview.tab === "permissions") {
+      permissionsPanel(body);
+    } else {
+      inGroup("advanced").forEach(function (s) { body.appendChild(settingRow(s)); });
+    }
+  }
+  function loadSettings() {
+    api("/settings").then(function (reply) { sview.reply = reply; renderSettings(); }, failure);
+    api("/tools").then(function (reply) { sview.tools = reply.tools || []; if (sview.tab === "permissions") renderSettings(); }, function () { sview.tools = []; });
+  }
+  function openSettings() {
+    $("settings").hidden = false;
+    settingsNote("");
+    renderSettings();
+    loadSettings();
+  }
+  function closeSettings() { $("settings").hidden = true; }
+  $("open-settings").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings").addEventListener("click", function (event) { if (event.target === $("settings")) closeSettings(); });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !$("settings").hidden) { closeSettings(); event.stopPropagation(); }
+  }, true);
+  $("settings-restart").addEventListener("click", function () {
+    settingsNote("Restarting. This page reconnects by itself in a few seconds.");
+    putJson("/restart", "POST").then(function () {
+      $("settings-restart").className = "";
+      setTimeout(closeSettings, 1500);
+    }, function (error) { settingsNote(explain(error, "Could not restart from here; run `jarvis restart`."), true); });
+  });
   // ---- header and caption ---------------------------------------------------------------------------------------
   function uiState() {
     if (S.offline) return "offline";

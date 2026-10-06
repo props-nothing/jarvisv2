@@ -6986,8 +6986,25 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   model, kept the folder, refused a voice id without a key, `keys test model` against a real Ollama, `keys set voice --file`.
   Limits: the file is rewritten from its parsed form, so hand-written comments are lost; the paste prompt echoes (hidden
   input needs a dependency decision, `P9-013`); `keys test voice` needs a running daemon and a real key.
-- [ ] `P9-015` Settings view in the console (brain, keys, voice, folders, ask/trust) over `GET/PUT /api/v1/settings` that never returns a
-  secret and accepts a new one write-only; "restart to apply" using `P9-012`.
+- [x] `P9-015` Settings screen in the console (`ADR-0139`): keys (password fields, write-only, status only), every setting with the
+  daemon's own refusal reason, **Restart to apply** (`POST /api/v1/restart`). The settings logic moved into
+  `jarvis_storage::settings` and the CLI is now a thin caller, so there is one validation path. Tests: storage (one change keeps
+  the rest, invalid changes leave the file identical, keys never in the config or any listing), routes (401 on every one, key
+  write-only and never echoed, invalid vs valid). Live: set a voice key through the password field (cleared after sending), saw
+  "a port is a number from 1 to 65535" for a bad port, saved a voice id, pressed Restart: new process, page reconnected by itself,
+  `GET /api/v1/speech` reported the voice enabled. Limits: no "test key" button yet (use `jarvis keys test`); the tool ask/trust
+  list is edited as text (`policy.trust`), not per-tool toggles; the file loses hand-written comments on the first change.
+- [x] `P9-015b` Settings in tabs (Brain, Voice, Folders & code, Permissions, Advanced). Every setting now carries its tab, its effective default and a
+  plain "what unset means" (the review found no setting is "not built yet": each unset one is opt-in by design or needs a key,
+  Docker or a folder; the screen simply did not say so and showed an unwritten default as "(not set)"). Related settings apply
+  together (`PUT /api/v1/settings` is all-or-nothing, so the code image and its command are one save), and a Permissions tab sets
+  one posture per tool (default / ask / trusted / off) over `PUT /api/v1/settings/tools/{tool}`, checked against the real tool
+  registry. Tests: all-or-nothing batch, one posture per tool with the file left tidy, every setting has a tab and an
+  explanation, 401 on the new routes. Live: tabs rendered, a tool made trusted, the sandbox pair saved in one click, a half
+  pair refused. Reference doc: `docs/user/settings.md`.
+- [ ] `P9-020` An editor for `mcp-servers.toml` (add, remove and test an MCP server) in the Settings screen and as `jarvis mcp`; today it is
+  hand-edited.
+- [ ] `P9-021` "Test" buttons beside each key in the console (model and voice), reusing `jarvis keys test`.
 - [ ] `P9-016` `jarvis doctor` that checks the model answers, the keys work, Docker for the code tool, the port, and a browser.
 - [ ] `P9-017` Release archive per platform with both binaries, checksums and a CI release job; `jarvis` locates `jarvisd` beside itself or
   on `PATH`.

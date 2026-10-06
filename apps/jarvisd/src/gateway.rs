@@ -82,6 +82,8 @@ pub struct GatewayState {
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
     /// The speech provider, when a key file is configured (`ADR-0138`). `None` means the page speaks with the browser's own voice.
     speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
+    /// Where the profile's configuration is, for the Settings routes (`P9-015`). `None` in a bare transport test.
+    settings: Option<crate::settings_service::SettingsContext>,
 }
 
 impl GatewayState {
@@ -98,6 +100,7 @@ impl GatewayState {
             executor: None,
             tools: None,
             speech: None,
+            settings: None,
         }
     }
 
@@ -120,6 +123,19 @@ impl GatewayState {
     pub fn with_speech(mut self, speech: Arc<jarvis_voice::ElevenLabsSpeech>) -> Self {
         self.speech = Some(speech);
         self
+    }
+
+    /// Attaches the profile location, which turns the Settings routes on.
+    #[must_use]
+    pub fn with_settings(mut self, settings: crate::settings_service::SettingsContext) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// Returns the settings context, when the profile location is known.
+    #[must_use]
+    pub fn settings(&self) -> Option<&crate::settings_service::SettingsContext> {
+        self.settings.as_ref()
     }
 
     /// Returns the speech provider, when one is configured.
@@ -271,6 +287,24 @@ pub fn router(state: GatewayState) -> Router {
         .route("/runs/{id}/events", get(read_events))
         .route("/runs/{id}/stream", get(crate::sse::stream_events))
         .route("/shutdown", post(crate::stop::request))
+        .route("/restart", post(crate::settings_service::restart))
+        .route(
+            "/settings",
+            get(crate::settings_service::list).put(crate::settings_service::batch),
+        )
+        .route(
+            "/settings/tools/{tool}",
+            axum::routing::put(crate::settings_service::set_posture),
+        )
+        .route(
+            "/settings/{key}",
+            axum::routing::put(crate::settings_service::set).delete(crate::settings_service::unset),
+        )
+        .route(
+            "/settings/keys/{which}",
+            axum::routing::put(crate::settings_service::set_key)
+                .delete(crate::settings_service::remove_key),
+        )
         .route(
             "/speech",
             get(crate::speech_service::status).post(crate::speech_service::speak),
@@ -2274,6 +2308,266 @@ mod tests {
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(body_text(response).await.contains(r#""stopping":true"#));
+    }
+
+    /// A router over a profile whose configuration is real, so the Settings routes have something to read and write.
+    async fn test_router_with_settings() -> (Router, String, TempProfile, jarvis_storage::AppPaths)
+    {
+        let profile = TempProfile::new();
+        let paths = jarvis_storage::AppPaths::from_root(&profile.0)
+            .unwrap_or_else(|error| panic!("paths: {error}"));
+        std::fs::create_dir_all(paths.config()).unwrap_or_else(|error| panic!("{error}"));
+        let key = paths.config().join("model.key");
+        std::fs::write(&key, "ollama").unwrap_or_else(|error| panic!("{error}"));
+        let document = format!(
+            "schema_version = 1\n\n[profile]\nname = \"default\"\n\n[logging]\nlevel = \"info\"\n\n[daemon]\nshutdown_timeout_seconds = 30\nhttp_enabled = true\nexecutor_model = \"openai-compatible\"\nexecutor_model_name = \"m1\"\nexecutor_base_url = 'http://localhost:11434/v1'\nexecutor_api_key_ref = '{}'\n",
+            key.display()
+        );
+        std::fs::write(
+            jarvis_storage::ConfigStore::from_paths(&paths).path(),
+            document,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate().unwrap_or_else(|error| panic!("{error}"));
+        let presented = credential.expose().to_owned();
+        let state = GatewayState::new(database, credential).with_settings(
+            crate::settings_service::SettingsContext::new(paths.clone(), None),
+        );
+        (router(state), presented, profile, paths)
+    }
+
+    fn put_json(path: &str, credential: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .method("PUT")
+            .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap_or_else(|error| panic!("fixture request: {error}"))
+    }
+
+    /// **The settings routes need the credential: nobody else can read the configuration, change it, or set a key.**
+    #[tokio::test]
+    async fn the_settings_routes_require_the_credential() {
+        let (app, _presented, _profile, _paths) = test_router_with_settings().await;
+        for (method, path) in [
+            ("GET", "/api/v1/settings"),
+            ("PUT", "/api/v1/settings"),
+            ("PUT", "/api/v1/settings/tools/jarvis.files.edit"),
+            ("PUT", "/api/v1/settings/speech_model"),
+            ("DELETE", "/api/v1/settings/speech_model"),
+            ("PUT", "/api/v1/settings/keys/voice"),
+            ("DELETE", "/api/v1/settings/keys/voice"),
+            ("POST", "/api/v1/restart"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .method(method)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"values":["x"],"key":"sk_x"}"#))
+                        .unwrap_or_else(|error| panic!("fixture request: {error}")),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// **A pair of related settings is one request**, a half-pair is refused, and a tool''s permission has one value.
+    #[tokio::test]
+    async fn related_settings_apply_together_and_a_tool_permission_is_one_value() {
+        let (app, presented, _profile, paths) = test_router_with_settings().await;
+        let store = jarvis_storage::ConfigStore::from_paths(&paths);
+        let read = || std::fs::read_to_string(store.path()).unwrap_or_default();
+
+        // Alone, the image is half a sandbox.
+        let half = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/code_sandbox_image",
+                &presented,
+                r#"{"values":["node:22-alpine"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(half.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Together, it is one valid change.
+        let both = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings",
+                &presented,
+                r#"{"changes":[{"key":"code_sandbox_image","values":["node:22-alpine"]},{"key":"code_sandbox_interpreter","values":["node -e"]}]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(both.status(), StatusCode::OK);
+        assert!(read().contains("node:22-alpine"));
+
+        // A tool permission: trusted, then off replaces it, and a bad word is refused.
+        let trusted = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/tools/jarvis.files.edit",
+                &presented,
+                r#"{"posture":"trusted"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(trusted.status(), StatusCode::OK);
+        let off = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/tools/jarvis.files.edit",
+                &presented,
+                r#"{"posture":"off"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(off.status(), StatusCode::OK);
+        let listed = body_text(
+            app.clone()
+                .oneshot(get_request("/api/v1/settings", Some(&presented)))
+                .await
+                .unwrap_or_else(|error| panic!("router call: {error}")),
+        )
+        .await;
+        assert!(listed.contains(r#""jarvis.files.edit":"off""#), "{listed}");
+        assert!(listed.contains(r#""group":"files""#));
+        assert!(listed.contains(r#""unset_means""#));
+
+        let bad = app
+            .oneshot(put_json(
+                "/api/v1/settings/tools/jarvis.files.edit",
+                &presented,
+                r#"{"posture":"always"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// **A key is accepted write-only: it lands in a private file, and no response ever contains it.**
+    #[tokio::test]
+    async fn a_key_is_set_write_only_and_never_echoed() {
+        let (app, presented, _profile, paths) = test_router_with_settings().await;
+        let secret = "sk_console_secret_0123456789";
+
+        let saved = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/keys/voice",
+                &presented,
+                &format!(r#"{{"key":"{secret}"}}"#),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved = body_text(saved).await;
+        assert!(saved.contains(r#""state":"set""#), "{saved}");
+        assert!(
+            !saved.contains(secret),
+            "the response must not contain the key"
+        );
+
+        let listed = app
+            .clone()
+            .oneshot(get_request("/api/v1/settings", Some(&presented)))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        let listed = body_text(listed).await;
+        assert!(listed.contains("speech_api_key_ref"));
+        assert!(
+            !listed.contains(secret),
+            "the listing must not contain the key"
+        );
+
+        let on_disk =
+            std::fs::read_to_string(paths.config().join("speech.key")).unwrap_or_default();
+        assert_eq!(on_disk, secret);
+        let config =
+            std::fs::read_to_string(jarvis_storage::ConfigStore::from_paths(&paths).path())
+                .unwrap_or_default();
+        assert!(
+            !config.contains(secret),
+            "the key must not be in the configuration"
+        );
+
+        let bad = app
+            .oneshot(put_json(
+                "/api/v1/settings/keys/voice",
+                &presented,
+                r#"{"key":"has spaces in it"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !body_text(bad).await.contains("has spaces"),
+            "a refusal must not repeat the key"
+        );
+    }
+
+    /// **A change the daemon would refuse is refused with a reason, and the configuration is left as it was.**
+    #[tokio::test]
+    async fn an_invalid_setting_is_refused_and_a_valid_one_is_saved() {
+        let (app, presented, _profile, paths) = test_router_with_settings().await;
+        let store = jarvis_storage::ConfigStore::from_paths(&paths);
+        let before = std::fs::read_to_string(store.path()).unwrap_or_default();
+
+        let refused = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/speech_voice_id",
+                &presented,
+                r#"{"values":["abc"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            std::fs::read_to_string(store.path()).unwrap_or_default(),
+            before
+        );
+
+        let unknown = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/nonsense",
+                &presented,
+                r#"{"values":["x"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let saved = app
+            .oneshot(put_json(
+                "/api/v1/settings/executor_model_name",
+                &presented,
+                r#"{"values":["glm-5.3:cloud"]}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert!(
+            std::fs::read_to_string(store.path())
+                .unwrap_or_default()
+                .contains("glm-5.3:cloud")
+        );
     }
 
     fn get_request(path: &str, credential: Option<&str>) -> Request<Body> {

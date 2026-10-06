@@ -16,6 +16,7 @@ mod memory_propose;
 mod memory_service;
 mod run_service;
 mod schedule_service;
+mod settings_service;
 mod singleton;
 mod skill_service;
 mod speech_service;
@@ -1044,7 +1045,7 @@ impl HttpTransport {
         executor: Option<Arc<executor::Executor>>,
         tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
         speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
-        _paths: &AppPaths,
+        settings: settings_service::SettingsContext,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
@@ -1063,6 +1064,7 @@ impl HttpTransport {
         if let Some(speech) = speech {
             state = state.with_speech(speech);
         }
+        state = state.with_settings(settings);
         // Scheduled tasks fire through the same state the routes use, so a scheduled run is an ordinary run. Only
         // when runs are driven at all: a scheduler over a daemon with no executor would start runs nothing runs.
         let scheduler = state
@@ -1280,7 +1282,7 @@ where
                 executor,
                 tools,
                 speech,
-                &paths,
+                settings_service::SettingsContext::new(paths.clone(), root.clone()),
             )
             .await?;
             (Some(transport), Some(stop))

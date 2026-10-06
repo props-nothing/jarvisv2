@@ -38,7 +38,7 @@ A professional user gets the same things as commands, all with `--json`, none of
 | Pick a brain | `init` finds a local Ollama and lists its models. Any other provider needs flags (`--base-url`, `--model`, `--api-key-file PATH`): the person must already have made a key file. No presets, no prompt for a key, no test call. | **Weak** |
 | Keys | `jarvis keys status\|set\|remove\|test` for the model and voice keys: written to a private file, never printed, read from an environment variable, a file or standard input (never an argument), and tested against the provider. The prompt still echoes what you paste. | **Done (`P9-014`)**, hidden prompt is `P9-013` |
 | Change a setting | `jarvis config show\|get\|set\|unset` changes one setting at a time, validated by the daemon's own parser, leaving the file untouched on refusal; no more `init --force` to change one thing. Comments in a hand-edited file are not preserved (the file is rewritten from its parsed form). | **Done (`P9-014`)** |
-| Settings screen | None. The console shows state, tools and runs, and edits nothing. | **Missing** |
+| Settings screen | **Settings** in the console header, in five tabs (Brain, Voice, Folders & code, Permissions, Advanced): write-only key fields, each setting with its default or why it is off, the code sandbox saved as one pair, a per-tool permission list (default / ask / run without asking / off), the daemon's own refusal reasons, and **Restart to apply** (`ADR-0139`). Reference: `docs/user/settings.md`. No per-key test button and no editor for `mcp-servers.toml` yet. | **Done (`P9-015`)** |
 | Stop / restart | `jarvis stop` and `jarvis restart` (an authenticated `POST /api/v1/shutdown` that runs the daemon's normal graceful shutdown, then wait for the port). `jarvis start` also no longer hangs a script that captures its output. | **Done (`P9-012`)** |
 | Autostart | `jarvis service` prints a plan and never installs (`P9-003`). | **Missing** |
 | Diagnose | `jarvis doctor` checks the installation, not whether the model answers or a key works. | **Partial** |
@@ -59,7 +59,7 @@ Each is a vertical slice with a test that fails closed where a secret or a trust
 - **`P9-014` `jarvis config` and `jarvis keys` (done).** Show, get, set and unset one setting; set, test and remove a key; secrets never
   printed (only "set", length class and last four characters on request); every change validated by the daemon's parser and
   written atomically; `--json` everywhere. This needs a TOML editing approach that preserves comments (an ADR).
-- **`P9-015` Settings in the console.** A Settings view: brain and model, keys (status, replace, test), voice, folders, which tools
+- **`P9-015` Settings in the console (done).** A Settings view: brain and model, keys (status, replace, test), voice, folders, which tools
   ask first and what is trusted, with a "restart to apply" button using `P9-012`. Backed by `GET/PUT /api/v1/settings`, which
   **never returns a secret** and accepts a new one write-only. The same validation as `P9-014`, one code path.
 - **`P9-016` A real `doctor`.** Adds: the model answers, the key is accepted, the voice key works, Docker is usable for the

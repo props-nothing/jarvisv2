@@ -17,6 +17,7 @@ mod summary_repository;
 
 mod approval_repository;
 mod schedule_repository;
+pub mod settings;
 mod skill_repository;
 mod tool_call_repository;
 mod workspace_repository;
