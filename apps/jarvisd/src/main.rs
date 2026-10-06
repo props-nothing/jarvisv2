@@ -374,6 +374,17 @@ async fn settle_interrupted_runs(
 /// Order matters: the credential is read before logging so the redactor can mask
 /// it from the first recorded line, and the singleton lock is taken before the
 /// database so a second daemon never touches state.
+/// Names (never values) any `JARVIS_` variable that is set but not used, so a mistyped override does not vanish silently.
+fn warn_about_unused_environment() {
+    let unused = jarvis_storage::unrecognized_environment_keys(std::env::vars_os());
+    if !unused.is_empty() {
+        tracing::warn!(
+            variables = %unused.join(", "),
+            "environment variables with the JARVIS_ prefix are set but not used, so they are ignored"
+        );
+    }
+}
+
 async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonError> {
     let health = Arc::new(HealthState::new());
     let paths = resolve_paths(root)?;
@@ -1251,6 +1262,7 @@ where
         daemon_id,
         accept_loop,
     } = start(build, root.as_deref()).await?;
+    warn_about_unused_environment();
 
     let ready = health.snapshot();
     tracing::info!(

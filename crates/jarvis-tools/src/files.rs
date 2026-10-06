@@ -69,7 +69,13 @@ pub const EDIT_TOOL: &str = "jarvis.files.edit";
 pub const MAX_WRITE_CHARS: usize = 60_000;
 
 /// The most characters of text to find in an edit.
-pub const MAX_EDIT_FIND_CHARS: usize = 20_000;
+pub const MAX_EDIT_FIND_CHARS: usize = 2000;
+/// Most characters an edit may put in place of the old text.
+///
+/// Much smaller than a write, on purpose: an edit asks first by default, a pending approval holds its arguments in at most
+/// 8,192 bytes, and a larger edit could not be shown to the person deciding (so could never be approved). A big change is a
+/// write of the whole file instead.
+pub const MAX_EDIT_REPLACE_CHARS: usize = 4000;
 
 /// The largest file an edit will read and rewrite. Larger is refused, never truncated.
 const MAX_EDITABLE_FILE_BYTES: u64 = 512 * 1024;
@@ -176,8 +182,8 @@ const EDIT_INPUT_SCHEMA: &str = r#"{
   "required": ["path", "find", "replace"],
   "properties": {
     "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "An existing file path relative to a granted workspace root." },
-    "find": { "type": "string", "minLength": 1, "maxLength": 20000, "description": "The exact text to replace. It must occur exactly once; include surrounding lines to make it unique." },
-    "replace": { "type": "string", "maxLength": 60000, "description": "The text to put in its place (may be empty to delete the text)." }
+    "find": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "The exact text to replace. It must occur exactly once; include surrounding lines to make it unique." },
+    "replace": { "type": "string", "maxLength": 4000, "description": "The text to put in its place (may be empty to delete the text)." }
   }
 }"#;
 
@@ -502,7 +508,7 @@ impl FilesystemTool {
             Ok(text) => text,
             Err(error) => return Ok(Err(error)),
         };
-        let replace = match text_argument(request, "replace", MAX_WRITE_CHARS, true) {
+        let replace = match text_argument(request, "replace", MAX_EDIT_REPLACE_CHARS, true) {
             Ok(text) => text,
             Err(error) => return Ok(Err(error)),
         };

@@ -46,7 +46,7 @@ pub const MAX_APPROVAL_PREVIEW_CHARS: usize = 512;
 ///
 /// Bounded before hashing, so an enormous argument object cannot make the hash computation itself a
 /// denial-of-service, and so the limit is the same for the value that is stored and hashed.
-pub const MAX_CANONICAL_INTENT_CHARS: usize = 8192;
+pub const MAX_CANONICAL_INTENT_CHARS: usize = 1_048_576;
 
 /// Maximum approval lifetime in seconds.
 ///

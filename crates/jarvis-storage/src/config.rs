@@ -473,12 +473,16 @@ impl Config {
     /// Parses, migrates, overrides, and validates a TOML document.
     ///
     /// Environment values use file precedence followed by the explicit
-    /// `JARVIS_*` allowlist. Unrelated variables are ignored.
+    /// `JARVIS_*` allowlist. Variables this build does not recognize are ignored, including ones with the `JARVIS_` prefix:
+    /// the prefix is not JARVIS's alone (another tool of the same name set `JARVIS_MODEL_KEY` in a user's environment and
+    /// stopped JARVIS starting at all, which punished the user for a variable that was never meant for this program). They are
+    /// reported by [`unrecognized_environment_keys`] so `jarvis doctor` can say so, which keeps a mistyped override visible
+    /// without making it fatal.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] for malformed or unsupported documents, unknown
-    /// keys, invalid values, or unrecognized prefixed environment variables.
+    /// keys, or invalid values for a *recognized* environment variable.
     pub fn parse_with_environment<I, K, V>(
         document: &str,
         environment: I,
@@ -488,6 +492,7 @@ impl Config {
         K: Into<OsString>,
         V: Into<OsString>,
     {
+        let environment = recognized_environment(environment);
         let table = document
             .parse::<Table>()
             .map_err(|_| ConfigError::InvalidDocument)?;
@@ -1177,6 +1182,58 @@ fn collect_unknown_keys(table: &Table, allowed: &[&str], prefix: &str, unknown: 
     }
 }
 
+/// Whether `key` is an override this build understands, judged by the same code that applies it, so the two cannot drift.
+fn is_recognized_environment_key(key: &str, value: &OsString) -> bool {
+    !matches!(
+        apply_environment(&mut Config::default(), [(key, value.clone())]),
+        Err(ConfigError::UnknownEnvironmentKey { .. })
+    )
+}
+
+/// Keeps only what JARVIS understands: everything not starting with `JARVIS_`, and the `JARVIS_` overrides it defines.
+fn recognized_environment<I, K, V>(environment: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<OsString>,
+    V: Into<OsString>,
+{
+    environment
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .filter(|(key, value)| {
+            key.to_str().is_none_or(|text| {
+                !text.starts_with("JARVIS_") || is_recognized_environment_key(text, value)
+            })
+        })
+        .collect()
+}
+
+/// The `JARVIS_`-prefixed variables set in `environment` that this build does not use.
+///
+/// For `jarvis doctor` and the daemon's log: a typo in an override (`JARVIS_LOG_LEVLE`) is ignored, not fatal, so it is
+/// reported here instead of failing silently. Values are never returned, only names (a name can be a key's tail, a value can be
+/// a secret).
+#[must_use]
+pub fn unrecognized_environment_keys<I, K, V>(environment: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<OsString>,
+    V: Into<OsString>,
+{
+    let mut found: Vec<String> = environment
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .filter_map(|(key, value): (OsString, OsString)| {
+            let text = key.to_str()?;
+            (text.starts_with("JARVIS_") && !is_recognized_environment_key(text, &value))
+                .then(|| bounded_identifier(text))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 fn apply_environment<I, K, V>(config: &mut Config, environment: I) -> Result<(), ConfigError>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -1853,11 +1910,24 @@ shutdown_timeout_seconds = 20
         );
 
         assert_eq!(
-            Config::parse_with_environment(V1_CONFIG, [("JARVIS_LOG_LEVLE", "debug")]),
-            Err(ConfigError::UnknownEnvironmentKey {
-                key: "JARVIS_LOG_LEVLE".to_owned()
-            })
+            Config::parse_with_environment(V1_CONFIG, [("JARVIS_LOG_LEVLE", "debug")])
+                .map(|loaded| loaded.config),
+            Config::parse_with_environment(V1_CONFIG, Vec::<(String, String)>::new())
+                .map(|loaded| loaded.config),
+            "a variable with the JARVIS_ prefix that JARVIS does not define is ignored, not fatal: another tool may own it"
         );
+        assert_eq!(
+            unrecognized_environment_keys([
+                ("JARVIS_LOG_LEVLE", "debug"),
+                ("JARVIS_MODEL_KEY", "secret-value"),
+                ("JARVIS_LOG_LEVEL", "debug"),
+                ("PATH", "x"),
+            ]),
+            vec!["JARVIS_LOG_LEVLE".to_owned(), "JARVIS_MODEL_KEY".to_owned()],
+            "only names of the unused prefixed variables are reported, never values"
+        );
+        // A variable JARVIS does define is still checked strictly: a bad value is an error, not ignored.
+        assert!(Config::parse_with_environment(V1_CONFIG, [("JARVIS_LOG_LEVEL", "loud")]).is_err());
     }
 
     #[test]

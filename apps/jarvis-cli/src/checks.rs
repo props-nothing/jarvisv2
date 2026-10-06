@@ -290,9 +290,29 @@ async fn daemon(paths: &AppPaths, credential: Option<&str>) -> Vec<Finding> {
     out
 }
 
+/// Variables in the environment with the `JARVIS_` prefix that JARVIS does not use. They are ignored (another tool may own them),
+/// but a mistyped override would otherwise vanish without a word, so they are named here, never with their values.
+fn environment() -> Option<Finding> {
+    let names = jarvis_storage::unrecognized_environment_keys(std::env::vars_os());
+    if names.is_empty() {
+        return None;
+    }
+    Some(finding(
+        "environment",
+        Level::Warn,
+        format!(
+            "{} set but not used by JARVIS, so ignored (another program may own {}): if you meant an override, check the spelling",
+            names.join(", "),
+            if names.len() == 1 { "it" } else { "them" }
+        ),
+        Some("see docs/development/getting-started.md for the variables JARVIS reads"),
+    ))
+}
+
 /// Runs every live check.
 pub async fn run(paths: &AppPaths, credential: Option<&str>) -> Vec<Finding> {
     let mut out = vec![model(paths).await, folders(paths)];
+    out.extend(environment());
     out.extend(docker(paths));
     out.extend(daemon(paths, credential).await);
     out

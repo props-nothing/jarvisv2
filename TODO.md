@@ -7075,6 +7075,24 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   on the PATH, never replacing a file that is not its own link. `jarvis start` prints a tip when the folder is not on the PATH.
   Live on Windows: installed, second run reported "already", the user PATH holds the folder once. Not run on Linux or macOS (type-checked
   for both). Not done: installers (`P9-017b`) should do this for you.
+- [x] `P9-027` No small limits, and no silent hangs (ADR-0142). A "create a Next.js app" request failed at its sixteenth tool call with "the
+  run failed". Raised: model calls 8 to 400 and tool calls 16 to 1,200 as ceilings; a repeat guard replaces them as the loop stop; file
+  write 4,000 to 60,000 characters (and the canonical-intent cap 8,192 to 1,048,576, without which no call over 8 KB worked; an edit
+  stays at 2,000 and 4,000 because a held call must fit the 8,192-byte approval), context window 8,192 to 64,000 tokens, history 12 to 40 turns, model
+  request timeout 2 to 15 minutes, request body 16 KB to 256 KB. Visibility: reasoning and tool-call writing are counted
+  (`StreamEvent::Progress`, never kept) and shown as "thinking (~11k tokens)", the progress line shows step, file and time, failures
+  say why and offer Continue, the model is asked to narrate stages (spoken when the voice is on), and a minute of quiet is spoken
+  about. A model that reasons over 40,000 characters without answering is cut off and re-asked with `reasoning_effort: low`, sticky for
+  the run. Live: a multi-page site ran past 50 tool calls with the limit firing and recovering. Not done: a setting for
+  `reasoning_effort` (it is only sent after an overrun); a per-run "allow edits" (each edit asks, so a big coding task is many
+  clicks; Settings, Permissions, can set Edit to run without asking); messages over 4,096 characters (a database check, needs a
+  migration).
+- [x] `P9-028` A stray `JARVIS_` environment variable no longer stops JARVIS starting. Found live: a user-level `JARVIS_MODEL_KEY` and
+  `JARVIS_VOICE_KEY` (set for a different program) made every `jarvis` command fail with "no usable configuration (unknown configuration
+  environment variable: JARVIS_MODEL_KEY)", the daemon stay down and the console read "offline". Unknown `JARVIS_*` variables are now
+  ignored (the prefix is not ours alone) and named, never with values, by `jarvis doctor --live` and the daemon log; a variable JARVIS
+  does define with a bad value is still an error. Tests: an unknown variable is ignored, only names are reported, a bad value for a known
+  one still fails.
 - [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

@@ -429,7 +429,7 @@ level = "info"
 shutdown_timeout_seconds = 15
 ```
 
-Allowed overrides are `JARVIS_PROFILE_NAME`, `JARVIS_LOG_LEVEL`, and `JARVIS_SHUTDOWN_TIMEOUT_SECONDS`. Unknown TOML keys and unknown `JARVIS_*` variables are errors. Missing files use defaults without writing; schema v0 is migrated in memory and must be saved explicitly. Newer schemas fail closed. Configuration writes validate first, replace atomically, and retain no secret values.
+Allowed overrides are `JARVIS_PROFILE_NAME`, `JARVIS_LOG_LEVEL`, and `JARVIS_SHUTDOWN_TIMEOUT_SECONDS`. Unknown TOML keys are errors. A `JARVIS_*` variable JARVIS does not define is **ignored**, not an error (another program may own it: a stray `JARVIS_MODEL_KEY` from a different tool used to stop JARVIS starting at all), and `jarvis doctor --live` and the daemon's log name it so a mistyped override does not vanish silently; a variable JARVIS does define with a bad value is still an error. Missing files use defaults without writing; schema v0 is migrated in memory and must be saved explicitly. Newer schemas fail closed. Configuration writes validate first, replace atomically, and retain no secret values.
 
 ### Configuring tool approval
 

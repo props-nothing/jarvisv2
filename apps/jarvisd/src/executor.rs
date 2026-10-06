@@ -3876,6 +3876,46 @@ mod tests {
             "the first calls ran normally: {results:?}"
         );
     }
+    /// **A file of tens of thousands of characters is written in one call.**
+    ///
+    /// The canonical intent of a call used to be capped at 8,192 characters (a limit meant for what an approval stores), so any
+    /// write over about 8 KB was refused with "a canonical intent exceeds 8192 characters" and the model had to split every file
+    /// into appends. The intent is only hashed (the database holds the digest), so it is bounded far higher now.
+    #[tokio::test]
+    async fn a_large_file_is_written_in_one_call() {
+        let (profile, database) = database().await;
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "write a big file").await;
+        let content = "abcdefghij\n".repeat(4_000); // 44,000 characters
+        let arguments = serde_json::json!({ "path": "big.txt", "content": content }).to_string();
+        let model = model(vec![
+            Turn::tool_call("call_1", "jarvis.files.write", &arguments),
+            Turn::answer("Done."),
+        ]);
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+        let written = std::fs::read_to_string(root.join("big.txt"))
+            .unwrap_or_else(|error| panic!("the file must exist: {error}"));
+        assert_eq!(
+            written.chars().count(),
+            44_000,
+            "the whole file, not a refusal"
+        );
+    }
     /// **A model that reasons past its budget without answering is cut off with a reason the loop can act on.**
     ///
     /// In a real run a reasoning model spent 166,000 characters (about 40,000 tokens) deciding how to style a page, with no

@@ -85,6 +85,9 @@ default.
   "Jarvis, stop" cancels everything. Voice recognition is your browser's (Chrome or Edge).
 - **The terminal:** `jarvis chat`, `jarvis ask "..."`, `jarvis watch`, `jarvis approvals`, `jarvis cancel --all`, `jarvis runs`,
   `jarvis schedule`, `jarvis memory`, `jarvis tools list`. Every command has `--json` where it prints data.
+- **Long tasks.** While it works you see a live line (the step it is on, what it is doing, how long, and "thinking (~11k tokens)" during a
+  silent think), and the model is asked to tell you what it is about to do and to say when each stage is done. If a task stops, it says why
+  and offers **Continue**. A task may take hundreds of steps; **Stop everything** is always there.
 - **What it can do on a fresh install:** read web pages, hand work to helper agents, and offer to remember things. Files need a folder
   you grant (Settings, Folders & code) and running code needs Docker. More tools (search what it remembers, the clock, scheduling from
   conversation, mail and calendar) are on the roadmap (`P9-024`).
