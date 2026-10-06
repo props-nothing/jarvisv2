@@ -688,7 +688,7 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
 
     let Some(binary) = std::env::current_exe()
         .ok()
-        .and_then(|client| jarvis_diagnostics::daemon_binary_beside(&client))
+        .and_then(|client| jarvis_diagnostics::find_daemon(&client))
     else {
         eprintln!("jarvis: the daemon binary (jarvisd) was not found next to this program");
         return ExitStatus::Unavailable;

@@ -437,6 +437,33 @@ pub fn daemon_binary_beside(client: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Finds the daemon for a client: beside it first, then on `PATH`.
+///
+/// Beside is preferred because the two are released together and a copy next to the client is the one that matches its version.
+/// `PATH` is the fallback for the common case of only `jarvis` having been put on it. The result is always absolute, which a
+/// service definition requires.
+#[must_use]
+pub fn find_daemon(client: &Path) -> Option<PathBuf> {
+    daemon_binary_beside(client)
+        .or_else(|| find_on_path(daemon_file_name(), std::env::var_os("PATH")))
+}
+
+const fn daemon_file_name() -> &'static str {
+    if cfg!(windows) {
+        "jarvisd.exe"
+    } else {
+        "jarvisd"
+    }
+}
+
+/// The first absolute `name` found in the directories of a `PATH`-style value.
+fn find_on_path(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    std::env::split_paths(&path?)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Explains why a service plan could not be produced.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ServiceError {
@@ -832,5 +859,33 @@ mod tests {
                 .any(|argument| argument.contains("Start-Process") && argument.contains("it''s"))
         );
         assert_eq!(windows.uninstall_steps()[0].args[0], "delete");
+    }
+
+    #[test]
+    fn the_daemon_is_found_beside_the_client_then_on_the_path() {
+        let beside = TempDirectory::new();
+        let elsewhere = TempDirectory::new();
+        let name = daemon_file_name();
+        fs::write(elsewhere.0.join(name), b"daemon").unwrap_or_else(|error| panic!("{error}"));
+        let client = beside.0.join(if cfg!(windows) {
+            "jarvis.exe"
+        } else {
+            "jarvis"
+        });
+
+        // Not beside it, but on the path.
+        let path = std::env::join_paths([beside.0.clone(), elsewhere.0.clone()]).ok();
+        assert_eq!(
+            find_on_path(name, path.clone()),
+            Some(elsewhere.0.join(name))
+        );
+        // A relative path entry is ignored: it would resolve against whatever directory the process happens to be in.
+        let relative = std::env::join_paths(["relative-dir"]).ok();
+        assert_eq!(find_on_path(name, relative), None);
+        assert_eq!(find_on_path(name, None), None);
+
+        // A copy beside the client wins over the path.
+        fs::write(beside.0.join(name), b"daemon").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(daemon_binary_beside(&client), Some(beside.0.join(name)));
     }
 }

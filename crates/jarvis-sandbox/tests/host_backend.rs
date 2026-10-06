@@ -342,7 +342,13 @@ fn process_is_alive(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        // Signal 0 asks the kernel whether the process exists without sending anything. `/proc` is not used
+        // because macOS has none, which made this test fail there while the production code was fine.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
 

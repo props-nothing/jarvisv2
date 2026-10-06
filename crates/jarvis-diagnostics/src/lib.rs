@@ -22,5 +22,5 @@ pub use findings::{Finding, FindingCode, Severity};
 pub use repair::{RepairOutcome, RepairReport, repair};
 pub use service::{
     OWNERSHIP_MARKER, ServiceCommand, ServiceDrift, ServiceError, ServiceKind, ServicePlan,
-    daemon_binary_beside, detect_drift, drift_finding,
+    daemon_binary_beside, detect_drift, drift_finding, find_daemon,
 };

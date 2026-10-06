@@ -13,6 +13,7 @@ mod api_client;
 mod approvals;
 mod cancel;
 mod chat;
+mod checks;
 mod connector;
 mod entity;
 mod hud;
@@ -423,7 +424,7 @@ fn service(arguments: &[String]) -> ExitStatus {
         Ok(path) => path,
         Err(error) => return fail("locate the client binary", &error),
     };
-    let Some(binary) = jarvis_diagnostics::daemon_binary_beside(&client) else {
+    let Some(binary) = jarvis_diagnostics::find_daemon(&client) else {
         eprintln!(
             "jarvis: could not find jarvisd beside {}; the service would launch the client",
             client.display()
@@ -485,6 +486,14 @@ fn service(arguments: &[String]) -> ExitStatus {
     }
 }
 
+/// The local credential if there is one, without complaining when there is not (the daemon may never have run).
+fn load_credential_quietly(paths: &AppPaths) -> Option<String> {
+    CredentialStore::at(paths.config().join(CREDENTIAL_FILE_NAME))
+        .load()
+        .ok()
+        .map(|credential| credential.expose().to_owned())
+}
+
 /// Runs the offline doctor checks, optionally applying safe repairs.
 ///
 /// Doctor is non-mutating unless `--repair` is passed, and any repair is
@@ -534,6 +543,43 @@ async fn doctor(arguments: &[String]) -> ExitStatus {
         println!("{}", report.to_json());
     } else {
         render_report(&report);
+    }
+
+    if arguments.iter().any(|argument| argument == "--live") {
+        let credential = load_credential_quietly(&paths);
+        let findings = checks::run(&paths, credential.as_deref()).await;
+        let worst =
+            findings
+                .iter()
+                .map(|finding| finding.level)
+                .fold(checks::Level::Ok, |worst, level| match (worst, level) {
+                    (checks::Level::Fail, _) | (_, checks::Level::Fail) => checks::Level::Fail,
+                    (checks::Level::Warn, _) | (_, checks::Level::Warn) => checks::Level::Warn,
+                    _ => checks::Level::Ok,
+                });
+        if json {
+            let items: Vec<_> = findings
+                .iter()
+                .map(|f| serde_json::json!({ "check": f.name, "level": f.level.word(), "detail": f.detail, "fix": f.fix }))
+                .collect();
+            println!("{}", serde_json::json!({ "kind": "live", "checks": items }));
+        } else {
+            println!("live checks:");
+            for f in &findings {
+                println!("  [{}] {}: {}", f.level.word(), f.name, f.detail);
+                if let Some(fix) = &f.fix {
+                    let label = if f.level == checks::Level::Ok {
+                        "to change"
+                    } else {
+                        "fix"
+                    };
+                    println!("        {label}: {fix}");
+                }
+            }
+        }
+        if worst == checks::Level::Fail {
+            return ExitStatus::DoctorFailed;
+        }
     }
 
     match report.outcome() {

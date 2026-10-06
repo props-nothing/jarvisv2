@@ -373,7 +373,13 @@ pub fn get(paths: &AppPaths, key: &str) -> Result<String, String> {
     let setting = find(key).ok_or_else(|| unknown(key))?;
     let table = read_table(&ConfigStore::from_paths(paths))?;
     lookup(&table, setting)
-        .map(show_value)
+        .map(|value| match (setting.kind, value) {
+            // A command reads as a command (`node -e`), not as a list.
+            (Kind::Words, Value::Array(words)) => {
+                words.iter().map(show_value).collect::<Vec<_>>().join(" ")
+            }
+            _ => show_value(value),
+        })
         .ok_or_else(|| format!("{key} is not set"))
 }
 

@@ -15,13 +15,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use jarvis_sandbox::{
-    Guarantee, Isolation, Limits, SandboxError, SandboxPolicy, SandboxRequest, backend_for_host,
-    refusing_launcher,
+    Guarantee, Isolation, Limits, SandboxPolicy, SandboxRequest, Support, backend_for_host,
 };
 
 /// A shell command request, with an environment that lets a shell resolve its own builtins.
@@ -42,59 +39,45 @@ fn shell(script: &str) -> SandboxRequest {
     }
 }
 
-/// Returns whether this host has a delegated cgroup, i.e. whether the backend reports any support.
+/// Returns whether this host has a delegated cgroup, i.e. whether the backend this host chose **is the cgroup one**.
+///
+/// Not "whether the backend reports any support": a host with no delegated cgroup but a reachable Docker (every GitHub Actions
+/// Ubuntu runner) is given the container backend, which has support too, and these tests are about the cgroup backend. They
+/// must neither run against a container (which needs an image) nor treat it as delegation.
 fn delegation_available() -> bool {
-    !backend_for_host().support().is_empty()
+    backend_for_host().facility() == Support::CgroupV2
 }
 
-/// **A host with no delegation refuses, and the refusal happens without spawning anything.**
+/// **A host that offers nothing refuses a required guarantee, and nothing is spawned.**
 ///
-/// This is the ordering property the whole design rests on: the backend writes its limits **before** a child
-/// exists, so a refusal at that point must not have created one. The `refusing_launcher` records whether it was
-/// called, which is exact — a process-table inspection would be racy, and would fail only when a race was lost.
+/// A Linux host with no delegated cgroup and no reachable container runtime is given the unconfined backend, whose support
+/// set is empty. A request that *requires* a guarantee must then be refused by `SandboxPolicy::new`, **before** any launcher
+/// exists: the alternative is a child that runs with none of the limits the caller was promised.
 ///
-/// It also asserts the refusal is a `Setup` failure naming the facility, because the two error kinds call for
-/// different operator actions: `Setup` means "delegate a cgroup on this host", `Launch` means "the program could
-/// not be started".
+/// This replaces a test that expected the cgroup backend itself to refuse at launch. `backend_for_host()` no longer returns
+/// a cgroup backend that cannot enforce anything (it falls back to a container, then to this), so that path is not reachable
+/// through the public API; the refusal that *is* reachable is the one asserted here.
 ///
-/// Falsified by mutation: calling `launcher()` before the delegation check fails the `observed` assertion;
-/// mapping the missing delegation to `SandboxError::Launch` fails the kind assertion.
-#[tokio::test]
-async fn a_host_without_a_delegation_refuses_without_spawning() {
-    if delegation_available() {
+/// Falsified by mutation: letting the unconfined backend claim a guarantee fails the `unsupported` assertion.
+#[test]
+fn a_host_that_offers_nothing_refuses_a_required_guarantee() {
+    let backend = backend_for_host();
+    if backend.facility() != Support::Unconfined {
         eprintln!(
-            "SKIPPED a_host_without_a_delegation_refuses_without_spawning: this host HAS a delegated cgroup, so \
-             the no-delegation path cannot be reached here"
+            "SKIPPED a_host_that_offers_nothing_refuses_a_required_guarantee: this host has a delegated cgroup or a \
+             reachable container runtime, so it does offer something"
         );
         return;
     }
-    let backend = backend_for_host();
-    let observed = Arc::new(AtomicBool::new(false));
-    // No requirement, so `SandboxPolicy::new` accepts and the refusal comes from `launch`. That is the path
-    // being tested: a *permitted* policy that the facility still cannot honour.
-    let policy = SandboxPolicy::new(shell("true"), backend.as_ref())
-        .unwrap_or_else(|error| panic!("a request requiring nothing must be accepted: {error}"));
+    let mut request = shell("true");
+    request.required = vec![Guarantee::ProcessCountCeiling];
+    request.limits.max_processes = Some(2);
 
-    let outcome = backend
-        .launch(&policy, refusing_launcher(Arc::clone(&observed)))
-        .await;
-
-    assert!(
-        !observed.load(Ordering::SeqCst),
-        "the launcher was called, so a child was created before the delegation was checked"
-    );
-    match outcome {
-        Err(SandboxError::Setup { facility, .. }) => {
-            assert_eq!(
-                facility, "cgroup v2",
-                "the refusal must name the facility an operator has to fix"
-            );
-        }
-        Err(other) => panic!("a missing delegation is a setup failure, got: {other}"),
-        Ok(_) => panic!("a host with no delegation cannot have launched a confined child"),
-    }
+    let error = SandboxPolicy::new(request, backend.as_ref())
+        .err()
+        .unwrap_or_else(|| panic!("a host that enforces nothing must refuse a required guarantee"));
+    assert_eq!(error.unsupported(), Some(Guarantee::ProcessCountCeiling));
 }
-
 /// **A guarantee the Linux backend cannot enforce is refused by name — the platform asymmetry, on the platform.**
 ///
 /// `CpuTimeCeiling` is the guarantee cgroup v2 genuinely lacks: it accounts CPU time in `cpu.stat` but has no

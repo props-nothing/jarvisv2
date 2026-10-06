@@ -7005,9 +7005,22 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P9-020` An editor for `mcp-servers.toml` (add, remove and test an MCP server) in the Settings screen and as `jarvis mcp`; today it is
   hand-edited.
 - [ ] `P9-021` "Test" buttons beside each key in the console (model and voice), reusing `jarvis keys test`.
-- [ ] `P9-016` `jarvis doctor` that checks the model answers, the keys work, Docker for the code tool, the port, and a browser.
-- [ ] `P9-017` Release archive per platform with both binaries, checksums and a CI release job; `jarvis` locates `jarvisd` beside itself or
-  on `PATH`.
+- [x] `P9-016` `jarvis doctor --live` (the existing offline `doctor` and its acceptance output are unchanged): asks the model server to list its models
+  with the saved key (rejected key, unreachable server, model not listed), checks the granted folders exist, Docker and the pulled
+  image when the code tool is on, whether the daemon is running and has the voice a saved key implies; every non-OK finding prints
+  the command that fixes it, `--json` gives the same, and a failure exits non-zero. Also: `jarvis config set code_sandbox IMAGE
+  COMMAND...` / `unset code_sandbox` set or remove the pair together (one at a time the daemon's parser refuses half a pair), and
+  `config get` prints a command as `node -e`. Live: found Ollama unreachable (it was updating), a deleted folder, and Docker not
+  running, each with its fix. Tests: both model-list shapes read exactly, every failing status carries a fix. Not done: a hidden key
+  prompt and provider presets (`P9-013`).
+- [x] `P9-017a` Release archives: `scripts/package-release.sh` builds `jarvis-<version>-<platform>.zip|tar.gz` (both programs, a README, the
+  user docs, `THIRD_PARTY.md`) with a SHA-256 file, and `.github/workflows/release.yml` builds and smoke-tests it on Linux x86_64 and
+  aarch64, macOS Apple silicon and Intel (cross-built) and Windows, then uploads **private workflow artifacts**. No public release is
+  created: no licence has been chosen (README, "License Status"), which blocks distribution. Live: the Windows archive was built here,
+  its checksum verified, and the unpacked `jarvis` and `jarvisd` run from an empty folder (about 35 MB). The workflow YAML parses;
+  it has not run on GitHub yet. `THIRD_PARTY.md` now records the one bundled asset (the face mesh, Apache-2.0).
+- [ ] `P9-017b` Publishing: choose a licence, generate the dependency-licence list for the archive, sign and notarize (macOS, Windows), publish
+  a release, and add the one-line installers (`P9-004`). Also: `jarvis` should find `jarvisd` on `PATH` when it is not beside it.
 - [x] `P9-018` `jarvis service install|uninstall` install and remove the per-user service: a systemd user unit (plus `loginctl
   enable-linger` for servers), a launchd agent, a Windows Run entry; the command sequences are pure data (`ServicePlan::install_steps`)
   and refuse to touch a definition JARVIS did not write. Also fixed: the launchd plist put its comment before the XML declaration
@@ -7021,6 +7034,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   on a background task on a slow runner; both fixed.
 - [ ] `P9-022` First real run on a clean Linux VPS and a Mac (and an aarch64 Linux): install, init, start, tunnel to the console, run a
   conversation, `service install`, reboot; record what breaks. Prerequisite for calling either platform supported.
+  CI-found so far, fixed: a Unix socket path over 103 bytes is now refused by name (`EndpointError::SocketPathTooLong`); sandbox tests no
+  longer assume a delegated cgroup; the kill test no longer reads `/proc` (absent on macOS); tests no longer use `C:/` paths on Unix.
 - [ ] `P9-019` Tauri shell with a tray icon over the same console (see `P9-001`).
 
 ## P10: Server And Multi-Device

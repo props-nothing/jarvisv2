@@ -8,8 +8,9 @@ The target experience, and what is still missing from it, is in [product/onboard
 - A model. The easiest is [Ollama](https://ollama.com) running on this machine (local models, or Ollama Cloud models through it).
   Any OpenAI-compatible server works too.
 - Optionally Docker, if you want the assistant to run code in a throwaway container.
-- Until releases are packaged (`P9-017`), a Rust toolchain to build it: `cargo build --release`. The two programs you need,
-  `jarvis` and `jarvisd`, are in `target/release/`. **Keep them in the same folder.**
+- The two programs, `jarvis` and `jarvisd`, **kept in the same folder**. Either unpack a release archive (CI builds one per platform as
+  a private artifact; there is no public download until a licence is chosen), or build them with a Rust toolchain:
+  `cargo build --release -p jarvis-cli -p jarvisd`, then take them from `target/release/`.
 
 ## First run
 
@@ -54,6 +55,7 @@ asks you to paste it (visible as you type; a hidden prompt is `P9-013`).
 ## Changing settings
 
 ```text
+jarvis config set code_sandbox node:22-alpine node -e    # the code container and its command are set together
 jarvis config show               # every setting you can change, and whether key files are present
 jarvis config get executor_model_name
 jarvis config set executor_model_name deepseek-v4-flash:cloud
@@ -93,7 +95,8 @@ default.
 
 - `jarvis stop` ends the background program gracefully; `jarvis restart` stops it (if it is running) and starts it again, for example
   after you change a setting. Both wait until it has really finished.
-- `jarvis doctor` diagnoses the installation; `jarvis logs --lines 50` shows what the daemon said; `jarvis status` says whether it
+- `jarvis doctor --live` checks the things that actually go wrong, each with its fix: the model server unreachable or rejecting the key,
+  a granted folder gone, Docker not running for the code tool, JARVIS not started. `jarvis doctor` alone diagnoses the installation; `jarvis logs --lines 50` shows what the daemon said; `jarvis status` says whether it
   is running.
 - "No credential": open the console with `jarvis hud`, not by typing the address.
 - A portable, throwaway profile: add `--root DIR` (an existing folder) to any command.

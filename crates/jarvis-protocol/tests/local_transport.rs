@@ -19,10 +19,10 @@ struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "jarvis-protocol-transport-{}",
-            jarvis_core::scratch_tag()
-        ));
+        // Short on purpose: the socket lives inside this directory and macOS caps a socket path at 103 bytes, with a
+        // temp directory that is already about 50. The tail of the tag is the random part.
+        let tag = jarvis_core::scratch_tag();
+        let path = std::env::temp_dir().join(format!("jpt-{}", &tag[tag.len() - 12..]));
         std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create temp dir: {error}"));
         Self(path)
     }

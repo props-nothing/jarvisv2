@@ -1,0 +1,83 @@
+name: Release (private artifacts)
+
+# Builds the two programs for each platform and packages them. The result is a set of **workflow artifacts**, visible only to people
+# with access to this repository: no public release is created, because no licence has been chosen for JARVIS yet (README.md,
+# "License Status"), which blocks distributing it. When a licence is chosen, publishing is one extra step here.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: linux-x86_64, target: "" }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64, target: "" }
+          - { os: macos-latest, label: macos-aarch64, target: "" }
+          # Built on the Apple-silicon runner for the Intel target, so it is not smoke-tested here.
+          - { os: macos-latest, label: macos-x86_64, target: x86_64-apple-darwin }
+          - { os: windows-latest, label: windows-x86_64, target: "" }
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report pinned toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+      - name: Add the cross target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+      - name: Build release programs
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --locked --target "${{ matrix.target }}" -p jarvis-cli -p jarvisd
+          else
+            cargo build --release --locked -p jarvis-cli -p jarvisd
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            scripts/package-release.sh "${{ matrix.label }}" "target/${{ matrix.target }}/release"
+          else
+            scripts/package-release.sh "${{ matrix.label }}"
+          fi
+      - name: Smoke test the packaged programs
+        # The archive is unpacked into an empty folder and the programs are asked for their version, which proves they start and
+        # that nothing outside the archive is needed. Skipped for the cross-built Intel macOS archive, which cannot run here.
+        if: matrix.target == ''
+        shell: bash
+        run: |
+          rm -rf smoke && mkdir smoke
+          archive="$(ls dist/*.tar.gz dist/*.zip 2>/dev/null | head -n 1)"
+          case "$archive" in
+            *.zip) (cd smoke && unzip -q "../$archive" || 7z x -bso0 "../$archive") ;;
+            *) tar -C smoke -xzf "$archive" ;;
+          esac
+          dir="$(ls -d smoke/jarvis-*)"
+          ext=""; [ -f "$dir/jarvis.exe" ] && ext=".exe"
+          "$dir/jarvis$ext" version
+          "$dir/jarvisd$ext" --version
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jarvis-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

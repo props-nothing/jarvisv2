@@ -1294,12 +1294,13 @@ mod tests {
         link_directory(&outer.path().join("outside"), &root.join("escape"));
         let executor = adapter(&root);
 
-        for path in [
-            "../escaped.txt",
-            "escape/escaped.txt",
-            "C:/escaped.txt",
-            "/escaped.txt",
-        ] {
+        // `C:/x` is a drive-qualified path only on Windows; on Unix it is an ordinary relative name inside the root, so it is
+        // not an escape there and must not be asserted as one.
+        let mut escapes = vec!["../escaped.txt", "escape/escaped.txt", "/escaped.txt"];
+        if cfg!(windows) {
+            escapes.push("C:/escaped.txt");
+        }
+        for path in escapes {
             let result = run(&executor, WRITE_TOOL, write_args(path, "x", false))
                 .unwrap_or_else(|error| panic!("a refusal is a result: {error}"));
             assert_eq!(

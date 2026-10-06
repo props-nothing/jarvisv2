@@ -64,19 +64,39 @@ pub fn config(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
             |key| settings::get(paths, key).map(|value| println!("{value}")),
         ),
         Some("set") => match rest.split_first() {
+            Some((key, values)) if key == "code_sandbox" && values.len() >= 2 => {
+                set_sandbox(paths, Some(values))
+            }
             Some((key, values)) if !values.is_empty() => {
                 settings::set(paths, key, values).map(|()| apply_note(paths))
             }
-            _ => Err("usage: jarvis config set KEY VALUE...".to_owned()),
+            _ => Err("usage: jarvis config set KEY VALUE...   (code sandbox: jarvis config set code_sandbox IMAGE COMMAND...)".to_owned()),
         },
-        Some("unset") => rest.first().map_or_else(
-            || Err("usage: jarvis config unset KEY".to_owned()),
-            |key| settings::unset(paths, key).map(|()| apply_note(paths)),
-        ),
+        Some("unset") => match rest.first().map(String::as_str) {
+            Some("code_sandbox") => set_sandbox(paths, None),
+            Some(key) => settings::unset(paths, key).map(|()| apply_note(paths)),
+            None => Err("usage: jarvis config unset KEY".to_owned()),
+        },
         Some(other) => Err(format!(
             "unknown config command {other:?}; use show, get, set or unset"
         )),
     })
+}
+
+/// The code sandbox is an image and the command that runs a snippet in it; one without the other is refused, so they are set
+/// and removed together: `jarvis config set code_sandbox node:22-alpine node -e`, `jarvis config unset code_sandbox`.
+fn set_sandbox(paths: &AppPaths, values: Option<&[String]>) -> Result<(), String> {
+    let changes = [
+        settings::Change {
+            key: "code_sandbox_image".to_owned(),
+            values: values.map(|v| vec![v[0].clone()]),
+        },
+        settings::Change {
+            key: "code_sandbox_interpreter".to_owned(),
+            values: values.map(|v| v[1..].to_vec()),
+        },
+    ];
+    settings::apply(paths, &changes).map(|()| apply_note(paths))
 }
 
 fn show(paths: &AppPaths, json: bool) -> Result<(), String> {

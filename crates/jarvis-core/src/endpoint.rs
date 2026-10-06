@@ -8,6 +8,11 @@ pub const MAX_PROFILE_NAME_BYTES: usize = 64;
 pub const UNIX_SOCKET_FILE_NAME: &str = "jarvis.sock";
 /// Windows named-pipe namespace prefix.
 pub const WINDOWS_PIPE_PREFIX: &str = r"\\.\pipe\";
+/// Longest Unix socket path, in bytes, that every supported platform can bind.
+///
+/// `sun_path` is 104 bytes on macOS and 108 on Linux, and both need a trailing NUL, so 103 is the portable ceiling.
+/// A longer path fails at `bind` with an error that does not name the cause.
+pub const UNIX_SOCKET_MAX_PATH_BYTES: usize = 103;
 /// Daemon singleton lock filename inside the runtime directory.
 pub const DAEMON_LOCK_FILE_NAME: &str = "jarvisd.lock";
 
@@ -20,6 +25,12 @@ pub enum EndpointError {
     /// The runtime directory was relative, so the endpoint would be ambiguous.
     #[error("the runtime directory is not absolute")]
     RelativeRuntimeDirectory,
+    /// The socket path would exceed what a Unix domain socket can bind.
+    #[error(
+        "the runtime directory is too deep for a Unix socket (the path must be at most {UNIX_SOCKET_MAX_PATH_BYTES} \
+         bytes); start with `--root` set to a short absolute directory"
+    )]
+    SocketPathTooLong,
 }
 
 /// One profile's native local client endpoint.
@@ -48,7 +59,11 @@ impl LocalEndpoint {
         if !is_valid_profile(profile) {
             return Err(EndpointError::InvalidProfileName);
         }
-        Ok(Self::UnixSocket(runtime_dir.join(UNIX_SOCKET_FILE_NAME)))
+        let socket = runtime_dir.join(UNIX_SOCKET_FILE_NAME);
+        if socket.as_os_str().len() > UNIX_SOCKET_MAX_PATH_BYTES {
+            return Err(EndpointError::SocketPathTooLong);
+        }
+        Ok(Self::UnixSocket(socket))
     }
 
     /// Derives the Windows named-pipe endpoint for a profile.
@@ -198,6 +213,33 @@ mod tests {
     fn unix_endpoint_requires_absolute_runtime_directory() {
         let relative = LocalEndpoint::unix_socket(Path::new("runtime"), "default");
         assert_eq!(relative, Err(EndpointError::RelativeRuntimeDirectory));
+    }
+
+    /// A socket path longer than `sun_path` fails at `bind` with an error that names nothing, which is what macOS
+    /// users with a deep home directory met. It must be refused up front, by name, and the boundary must be exact.
+    #[test]
+    fn a_socket_path_beyond_the_bind_limit_is_refused_by_name() {
+        let base = if cfg!(windows) { r"C:\" } else { "/" };
+        let overhead = base.len() + 1 + UNIX_SOCKET_FILE_NAME.len();
+        let fits = PathBuf::from(format!(
+            "{base}{}",
+            "d".repeat(UNIX_SOCKET_MAX_PATH_BYTES - overhead)
+        ));
+        let too_deep = PathBuf::from(format!(
+            "{base}{}",
+            "d".repeat(UNIX_SOCKET_MAX_PATH_BYTES - overhead + 1)
+        ));
+
+        assert!(LocalEndpoint::unix_socket(&fits, "default").is_ok());
+        assert_eq!(
+            LocalEndpoint::unix_socket(&too_deep, "default"),
+            Err(EndpointError::SocketPathTooLong)
+        );
+        assert!(
+            EndpointError::SocketPathTooLong
+                .to_string()
+                .contains("--root")
+        );
     }
 
     #[test]

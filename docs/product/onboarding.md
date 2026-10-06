@@ -33,7 +33,7 @@ A professional user gets the same things as commands, all with `--json`, none of
 
 | Step | Today | Verdict |
 | --- | --- | --- |
-| Get it | `cargo build --release` gives `jarvis` and `jarvisd`; no archive, installer, checksum or CI release job (`P9-004` to `P9-007`). | **Missing** |
+| Get it | `cargo build --release` gives `jarvis` and `jarvisd`, and a CI workflow packages them per platform as a private archive with a checksum (`P9-017a`). No public download (no licence yet), installers, signing or updates (`P9-017b`, `P9-004` to `P9-007`). | **Partial** |
 | Run it | `jarvis` with no arguments now sets up on first run, starts the daemon and opens the console. `jarvis` finds `jarvisd` only when it is in the same folder. | **Done (this review)** |
 | Pick a brain | `init` finds a local Ollama and lists its models. Any other provider needs flags (`--base-url`, `--model`, `--api-key-file PATH`): the person must already have made a key file. No presets, no prompt for a key, no test call. | **Weak** |
 | Keys | `jarvis keys status\|set\|remove\|test` for the model and voice keys: written to a private file, never printed, read from an environment variable, a file or standard input (never an argument), and tested against the provider. The prompt still echoes what you paste. | **Done (`P9-014`)**, hidden prompt is `P9-013` |
@@ -41,7 +41,7 @@ A professional user gets the same things as commands, all with `--json`, none of
 | Settings screen | **Settings** in the console header, in five tabs (Brain, Voice, Folders & code, Permissions, Advanced): write-only key fields, each setting with its default or why it is off, the code sandbox saved as one pair, a per-tool permission list (default / ask / run without asking / off), the daemon's own refusal reasons, and **Restart to apply** (`ADR-0139`). Reference: `docs/user/settings.md`. No per-key test button and no editor for `mcp-servers.toml` yet. | **Done (`P9-015`)** |
 | Stop / restart | `jarvis stop` and `jarvis restart` (an authenticated `POST /api/v1/shutdown` that runs the daemon's normal graceful shutdown, then wait for the port). `jarvis start` also no longer hangs a script that captures its output. | **Done (`P9-012`)** |
 | Autostart | `jarvis service` prints a plan and never installs (`P9-003`). | **Missing** |
-| Diagnose | `jarvis doctor` checks the installation, not whether the model answers or a key works. | **Partial** |
+| Diagnose | `jarvis doctor` checks the installation; `jarvis doctor --live` also asks the model server (key accepted? model listed?), checks folders, Docker and the running daemon, each with its fix. | **Done (`P9-016`)** |
 | Voice | Works without a key (browser voice); neural voice with an ElevenLabs key (`ADR-0138`). | **Done**, setup is the weak part above |
 | Docs | The only "getting started" is a developer document mixed with the contributor loop. | **Fixed here**: `docs/user/quick-start.md` |
 

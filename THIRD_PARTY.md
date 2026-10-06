@@ -2,6 +2,17 @@
 
 This project studies public architecture and documentation but does not import third-party source code by default. Before copying or adapting code, verify the exact file's license, notices, compatibility with the intended JARVIS license, and attribution requirements.
 
+## Bundled Assets
+
+One third-party asset is bundled in the product, with its licence verified against the upstream repository (not the prototype):
+
+| Asset | Where | Source and licence |
+| --- | --- | --- |
+| Canonical face mesh (468 vertices, 898 triangles; positions and triangle indices only, as integers) | `apps/jarvisd/src/hud/head.js`, served by the console | MediaPipe `canonical_face_model.obj`, **Apache License 2.0**, Copyright 2019-2023 The MediaPipe Authors, <https://github.com/google-ai-edge/mediapipe>. Research record: `docs/research/integrations/mediapipe-canonical-face-model.md`. The attribution is in the header of `head.js` and a test keeps it there. |
+
+Rust dependencies are checked against the licence allowlist by `cargo deny` in CI; a shipped archive also needs a generated list of
+their licences before a public release (`P9-017`).
+
 ## Local Prototype
 
 The [example](example/readme.md) identifies itself as **Creative Commons BY-NC 4.0** and credits FatihMakes. Treat it as a quarantined behavior reference. Do not copy its implementation into a commercial or differently licensed JARVIS distribution without explicit legal review or permission.
