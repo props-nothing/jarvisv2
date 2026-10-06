@@ -22,10 +22,10 @@ struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "jarvis-portable-{label}-{}",
-            jarvis_core::scratch_tag()
-        ));
+        // Kept short because a Unix socket lives under this root and macOS refuses a path over 103 bytes while its
+        // temp directory is already about 50; the tail of the tag is the random part.
+        let tag = jarvis_core::scratch_tag();
+        let path = std::env::temp_dir().join(format!("jp-{label}-{}", &tag[tag.len() - 12..]));
         fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create temp dir: {error}"));
         Self(path)
     }

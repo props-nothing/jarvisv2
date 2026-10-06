@@ -74,9 +74,11 @@ uninstall` removes it. `jarvis start` launches the daemon so that scripts which 
 
 ## Known gaps
 
-- Archives are built by CI as **private** workflow artifacts (Actions, "Release (private artifacts)"); there is no public download because no
-  licence has been chosen yet, and no installer, signing or update mechanism (`P9-004` to `P9-007`, `P9-017b`). Each archive has
-  `jarvis` and `jarvisd` side by side plus a SHA-256 file; unpack it and run `jarvis`.
+- Archives are built by CI (Actions, "Release (private artifacts)"). Run it by hand for 14-day workflow artifacts, or push a `v*` tag to
+  also attach the archives to a **draft** GitHub release, which only people with write access can see. Nothing is published, because no
+  licence has been chosen yet, and there is no installer, signing or update mechanism (`P9-004` to `P9-007`, `P9-017b`). Each archive has
+  `jarvis` and `jarvisd` side by side plus a SHA-256 file; unpack it and run `jarvis`. This workflow has not run on GitHub yet, so the first
+  run (`Run workflow`) is also its test.
 - The Linux sandbox backend without a container runtime has no wait-for-exit support recorded in the sandbox research; use the
   Docker-backed code tool.
 - Telephony, messaging apps and the connectors are not built, so a server has no way to reach you except the console, the CLI and the

@@ -5262,8 +5262,8 @@ mod tests {
             scoped.status()
         );
 
-        // An entity-less remember is refused by the **service**, so the route reports `422` with a message
-        // naming the field — not a `500` from a foreign-key failure at the link step.
+        // An entity-less remember is about the profile owner (ADR-0140), so it is accepted and filed as an active claim;
+        // it is naming an entity nothing holds that the service refuses, by field, rather than a `500` at the link step.
         let entity_less = app
             .clone()
             .oneshot(post_json(
@@ -5275,9 +5275,27 @@ mod tests {
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
             entity_less.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "an entity-less remember must be refused with a field-naming 422: {}",
+            StatusCode::CREATED,
+            "an entity-less remember is about the owner: {}",
             body_text(entity_less).await
+        );
+        let invented = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                &presented,
+                &format!(
+                    r#"{{"content":"About nobody","memory_type":"preference","source_kind":"user_statement","entity_ids":["{}"]}}"#,
+                    jarvis_core::EntityId::new()
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(
+            invented.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an entity nothing holds must still be refused with a field-naming 422: {}",
+            body_text(invented).await
         );
 
         // A missing claim is a `404`, and a page over the bound is a `422` rather than a silent clamp.

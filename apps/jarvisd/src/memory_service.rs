@@ -1041,11 +1041,13 @@ impl MemoryService {
         workspace: WorkspaceId,
         entity_ids: &[String],
     ) -> Result<Vec<EntityRef>, MemoryServiceError> {
+        // A claim with no named subject is a claim about the person who owns this profile. Refusing it made
+        // "remember that I like short answers" impossible: the model has no way to know an identifier, so the
+        // product's most ordinary request failed with a message about an ID nobody could supply (ADR-0140).
         if entity_ids.is_empty() {
-            return Err(MemoryServiceError::UnknownValue {
-                field: "entity_ids",
-                value: "(empty)".to_owned(),
-            });
+            return Ok(vec![EntityRef::confirmed(
+                self.owner_entity(workspace).await?,
+            )]);
         }
         let mut resolved = Vec::with_capacity(entity_ids.len());
         for value in entity_ids {
@@ -1083,6 +1085,47 @@ impl MemoryService {
             resolved.push(EntityRef::confirmed(entity_id));
         }
         Ok(resolved)
+    }
+}
+
+/// The label of the entity that stands for the person who owns the profile.
+pub const OWNER_ENTITY_LABEL: &str = "You";
+
+impl MemoryService {
+    /// Returns the entity for the profile's owner, creating it the first time it is needed.
+    ///
+    /// Looked up by its label within the workspace, so it is one entity per profile and a restart finds the same
+    /// one. It is created `Confirmed` because it is not an inference about anyone: the daemon has one local
+    /// identity and this is it.
+    async fn owner_entity(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<jarvis_core::EntityId, MemoryServiceError> {
+        let existing = jarvis_storage::read_entities_by_label(
+            &self.database,
+            workspace,
+            OWNER_ENTITY_LABEL,
+            1,
+        )
+        .await?;
+        if let Some(found) = existing.iter().find(|entity| entity.is_usable()) {
+            return Ok(found.id());
+        }
+        let id = jarvis_core::EntityId::new();
+        jarvis_storage::record_entity(
+            &self.database,
+            &jarvis_storage::NewEntity {
+                id,
+                workspace_id: workspace,
+                kind: jarvis_storage::EntityKind::Person,
+                label: OWNER_ENTITY_LABEL.to_owned(),
+                attributes: None,
+                confidence: MemoryConfidence::Confirmed,
+                created_at: UtcTimestamp::now(&SystemClock),
+            },
+        )
+        .await?;
+        Ok(id)
     }
 }
 
@@ -1873,27 +1916,61 @@ mod tests {
         );
     }
 
-    /// **A remember with no entity is refused rather than filed against a placeholder.**
+    /// **A remember with no entity is about the profile's owner, as one real entity, and an unknown one is still refused.**
     ///
-    /// The refusal direction is the one that matters: a placeholder subject would make the claim *look*
-    /// resolved, so a later question about the real subject would not find it and nothing in the store would
-    /// say why. Asserting the refusal is what keeps the placeholder from being reintroduced as a convenience.
+    /// The earlier rule refused an entity-less claim, which made "remember that I like short answers" impossible
+    /// (ADR-0140). What it protected against was a *placeholder*: a fabricated subject that makes the claim look
+    /// resolved. The owner entity is a stored, confirmed entity, created once and reused, so the two properties
+    /// asserted are that two claims share **one** subject and that a made-up identifier is still refused, which is
+    /// the placeholder direction.
     #[tokio::test]
-    async fn a_remember_that_names_no_entity_is_refused() {
-        let (service, _database, _profile) = service().await;
-        let mut request =
-            remember_request(&jarvis_core::EntityId::new(), "Prefers dark roast coffee");
-        request.entity_ids.clear();
+    async fn a_remember_that_names_no_entity_is_about_the_owner() {
+        let (service, database, _profile) = service().await;
+        let mut first = remember_request(&jarvis_core::EntityId::new(), "Prefers short answers");
+        first.entity_ids.clear();
+        let mut second = remember_request(&jarvis_core::EntityId::new(), "Lives in Utrecht");
+        second.entity_ids.clear();
 
-        let refused = service.remember(&request).await;
-        match refused {
-            Err(MemoryServiceError::UnknownValue { field, .. }) => {
-                assert_eq!(
-                    field, "entity_ids",
-                    "the refusal must name the field the caller can fix"
-                );
-            }
-            other => panic!("an entity-less remember must be refused, got {other:?}"),
+        let one = service
+            .remember(&first)
+            .await
+            .unwrap_or_else(|error| panic!("an entity-less remember must be accepted: {error}"));
+        let two = service
+            .remember(&second)
+            .await
+            .unwrap_or_else(|error| panic!("a second one must be accepted: {error}"));
+
+        let workspace = service
+            .workspace()
+            .await
+            .unwrap_or_else(|error| panic!("workspace: {error}"));
+        let owners =
+            jarvis_storage::read_entities_by_label(&database, workspace, OWNER_ENTITY_LABEL, 10)
+                .await
+                .unwrap_or_else(|error| panic!("read owner: {error}"));
+        assert_eq!(
+            owners.len(),
+            1,
+            "the owner is one entity, not one per claim"
+        );
+        for reply in [&one, &two] {
+            let linked =
+                jarvis_storage::read_entity_memories(&database, workspace, owners[0].id(), 10)
+                    .await
+                    .unwrap_or_else(|error| panic!("read links: {error}"));
+            assert!(
+                linked
+                    .iter()
+                    .any(|memory| memory.record().id().to_string() == reply.memory_id),
+                "the claim must be linked to the owner"
+            );
+        }
+
+        // The placeholder direction is still closed: naming an identifier nothing holds is refused by name.
+        let invented = remember_request(&jarvis_core::EntityId::new(), "About nobody");
+        match service.remember(&invented).await {
+            Err(MemoryServiceError::UnknownValue { field, .. }) => assert_eq!(field, "entity_ids"),
+            other => panic!("an unknown entity must still be refused, got {other:?}"),
         }
     }
 

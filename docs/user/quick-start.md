@@ -9,7 +9,7 @@ The target experience, and what is still missing from it, is in [product/onboard
   Any OpenAI-compatible server works too.
 - Optionally Docker, if you want the assistant to run code in a throwaway container.
 - The two programs, `jarvis` and `jarvisd`, **kept in the same folder**. Either unpack a release archive (CI builds one per platform as
-  a private artifact; there is no public download until a licence is chosen), or build them with a Rust toolchain:
+  a workflow artifact, or a draft release for a tagged build; there is no public download until a licence is chosen), or build them with a Rust toolchain:
   `cargo build --release -p jarvis-cli -p jarvisd`, then take them from `target/release/`.
 
 ## First run
@@ -80,6 +80,11 @@ default.
   "Jarvis, stop" cancels everything. Voice recognition is your browser's (Chrome or Edge).
 - **The terminal:** `jarvis chat`, `jarvis ask "..."`, `jarvis watch`, `jarvis approvals`, `jarvis cancel --all`, `jarvis runs`,
   `jarvis schedule`, `jarvis memory`, `jarvis tools list`. Every command has `--json` where it prints data.
+- **What it can do on a fresh install:** read web pages, hand work to helper agents, and offer to remember things. Files need a folder
+  you grant (Settings, Folders & code) and running code needs Docker. More tools (search what it remembers, the clock, scheduling from
+  conversation, mail and calendar) are on the roadmap (`P9-024`).
+- **Remembering.** Say "remember that I like short answers". JARVIS offers it in **Waiting for you** as a "remember?" card; **Keep**
+  makes it shape later answers, **Dismiss** forgets it. It asks because a web page it read could otherwise tell it what to remember.
 - **Approvals are a yes or no.** Anything it asks about appears with Approve and Deny; you can also say "yes" or "no", or use
   `jarvis approvals approve|deny`.
 

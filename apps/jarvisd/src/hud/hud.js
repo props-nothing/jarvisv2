@@ -785,6 +785,57 @@
     }), "nothing yet");
   }
 
+  // ---- things JARVIS offers to remember --------------------------------------------------------------------------------
+  // The model may only *propose* a memory (a page it read could say "remember this"), so a proposal waits here until you keep
+  // it. Keeping files it again as your own statement, which is what lets it shape later answers; dismissing forgets it.
+  var proposalsAt = 0;
+  function proposalCard(memory) {
+    var item = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("span", "tag wait", "remember?"));
+    item.appendChild(row);
+    item.appendChild(el("div", "obj", clip(memory.content, 300)));
+    var buttons = el("div", "row cmd");
+    var keep = el("button", "yes", "Keep");
+    var drop = el("button", "danger", "Dismiss");
+    function settle(keepIt) {
+      keep.disabled = true;
+      drop.disabled = true;
+      // The proposal goes first, and on Keep without the block that stops a forgotten claim returning: the same words filed
+      // again as the person's own statement would otherwise be recognised as the claim already held and nothing would be saved.
+      api("/memories/" + encodeURIComponent(memory.memory_id) + "/forget", "POST", { expected_version: memory.version, allow_relearn: keepIt })
+        .then(function () {
+          return keepIt
+            ? api("/memories", "POST", { content: memory.content, memory_type: memory.memory_type, source_kind: "user_statement" })
+            : null;
+        })
+        .then(function () { proposalsAt = 0; refreshProposals(); }, function () { keep.disabled = false; drop.disabled = false; proposalsAt = 0; });
+    }
+    keep.addEventListener("click", function () { settle(true); });
+    drop.addEventListener("click", function () { settle(false); });
+    buttons.appendChild(keep);
+    buttons.appendChild(drop);
+    item.appendChild(buttons);
+    return item;
+  }
+  function refreshProposals() {
+    if (Date.now() - proposalsAt < 8000) return;
+    proposalsAt = Date.now();
+    api("/memories?limit=50").then(function (list) {
+      var proposed = (list.memories || []).filter(function (memory) { return memory.status === "proposed"; }).slice(0, 5);
+      return Promise.all(proposed.map(function (memory) {
+        return api("/memories/" + encodeURIComponent(memory.memory_id)).then(function (detail) {
+          return { memory_id: memory.memory_id, memory_type: memory.memory_type, version: detail.version, content: detail.content };
+        });
+      }));
+    }).then(function (cards) {
+      var host = $("remember");
+      host.replaceChildren();
+      cards.forEach(function (card) { host.appendChild(proposalCard(card)); });
+      S.proposals = cards.length;
+    }, function () { proposalsAt = 0; });
+  }
+
   // ---- what it can do: the tools, and which of them it asks about ------------------------------------------------------
   var abilitiesAt = 0;
   function renderAbilities(tools) {
@@ -1139,6 +1190,7 @@
       }
       announce(results[1].approvals);
       refreshAbilities();
+      refreshProposals();
       tickAges();
       paintHeader();
     }).catch(function (error) {

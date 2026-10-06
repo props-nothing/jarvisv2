@@ -33,7 +33,7 @@ A professional user gets the same things as commands, all with `--json`, none of
 
 | Step | Today | Verdict |
 | --- | --- | --- |
-| Get it | `cargo build --release` gives `jarvis` and `jarvisd`, and a CI workflow packages them per platform as a private archive with a checksum (`P9-017a`). No public download (no licence yet), installers, signing or updates (`P9-017b`, `P9-004` to `P9-007`). | **Partial** |
+| Get it | `cargo build --release` gives `jarvis` and `jarvisd`, and a CI workflow packages them per platform as an archive with a checksum (workflow artifact, or a draft release for a tag) (`P9-017a`). No public download (no licence yet), installers, signing or updates (`P9-017b`, `P9-004` to `P9-007`). | **Partial** |
 | Run it | `jarvis` with no arguments now sets up on first run, starts the daemon and opens the console. `jarvis` finds `jarvisd` only when it is in the same folder. | **Done (this review)** |
 | Pick a brain | `init` finds a local Ollama and lists its models. Any other provider needs flags (`--base-url`, `--model`, `--api-key-file PATH`): the person must already have made a key file. No presets, no prompt for a key, no test call. | **Weak** |
 | Keys | `jarvis keys status\|set\|remove\|test` for the model and voice keys: written to a private file, never printed, read from an environment variable, a file or standard input (never an argument), and tested against the provider. The prompt still echoes what you paste. | **Done (`P9-014`)**, hidden prompt is `P9-013` |

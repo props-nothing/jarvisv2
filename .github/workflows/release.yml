@@ -1,19 +1,58 @@
 name: Release (private artifacts)
 
-# Builds the two programs for each platform and packages them. The result is a set of **workflow artifacts**, visible only to people
-# with access to this repository: no public release is created, because no licence has been chosen for JARVIS yet (README.md,
-# "License Status"), which blocks distributing it. When a licence is chosen, publishing is one extra step here.
+# Builds the two programs for each platform and packages them.
+#
+#   * It runs by itself on every push to `main` (code changes only) and can be run by hand (Actions > "Release (private
+#     artifacts)" > Run workflow). Either gives **workflow artifacts**, kept 14 days: open the run and download the archive for
+#     your platform. This repository is public, so anyone signed in to GitHub can download the artifacts of a public repository.
+#   * Push a tag (`git tag v0.1.0 && git push origin v0.1.0`) to also attach the archives to a **draft** GitHub release. A draft is
+#     visible only to people with write access, so it is the durable place to download the exe from; publish it by hand when
+#     you decide to.
+#
+# No *published* release is ever created here, because no licence has been chosen for JARVIS yet (README.md, "License Status"),
+# which blocks distributing it. When a licence is chosen, publishing is one extra step.
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    # Documentation alone does not change what is shipped, so it does not spend five builds.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
     tags:
       - "v*"
+
+# A newer push to the same ref makes an older build pointless; a tag build is never cancelled by a branch push.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  draft:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --prerelease \
+                 --title "JARVIS $GITHUB_REF_NAME" \
+                 --notes "Unsigned private build. Unpack, keep jarvis and jarvisd together, run jarvis. See docs/user/quick-start.md."
+
   package:
+    needs: draft
+    # `draft` is skipped for a manual run, and a skipped dependency would skip this job too unless it is named here.
+    if: ${{ !cancelled() && (needs.draft.result == 'success' || needs.draft.result == 'skipped') }}
+    permissions:
+      contents: write
     name: Package (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -71,6 +110,14 @@ jobs:
           ext=""; [ -f "$dir/jarvis.exe" ] && ext=".exe"
           "$dir/jarvis$ext" version
           "$dir/jarvisd$ext" --version
+      - name: Attach to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber --repo "$GITHUB_REPOSITORY"
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

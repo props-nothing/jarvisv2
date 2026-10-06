@@ -234,6 +234,51 @@ async fn a_proposals_is_stored_as_a_proposal() {
     );
 }
 
+/// **A proposal that names no subject is about the user, and is still only a proposal.**
+///
+/// The model has no way to know an entity identifier, so requiring one made the tool fail on its most ordinary use
+/// ("remember that I like short answers", ADR-0140). Omitting the field now means the profile owner. What must not
+/// change is the inference boundary, so the stored claim is asserted to still be a model inference, `Proposed`.
+#[tokio::test]
+async fn a_proposal_with_no_subject_is_about_the_owner_and_still_a_proposal() {
+    let (_directory, database) = database().await;
+    let tool = MemoryProposeTool::new(Arc::clone(&database));
+
+    let result = must(
+        tool.execute(&request(
+            PROPOSE_TOOL,
+            json!({ "content": "Prefers short answers", "memory_type": "preference" }),
+            at(30),
+        ))
+        .await,
+    );
+    let output = output(&result);
+    assert_eq!(output["outcome"], "proposed");
+    let memory_id = output["memory_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the output must name the stored claim"));
+    let stored = must(jarvis_storage::find_memory(&database, memory_id).await);
+    assert_eq!(
+        stored.record().status(),
+        jarvis_core::MemoryStatus::Proposed
+    );
+    assert_eq!(
+        stored.record().source().kind(),
+        jarvis_core::MemorySourceKind::ModelInference
+    );
+    let identity = must(jarvis_storage::load_local_identity(&database).await);
+    let owners = must(
+        jarvis_storage::read_entities_by_label(
+            &database,
+            must(identity.workspace_id().parse()),
+            crate::memory_service::OWNER_ENTITY_LABEL,
+            5,
+        )
+        .await,
+    );
+    assert_eq!(owners.len(), 1, "the claim is about the one owner entity");
+}
+
 /// **A model cannot declare its own claim a user statement, or set a confidence.**
 ///
 /// The load-bearing refusals. Both fields exist on `RememberRequest`, so the tempting implementation is to

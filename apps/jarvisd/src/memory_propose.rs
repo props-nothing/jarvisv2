@@ -93,7 +93,7 @@ const INPUT_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["content", "memory_type", "entity_ids"],
+  "required": ["content", "memory_type"],
   "properties": {
     "content": {
       "type": "string",
@@ -114,7 +114,7 @@ const INPUT_SCHEMA: &str = r#"{
       "minItems": 1,
       "maxItems": 16,
       "items": { "type": "string", "minLength": 1 },
-      "description": "The subjects the claim is about, by identifier. Each must already exist in this workspace."
+      "description": "Leave this out for a claim about the user, which is almost always what is wanted. Only to name other existing subjects, by identifier."
     },
     "importance": {
       "type": "integer",
@@ -378,21 +378,31 @@ impl ProposalArguments {
             .ok_or_else(|| "the memory_type argument is required".to_owned())?
             .parse::<MemoryType>()
             .map_err(|_| "the memory_type argument is not a type this build knows".to_owned())?;
-        let entity_ids = arguments
-            .get("entity_ids")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "the entity_ids argument is required and must be an array".to_owned())?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "every entity_ids entry must be a string".to_owned())
-            })
-            .collect::<Result<Vec<String>, String>>()?;
-        if entity_ids.is_empty() {
-            return Err("the entity_ids argument must name at least one subject".to_owned());
-        }
+        // Absent means "about the user": the service resolves an empty list to the profile owner's entity.
+        let entity_ids = match arguments.get("entity_ids") {
+            None => Vec::new(),
+            Some(value) => {
+                let named = value
+                    .as_array()
+                    .ok_or_else(|| "the entity_ids argument must be an array".to_owned())?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| "every entity_ids entry must be a string".to_owned())
+                    })
+                    .collect::<Result<Vec<String>, String>>()?;
+                // Present but empty is malformed, not "the user": omitting the field is how that is asked for.
+                if named.is_empty() {
+                    return Err(
+                        "the entity_ids argument must name at least one subject, or be left out"
+                            .to_owned(),
+                    );
+                }
+                named
+            }
+        };
         let importance = match arguments.get("importance") {
             None => crate::memory_service::DEFAULT_MEMORY_IMPORTANCE,
             Some(value) => {

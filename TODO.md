@@ -7015,7 +7015,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   prompt and provider presets (`P9-013`).
 - [x] `P9-017a` Release archives: `scripts/package-release.sh` builds `jarvis-<version>-<platform>.zip|tar.gz` (both programs, a README, the
   user docs, `THIRD_PARTY.md`) with a SHA-256 file, and `.github/workflows/release.yml` builds and smoke-tests it on Linux x86_64 and
-  aarch64, macOS Apple silicon and Intel (cross-built) and Windows, then uploads **private workflow artifacts**. No public release is
+  aarch64, macOS Apple silicon and Intel (cross-built) and Windows, then uploads workflow artifacts, and on a `v*` tag also attaches the
+  archives to a **draft** release (visible only to people with write access). No published release is
   created: no licence has been chosen (README, "License Status"), which blocks distribution. Live: the Windows archive was built here,
   its checksum verified, and the unpacked `jarvis` and `jarvisd` run from an empty folder (about 35 MB). The workflow YAML parses;
   it has not run on GitHub yet. `THIRD_PARTY.md` now records the one bundled asset (the face mesh, Apache-2.0).
@@ -7035,7 +7036,23 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P9-022` First real run on a clean Linux VPS and a Mac (and an aarch64 Linux): install, init, start, tunnel to the console, run a
   conversation, `service install`, reboot; record what breaks. Prerequisite for calling either platform supported.
   CI-found so far, fixed: a Unix socket path over 103 bytes is now refused by name (`EndpointError::SocketPathTooLong`); sandbox tests no
-  longer assume a delegated cgroup; the kill test no longer reads `/proc` (absent on macOS); tests no longer use `C:/` paths on Unix.
+  longer assume a delegated cgroup; the kill test no longer reads `/proc` (absent on macOS); tests no longer use `C:/` paths on Unix; the phase 3
+  gate no longer looks for its freshness witnesses with backslash paths (it reported a built `jarvisd` as missing on Linux and macOS); the
+  portable-mode test uses a short directory so its socket fits.
+- [x] `P9-023` Remembering works in conversation (ADR-0140). Found in a real chat: "remember to reply with short sentences" failed
+  because the model had to supply an entity identifier it cannot know. A claim with no named subject is now about the profile's owner
+  (one confirmed `You` entity, created on first use); a named entity must still exist. A model's proposal stays a `Proposed`
+  `model_inference` and is never retrieved, so the console shows proposals in "Waiting for you" as "remember?" cards: Keep files the
+  text as the person's own statement (which retrieval reads), Dismiss forgets it. Live: asked to remember, the card appeared, Keep
+  made it `active user_statement`, and a later answer in a new run followed it. Tests: two claims share one owner; an invented id is
+  still refused with a 422; a proposal with no subject is still `Proposed`; an explicit empty `entity_ids` is still refused.
+  Not done: keeping a proposal by voice ("Jarvis, keep that") or in one terminal step.
+- [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
+  model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
+  context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),
+  a notes/todo tool, then the connectors (mail, calendar: `P5`, needing your OAuth credentials) and coding-agent runtimes (`P7`).
+  Also show in the console, next to "Can do", what turns each missing tool on.
 - [ ] `P9-019` Tauri shell with a tray icon over the same console (see `P9-001`).
 
 ## P10: Server And Multi-Device

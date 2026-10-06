@@ -70,14 +70,10 @@ pub struct RememberRequest {
     pub importance: Option<u8>,
     /// The entities the claim is about, by their stored identifier.
     ///
-    /// Required in practice even though the type does not encode it: a claim must be *about* something, so a
-    /// request with an empty list is refused with a `422` rather than defaulted. The earlier version of this
-    /// note said the daemon would attach the workspace's own subject entity, which would have been a
-    /// placeholder standing in for an answer the caller did not give — and a claim filed against a
-    /// placeholder is indistinguishable from one the user meant, so the refusal is the honest behaviour.
-    ///
-    /// There is no entity *resolution* yet (`P4-008` limit): the caller must already hold an entity
-    /// identifier, which it obtains from the entities surface.
+    /// Optional. Left empty, the claim is about the profile's owner (ADR-0140): a person saying "remember that I like
+    /// short answers" names no subject, and no client can know an entity identifier it was never given. A *named* entity
+    /// must still exist in this workspace, so an invented identifier is refused with a 422 naming the field; what the
+    /// owner default replaces is the refusal of the empty list, not that check.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entity_ids: Vec<String>,
     /// The claim in normalized subject/predicate/object form, when the caller has one.

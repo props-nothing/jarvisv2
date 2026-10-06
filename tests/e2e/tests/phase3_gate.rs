@@ -226,11 +226,13 @@ fn binary_is_fresh(candidate: &Path) -> bool {
     let Some(repo) = repo else {
         return false;
     };
+    // Forward slashes: Windows accepts them, and a backslash is a filename character on Unix, which made every witness
+    // "missing" there and the gate report a fresh binary as absent.
     let witnesses = [
-        repo.join(r"apps\jarvisd\src\gateway.rs"),
-        repo.join(r"apps\jarvisd\src\run_service.rs"),
-        repo.join(r"apps\jarvisd\src\tool_pipeline.rs"),
-        repo.join(r"crates\jarvis-protocol\src\approval.rs"),
+        repo.join("apps/jarvisd/src/gateway.rs"),
+        repo.join("apps/jarvisd/src/run_service.rs"),
+        repo.join("apps/jarvisd/src/tool_pipeline.rs"),
+        repo.join("crates/jarvis-protocol/src/approval.rs"),
     ];
     witnesses.into_iter().all(|path| {
         std::fs::metadata(path)
