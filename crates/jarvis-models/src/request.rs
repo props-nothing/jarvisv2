@@ -328,6 +328,38 @@ pub struct ChatRequest {
     /// Usage is requested explicitly so a streaming run persists a cost record
     /// instead of silently omitting one.
     include_usage: bool,
+    /// How hard a reasoning model should think, when the caller wants to say.
+    ///
+    /// Left out of the request body when unset, because a provider that does not know the field may reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// How much a reasoning model is asked to think before it answers or acts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Do not reason.
+    None,
+    /// A little.
+    Low,
+    /// A moderate amount.
+    Medium,
+    /// As much as the model likes.
+    High,
+}
+
+impl ReasoningEffort {
+    /// The word providers use for it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 impl ChatRequest {
@@ -343,7 +375,21 @@ impl ChatRequest {
             stop: Vec::new(),
             tools: Vec::new(),
             include_usage: true,
+            reasoning_effort: None,
         }
+    }
+
+    /// Asks a reasoning model to think less (or more) for this request.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, value: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = value;
+        self
+    }
+
+    /// Returns the requested reasoning effort, if one was set.
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
     }
 
     /// Offers these tools to the model.

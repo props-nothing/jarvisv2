@@ -96,6 +96,8 @@ pub(super) struct WireChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) temperature: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) stop: Vec<&'a str>,

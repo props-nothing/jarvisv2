@@ -61,8 +61,8 @@ pub use error::{ModelError, ModelErrorKind, ProviderRequestId};
 pub use identity::{IdentityError, MAX_IDENTIFIER_BYTES, ModelId, ProviderId};
 pub use port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
 pub use request::{
-    ChatMessage, ChatRequest, ContentPart, MAX_MESSAGE_BYTES, MAX_MESSAGES, MessageContent, Role,
-    ToolSpec,
+    ChatMessage, ChatRequest, ContentPart, MAX_MESSAGE_BYTES, MAX_MESSAGES, MessageContent,
+    ReasoningEffort, Role, ToolSpec,
 };
 pub use response::{ChatResponse, FinishReason, OutputContent, ToolCall};
 pub use scripted::{SCRIPTED_PROVIDER, ScriptedCancellation, ScriptedModel, Turn, scripted};

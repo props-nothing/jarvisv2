@@ -45,7 +45,7 @@ use jarvis_core::{
 };
 use jarvis_models::{
     ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, ProgressKind,
-    StreamEvent, StreamValidator, ToolSpec,
+    ReasoningEffort, StreamEvent, StreamValidator, ToolSpec,
 };
 use jarvis_storage::{
     DatabaseError, NewRunEvent, SqliteDatabase, StoredRun, TerminalTransition, append_run_event,
@@ -65,16 +65,16 @@ const MAX_OBJECTIVE_REFERENCE_CHARS: usize = 120;
 /// `P2-009` sends policy text, the conversation so far, and the objective, because memory retrieval
 /// is `P4-004`. The budget is explicit rather than unlimited so the reserved tiers are exercised and
 /// a later retrieval step draws on a measured remainder instead of on everything.
-const TOTAL_CONTEXT_TOKENS: u32 = 8_192;
+const TOTAL_CONTEXT_TOKENS: u32 = 64_000;
 
 /// Tokens reserved for immutable policy text.
 const RESERVED_POLICY_TOKENS: u32 = 512;
 
 /// Tokens reserved for the current user intent.
-const RESERVED_USER_INTENT_TOKENS: u32 = 1_024;
+const RESERVED_USER_INTENT_TOKENS: u32 = 4_096;
 
 /// Maximum tokens any single source kind may contribute.
-const PER_SOURCE_CAP_TOKENS: u32 = 4_096;
+const PER_SOURCE_CAP_TOKENS: u32 = 24_000;
 
 /// Conversation turns replayed into a model call.
 ///
@@ -166,6 +166,18 @@ const REPEAT_FAIL: u32 = 7;
 /// the tool returned little.
 const MAX_TOOL_RESULT_CHARS: usize = jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS;
 
+/// How much a model may reason, in one call, before it is asked to act instead (characters; about four per token).
+///
+/// A reasoning model can deliberate for many minutes: in a real run it spent 166,000 characters, about 40,000 tokens, deciding
+/// how to style a page, with no output at all. That is not a limit on how hard a task may be (this is generous, a few
+/// thousand words of thought), it is a cut-off for a model that has lost the thread. When it is reached the call is dropped and
+/// made again once with the reasoning turned down and a nudge to take the next concrete step.
+const REASONING_BUDGET_CHARS: u64 = 80_000;
+
+/// What the model is told when its reasoning ran past the budget.
+const ACT_NOW: &str = "You have spent a very long time reasoning without acting. Stop deliberating. Take the next concrete step \
+now (call a tool or give the user a short status), and keep any further thinking brief.";
+
 /// How often a silent model call reports that it is still working.
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -183,7 +195,10 @@ const MAX_EVENTS_READ: u32 = 1_000;
 /// described as done.
 const SYSTEM_POLICY: &str = "You are JARVIS, a local assistant. Answer the user's request directly and concisely. \
 Use the tools you are offered when they are needed, and base your answer on their results. \
-Do not claim to have performed actions you did not perform: if a tool is unavailable or fails, say so.";
+Do not claim to have performed actions you did not perform: if a tool is unavailable or fails, say so. \
+For a task with several steps, first say in one short sentence what you are about to do, then keep the user informed with a \
+one-line status in plain words whenever you finish a stage (what is done, what is next). Think briefly and start acting rather \
+than planning at length.";
 
 /// Maximum characters of an error message copied into an event payload.
 ///
@@ -838,8 +853,6 @@ async fn assemble_context_messages(
     correlation_id: CorrelationId,
 ) -> Result<Vec<ChatMessage>, DatabaseError> {
     let database = deps.database;
-    let model = deps.model;
-    let model_id = deps.model_id;
     let budget = ContextBudget::new(
         TOTAL_CONTEXT_TOKENS,
         RESERVED_POLICY_TOKENS,
@@ -917,7 +930,7 @@ async fn assemble_context_messages(
     // unprobed model may not receive Confidential content. It is needed **before** the skills are selected,
     // because selection refuses a procedure above the ceiling, so this one value is computed once and
     // reused by the assembler below.
-    let ceiling = destination_ceiling(model, model_id).await;
+    let ceiling = destination_ceiling(deps.model, deps.model_id).await;
 
     // Retrieved memory, isolated and offered through the same assembler. A claim whose type the use case
     // does not allow, or which is not current truth, is **refused by conversion** and never offered — that
@@ -1546,6 +1559,22 @@ async fn consume_stream(
                     )
                     .await?;
                 }
+                if let StreamEvent::Progress {
+                    kind: ProgressKind::Reasoning,
+                    chars,
+                } = envelope.event()
+                    && *chars >= REASONING_BUDGET_CHARS
+                    && text.is_empty()
+                {
+                    return Ok(Err(StreamFailure {
+                        code: RunErrorCode::new("reasoning_overrun").map_err(|_| {
+                            DatabaseError::InvalidRunEventRequest {
+                                field: "error_code",
+                            }
+                        })?,
+                        message: "the model reasoned for too long without answering".to_owned(),
+                    }));
+                }
                 if let StreamEvent::TextDelta { text: fragment } = envelope.event() {
                     text.push_str(fragment);
                     // Each fragment is its own durable event, so a client that reconnects mid-answer
@@ -1587,6 +1616,34 @@ async fn consume_stream(
     }
 }
 
+/// One attempt at a model call: build the request, open the stream, and consume it.
+///
+/// A failure to open and a failure while streaming are both returned as a [`StreamFailure`], so the caller settles the run
+/// the same way for either, and can recognise `reasoning_overrun` and try again.
+async fn call_model(
+    deps: RunDeps<'_>,
+    run: &StoredRun,
+    specs: &[ToolSpec],
+    messages: Vec<ChatMessage>,
+    effort: Option<ReasoningEffort>,
+    correlation_id: CorrelationId,
+) -> Result<Result<(jarvis_models::StreamSummary, String), StreamFailure>, DatabaseError> {
+    let mut request = ChatRequest::new(deps.model_id.clone(), messages, correlation_id)
+        .with_reasoning_effort(effort);
+    if !specs.is_empty() {
+        request = request.with_tools(specs.to_vec());
+    }
+    let stream = match deps.model.stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return Ok(Err(StreamFailure {
+                code: model_error_code(error.kind()),
+                message: format!("the model call failed: {}", error.message()),
+            }));
+        }
+    };
+    consume_stream(deps.database, run, stream, correlation_id).await
+}
 /// Calls the model once, records the answer or the failure, and runs any requested tools.
 ///
 /// # What this returns, and which state the run is in afterwards
@@ -1618,40 +1675,51 @@ async fn generate(
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
     let database = deps.database;
-    let model = deps.model;
     // The tool surface is re-derived from the registry on every call rather than carried in the
     // transcript, so the offered set is always the current one and there is one statement of it.
     let sub_agent = crate::delegate::is_delegated_objective(run.objective());
     let specs = deps
         .tools
         .map_or_else(Vec::new, |tools| tool_specs(tools, sub_agent));
-    let mut request = ChatRequest::new(
-        deps.model_id.clone(),
+    // The stream is validated rather than accumulated blindly, so a gap or a late event is a reported failure (see
+    // `consume_stream`). A model that reasons past its budget without answering is asked once more to act, with its
+    // reasoning turned down; any other failure settles the run.
+    let mut attempt = call_model(
+        deps,
+        run,
+        &specs,
         state.messages.clone(),
+        None,
         correlation_id,
-    );
-    if !specs.is_empty() {
-        request = request.with_tools(specs);
+    )
+    .await?;
+    if attempt
+        .as_ref()
+        .err()
+        .is_some_and(|failure| failure.code.as_str() == "reasoning_overrun")
+    {
+        append(
+            database,
+            run,
+            RunEventKind::ActivityUpdated,
+            Some("reasoning limit"),
+            r#"{"phase":"reasoning_limit"}"#,
+            correlation_id,
+        )
+        .await?;
+        let mut nudged = state.messages.clone();
+        nudged.push(ChatMessage::user(ACT_NOW));
+        attempt = call_model(
+            deps,
+            run,
+            &specs,
+            nudged,
+            Some(ReasoningEffort::Low),
+            correlation_id,
+        )
+        .await?;
     }
-
-    let stream = match model.stream(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            return fail(
-                database,
-                run,
-                model_error_code(error.kind()),
-                &format!("the model call failed: {}", error.message()),
-                correlation_id,
-            )
-            .await;
-        }
-    };
-
-    // The stream is validated rather than accumulated blindly, so a gap or a late event is a
-    // reported failure. A sequence defect means events were lost, and a lost event could be the
-    // terminal one — the difference between a complete answer and a truncated one.
-    let (summary, text) = match consume_stream(database, run, stream, correlation_id).await? {
+    let (summary, text) = match attempt {
         Ok(outcome) => outcome,
         Err(failure) => {
             return fail(
@@ -1664,7 +1732,6 @@ async fn generate(
             .await;
         }
     };
-
     // A refusal is a provider decision, and recording it as a failure is what distinguishes "the
     // model would not answer" from "the model had nothing to say".
     if summary
@@ -3804,6 +3871,69 @@ mod tests {
                 .all(|text| text.contains("the sky is blue")),
             "the first calls ran normally: {results:?}"
         );
+    }
+    /// **A model that reasons past its budget without answering is cut off with a reason the loop can act on.**
+    ///
+    /// In a real run a reasoning model spent 166,000 characters (about 40,000 tokens) deciding how to style a page, with no
+    /// output, for seven minutes. The stream is dropped at the budget and reported as `reasoning_overrun`, which `generate`
+    /// answers by asking once more with the reasoning turned down. A model that has already started answering is not cut off.
+    #[tokio::test]
+    async fn a_model_that_only_reasons_past_its_budget_is_cut_off() {
+        use jarvis_models::{StreamEnvelope, StreamEvent};
+        let (_profile, database) = database().await;
+        let run = start(&database, "think forever").await;
+        let events = vec![
+            StreamEvent::Started,
+            StreamEvent::Progress {
+                kind: ProgressKind::Reasoning,
+                chars: 10_000,
+            },
+            StreamEvent::Progress {
+                kind: ProgressKind::Reasoning,
+                chars: REASONING_BUDGET_CHARS + 240,
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ];
+        let stream: jarvis_models::ModelStream = Box::pin(futures_util::stream::iter(
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| Ok(StreamEnvelope::new(index as u64, event))),
+        ));
+        let outcome = consume_stream(&database, &run, stream, CorrelationId::new())
+            .await
+            .unwrap_or_else(|error| panic!("consume: {error}"));
+        let failure = outcome
+            .err()
+            .unwrap_or_else(|| panic!("an overrun must not look like an answer"));
+        assert_eq!(failure.code.as_str(), "reasoning_overrun");
+
+        // The same amount of reasoning is fine once the model is answering: it is only cut off while it has said nothing.
+        let events = vec![
+            StreamEvent::Started,
+            StreamEvent::TextDelta {
+                text: "Working on it.".to_owned(),
+            },
+            StreamEvent::Progress {
+                kind: ProgressKind::Reasoning,
+                chars: REASONING_BUDGET_CHARS + 240,
+            },
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ];
+        let stream: jarvis_models::ModelStream = Box::pin(futures_util::stream::iter(
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| Ok(StreamEnvelope::new(index as u64, event))),
+        ));
+        let outcome = consume_stream(&database, &run, stream, CorrelationId::new())
+            .await
+            .unwrap_or_else(|error| panic!("consume: {error}"));
+        assert!(outcome.is_ok(), "a model already answering is not cut off");
     }
     /// **A tool refusal is fed back so the model can answer truthfully, not so the run fails.**
     ///

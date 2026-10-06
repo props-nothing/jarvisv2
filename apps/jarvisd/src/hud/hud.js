@@ -266,9 +266,13 @@
     status.hidden = true;
     view.node.insertBefore(status, view.chips);
     var began = Date.now(), steps = 0, doing = "thinking";
+    // A long quiet stretch is spoken about (when the voice is on), so you are not left listening to nothing: at most once a minute.
+    var lastSignal = began, lastSpoken = 0, quietHook = null;
     function tick() {
       if (done) return;
       var seconds = Math.round((Date.now() - began) / 1000);
+      var quiet = Date.now() - Math.max(lastSignal, lastSpoken);
+      if (quietHook && quiet > 45000) { lastSpoken = Date.now(); quietHook(seconds); }
       status.hidden = steps === 0 && seconds < 8;
       status.textContent = (steps ? "step " + steps + " \u00B7 " : "") + doing + " \u00B7 " + duration(seconds);
     }
@@ -281,12 +285,14 @@
       scroll();
     }
     return {
+      onQuiet: function (hook) { quietHook = hook; },
       add: function (piece) {
+        lastSignal = Date.now();
         text += piece;
         if (!queued) { queued = true; requestAnimationFrame(paint); }
       },
       activity: function (label, isStep) {
-        if (isStep) steps += 1;
+        if (isStep) { steps += 1; lastSignal = Date.now(); }
         doing = label;
         S.activity = label;
         tick();
@@ -297,6 +303,15 @@
         for (var i = 0; i < existing.length; i += 1) { if (existing[i].textContent === label) return; }
         view.chips.hidden = false;
         view.chips.appendChild(el("span", "chip" + (waiting ? " wait" : ""), label));
+        // A big task makes dozens of these; the latest few are shown and the rest are counted.
+        var all = [].filter.call(view.chips.children, function (chip) { return !chip.classList.contains("more"); });
+        var hidden = Math.max(0, all.length - 6);
+        all.forEach(function (chip, index) { chip.hidden = index < hidden; });
+        var more = view.chips.querySelector(".more");
+        if (hidden > 0) {
+          if (!more) { more = el("span", "chip more", ""); view.chips.insertBefore(more, view.chips.firstChild); }
+          more.textContent = "+" + hidden + " earlier";
+        }
       },
       finish: function (final) {
         done = true;
@@ -371,7 +386,11 @@
             var summary = (frame.body && frame.body.summary) || "";
             if (frame.event === "output_delta") { view.add(payload.text || ""); if (talker) feed(talker, payload.text || ""); }
             else if (frame.event === "output_completed") finalText = payload.text;
-            else if (frame.event === "tool_requested") { view.chip(summary || "using a tool"); view.activity(describeCall(payload.tool, payload.target), true); }
+            else if (frame.event === "tool_requested") {
+              var what = describeCall(payload.tool, payload.target);
+              view.chip(payload.target ? what : (summary || "using a tool"));
+              view.activity(what, true);
+            }
             else if (frame.event === "activity_updated" && payload.phase) {
               // The model is working but has said nothing yet (reasoning, or writing a large tool call): show that it is alive.
               var size = Math.round((payload.chars || 0) / 4);
@@ -414,6 +433,14 @@
     var view = pendingAnswer();
     // With the neural voice, speech starts while the answer is still being written (see "the neural voice, streamed").
     var talker = S.speak && neural.enabled ? neuralSession() : null;
+    if (talker) {
+      view.onQuiet(function (seconds) {
+        var minutes = Math.floor(seconds / 60);
+        var said = minutes < 1 ? "Still working on it." : "Still working. About " + minutes + (minutes > 1 ? " minutes" : " minute") + " in.";
+        // Newlines on both sides make it a sentence of its own even if the answer was mid-sentence.
+        feed(talker, "\n" + said + "\n");
+      });
+    }
     feel("attentive", 1.2, "nod");
     busy = true;
     S.thinking = 1;

@@ -149,6 +149,9 @@ impl OpenAiCompatibleProvider {
                 include_usage: request.include_usage(),
             }),
             max_tokens: request.max_output_tokens(),
+            reasoning_effort: request
+                .reasoning_effort()
+                .map(crate::request::ReasoningEffort::as_str),
             temperature: request
                 .temperature_milli()
                 .map(|value| f64::from(value) / 1000.0),
