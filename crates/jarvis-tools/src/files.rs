@@ -56,6 +56,24 @@ pub const READ_TOOL: &str = "jarvis.files.read";
 /// The tool that lists one directory.
 pub const LIST_TOOL: &str = "jarvis.files.list";
 
+/// The tool that creates a file or appends to one. It can never replace or remove existing content.
+pub const WRITE_TOOL: &str = "jarvis.files.write";
+
+/// The tool that replaces one exact piece of text in an existing file.
+pub const EDIT_TOOL: &str = "jarvis.files.edit";
+
+/// The most characters one write or one replacement may carry.
+///
+/// A held call keeps its arguments so the owner can see them (`ADR-0130`), and a pending approval holds at most
+/// 8 KiB. Keeping a call under that keeps it **decidable**; a larger file is written in several appends.
+pub const MAX_WRITE_CHARS: usize = 4000;
+
+/// The most characters of text to find in an edit.
+pub const MAX_EDIT_FIND_CHARS: usize = 2000;
+
+/// The largest file an edit will read and rewrite. Larger is refused, never truncated.
+const MAX_EDITABLE_FILE_BYTES: u64 = 512 * 1024;
+
 /// Maximum characters in a path argument.
 ///
 /// Not a security control — confinement is — but a bound on how much work one call can ask for. 4096
@@ -137,16 +155,53 @@ const LIST_OUTPUT_SCHEMA: &str = r#"{
   }
 }"#;
 
+/// The input schema of `jarvis.files.write`.
+const WRITE_INPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "content"],
+  "properties": {
+    "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "A file path relative to a granted workspace root. Missing folders are created." },
+    "content": { "type": "string", "maxLength": 4000, "description": "The text to write. Write a longer file in several appends." },
+    "mode": { "type": "string", "enum": ["create", "append"], "description": "create (default) makes a NEW file and refuses if it exists; append adds to the end of a file, creating it if missing." }
+  }
+}"#;
+
+/// The input schema of `jarvis.files.edit`.
+const EDIT_INPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "find", "replace"],
+  "properties": {
+    "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "An existing file path relative to a granted workspace root." },
+    "find": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "The exact text to replace. It must occur exactly once; include surrounding lines to make it unique." },
+    "replace": { "type": "string", "maxLength": 4000, "description": "The text to put in its place (may be empty to delete the text)." }
+  }
+}"#;
+
+/// The output schema of the two write tools.
+const WRITE_OUTPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome"],
+  "properties": {
+    "outcome": { "type": "string", "enum": ["created", "appended", "edited"] },
+    "bytes": { "type": "integer", "description": "Bytes written or added." }
+  }
+}"#;
 /// Reads files beneath granted workspace roots.
 ///
 /// Holds [`WorkspaceRoots`], which is the confinement boundary. An instance can only be built from
 /// roots that opened successfully, so "this adapter has a boundary" is a property of the type rather
 /// than of its configuration.
-pub struct FilesystemReadTool {
+pub struct FilesystemTool {
     roots: WorkspaceRoots,
 }
 
-impl FilesystemReadTool {
+impl FilesystemTool {
     /// Builds the adapter over the granted roots.
     ///
     /// Takes ownership rather than a reference: the handle set *is* the boundary, and a borrowed one
@@ -162,17 +217,19 @@ impl FilesystemReadTool {
         &self.roots
     }
 
-    /// Builds the canonical definitions of both tools.
+    /// Builds the canonical definitions of the four tools: read, list, write and edit.
     ///
     /// # Errors
     ///
-    /// Returns [`FilesystemToolError`] when a fixed constant is rejected. Both definitions are
-    /// constants, so a failure is an authoring error rather than a runtime condition — the test module
-    /// asserts both are accepted, which is what keeps the schema strings and the declarations honest.
+    /// Returns [`FilesystemToolError`] when a fixed constant is rejected. Every definition is a constant, so a
+    /// failure is an authoring error rather than a runtime condition — the test module asserts all are accepted,
+    /// which is what keeps the schema strings and the declarations honest.
     pub fn definitions() -> Result<Vec<ToolDefinition>, FilesystemToolError> {
         Ok(vec![
             Self::definition(READ_TOOL)?,
             Self::definition(LIST_TOOL)?,
+            Self::definition(WRITE_TOOL)?,
+            Self::definition(EDIT_TOOL)?,
         ])
     }
 
@@ -185,22 +242,77 @@ impl FilesystemReadTool {
     ///
     /// An unknown name is an error rather than defaulting to `read`: a fallback would make a mistyped
     /// tool name silently read a file.
+    ///
+    /// # What each tool declares, and why
+    ///
+    /// - `read` and `list`: `read_only`, risk 0, runs when scoped.
+    /// - `write`: `write`, risk 1, so it **runs without asking**. It creates a new file or appends and can never
+    ///   replace or remove content (`WorkspaceRoots::write_file`), so the worst it does is add text inside a folder
+    ///   the owner granted.
+    /// - `edit`: `write`, risk 2, so it **asks by default**: it changes content that already exists. An owner who
+    ///   trusts it (`ADR-0133`) is not asked.
     pub fn definition(tool: &str) -> Result<ToolDefinition, FilesystemToolError> {
-        let (id, title, description, input, output) = match tool {
-            READ_TOOL => (
-                READ_TOOL,
-                "Read a file",
-                "Reads one file inside a granted workspace root and returns its contents, bounded.",
-                READ_INPUT_SCHEMA,
-                READ_OUTPUT_SCHEMA,
-            ),
-            LIST_TOOL => (
-                LIST_TOOL,
-                "List a directory",
-                "Lists the entry names in one directory inside a granted workspace root, sorted.",
-                LIST_INPUT_SCHEMA,
-                LIST_OUTPUT_SCHEMA,
-            ),
+        struct Spec {
+            id: &'static str,
+            title: &'static str,
+            description: &'static str,
+            input: &'static str,
+            output: &'static str,
+            effect: ToolEffect,
+            risk: u8,
+            scope: &'static str,
+            reads: bool,
+        }
+        let spec = match tool {
+            READ_TOOL => Spec {
+                id: READ_TOOL,
+                title: "Read a file",
+                description: "Reads one file inside a granted workspace root and returns its contents, bounded.",
+                input: READ_INPUT_SCHEMA,
+                output: READ_OUTPUT_SCHEMA,
+                effect: ToolEffect::ReadOnly,
+                risk: 0,
+                scope: "files.read",
+                reads: true,
+            },
+            LIST_TOOL => Spec {
+                id: LIST_TOOL,
+                title: "List a directory",
+                description: "Lists the entry names in one directory inside a granted workspace root, sorted.",
+                input: LIST_INPUT_SCHEMA,
+                output: LIST_OUTPUT_SCHEMA,
+                effect: ToolEffect::ReadOnly,
+                risk: 0,
+                scope: "files.read",
+                reads: true,
+            },
+            WRITE_TOOL => Spec {
+                id: WRITE_TOOL,
+                title: "Write a file",
+                description: "Creates a NEW text file inside a granted workspace root (mode create, the default, \
+                              refuses if it exists), or appends text to the end of one (mode append). It never \
+                              replaces existing content: use jarvis.files.edit to change a file. Missing folders are \
+                              created. At most 4000 characters per call; write a longer file in several appends.",
+                input: WRITE_INPUT_SCHEMA,
+                output: WRITE_OUTPUT_SCHEMA,
+                effect: ToolEffect::Write,
+                risk: 1,
+                scope: "files.write",
+                reads: false,
+            },
+            EDIT_TOOL => Spec {
+                id: EDIT_TOOL,
+                title: "Edit a file",
+                description: "Replaces one exact piece of text in an existing file inside a granted workspace root. \
+                              The text to find must occur exactly once (add surrounding lines to make it unique), \
+                              and read the file first so the text matches exactly. The change is applied atomically.",
+                input: EDIT_INPUT_SCHEMA,
+                output: WRITE_OUTPUT_SCHEMA,
+                effect: ToolEffect::Write,
+                risk: 2,
+                scope: "files.write",
+                reads: false,
+            },
             other => {
                 return Err(FilesystemToolError::UnknownTool {
                     tool: other.to_owned(),
@@ -208,37 +320,45 @@ impl FilesystemReadTool {
             }
         };
         Ok(ToolDefinition::new(ToolDefinitionParts {
-            id: ToolId::new(id)?,
+            id: ToolId::new(spec.id)?,
             version: "1.0.0".to_owned(),
-            title: title.to_owned(),
-            description: description.to_owned(),
-            input_schema: schema(input)?,
-            output_schema: schema(output)?,
-            effects: EffectSet::single(ToolEffect::ReadOnly),
-            // Risk 0, `Auto`: reading granted content with a scope. A read discloses rather than
-            // changes, so the guidance table's "risk 0 is auto when scoped" applies.
-            risk: 0,
-            required_scopes: ScopeSet::single(Scope::new("files.read")?),
-            approval: ApprovalPolicy::Auto,
-            timeout_seconds: TIMEOUT_SECONDS,
-            // A read may be repeated, so a blind retry is safe — `RetryPolicy::blind` allows it
-            // precisely because the effect is not mutating.
-            retry: RetryDeclaration {
-                attempts: 2,
-                backoff_ceiling_seconds: 1,
+            title: spec.title.to_owned(),
+            description: spec.description.to_owned(),
+            input_schema: schema(spec.input)?,
+            output_schema: schema(spec.output)?,
+            effects: EffectSet::single(spec.effect),
+            risk: spec.risk,
+            required_scopes: ScopeSet::single(Scope::new(spec.scope)?),
+            // `Policy`: the workspace's threshold decides, so risk 0 and 1 run and risk 2 asks.
+            approval: if spec.reads {
+                ApprovalPolicy::Auto
+            } else {
+                ApprovalPolicy::Policy
             },
-            idempotency: Idempotency::Required,
+            timeout_seconds: TIMEOUT_SECONDS,
+            // A read may be repeated, so a blind retry is safe. A write is not retried blindly: an append
+            // repeated would add its text twice.
+            retry: if spec.reads {
+                RetryDeclaration {
+                    attempts: 2,
+                    backoff_ceiling_seconds: 1,
+                }
+            } else {
+                RetryDeclaration::none()
+            },
+            idempotency: if spec.reads {
+                Idempotency::Required
+            } else {
+                Idempotency::Unsupported
+            },
             source: ToolSource::Native,
             availability: Availability::Available,
-            // A file inside a granted root is at most internal, and it is read into a model's
-            // context. Declaring `Internal` rather than `Public` says "not public" without claiming a
-            // classification of content this adapter cannot know; the *destination* ceiling is
-            // `P3-003`'s decision.
+            // A file inside a granted root is at most internal. Declaring `Internal` rather than `Public` says
+            // "not public" without claiming a classification of content this adapter cannot know.
             sensitivity: ToolSensitivity::new(Sensitivity::Internal, Sensitivity::Internal),
         })?)
     }
 }
-
 /// Explains why an adapter-level definition could not be produced.
 ///
 /// Separate from [`ToolDefinitionError`] because the first case is not a definition fault at all: an
@@ -276,7 +396,7 @@ fn schema(text: &str) -> Result<ToolSchema, SchemaError> {
 }
 
 #[async_trait]
-impl ToolExecutor for FilesystemReadTool {
+impl ToolExecutor for FilesystemTool {
     fn adapter_id(&self) -> &'static str {
         "filesystem-read"
     }
@@ -289,9 +409,11 @@ impl ToolExecutor for FilesystemReadTool {
         // `NotImplemented` for an unrecognized tool is what makes a registry mistake ("a tool was
         // advertised that no adapter can run") visible instead of silent.
         let tool = request.tool().to_string();
-        let listed = match tool.as_str() {
-            READ_TOOL => false,
-            LIST_TOOL => true,
+        let operation = match tool.as_str() {
+            READ_TOOL => Operation::Read,
+            LIST_TOOL => Operation::List,
+            WRITE_TOOL => Operation::Write,
+            EDIT_TOOL => Operation::Edit,
             other => {
                 return Err(AdapterError::NotImplemented {
                     tool: other.to_owned(),
@@ -313,18 +435,94 @@ impl ToolExecutor for FilesystemReadTool {
         // is not enabled for this crate, and a read of a granted local file is not the long operation
         // a blocking-pool hand-off exists for. Resource limits for a slow mount belong to `P3-011`,
         // which owns sandboxing.
-        match if listed {
-            self.list_bounded(&path)
-        } else {
-            self.read_bounded(&path)
-        } {
+        let outcome = match operation {
+            Operation::List => self.list_bounded(&path),
+            Operation::Read => self.read_bounded(&path),
+            Operation::Write => self.write_bounded(request, &path),
+            Operation::Edit => self.edit_bounded(request, &path),
+        };
+        match outcome {
             Ok(result) => result,
             Err(error) => refuse(&describe_io_error(&error)),
         }
     }
 }
 
-impl FilesystemReadTool {
+/// Which of the four tools a call is for.
+#[derive(Clone, Copy)]
+enum Operation {
+    Read,
+    List,
+    Write,
+    Edit,
+}
+
+impl FilesystemTool {
+    /// Creates a file or appends to one, and reports what happened.
+    ///
+    /// Every argument problem is refused **before reaching** the filesystem. The write itself resolves beneath a
+    /// root's handle, so a path that would leave the root fails exactly as a read does.
+    fn write_bounded(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &Path,
+    ) -> Result<Result<ToolCallResult, AdapterError>, std::io::Error> {
+        let content = match text_argument(request, "content", MAX_WRITE_CHARS, true) {
+            Ok(text) => text,
+            Err(error) => return Ok(Err(error)),
+        };
+        let append = match request.arguments().get("mode") {
+            None => false,
+            Some(Value::String(mode)) if mode == "create" => false,
+            Some(Value::String(mode)) if mode == "append" => true,
+            Some(_) => {
+                return Ok(Err(AdapterError::RefusedBeforeReaching {
+                    reason: "the mode argument must be \"create\" or \"append\"".to_owned(),
+                }));
+            }
+        };
+        let (created, root) = self.roots.write_file(path, content.as_bytes(), append)?;
+        let body = json!({
+            "outcome": if created { "created" } else { "appended" },
+            "bytes": content.len(),
+        });
+        Ok(confirm(
+            &locator("file", path, root),
+            BoundedOutput::from_bounded(body.to_string(), false),
+        ))
+    }
+
+    /// Replaces one exact piece of text in an existing file, atomically.
+    fn edit_bounded(
+        &self,
+        request: &ToolExecutionRequest,
+        path: &Path,
+    ) -> Result<Result<ToolCallResult, AdapterError>, std::io::Error> {
+        let find = match text_argument(request, "find", MAX_EDIT_FIND_CHARS, false) {
+            Ok(text) => text,
+            Err(error) => return Ok(Err(error)),
+        };
+        let replace = match text_argument(request, "replace", MAX_WRITE_CHARS, true) {
+            Ok(text) => text,
+            Err(error) => return Ok(Err(error)),
+        };
+        if find == replace {
+            return Ok(Err(AdapterError::RefusedBeforeReaching {
+                reason: "the replacement is identical to the text it replaces".to_owned(),
+            }));
+        }
+        let root = self
+            .roots
+            .replace_text(path, MAX_EDITABLE_FILE_BYTES, |text| {
+                replace_once(text, &find, &replace)
+            })?;
+        let body = json!({ "outcome": "edited", "bytes": replace.len() });
+        Ok(confirm(
+            &locator("file", path, root),
+            BoundedOutput::from_bounded(body.to_string(), false),
+        ))
+    }
+
     /// Reads a bounded prefix of a file and reports it.
     ///
     /// The inner `Result` is the adapter's vocabulary and the outer one is I/O, so the caller can map
@@ -402,6 +600,60 @@ impl FilesystemReadTool {
             BoundedOutput::from_bounded(text, truncated),
         ))
     }
+}
+
+/// Replaces `find` by `replace` when it occurs exactly once, and says why when it does not.
+///
+/// A file with Windows line endings is matched by a `find` written with plain newlines (and the replacement is
+/// converted the same way), because a model reading the file sees lines and not their terminators.
+fn replace_once(text: &str, find: &str, replace: &str) -> Result<String, std::io::Error> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    let (needle, replacement) =
+        if text.contains(find) || !text.contains("\r\n") || find.contains('\r') {
+            (find.to_owned(), replace.to_owned())
+        } else {
+            (find.replace('\n', "\r\n"), replace.replace('\n', "\r\n"))
+        };
+    match text.matches(needle.as_str()).count() {
+        0 => Err(invalid(
+            "the text to replace was not found; read the file again and copy the text exactly"
+                .to_owned(),
+        )),
+        1 => Ok(text.replacen(needle.as_str(), &replacement, 1)),
+        many => Err(invalid(format!(
+            "the text to replace occurs {many} times; include more surrounding lines so it matches once"
+        ))),
+    }
+}
+
+/// Reads a text argument, refusing one that is missing, too long, empty when it must not be, or holding a NUL.
+fn text_argument(
+    request: &ToolExecutionRequest,
+    name: &str,
+    max_chars: usize,
+    may_be_empty: bool,
+) -> Result<String, AdapterError> {
+    let Some(Value::String(text)) = request.arguments().get(name) else {
+        return Err(AdapterError::RefusedBeforeReaching {
+            reason: format!("the {name} argument is missing or is not a string"),
+        });
+    };
+    if text.is_empty() && !may_be_empty {
+        return Err(AdapterError::RefusedBeforeReaching {
+            reason: format!("the {name} argument is empty"),
+        });
+    }
+    if text.chars().count() > max_chars {
+        return Err(AdapterError::RefusedBeforeReaching {
+            reason: format!("the {name} argument exceeds {max_chars} characters"),
+        });
+    }
+    if text.contains('\0') {
+        return Err(AdapterError::RefusedBeforeReaching {
+            reason: format!("the {name} argument contains a NUL byte"),
+        });
+    }
+    Ok(text.clone())
 }
 
 /// Builds the evidence locator for a resolved path.
@@ -503,6 +755,8 @@ fn describe_io_error(error: &std::io::Error) -> String {
         std::io::ErrorKind::PermissionDenied => "not permitted",
         std::io::ErrorKind::InvalidData => "not readable as text",
         std::io::ErrorKind::IsADirectory => "is a directory",
+        std::io::ErrorKind::AlreadyExists => "already exists",
+        std::io::ErrorKind::InvalidInput => "refused",
         std::io::ErrorKind::NotADirectory => "is not a directory",
         _ => "the filesystem refused the request",
     };
@@ -619,22 +873,17 @@ mod tests {
     /// now refuses to be built from anything else.
     fn allowing(tool: &str) -> crate::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
         use crate::scope::ScopeSet;
-        use jarvis_core::SessionChannel;
 
-        let definition =
-            FilesystemReadTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
+        let definition = FilesystemTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::new([
                 Scope::new("files.read").unwrap_or_else(|error| panic!("{error}"))
             ])),
             workspace: &WorkspacePolicy::default(),
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });
@@ -658,22 +907,17 @@ mod tests {
     #[expect(dead_code, reason = "the fixture for a future mismatch test")]
     fn denying(tool: &str) -> crate::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
         use crate::scope::ScopeSet;
-        use jarvis_core::SessionChannel;
 
         // A workspace that denies this tool outright.
-        let definition =
-            FilesystemReadTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
+        let definition = FilesystemTool::definition(tool).unwrap_or_else(|error| panic!("{error}"));
         let workspace = WorkspacePolicy::default().denying(definition.id().clone());
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::none()),
             workspace: &workspace,
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });
@@ -723,14 +967,14 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"))
     }
 
-    fn adapter(root: &Path) -> FilesystemReadTool {
+    fn adapter(root: &Path) -> FilesystemTool {
         let roots = WorkspaceRoots::new([root])
             .unwrap_or_else(|error| panic!("roots must be accepted: {error}"));
-        FilesystemReadTool::new(roots)
+        FilesystemTool::new(roots)
     }
 
     fn run(
-        executor: &FilesystemReadTool,
+        executor: &FilesystemTool,
         tool: &str,
         arguments: Value,
     ) -> Result<ToolCallResult, AdapterError> {
@@ -941,6 +1185,256 @@ mod tests {
         assert_eq!(inside.outcome(), ToolOutcome::Confirmed);
     }
 
+    fn write_args(path: &str, content: &str, append: bool) -> Value {
+        json!({"path": path, "content": content, "mode": if append { "append" } else { "create" }})
+    }
+
+    fn edit_args(path: &str, find: &str, replace: &str) -> Value {
+        json!({"path": path, "find": find, "replace": replace})
+    }
+
+    fn failure_reason(result: &ToolCallResult) -> String {
+        assert_eq!(result.outcome(), ToolOutcome::Failed);
+        result
+            .record()
+            .reason()
+            .unwrap_or_else(|| panic!("a failure must carry a reason"))
+            .to_owned()
+    }
+
+    #[test]
+    fn write_and_edit_are_declared_as_writes_with_the_intended_risk() {
+        let write = FilesystemTool::definition(WRITE_TOOL).unwrap_or_else(|e| panic!("{e}"));
+        let edit = FilesystemTool::definition(EDIT_TOOL).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(write.effects(), &EffectSet::single(ToolEffect::Write));
+        assert_eq!(edit.effects(), &EffectSet::single(ToolEffect::Write));
+        assert_eq!(write.risk(), Risk::Low);
+        assert_eq!(edit.risk(), Risk::Moderate);
+        assert!(
+            write.approval().is_runnable(),
+            "creating a file runs by default"
+        );
+    }
+
+    #[test]
+    fn write_creates_a_new_file_and_its_parents() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        let executor = adapter(&root);
+
+        let result = run(
+            &executor,
+            WRITE_TOOL,
+            write_args("notes/today/plan.txt", "ship it", false),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+        assert_eq!(
+            fs::read_to_string(root.join("notes").join("today").join("plan.txt"))
+                .unwrap_or_default(),
+            "ship it"
+        );
+    }
+
+    #[test]
+    fn write_never_replaces_an_existing_file() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/keep.txt", "original");
+        let executor = adapter(&root);
+
+        let result = run(
+            &executor,
+            WRITE_TOOL,
+            write_args("keep.txt", "clobber", false),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let reason = failure_reason(&result);
+        assert!(
+            reason.contains("exists"),
+            "the reason must say why: {reason}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).unwrap_or_default(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn write_can_append_to_an_existing_file() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/log.txt", "one\n");
+        let executor = adapter(&root);
+
+        let result = run(&executor, WRITE_TOOL, write_args("log.txt", "two\n", true))
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            result.outcome(),
+            ToolOutcome::Confirmed,
+            "{:?}",
+            result.record().reason()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("log.txt")).unwrap_or_default(),
+            "one\ntwo\n"
+        );
+    }
+
+    /// **Writing cannot leave the granted folder**: traversal, an absolute path and a link are all refused,
+    /// and nothing is created outside.
+    #[test]
+    fn write_cannot_escape_the_root() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.make_dir("outside");
+        link_directory(&outer.path().join("outside"), &root.join("escape"));
+        let executor = adapter(&root);
+
+        for path in [
+            "../escaped.txt",
+            "escape/escaped.txt",
+            "C:/escaped.txt",
+            "/escaped.txt",
+        ] {
+            let result = run(&executor, WRITE_TOOL, write_args(path, "x", false))
+                .unwrap_or_else(|error| panic!("a refusal is a result: {error}"));
+            assert_eq!(
+                result.outcome(),
+                ToolOutcome::Failed,
+                "{path} must be refused"
+            );
+        }
+        assert!(!outer.path().join("escaped.txt").exists());
+        assert!(!outer.path().join("outside").join("escaped.txt").exists());
+
+        let inside = run(&executor, WRITE_TOOL, write_args("inside.txt", "x", false))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            inside.outcome(),
+            ToolOutcome::Confirmed,
+            "the control must still write"
+        );
+    }
+
+    #[test]
+    fn write_refuses_oversized_content() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        let executor = adapter(&root);
+        let big = "a".repeat(MAX_WRITE_CHARS + 1);
+
+        let refused = run(&executor, WRITE_TOOL, write_args("big.txt", &big, false));
+        let refused = refused.map_or(true, |result| result.outcome() == ToolOutcome::Failed);
+        assert!(refused);
+        assert!(!root.join("big.txt").exists());
+    }
+
+    #[test]
+    fn edit_replaces_one_unique_text_and_leaves_no_temporary_file() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/app.txt", "alpha\nbeta\ngamma\n");
+        let executor = adapter(&root);
+
+        let result = run(&executor, EDIT_TOOL, edit_args("app.txt", "beta", "BETA"))
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+        assert_eq!(
+            fs::read_to_string(root.join("app.txt")).unwrap_or_default(),
+            "alpha\nBETA\ngamma\n"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["app.txt".to_owned()]);
+    }
+
+    #[test]
+    fn edit_refuses_text_that_is_missing_or_ambiguous_and_changes_nothing() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/app.txt", "x = 1\nx = 1\ny = 2\n");
+        let executor = adapter(&root);
+
+        let missing = run(&executor, EDIT_TOOL, edit_args("app.txt", "z = 3", "z = 4"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(failure_reason(&missing).contains("not found"));
+
+        let twice = run(&executor, EDIT_TOOL, edit_args("app.txt", "x = 1", "x = 9"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            failure_reason(&twice).contains('2'),
+            "the count must be named"
+        );
+
+        let same = run(&executor, EDIT_TOOL, edit_args("app.txt", "y = 2", "y = 2"));
+        assert!(
+            same.is_err(),
+            "an identical replacement is refused before reaching the file"
+        );
+
+        assert_eq!(
+            fs::read_to_string(root.join("app.txt")).unwrap_or_default(),
+            "x = 1\nx = 1\ny = 2\n"
+        );
+    }
+
+    #[test]
+    fn edit_matches_across_crlf_line_endings() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        fs::write(root.join("win.txt"), "one\r\ntwo\r\nthree\r\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let executor = adapter(&root);
+
+        let result = run(
+            &executor,
+            EDIT_TOOL,
+            edit_args("win.txt", "one\ntwo", "uno\ndos"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+        assert_eq!(
+            fs::read_to_string(root.join("win.txt")).unwrap_or_default(),
+            "uno\r\ndos\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn edit_cannot_reach_a_file_outside_the_root() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("outside/secret.txt", "keep");
+        link_directory(&outer.path().join("outside"), &root.join("escape"));
+        outer.write("outside.txt", "keep");
+        let executor = adapter(&root);
+
+        for path in ["../outside.txt", "escape/secret.txt"] {
+            let result = run(&executor, EDIT_TOOL, edit_args(path, "keep", "gone"))
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(
+                result.outcome(),
+                ToolOutcome::Failed,
+                "{path} must be refused"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(outer.path().join("outside.txt")).unwrap_or_default(),
+            "keep"
+        );
+        assert_eq!(
+            fs::read_to_string(outer.path().join("outside").join("secret.txt")).unwrap_or_default(),
+            "keep"
+        );
+    }
     /// An absolute path is refused, and a missing file is `Failed` rather than an adapter error.
     #[test]
     fn absolute_and_missing_paths_fail_without_reaching_a_host_file() {
@@ -1039,11 +1533,14 @@ mod tests {
     /// surfaces here rather than at a call.
     #[test]
     fn both_definitions_are_accepted_and_declare_a_read() {
-        let definitions = FilesystemReadTool::definitions()
+        let definitions = FilesystemTool::definitions()
             .unwrap_or_else(|error| panic!("both definitions must be accepted: {error}"));
-        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions.len(), 4);
 
-        for definition in &definitions {
+        for definition in definitions
+            .iter()
+            .filter(|d| [READ_TOOL, LIST_TOOL].contains(&d.id().to_string().as_str()))
+        {
             assert_eq!(
                 definition.effects(),
                 &EffectSet::single(ToolEffect::ReadOnly),
@@ -1071,7 +1568,7 @@ mod tests {
 
         // An unknown name is refused rather than defaulting to the read tool.
         assert!(matches!(
-            FilesystemReadTool::definition("jarvis.files.write"),
+            FilesystemTool::definition("jarvis.files.delete"),
             Err(FilesystemToolError::UnknownTool { .. })
         ));
     }

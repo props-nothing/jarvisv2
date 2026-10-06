@@ -24,6 +24,7 @@ These instructions apply to the entire repository.
 - Provider SDK types must not cross JARVIS domain boundaries.
 - Canonical memory, permissions, approvals, audit records, and workflow state belong to JARVIS, never to a model or external runtime.
 - All tool calls pass through schema validation, authentication, authorization, risk classification, approval policy, timeout, idempotency where relevant, execution, and audit.
+- Keep approvals light (`docs/adr/0136-an-approval-is-a-yes-or-no-from-the-owner.md`): policy decides what is asked, and the owner answers with one click, one command or one spoken word from any surface holding the local credential. Do not add steps, codes, devices or levels to answering an approval; make the question clearer or ask less often instead.
 - The model may request an effect; deterministic Rust policy decides whether it may happen.
 - SQLite is the default local backend. PostgreSQL plus pgvector is the server and multi-device backend.
 - Start with database-backed events and workflows. Add Redis, NATS, Kafka, Temporal, Qdrant, or Kubernetes only after a measured requirement and an ADR.

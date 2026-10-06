@@ -14,7 +14,8 @@ selected_sdk: cap-std 4.0.3
 In scope: how the read-only filesystem tool (`P3-006`) is confined to explicitly granted workspace
 roots, on Windows and unix, in a crate that **forbids `unsafe_code`**.
 
-Out of scope: write, move, delete, and trash/undo (a later slice, and each needs its own undo design);
+Write (create/append, and one-exact-text edit via a sibling temp file and rename) was added by `ADR-0137` using the same
+handles. Still out of scope: move, delete, and trash/undo (each needs its own undo design);
 archive handling; and OS-level sandboxing of a child process, which is `P3-011`.
 
 ## The Requirement This Satisfies
@@ -150,7 +151,7 @@ looks exactly like a right one.**
   each a configuration fault, because a root is granted when a workspace opens rather than chosen by a
   caller. A missing root is an error rather than a skip: skipping it makes a workspace whose disk was
   not mounted read as "no files", which is indistinguishable from a working tool that found nothing.
-- `jarvis_tools::FilesystemReadTool` (`crates/jarvis-tools/src/files.rs`) is the adapter:
+- `jarvis_tools::FilesystemTool` (`crates/jarvis-tools/src/files.rs`) is the adapter:
   `jarvis.files.read` and `jarvis.files.list`, both `read_only`, risk 0, `Auto` approval, idempotency
   `Required`.
 - Bounds: `MAX_TOOL_OUTPUT_BYTES` (32 KiB, applied at the read **and** by `BoundedOutput`) and

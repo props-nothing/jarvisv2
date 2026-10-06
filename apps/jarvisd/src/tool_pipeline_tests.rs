@@ -22,8 +22,7 @@ use jarvis_storage::{
     DatabaseError, LOCAL_USER_ID, LOCAL_WORKSPACE_ID, SqliteDatabase, StartRunInput, start_run,
 };
 use jarvis_tools::{
-    AuthenticationStrength, LIST_TOOL, READ_TOOL, ToolId, ToolOutcomeRecord, WorkspacePolicy,
-    WorkspaceRoots,
+    LIST_TOOL, READ_TOOL, ToolId, ToolOutcomeRecord, WorkspacePolicy, WorkspaceRoots,
 };
 use serde_json::json;
 
@@ -138,16 +137,7 @@ async fn pipeline_with(
     workspace: WorkspacePolicy,
 ) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline) {
     let (directory, database) = database_with_run().await;
-    // The secret store lives **inside this test's own root**, never in the shared temp directory: a fixed
-    // path would let two tests' nonce files collide, and a nonce file is exactly the thing that must belong
-    // to one approval.
-    let secrets = jarvis_storage::SecretStore::in_state(&directory.join("state"));
-    let pipeline = must(ToolPipeline::new(
-        Arc::clone(&database),
-        roots,
-        workspace,
-        secrets,
-    ));
+    let pipeline = must(ToolPipeline::new(Arc::clone(&database), roots, workspace));
     (directory, database, pipeline)
 }
 
@@ -169,13 +159,11 @@ async fn pipeline_with_extra(
     adapter: Arc<dyn jarvis_tools::ToolExecutor>,
 ) -> (TempRoot, Arc<SqliteDatabase>, ToolPipeline) {
     let (directory, database) = database_with_run().await;
-    let secrets = jarvis_storage::SecretStore::in_state(&directory.join("state"));
     let pipeline = must(ToolPipeline::with_adapters(
         Arc::clone(&database),
         Some(roots),
         WorkspacePolicy::default(),
         vec![(definitions, adapter)],
-        secrets,
     ));
     (directory, database, pipeline)
 }
@@ -226,7 +214,7 @@ impl jarvis_tools::ToolExecutor for RecordingAdapter {
 /// and the test asserts the *other* adapter did not run.
 #[tokio::test]
 async fn a_call_reaches_the_adapter_that_owns_its_definition() {
-    // A real granted root, so the filesystem adapter is registered and its two tools share the table with the
+    // A real granted root, so the filesystem adapter is registered and its four tools share the table with the
     // MCP one. A file is written as well, so a misroute that happened to parse its arguments would find
     // something to read rather than failing for a missing file — making "it did not run" an observation about
     // routing rather than about the fixture.
@@ -243,13 +231,13 @@ async fn a_call_reaches_the_adapter_that_owns_its_definition() {
     )
     .await;
 
-    // Three tools are dispatchable: the filesystem adapter's two and the MCP one. Asserted so a table that
+    // Five tools are dispatchable: the filesystem adapter's four and the MCP one. Asserted so a table that
     // registered only one cannot make the routing assertion below vacuous — which is exactly how the first
     // version of this test passed a falsification it should have failed.
     assert_eq!(
         pipeline.dispatchable_tools(),
-        3,
-        "the filesystem adapter's two tools and the additional one must all be dispatchable"
+        5,
+        "the filesystem adapter's four tools and the additional one must all be dispatchable"
     );
 
     let arguments = json!({ "q": "pumps" });
@@ -319,14 +307,8 @@ async fn a_call_reaches_the_adapter_that_owns_its_definition() {
 /// reason rather than passing for the wrong one — which is exactly what the assertion's `{outcome:?}` was
 /// there to show.
 fn mcp_actor() -> ToolActor {
-    ToolActor::workspace_and_mcp(
-        LOCAL_WORKSPACE_ID,
-        RUN,
-        SessionChannel::Cli,
-        AuthenticationStrength::Credential,
-        "policy-1",
-    )
-    .unwrap_or_else(|| panic!("both fixed scope literals must be accepted"))
+    ToolActor::workspace_and_mcp(LOCAL_WORKSPACE_ID, RUN, SessionChannel::Cli, "policy-1")
+        .unwrap_or_else(|| panic!("both fixed scope literals must be accepted"))
 }
 
 /// A read-only MCP-namespaced definition, built the way the catalog builds one.
@@ -369,13 +351,7 @@ fn mcp_definition(id: &str, remote: &str) -> jarvis_tools::ToolDefinition {
 }
 
 fn actor() -> ToolActor {
-    ToolActor::workspace_reader(
-        LOCAL_WORKSPACE_ID,
-        RUN,
-        SessionChannel::Cli,
-        AuthenticationStrength::Credential,
-        "policy-1",
-    )
+    ToolActor::workspace_reader(LOCAL_WORKSPACE_ID, RUN, SessionChannel::Cli, "policy-1")
 }
 
 /// **The seam that did not exist: a read reaches the filesystem and is recorded durably.**
@@ -736,15 +712,15 @@ fn held_definition() -> jarvis_tools::ToolDefinition {
 
 /// **The seam this slice adds: a held call writes the durable approval it is waiting on.**
 ///
-/// Before this, `AwaitingApproval` returned a `call_id` and a strength and persisted **nothing** — the
+/// Before this, `AwaitingApproval` returned a `call_id` and persisted **nothing** — the
 /// long-recorded limit every tool slice restated. The call row stayed truthfully `requested` forever, and
 /// the documented resume path (`security.md`'s "a trusted desktop/mobile/CLI approval may resume a
 /// voice-originated run") had no record to resume against.
 ///
 /// Three properties, and each is a way the write could be wrong rather than a way it could pass:
 /// no adapter ran; the row's intent is the **call's** canonical intent, so a decision binds to the action
-/// rather than to the request; and the requester is the **run**, which is what makes the domain's
-/// self-approval refusal do work in a single-owner profile.
+/// rather than to the request; and the requester is the **run**, so the stored row still points back to
+/// the work that asked for it.
 #[tokio::test]
 async fn a_held_call_writes_the_approval_it_is_waiting_on() {
     let directory = TempRoot::new();
@@ -773,7 +749,6 @@ async fn a_held_call_writes_the_approval_it_is_waiting_on() {
     let ToolPipelineOutcome::AwaitingApproval {
         call_id,
         approval_id,
-        required_strength,
         reason_code,
     } = outcome
     else {
@@ -784,10 +759,6 @@ async fn a_held_call_writes_the_approval_it_is_waiting_on() {
     // against what the decision "should" be called: `P3-003` owns the code, and a hand-written
     // expectation would drift from it silently.
     assert_eq!(reason_code, "approval_required");
-    // Risk 2 asks for `Credential`, not `Present`: `P3-003`'s table maps `Moderate` to a verified
-    // credential and reserves user presence for `High`. Asserting the value the engine computed also
-    // pins the **risk** the definition produced, which is what this fixture exists to hold.
-    assert_eq!(required_strength, AuthenticationStrength::Credential);
 
     // **The row exists, and a decision can name it.** Read back with the `approval_id` the outcome
     // carried, so the assertion is about the value a caller receives rather than about a lookup that
@@ -874,7 +845,7 @@ async fn a_held_call_writes_a_request_then_a_hold_to_the_run_stream() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
     let definition = held_definition();
-    let (root, database, pipeline) = pipeline_with_extra(
+    let (_root, database, pipeline) = pipeline_with_extra(
         roots,
         vec![definition],
         Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -894,7 +865,6 @@ async fn a_held_call_writes_a_request_then_a_hold_to_the_run_stream() {
     let ToolPipelineOutcome::AwaitingApproval { approval_id, .. } = outcome else {
         panic!("expected a hold, got {outcome:?}");
     };
-    let _ = root;
 
     let events = must(
         jarvis_storage::read_run_events(
@@ -945,8 +915,7 @@ async fn a_held_call_writes_a_request_then_a_hold_to_the_run_stream() {
 async fn a_refused_call_writes_nothing_to_the_run_stream() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
-    let (root, database) = database_with_run().await;
-    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
+    let (_root, database) = database_with_run().await;
 
     // A workspace that denies the tool outright, so the refusal happens at step 2 and before admission.
     let denied = must(ToolId::new("mcp.test.write"));
@@ -959,7 +928,6 @@ async fn a_refused_call_writes_nothing_to_the_run_stream() {
             vec![held_definition()],
             Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
-        secrets,
     ));
 
     let outcome = must(
@@ -1011,7 +979,7 @@ async fn a_refused_call_writes_nothing_to_the_run_stream() {
 ///
 /// - the adapter **ran**, and ran with the arguments the approval was decided against;
 /// - the stored outcome is terminal, so the call is not left ambiguous;
-/// - a **second** resume is refused, because a decision that is delivered twice must not become a second
+/// - a **second** resume is refused, because a repeated decision flow must not become a second
 ///   effect. This is the property the whole `P3-012` slice exists for, and it is the one a naive "call
 ///   again if approved" implementation gets wrong;
 /// - the resumed receipt **cites the approver**, which is what `P3-017` unblocked — without the approver
@@ -1020,7 +988,7 @@ async fn a_refused_call_writes_nothing_to_the_run_stream() {
 async fn an_approved_call_resumes_once_and_not_twice() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
-    let (root, database, pipeline) = pipeline_with_extra(
+    let (_root, database, pipeline) = pipeline_with_extra(
         roots,
         vec![held_definition()],
         Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -1041,31 +1009,19 @@ async fn an_approved_call_resumes_once_and_not_twice() {
     let ToolPipelineOutcome::AwaitingApproval {
         call_id,
         approval_id,
-        required_strength,
         ..
     } = outcome
     else {
         panic!("expected a hold, got {outcome:?}");
     };
-    assert_eq!(
-        required_strength,
-        AuthenticationStrength::Credential,
-        "a risk-2 write needs a credential, and the resume records what the hold demanded"
-    );
-
-    // The operator reads the delivered nonce and answers, exactly as the route does.
-    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
-    let nonce = must(secrets.take(&approval_id));
     let now = UtcTimestamp::now(&SystemClock);
     must(
         jarvis_storage::record_decision(
             &database,
             &approval_id,
-            nonce.expose(),
             &must(jarvis_core::ApprovalDecision::new(
                 jarvis_core::ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
-                jarvis_core::AuthenticationStrength::Present,
                 now,
                 LOCAL_USER_ID,
             )),
@@ -1100,7 +1056,7 @@ async fn an_approved_call_resumes_once_and_not_twice() {
         "a resumed call that completed must not be marked unrepeatable"
     );
 
-    // **The duplicate-delivery refusal.** The same decision delivered again must not run the call a second
+    // **The duplicate replay refusal.** The same decision replayed again must not run the call a second
     // time: the effect is the thing being protected, and a resume that reached the adapter twice would be
     // exactly the second effect this slice exists to prevent.
     let again = pipeline
@@ -1122,7 +1078,7 @@ async fn an_approved_call_resumes_once_and_not_twice() {
 async fn an_undecided_approval_cannot_be_resumed() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
-    let (root, database, pipeline) = pipeline_with_extra(
+    let (_root, database, pipeline) = pipeline_with_extra(
         roots,
         vec![held_definition()],
         Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -1148,7 +1104,7 @@ async fn an_undecided_approval_cannot_be_resumed() {
     else {
         panic!("expected a hold, got {outcome:?}");
     };
-    let _ = (root, database);
+    let _ = database;
 
     // Nothing has answered yet, so the approval is pending and does not authorize.
     let refused = pipeline
@@ -1179,7 +1135,7 @@ async fn an_undecided_approval_cannot_be_resumed() {
 async fn a_resume_with_different_arguments_is_refused() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
-    let (root, database, pipeline) = pipeline_with_extra(
+    let (_root, database, pipeline) = pipeline_with_extra(
         roots,
         vec![held_definition()],
         Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -1206,17 +1162,13 @@ async fn a_resume_with_different_arguments_is_refused() {
         panic!("expected a hold, got {outcome:?}");
     };
 
-    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
-    let nonce = must(secrets.take(&approval_id));
     must(
         jarvis_storage::record_decision(
             &database,
             &approval_id,
-            nonce.expose(),
             &must(jarvis_core::ApprovalDecision::new(
                 jarvis_core::ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
-                jarvis_core::AuthenticationStrength::Present,
                 UtcTimestamp::now(&SystemClock),
                 LOCAL_USER_ID,
             )),
@@ -1248,7 +1200,7 @@ async fn a_resume_with_different_arguments_is_refused() {
 async fn a_call_for_another_run_cannot_be_resumed() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
-    let (root, database, pipeline) = pipeline_with_extra(
+    let (_root, database, pipeline) = pipeline_with_extra(
         roots,
         vec![held_definition()],
         Arc::new(RecordingAdapter::default()) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -1275,17 +1227,13 @@ async fn a_call_for_another_run_cannot_be_resumed() {
         panic!("expected a hold, got {outcome:?}");
     };
 
-    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
-    let nonce = must(secrets.take(&approval_id));
     must(
         jarvis_storage::record_decision(
             &database,
             &approval_id,
-            nonce.expose(),
             &must(jarvis_core::ApprovalDecision::new(
                 jarvis_core::ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
-                jarvis_core::AuthenticationStrength::Present,
                 UtcTimestamp::now(&SystemClock),
                 LOCAL_USER_ID,
             )),
@@ -1299,7 +1247,6 @@ async fn a_call_for_another_run_cannot_be_resumed() {
         LOCAL_WORKSPACE_ID,
         "0198f000-0000-7000-8000-0000000000c9",
         SessionChannel::Cli,
-        AuthenticationStrength::Credential,
         "policy-1",
     )
     .unwrap_or_else(|| panic!("the fixed scope literals must be valid"));
@@ -1317,27 +1264,20 @@ async fn a_call_for_another_run_cannot_be_resumed() {
     );
 }
 
-/// **A held call can actually be decided, which is what `P3-012a` could not deliver on its own.**
+/// **A held call can be decided directly from its durable approval row.**
 ///
-/// `P3-012a` wrote the durable approval but the plaintext nonce was generated, digested, and dropped, so
-/// `record_decision` — which compares a presented value against the stored digest — had nothing to accept.
-/// This is the end-to-end proof that the delivery exists: hold a call, take the nonce the way the
-/// operator's client would, decide the approval, and assert the row moved to `approved`.
+/// This is the end-to-end proof of the current flow: hold a call, decide the approval through the stored
+/// row alone, and assert the row moved to `approved`.
 ///
-/// Four properties, each a way the delivery could be wrong rather than a way it could pass:
-///
-/// - the nonce is **not** in the durable row (it is a digest there, `ADR-0018`);
-/// - the nonce **is** presentable once and the decision is accepted;
-/// - the **approver must not equal the requester** — deciding as the run is refused, which is the guard
-///   that makes the identity decision in `P3-012a` load-bearing rather than decorative;
-/// - a decision on a **different intent** cannot be produced from this approval, because the intent is
-///   what a decision binds to and `record_decision` re-reads it from the stored row.
+/// Two properties, each a way the flow could be wrong rather than a way it could pass:
+/// the approval can be decided directly from the durable row; and the stored request still belongs to the
+/// originating run.
 #[tokio::test]
-async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
+async fn a_pending_approval_can_be_decided() {
     let directory = TempRoot::new();
     let roots = must(WorkspaceRoots::new([directory.path()]));
     let definition = held_definition();
-    let (root, _database, pipeline) = pipeline_with_extra(
+    let (_root, _database, pipeline) = pipeline_with_extra(
         roots,
         vec![definition],
         Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
@@ -1358,58 +1298,14 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
         panic!("expected a hold, got {outcome:?}");
     };
 
-    // The store is the profile's state directory, which for a fixture is inside its own root.
-    let secrets = jarvis_storage::SecretStore::in_state(&root.join("state"));
-
-    // **The nonce is presentable exactly once**, which is the one-time property `ADR-0018` requires and
-    // the only way a decision can be verified at all.
-    let nonce = must(secrets.take(&approval_id));
-    let again = secrets.take(&approval_id);
-    assert!(
-        matches!(again, Err(jarvis_storage::SecretStoreError::Absent { .. })),
-        "a nonce must not be presentable twice, got {again:?}"
-    );
-
-    // **Deciding as the run is refused.** The requester *is* the run (`P3-012a`), so an approver equal to
-    // it must be rejected — this is the self-approval guard doing real work rather than being
-    // unreachable, which is the whole reason the requester was chosen to be the agent.
     let now = UtcTimestamp::now(&SystemClock);
-    let as_the_agent = jarvis_storage::record_decision(
-        pipeline.database(),
-        &approval_id,
-        nonce.expose(),
-        &must(jarvis_core::ApprovalDecision::new(
-            jarvis_core::ApprovalDecisionOutcome::Approve,
-            jarvis_core::ApprovalChannel::Cli,
-            jarvis_core::AuthenticationStrength::Present,
-            now,
-            RUN,
-        )),
-    )
-    .await;
-    assert!(
-        matches!(
-            as_the_agent,
-            Err(DatabaseError::InvalidApprovalRequest {
-                field: "decided_by"
-            })
-        ),
-        "the agent that asked must not be able to approve, got {as_the_agent:?}"
-    );
-
-    // Deciding as the human is accepted. The nonce was **not** consumed by the refused attempt: the
-    // refusal happens in the domain after the digest check, and `record_decision`'s guarded UPDATE only
-    // rotates the digest when the write lands. Asserted rather than assumed, because a refused decision
-    // that silently burned the nonce would make an approval undecidable after one honest mistake.
     let decided = must(
         jarvis_storage::record_decision(
             pipeline.database(),
             &approval_id,
-            nonce.expose(),
             &must(jarvis_core::ApprovalDecision::new(
                 jarvis_core::ApprovalDecisionOutcome::Approve,
                 jarvis_core::ApprovalChannel::Cli,
-                jarvis_core::AuthenticationStrength::Present,
                 now,
                 LOCAL_USER_ID,
             )),
@@ -1424,9 +1320,6 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
         "the approval must be approved at the instant it was decided"
     );
 
-    // **The durable row holds a digest, not the nonce.** This is the property `ADR-0018` exists for, and
-    // asserting it here rather than only in the storage crate proves the *pipeline* did not accidentally
-    // write the plaintext anywhere a reader could reach.
     let stored = must(jarvis_storage::find_approval(pipeline.database(), &approval_id).await);
     assert_eq!(
         stored.actor_id(),
@@ -1445,6 +1338,66 @@ async fn a_pending_nonce_is_delivered_and_the_approval_can_be_decided() {
     assert_eq!(stored.intent().to_hex(), expected.to_hex());
 }
 
+/// **Asking again about the exact call the owner already answered is refused with a sentence, not a database
+/// error**, and a *different* call is still asked about.
+#[tokio::test]
+async fn a_repeated_identical_request_is_refused_readably_and_a_changed_one_is_held() {
+    let directory = TempRoot::new();
+    let roots = must(WorkspaceRoots::new([directory.path()]));
+    let (_root, _database, pipeline) = pipeline_with_extra(
+        roots,
+        vec![held_definition()],
+        Arc::new(UnreachableAdapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+    )
+    .await;
+    let arguments = json!({ "path": "notes/todo.txt" });
+
+    let first = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments.clone(),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(matches!(
+        first,
+        ToolPipelineOutcome::AwaitingApproval { .. }
+    ));
+
+    let repeat = must_err(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                arguments,
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(
+        matches!(repeat, ToolPipelineError::RepeatedRequest { .. }),
+        "got {repeat:?}"
+    );
+    assert!(repeat.to_string().contains("pending"), "{repeat}");
+
+    let changed = must(
+        pipeline
+            .call_tool(
+                "mcp.test.write",
+                json!({ "path": "notes/other.txt" }),
+                &mcp_actor(),
+                CorrelationId::new(),
+            )
+            .await,
+    );
+    assert!(matches!(
+        changed,
+        ToolPipelineOutcome::AwaitingApproval { .. }
+    ));
+}
 /// A pipeline whose only adapter is the real web fetch tool, and the actor the daemon derives for it.
 async fn web_pipeline(
     workspace: WorkspacePolicy,
@@ -1459,7 +1412,6 @@ async fn web_pipeline(
             vec![definition.clone()],
             Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
-        jarvis_storage::SecretStore::in_state(&directory.join("state")),
     ));
     // Derived from the composed definitions exactly as the daemon derives it, so a scope the tool declares is
     // granted without a list that could omit it.
@@ -1467,7 +1419,6 @@ async fn web_pipeline(
         LOCAL_WORKSPACE_ID,
         RUN,
         SessionChannel::Cli,
-        AuthenticationStrength::Credential,
         "policy-1",
         &[definition],
     );
@@ -1541,7 +1492,6 @@ async fn an_unattended_web_fetch_is_still_refused_by_the_address_guard() {
         jarvis_tools::Risk::High,
         jarvis_tools::Risk::High,
         true,
-        true,
     ));
     let (_root, _database, pipeline, actor) = web_pipeline(workspace).await;
     let correlation = CorrelationId::new();
@@ -1576,7 +1526,7 @@ async fn an_unattended_web_fetch_is_still_refused_by_the_address_guard() {
 /// they would run. Only the owner's explicit `policy.trust` entry waives it (`ADR-0133`), asserted next.
 #[tokio::test]
 async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
-    let (directory, database) = database_with_run().await;
+    let (_directory, database) = database_with_run().await;
     let interpreter = vec!["sh".to_owned(), "-c".to_owned()];
     let definition = must(crate::code_run::CodeRunTool::definition(&interpreter));
     let tool = must(crate::code_run::CodeRunTool::new(
@@ -1588,7 +1538,6 @@ async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
         jarvis_tools::Risk::High,
         jarvis_tools::Risk::High,
         false,
-        false,
     ));
     let pipeline = must(ToolPipeline::with_adapters(
         Arc::clone(&database),
@@ -1598,13 +1547,11 @@ async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
             vec![definition.clone()],
             Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
-        jarvis_storage::SecretStore::in_state(&directory.join("state")),
     ));
     let actor = ToolActor::for_composed_tools(
         LOCAL_WORKSPACE_ID,
         RUN,
         SessionChannel::Cli,
-        AuthenticationStrength::Credential,
         "policy-1",
         &[definition],
     );
@@ -1636,7 +1583,7 @@ async fn code_is_held_for_a_person_under_the_most_permissive_policy() {
 /// call executed rather than was held — and an untrusted sibling with the same declaration is still held.
 #[tokio::test]
 async fn a_trusted_code_tool_runs_without_a_hold() {
-    let (directory, database) = database_with_run().await;
+    let (_directory, database) = database_with_run().await;
     let interpreter = vec!["sh".to_owned(), "-c".to_owned()];
     let definition = must(crate::code_run::CodeRunTool::definition(&interpreter));
     let build = |workspace: WorkspacePolicy| {
@@ -1653,43 +1600,45 @@ async fn a_trusted_code_tool_runs_without_a_hold() {
                 vec![definition.clone()],
                 Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
             )],
-            jarvis_storage::SecretStore::in_state(&directory.join("state")),
         ))
     };
     let actor = ToolActor::for_composed_tools(
         LOCAL_WORKSPACE_ID,
         RUN,
         SessionChannel::Cli,
-        AuthenticationStrength::Credential,
         "policy-1",
         std::slice::from_ref(&definition),
     );
     let call = |pipeline: ToolPipeline| {
         let actor = actor.clone();
         async move {
-            must(
-                pipeline
-                    .call_tool(
-                        crate::code_run::RUN_TOOL,
-                        json!({ "code": "echo hi" }),
-                        &actor,
-                        CorrelationId::new(),
-                    )
-                    .await,
-            )
+            pipeline
+                .call_tool(
+                    crate::code_run::RUN_TOOL,
+                    json!({ "code": "echo hi" }),
+                    &actor,
+                    CorrelationId::new(),
+                )
+                .await
         }
     };
 
-    let untrusted = call(build(WorkspacePolicy::default())).await;
+    let untrusted = must(call(build(WorkspacePolicy::default())).await);
     assert!(
         matches!(untrusted, ToolPipelineOutcome::AwaitingApproval { .. }),
         "without trust the default workspace holds code: {untrusted:?}"
     );
     let trusted_policy = WorkspacePolicy::default()
         .trusting(must(jarvis_tools::ToolId::new(crate::code_run::RUN_TOOL)));
+    // What is asserted is that the call is **not held and reached the adapter**. Whether the adapter then runs the
+    // snippet depends on this host having a container runtime: without one it refuses before launching, which is
+    // still the adapter's answer and not the pipeline's hold.
     let trusted = call(build(trusted_policy)).await;
     assert!(
-        matches!(trusted, ToolPipelineOutcome::Executed(_)),
-        "a trusted tool must reach the adapter: {trusted:?}"
+        matches!(
+            trusted,
+            Ok(ToolPipelineOutcome::Executed(_)) | Err(ToolPipelineError::AdapterCall(_))
+        ),
+        "a trusted tool must reach the adapter, not be held: {trusted:?}"
     );
 }

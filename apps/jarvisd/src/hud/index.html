@@ -9,7 +9,7 @@
 <body>
 <div id="app">
   <header>
-    <div class="brand"><span class="logo">J.A.R.V.I.S</span><span class="sub">personal agent console</span></div>
+    <div class="brand"><span class="logo">J.A.R.V.I.S</span><span class="sub">just a rather very intelligent system</span></div>
     <div class="pills">
       <span class="pill" id="pill-link"><i></i><span>connecting</span></span>
       <span class="pill" id="pill-work"><i></i><span>0 working</span></span>
@@ -23,10 +23,15 @@
   <div id="message" role="status"></div>
 
   <div id="layout">
+    <aside class="dock" id="left">
+      <section class="frame"><h2>Waiting for you</h2><div id="waiting"></div></section>
+      <section class="frame"><h2>Working</h2><div id="working"></div></section>
+    </aside>
+
     <section id="stage">
       <div id="orbwrap">
         <canvas id="orb" aria-hidden="true"></canvas>
-        <div id="caption">idle</div>
+        <div id="caption">standing by</div>
       </div>
 
       <div id="chat" aria-live="polite"></div>
@@ -35,7 +40,7 @@
         <button type="button" id="mic" title="Talk (M)" aria-label="Talk">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z" fill="currentColor"/></svg>
         </button>
-        <input id="input" type="text" placeholder="Ask JARVIS anything  ( / )" maxlength="3000" aria-label="Message">
+        <input id="input" type="text" placeholder="Ask JARVIS anything   ( / )" maxlength="3000" aria-label="Message">
         <button type="submit" id="send">Send</button>
       </form>
       <div id="toggles">
@@ -45,15 +50,16 @@
       </div>
     </section>
 
-    <aside id="dock">
-      <section><h2>Waiting for you</h2><div id="waiting"></div></section>
-      <section><h2>Working</h2><div id="working"></div></section>
-      <section><h2>Scheduled</h2><div id="scheduled"></div></section>
-      <section><h2>Recent</h2><div id="recent"></div></section>
-      <p class="note">Approving happens where the decision code is delivered (your terminal): the command is shown above. This console can talk, watch and stop work, not approve it.</p>
+    <aside class="dock" id="right">
+      <section class="frame"><h2>Telemetry</h2><div id="stats"></div></section>
+      <section class="frame"><h2>Scheduled</h2><div id="scheduled"></div></section>
+      <section class="frame"><h2>Can do</h2><div id="abilities"></div></section>
+<section class="frame"><h2>Recent</h2><div id="recent"></div></section>
+      <p class="note">Anything that needs a yes or no appears on the left: press Approve or Deny, or just say &ldquo;yes&rdquo; or &ldquo;no&rdquo;. The terminal works too: <code>jarvis approvals</code>.</p>
     </aside>
   </div>
 </div>
+<script src="/head.js"></script>
 <script src="/hud.js"></script>
 </body>
 </html>

@@ -7,7 +7,7 @@
   the migration that carries it cannot be edited once applied.
 - **Relates to:** `ADR-0004` (canonical memory is JARVIS-owned), `ADR-0049` (untrusted content is fenced, and
   the fence is not a promise the model will obey), `ADR-0005` (canonical tools and MCP), `ADR-0017` (policy
-  evaluation outcomes and ownership), `ADR-0018` (approvals bind to a digest and store no bearer token),
+  evaluation outcomes and ownership), `ADR-0018` (an approval is bound to the exact arguments),
   `ADR-0045` (a correction is declared, not inferred), `ADR-0035` (a documented invariant with no test is a
   convention).
 

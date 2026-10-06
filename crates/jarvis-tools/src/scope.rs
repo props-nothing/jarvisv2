@@ -256,7 +256,7 @@ impl ScopeSet {
     ///
     /// A pure function over two declared sets, and nothing more: it answers "do these grants satisfy
     /// this contract", not "may this actor run this tool". The second question also needs identity,
-    /// workspace policy, channel ceiling, and approval, and `P3-003` owns it. Keeping this pure is
+    /// workspace policy, and approval posture, and `P3-003` owns it. Keeping this pure is
     /// what lets the interesting part of that decision be read as a function of data.
     #[must_use]
     pub fn is_satisfied_by(&self, held: &Self) -> bool {

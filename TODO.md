@@ -351,30 +351,25 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [x] `P3-003` Implement deterministic policy evaluation with deny-overrides, workspace grants, actor identity, channel constraints, and reason codes.
       `crates/jarvis-tools/src/evaluation.rs`: `evaluate` is a pure function over a **borrowed**
       `ToolDefinition` (no clock, no I/O, no repository), returning `Allow` / `RequireApproval` /
-      `Deny` plus an `effective_risk`, a `DenyReason` code, the strength an approval would need, and
+      `Deny` plus an `effective_risk`, a `DenyReason` code, and
       the escalation signals that raised the risk. Deny overrides is a control-flow property: the
       checks are ordered and the first refusal ends the evaluation, so no permissive finding can
       mask a later refusal. The denials precede the approval steps, so a call that is denied *and*
       would need approval reports the denial rather than sending an operator to approve something
-      that cannot run. A channel **caps** the authentication an actor may claim (`channel_ceiling`),
-      which is what produces the documented voice rule: a voice-originated risk-3 call is *held* for
-      a desktop/CLI approval, not refused, so the resume path stays reachable. Workspace policy can
+      that cannot run. Workspace policy can
       only narrow what a tool declares. 150 in-crate tests. ADR-0017 records the ownership tension:
       `repository-layout.md` gives core "policy decisions and reason codes" while `jarvis-tools` is
       named for the policy pipeline, and the decision must read a definition holding compiled JSON
       Schema validators — so core cannot own it without either gaining a vendor SDK or inverting the
       adapter direction.
       Deliberately not a placeholder: nothing calls this yet and nothing is persisted. Recording an
-      approval obligation (nonce, expiry, resume) is `P3-004`; the execution receipt is `P3-005`.
+      approval obligation (expiry, resume) is `P3-004`; the execution receipt is `P3-005`.
 - [x] `P3-004` Implement durable approval requests, expiry, approve/deny/cancel, authenticated approvers, and resume semantics.
       `jarvis_core::approval` (the domain) + `jarvis_storage::approval_repository` + migration
       `0006_approvals.sql` (schema v6). An approval binds to a **canonical intent digest** computed
       from the tool, its version, and a sorted-key rendering of the arguments, domain-separated so
-      two parts cannot bleed into each other. The one-time decision nonce is stored only as a
-      SHA-256 **digest** and rotated on use, so a leaked row proves a decision happened without
-      yielding the ability to make one. A storage-loaded request **cannot verify a nonce** and says
-      so, because it holds only the digest; the store verifies and then calls the domain's verified
-      path, which enforces the strength floor, the expiry, and the self-approval refusal. Expiry is
+      two parts cannot bleed into each other. A decision records its outcome, channel, instant and approver and
+      enforces the expiry. Expiry is
       evaluated in Rust from `unix_nanos` and is a **read-side** fact, never a stored state and never
       a SQL comparison. One approval per intent per run (unique index), and a second decision is
       refused, so a denial cannot be overwritten. 113 core tests plus 19 in-crate storage tests, with
@@ -553,14 +548,12 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       was conflating HTTP success with "the read happened" — exactly the confusion `P3-005` exists to
       remove — so it now asserts on the outcome and on the absence of content.
       **Honest limits.** **There is no approval round-trip**: a held decision returns `202` with `call_id`
-      and `required_strength` and then nothing happens — no `ApprovalRequest` is persisted, no route lets a
+      and the reason and then nothing happens — no `ApprovalRequest` is persisted, no route lets a
       human decide, and nothing resumes the call, so the row stays truthfully `requested` forever. That is
       a gap, not a design. **No `run_events` row is written for a tool call** (`P3-012` owns it), so a call
       is absent from any stream a client is watching. **`policy_version` is a label, not a verifiable
       version** — the handler passes the literal `"policy-1"` and nothing checks it, so a receipt citing it
-      proves which string was supplied rather than which rules were applied. **The authentication strength
-      is asserted, not proven**: `Credential` is passed because a loopback credential was presented, with
-      no per-call verification at the call site. The route takes its workspace from the run but **does not
+      proves which string was supplied rather than which rules were applied. The route takes its workspace from the run but **does not
       check that the run is the caller's**, because this transport has one local identity; that becomes a
       real question when a second identity exists. No CLI verb drives the route, so it is exercised by the
       gateway tests and no end-to-end process gate yet.
@@ -1040,9 +1033,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       deliberately (`P3-001`'s contract, `P3-006b`'s binding), so the routing moved into the adapter,
       supplied from the catalog entries at construction and filtered to one server so an identifier cannot
       be sent to a server it does not belong to.
-      **Two fixture mistakes are recorded in the test rather than fixed silently**: an MCP tool requires the
-      `mcp.call` scope, and even a minimal-risk tool requires `ChannelEvidence` — so an `Absent` strength
-      claim is a hold. Both turned every test into a held call, and both were visible only because the
+      **A fixture mistake is recorded in the test rather than fixed silently**: an MCP tool requires the
+      `mcp.call` scope, and an empty grant turned every test into a refusal, visible only because the
       fixture asserts an allowance instead of assuming one.
       **Honest limits.** **At the time of this slice nothing composed `McpToolAdapter` into the daemon** — no
       run drove an MCP tool, no `ToolOutcome` from an MCP call was stored, and `apps/jarvisd` had zero
@@ -1863,187 +1855,12 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       all green.
 - [ ] `P3-012` Prove approval restart and duplicate-delivery safety; pass the Phase 3 gate.
   - [x] `P3-012a` A held call persists the durable approval it is waiting on.
-        **The limit every tool slice restated, closed.** `P3-005`, `P3-006`, `P3-006d`, and each of
-        `P3-008a`..`P3-009c-b` recorded a version of "nothing persists an `ApprovalRequest`": an
-        `AwaitingApproval` outcome returned a call id and a strength and wrote **nothing**, so the call row
-        stayed truthfully `requested` forever and the documented resume path (`security.md`: "a trusted
-        desktop/mobile/CLI approval may resume a voice-originated run") had no record to resume against.
-        `ToolPipeline::authorize_and_admit` now returns an `Admission::{Runnable,Held}` and a held decision
-        writes an `ApprovalRequest` bound to the **call's own canonical intent**, so a decision binds to the
-        action rather than to a description of it. `AwaitingApproval` carries the `approval_id`, and the
-        gateway replies with it beside the call id.
-        **A held call has no receipt, and that is why the value types differ.** `AuthorizationReceipt::new`
-        refuses a `RequireApproval` with no citation (`P3-006a`), because a receipt is what an adapter treats
-        as **permission** and none exists yet — so a hold could only produce one by inventing a citation for a
-        decision nobody made. `Admission` is therefore two variants rather than `Option<PreparedCall>`: the two
-        cases carry different values, and filling a hold's facts into the runnable type would mean writing
-        placeholders for fields only the runnable case has.
-        **⚠ The call is now admitted BEFORE the receipt is built, and that reordering is safe for a stated
-        reason.** `CallBinding` takes the receipt identifier as a parameter, and the pipeline passes the
-        call's own id for both fields. That is not a fabrication: a call that is never authorized cannot cite
-        a receipt, and the ledger key is `(run_id, idempotency_key)` rather than the receipt, so the binding
-        value is not part of any uniqueness constraint. The alternative — keeping the old order — meant
-        building a receipt whose constructor refuses exactly this decision.
-        **The identity decision, which is the security content of the slice.** The domain refuses an approval
-        whose approver equals its requester, and `security.md` names the threat as **model self-approval /
-        confused deputy**. For that refusal to do any work in a single-owner profile the requester must be the
-        **agent acting for the run**, because the person is the only identity eligible to approve anything
-        here — recording the user as the requester would make the two equal by construction and turn the guard
-        into a check that can only refuse real work, the shape `ADR-0022` removed from cancellation. So the
-        requester is the run, which the call's own origin already records for the same reason, and the
-        approver is chosen by the decide path and never travels in a request body.
-        **The preview names the tool and version, not its arguments** — deliberately, and the reason is the
-        bound rather than tidiness. The arguments are already bound by the intent digest, so a preview is
-        *additional* context; rendering arbitrary model-authored arguments into a field `P3-004` caps at 512
-        characters would fail the hold for a tool whose arguments are simply large. A rich, effect-shaped
-        preview is `A11`'s job, where the content is a message or an event this layer can summarize.
-        **Falsified, one property each.** Removing the `create_approval` call fails with `ApprovalNotFound`
-        (the test reads the row back by the `approval_id` the outcome carried, so it cannot pass on any other
-        row). Replacing the requester with `LOCAL_USER_ID` fails with the run id vs the user id, so the
-        identity assertion is not vacuous. Both mutations were restored and the suite re-run green.
-        **⚠ Two traps hit during this slice, both already recorded and both worth restating.** A
-        PowerShell `-replace` on a multi-line anchor **silently no-opped** because the working copy has LF
-        while the anchor used `r`n`, so the first falsification passed for the wrong reason — the fix is to
-        assert the string actually changed (and prefer a single-line anchor). And `Copy-Item` restoring a
-        `.bak` **restores the older timestamp**, so cargo skipped the rebuild and the restored suite looked
-        red; the working copy was correct and `cargo` was running the mutated artifact. *A falsification that
-        passes is a finding about the harness, not a reprieve.*
-        **Limits, recorded rather than glossed:** nothing decides the approval yet and nothing resumes the
-        call, which is `P3-012b`. A held call has **no durable link to its approval** (the `tool_calls` row's
-        `approval_id` column is a migration away), so the association is carried in an outcome value and a
-        log rather than a join — `P3-012c`. Nothing writes a `run_events` row, and a run does not park in
-        `awaiting_approval`: the hold is a **tool-level** fact until the executor path (`P3-012c`) makes it a
-        run-state change. Gates: fmt, clippy `-D warnings`, 44 suites / `--all-features` / `--locked` green,
-        `cargo deny check` ok.
-  - [x] `P3-012b` Deliver the decision nonce so a stored approval can be decided. (The decision route and the
-        resumption of the held call remain, recorded below.)
-        **Recon done, and it found the crux before any code was written.** A stored approval **could not
-        be decided by anything**, and the reason is a design tension rather than a missing function:
-        `DecisionNonce` is generated into `record_hold`, stored only as a SHA-256 **digest**
-        (`ADR-0018`), and the plaintext was **dropped** when the hold returned. `record_decision` requires
-        the plaintext and compares it against that digest, so `expose()`/`nonce_for_storage()` had **no
-        production reader**. The nonce is meant to be **presented**, which needs an out-of-band delivery
-        channel that did not exist.
-        **DELIVERED: the delivery channel (`ADR-0042`).** New `crates/jarvis-storage/src/secret_store.rs`
-        holds the plaintext nonce in a **profile-private file** and `ToolPipeline::record_hold` writes it
-        immediately after the approval row. This is the shape the daemon already uses for its own client
-        credential: the daemon **issues** a secret into a file the human's account can read, and the
-        secret never travels in a request body and is never returned to whoever asked for the action.
-        Permission hardening reuses `paths::secure_private_file`, so `0600` on unix and the hardened DACL
-        on Windows keep one home.
-        **⭐ Why not the obvious place.** Returning the nonce in the hold's response would look like a fix
-        today and become a **self-approval primitive** the moment `P3-012c` routes model→tool: that
-        response travels the tool-call path, whose requester is the **run** — and the nonce exists to
-        defeat *model self-approval*. The one identity that must never receive it is the one that would.
-        Deliberately **not** "derive it from a server secret" either; `ADR-0018` already rejected that
-        because a derived value stays valid until the secret rotates and so is not one-time.
-        **The one-time property is enforced by the filesystem.** `SecretStore::take` removes the file
-        **before** returning the value, so two concurrent decisions race on one `remove_file` and exactly
-        one wins; the failure direction is the safe one — a crash loses the nonce and makes the approval
-        **undecidable** rather than **reusable**. A corrupt stored value is consumed as well as reported,
-        so a retry cannot repeat the read.
-        **`ApprovalRequest::nonce() -> &DecisionNonce`, never `&str`.** The nonce and its digest are both
-        fixed-length lowercase hex, so a caller holding a `&str` cannot tell them apart and a **digest
-        passed where a nonce belongs would be written out as the secret** — recreating exactly the flaw
-        `P3-004` found. The typed return makes "the digest is not the nonce" a property of the type system.
-        **The identifier is parsed, not sanitized**: `path_for` refuses anything that is not an
-        `ApprovalId` *before* joining a path, so `../../escape` has to be unrepresentable rather than
-        escaped.
-        **Proved end to end, which no unit test could show:** hold a call, take the nonce the way the
-        operator's client would, decide as the **human** and land `approved`. The gap was *between* a
-        correct store and a correct pipeline. Also asserted: deciding as the **run** is refused (so
-        `P3-012a`'s requester choice now has an executable consequence), and a refused decision does
-        **not** burn the nonce (the domain refuses after the digest matches and the guarded UPDATE rotates
-        only when the write lands) — so one honest mistake does not destroy an approval.
-        **Falsified, one property each:** deleting the `secrets.store(..)` call fails with `Absent`;
-        deleting the `remove_file` in `take` fails `a nonce must not be presentable twice` **and** the
-        corrupt-value test. Both mutations restored, both suites re-run green.
-        **⚠ The stale-mtime trap again:** `Copy-Item` restoring a `.bak` restores the **older**
-        timestamp, so cargo skipped the rebuild and the restored suite appeared red while the working copy
-        was correct. Touch the file before believing a post-restoration failure.
-        **DELIVERED: the decision route, and it forced a correction to the control itself.**
-        `POST /api/v1/approvals/{id}/decision` (`jarvis-protocol::ApprovalDecisionBody`) closes the slice;
-        the approver is the **local identity**, never a request field, and `deny_unknown_fields` makes an
-        attempt to supply one a `422` rather than a silently ignored value.
-        **⭐ The first cut was wrong, and the failing test is what exposed it.** It had the daemon `take`
-        the nonce from the file and present *that*. But the file is a **delivery channel** — the operator's
-        client is its legitimate reader — so the daemon consuming it would refuse a decision the operator
-        had every right to make, and the route's answer would depend on filesystem state rather than on the
-        caller's credential. Fixed: the daemon now verifies the **presented** nonce via `record_decision`
-        (which compares it to the stored digest and rotates that digest on a landed write) and then
-        `discard`s the file. **The digest rotation is the one-time mechanism; the file removal is defence
-        in depth.** A `discard` failure is **logged, not reported** — telling an operator a decision *did
-        not happen* when it did is a worse answer than a stale file.
-        **A refused decision therefore consumes nothing**: a wrong nonce, a self-approval, or a lapsed
-        approval leaves the nonce valid and the operator retries. Burning an approval on a retryable error
-        turns a typo into a fresh tool call, which is how an approval flow gets routed around.
-        **Falsified through the route, one guard each:** forcing `stored != digest(presented_nonce)` false
-        made a **forged nonce decide an approval** (`200` where `403` was asserted), and removing
-        `deny_unknown_fields` made an `approver_id` field **silently accepted** (`200` where `422` was
-        asserted). Both restored byte-identically (`git status` clean) and re-run green: 81 daemon tests.
-        Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero
-        skips**, both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok. Limits recorded
-        in `ADR-0042`: the secret is cleartext protected by filesystem permissions only; nothing sweeps a
-        lapsed approval's nonce file.
-  - [x] `P3-015` Honor a tool's own `ApprovalPolicy::Ask` declaration (**production defect, found by a test**).
-        `evaluate`'s step 7 consulted the **workspace** policy and the risk threshold but **never the
-        tool's own `approval()`**, so a tool declaring "always ask me" was auto-allowed whenever the
-        workspace did not require approval for that risk. Every existing `Ask` fixture happened to be
-        risk 2 or 3, where the risk threshold holds the call anyway — so the missing check was **masked by
-        the fixtures**, and only a **risk-0 `Ask`** tool exposes it. Found because the route test could not
-        produce a held call from a read-only tool. Fixed: step 7 now ORs the tool's declaration with the
-        risk and external requirements, and `ApprovalPolicy::Policy` is deliberately **not** treated as
-        `Ask` (deferring to policy is the opposite of always asking). Two tests: a tool declaring `Ask` at
-        risk 0 is held; a tool deferring to policy at risk 0 runs. **Falsified**: forcing
-        `tool_requires_approval = false` returns `Decision::Allow` and the new test fails.
-        **The lesson recorded here:** a fixture that shares the bug's assumption cannot catch the bug, and
-        a threshold in front of a check can hide that the check is absent.
-  - [x] `P3-016` Link a held call to its approval and to the run's event stream.
-        **The gap was a column with no writer.** `tool_calls.approval_id` existed since `0007`, nullable and
-        with its foreign key, and **nothing ever set it**: `admit_tool_call` runs before `create_approval`
-        (the write order `P3-012a` fixed so a crash leaves an undecidable approval rather than a dangling
-        secret), so the identifier did not exist at insert time and no second statement set it either. The
-        consequence was that a decision moved the approval to `approved` and nothing could find the call
-        waiting on it — the two rows shared no column, so there was **no join from a decision back to its
-        subject**. `link_tool_call_approval` is that join, written by `ToolPipeline::record_hold` after the
-        row and the secret.
-        **⭐ Write-once, and the falsification is what made that worth asserting.** The `UPDATE` requires
-        `approval_id IS NULL`, so a link cannot be **moved**. A re-pointable link would let a call
-        authorized under one approval be resumed under another — a way to obtain an effect the operator
-        never decided, because their decision was about a *different* action. Linking again to the **same**
-        approval is a no-op, following `record_tool_outcome`'s rule that a retried write of one fact is not
-        an error while a changed fact is.
-        **⚠ The falsification found a coverage gap, which is the point of running it.** Deleting the
-        `AND approval_id IS NULL` guard left **every one of the 149 tests green** — no test linked a call
-        twice, so the guard was unprotected. Two tests were added (`a_call_links_to_its_approval_exactly_once`,
-        `a_link_requires_both_ends_to_exist`) and the same mutation then **failed** with
-        `ToolCallApprovalLinkConflict` expected. *A guard with no test is a guard the next person deletes.*
-        **The event stream now shows a call, in order.** `ToolPipeline` appends `tool_requested` before
-        admitting a call and `approval_requested` when a hold is recorded, so a client replaying the stream
-        sees the run ask for something and then block on a human, without reading a second table. The
-        `P3-012` limit "no `run_events` row is written for a tool call" is closed for this path.
-        **A refusal writes nothing, deliberately.** The event is emitted after the policy decision allows,
-        so a `Deny` produces no row — otherwise a caller could fill the run's log by asking for tools it may
-        not use, making a refusal a write primitive. Asserted separately
-        (`a_refused_call_writes_nothing_to_the_run_stream`) so a future change that emits on refusal fails
-        there.
-        **Migration `0008` adds an index and nothing else, after a first attempt was withdrawn.** The first
-        version rebuilt the whole table to "tidy" the column, which re-stated every `CHECK` by hand and
-        **silently widened two byte bounds into character bounds** — `evidence` 256→512 and `output` from
-        bytes to chars, in the column holding untrusted provider text. Those bounds are written in **bytes**
-        on purpose, so a multi-byte payload cannot smuggle past a character count. The column was already
-        correct; only a partial index (`WHERE approval_id IS NOT NULL`) was missing. *Re-typing a constraint
-        is how a bound changes.* No backfill: a guessed link could connect a call to a decision that was
-        never about it, and an unlinked call (visible, never resumes) is the safe direction.
-        Gates: fmt, clippy `-D warnings`, 44 suites with the application binaries absent and **zero skips**,
-        both phase gates with `ACCEPTANCE_REQUIRE_BINARIES=1`, `cargo deny` ok. 151 storage tests, 83 daemon
-        tests.
-        **Recorded as a limit:** the link makes a held call **findable**, and nothing yet **resumes** it. A
-        decision moves the approval to `approved` and the call stays `requested`; the resumption needs the
-        approver identity from a decided approval, which `ApprovalRequest` does not currently expose (the
-        row stores `decided_by`; the domain type returns only the decision), so it is a domain change rather
-        than a call-site one. That is `P3-012c`'s remainder and is where a duplicate delivery would become a
-        second effect.
+        `ToolPipeline::authorize_and_admit` returns `Admission::{Runnable,Held}`; a held decision writes an
+        `ApprovalRequest` bound to the call's own canonical intent, and `AwaitingApproval` carries the `approval_id`.
+        A held call has no receipt, because a receipt is what an adapter treats as permission and none exists yet.
+        The requester is the run; the answer comes from the owner.
+  - [x] `P3-012b` Let the owner answer a stored approval. (Simplified by `P3-037` / `ADR-0136`: an answer needs only
+        the authenticated request. The decision route and the resumption of the held call are `P3-012c`.)
   - [x] `P3-012c` Link calls to approvals and events, and pass the Phase 3 process gate.
         Delivered as four slices, because each step exposed the next gap:
         - `P3-016` **linked a held call to its approval** (the `approval_id` column existed since `0007` with
@@ -2057,8 +1874,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
         **The gate drives the real platform end to end**: it configures one real MCP server over stdio (the
         hand-written `fixture-peer`) with the daemon's **unclassified** posture — risk 3, effects
         `Write`+`ExternalCommunication`, `ApprovalPolicy::Ask`, which is what an operator gets by naming a
-        server and saying nothing else — holds a call, reads the delivered nonce out of the profile's private
-        store, **kills the daemon**, restarts it, decides the approval, resumes the call, and asserts the
+        server and saying nothing else — holds a call,
+        **kills the daemon**, restarts it, decides the approval, resumes the call, and asserts the
         second resumption is refused. So the hold comes from the product's own configuration path rather
         than from a writable test adapter compiled into `jarvisd`.
         **Falsified end to end**: configuring the server `read-only` instead of unclassified makes the gate
@@ -2316,10 +2133,6 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       not name `jarvis-tools`'s type. The workaround would have been a second risk vocabulary in storage:
       **two values that must agree with nothing holding both**, where a drift would compile and an operator's
       configured ceiling would be silently ignored. Core already held `Sensitivity` for the same reason.
-      Deliberately **not** the `AuthenticationStrength` situation: that type exists twice and the duplication
-      is correct, because the two mean different things (what a channel *can* establish versus what the
-      answering channel *did* establish). **Duplication is right when the meanings differ and wrong when they
-      do not — the test is whether one value could be substituted for the other without changing a claim.**
       `Risk::declared_for` now takes the floor as a **number** (an `EffectSet` is `jarvis-tools`'s type), and
       `jarvis-tools::declared_for_effects` is the single binding that supplies `EffectSet::risk_floor()`, so
       the rule keeps exactly one home.
@@ -2381,7 +2194,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       **Delivered:** `jarvis-protocol` gains `tool_api` (`ToolReply`, `ToolListReply`,
       `ToolPreviewRequest`, `ToolPreviewReply`); `ToolPipeline` gains `policy_inventory`, `preview_call`, and
       `workspace_policy`; `jarvisd` gains `GET /api/v1/tools` and `POST /api/v1/tools/{tool}/preview`; the CLI
-      gains a `jarvis tools <list|preview>` group with `--escalation`, `--channel`, `--strength`, and
+      gains a `jarvis tools <list|preview>` group with `--escalation`, `--channel`, and
       `--json`. **`ADR-0123`.**
       **⭐⭐ A PREVIEW IS A DECISION, NOT A PREDICTION, AND IT WRITES NOTHING.** `evaluate` is a pure function
       of declared facts, so `preview_call` calls the **same** function the tool-call path calls over the same
@@ -2404,16 +2217,14 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       the move made `Risk`, `ApprovalPolicy`, and `EscalationSignal` nameable. A mistyped policy is now a `422`
       naming the field rather than a default, and a default here would be the *most permissive* reading of a
       value the caller mistyped. `EscalationSignal` moved to core in this slice for exactly that reason.
-      `AuthenticationStrength` deliberately stays a name on the wire: core's type of that name means what an
-      answering channel *did* establish, so substituting it would let a ceiling be recorded as an observation.
       **⭐ THREE STATUSES STAY DISTINCT BECAUSE THE REMEDIES DIFFER.** An unknown tool is `404` rather than a
       refusal, because a typo and a policy denial have opposite remedies. No tool surface at all is `404`
       rather than an empty list, because "nothing is configured" and "this daemon cannot serve tools" are
       different deployment facts. A **denied** tool is still `callable: true`, because the denial is a policy
       fact rather than an availability one — conflating them would send an operator to fix a grant when the
       remedy is a configuration line.
-      **⭐ A CALLER SUPPLIES CONTEXT; THE DAEMON SUPPLIES AUTHORITY.** A preview body carries only `channel`,
-      `claimed_strength`, and `escalation` — the parts of the call only the caller knows. Scopes, the workspace
+      **⭐ A CALLER SUPPLIES CONTEXT; THE DAEMON SUPPLIES AUTHORITY.** A preview body carries only `channel` and
+      `escalation` — the parts of the call only the caller knows. Scopes, the workspace
       policy, and the definition come from the daemon, and `deny_unknown_fields` makes an attempt to name them
       a `422` rather than an ignored value. A test asserts a body naming `scopes` is refused, so the preview
       cannot become an authorization oracle.
@@ -2422,7 +2233,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       `unknown tools option "jarvis.files.read"`. It was caught because the parser is tested **directly**
       rather than through the rendered output: a rendering test would have shown a plausible error and the
       cause would have looked like a bad identifier. Two more CLI tests assert that an unknown escalation,
-      channel, or strength is a **usage error** rather than an ignored flag, because silently dropping an
+      or channel is a **usage error** rather than an ignored flag, because silently dropping an
       escalation computes the preview for a call *without* it and reads as more permissive than the user asked
       about — with a `--json` control so a parser that refused every flag cannot pass.
       Gates: fmt, clippy `-D warnings`, `cargo test --workspace --all-features --locked` (adds 10 gateway
@@ -2541,7 +2352,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   exfiltration-by-URL risk is bounded (2,048-character URL cap, address rule, audit) and documented in `security.md`;
   `"jarvis.web.fetch" = "ask"` restores the hold.
 - [x] `[policy] trust = [...]` / `WorkspacePolicy::trusting`: the owner's advance decision waives a tool's `Ask`, the
-  risk threshold and the authentication strength — and not the ceiling, a denial, scopes or the external-communication
+  risk threshold — and not the ceiling, a denial, scopes or the external-communication
   rule; never consulted for externally communicating tools; a denial or approval override wins in either order.
 - [x] `jarvis init --code-image IMAGE [--code-interpreter "node -e"] [--trust-code]` writes the code sandbox and, only
   on request, the trust.
@@ -2558,7 +2369,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [x] **Defect found by the live run:** cancelling a run parked at `awaiting_approval` recorded a request nobody read (a
   parked run has no driver), so the run stayed in the approvals list for ever. `settle_parked_run_cancelled` now settles
   it directly (`awaiting_approval → cancelled`, refused for a run with a driver) and
-  `withdraw_cancelled_run_approvals` expires its pending approvals (payload and nonce gone) and drops approved-but-
+  `withdraw_cancelled_run_approvals` expires its pending approvals (payload gone) and drops approved-but-
   unreleased arguments, so `resume` cannot run an action for a cancelled run. Restart recovery runs the same sweep, which
   also repaired the orphan the live run had already left. Amends `ADR-0013`.
   - Tests: storage `cancelling_a_parked_run_settles_it_and_a_running_one_is_refused`, gateway
@@ -2596,7 +2407,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 
 ### P3-036: Visual presence — the heads-up display (`jarvis hud`)
 
-- [x] The daemon serves a static display at `/hud` (`apps/jarvisd/src/hud.rs`, `ADR-0135`): an orb that is idle, working,
+- [x] The daemon serves a static display at `/` (alias `/hud`) (`apps/jarvisd/src/hud.rs`, `ADR-0135`): an orb that is idle, working,
   or amber and pulsing when something **needs you**, plus waiting-for-you (with the exact approve command and a copy
   button), working (with **Stop** per run and **Stop everything**), scheduled and recent. `jarvis hud` opens it with the
   credential in the URL fragment, which the page moves to session storage and removes from the address bar. No
@@ -2605,7 +2416,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
     `POST` and sibling paths), the script never inserts markup / inline script / query credential, the fragment form.
   - **Live in a browser:** the page rendered the parked code approval and its run, Stop cancelled the run and the
     approval vanished, the orb returned to idle; a reload kept working from session storage.
-  - **Limits:** it cannot approve (the decision code is a private file, by design); polling every 1.5 s rather than a
+  - **Limits:** polling every 1.5 s rather than a
     push stream; one workspace; no per-run event detail yet.
 - [x] **Upgraded to a full console** (same slice): animated canvas orb whose waveform follows the mic or the spoken
   answer, a streaming conversation over the run's SSE (tool chips, safe markdown, session kept across turns), the four
@@ -2614,8 +2425,67 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   answers, interruption, and the hands-free kill switch ("Jarvis, stop"). Tests: no markup insertion, no outside
   origin, no `MediaRecorder`, no inline style. **Live:** a streamed answer with tool chips and two parallel sub-agents
   visible in the panels; the stale-cursor and raw-markdown-in-panel defects found by looking at it were fixed.
+- [x] **The face** (2026-10-06): the orb became a film-style interface (concentric ticked rings, segmented arcs, name
+  ring that fills one turn, radar sweep, radial voice spectrum, arc-reactor core, sight lines and brackets) in a
+  three-column HUD layout with framed panels and a telemetry panel; state shown by colour and tempo. **Live:** idle and
+  working states checked in a browser while two sub-agents ran; a name-ring overprint and an undersized face found by
+  looking at it were fixed. See `ADR-0135`.
   - **Limits:** the microphone path could not be exercised here (no audio device); browser recognition may use the
     vendor's cloud (Chrome/Edge); no file attach; no spoken approval; Firefox has no speech recognition.
+
+### P3-037: Light approvals — an approval is a yes or no from the owner
+
+- [x] `ADR-0136`: deciding whether to ask stays deterministic policy (risk threshold, per-tool `ask`/`deny`, always-ask for
+  tools that talk to other people, `trust`); answering is one click, one command or one spoken word from any surface that
+  holds the local credential. `POST /api/v1/approvals/{id}/decision` takes `{ decision, resume, channel? }` and the bearer
+  credential alone; an old-style body that still sends a code is refused with a validation error.
+- [x] Removed from the code and the docs: the one-time decision code and its delivery file, the authentication-strength
+  levels with the per-channel ceiling, and the distinct-approver rule. Kept: the digest that binds an approval to the
+  exact arguments shown, arguments held until the call runs, expiry, withdrawal on cancel, restart survival, and a decision
+  that records the outcome, the surface, the instant and a plain approver label. Three older database columns stay in the
+  table (they cannot be dropped safely) and are written with fixed values in one isolated place.
+- [x] Console: **Approve** / **Deny** buttons on the waiting panel, a spoken announcement when something new needs an answer
+  (spoken answers on), and a bare "yes"/"no" that answers the single waiting question (several waiting: it asks you to use
+  the buttons). A conversation that no longer exists starts a fresh one instead of failing.
+  - Tests: storage approval tests restored and adapted after review found a dozen deleted tests of behaviour that stays;
+    gateway tests for deciding with the credential alone, 401 without it, and refusing an old-style body; policy and
+    pipeline tests updated. 2,103 tests pass.
+  - **Live, real model:** a held fetch appeared amber with its exact arguments; one click on Approve ran it and the answer
+    came back; a second held fetch was denied from the CLI and the model said it had not fetched the page. No approval-code
+    directory exists on disk any more.
+  - **Limits:** a spoken answer is as reliable as the browser's recognition (the microphone path could not be exercised
+    here); with several approvals waiting a word cannot pick one; no per-surface restriction on who may answer, deliberately.
+
+### P3-038: Write and edit files in granted folders
+
+- [x] `ADR-0137`: `jarvis.files.write` (create or append, never replaces; runs by default) and `jarvis.files.edit`
+  (replace one exact text; asked about once, waived by `trust`), both confined by the same directory handles as reads,
+  content capped so a held call stays decidable, and not served to remote MCP callers.
+- [x] A failed tool call now tells the model why (also after an approval), and a repeated identical request that was already
+  answered is refused with a sentence instead of a database error (both found live).
+  - Tests: create/parents/no-overwrite/append, traversal + absolute + link escapes for write and edit, oversize, unique
+    replace, not-found/ambiguous/identical, CRLF, no temp file left, MCP exclusion, repeated request.
+  - **Live, real model:** asked to create `shopping/list.txt` it ran without asking; an edit was held with its exact
+    arguments, approved from the CLI and applied with no temp file left; an edit of text that is not there came back as
+    "the text to replace was not found" and the model reported exactly that.
+  - **Limits:** no delete/move/overwrite; one approval per edit; 4,000 characters per write call.
+
+### P3-039: The console gets a real head, a "can do" panel, and opens on start
+
+- [x] The face is now a real human head: MediaPipe's canonical face mesh (Apache-2.0, from upstream, recorded in
+  `docs/research/integrations/mediapipe-canonical-face-model.md`; not copied from `example/`) drawn as a hologram in plain 2D
+  canvas inside the existing rings, with a wire skull and neck. Jaw opens with speech, eyes glow and follow the pointer,
+  brows lift when something needs you, it leans in while listening, offline it dims with eyes shut.
+- [x] A "Can do" panel lists every tool as **runs**, **asks** or **off**. The daemon says which (`asks_first` on
+  `GET /api/v1/tools`); a test pins it to `evaluate` over 180 effect/risk/approval/posture combinations (it caught a
+  divergence: a workspace denial is checked apart from the approval policy).
+- [x] `jarvis start` opens the console (`--no-open` skips it); an already-running daemon just opens it.
+  - Tests: head asset is public and `GET` only, pinned to 468 vertices / 898 in-range triangles with attribution kept,
+    no outside origin or markup insertion; `asks_first` parity.
+  - **Live, real daemon:** the head renders in all states (mouth open, amber brows, green lean); the panel showed 8 tools
+    with only "Edit a file" asking.
+  - **Limits:** the head is a mask plus wire skull (no hair or shoulders); speech mouth motion is a synthetic envelope, not
+    phoneme-driven; no settings editing in the console yet (policy and folders are still `config.toml` / `jarvis init`).
 
 ## P4: Memory And Context
 
@@ -2693,7 +2563,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       removes text **and derived indexes**", and a search key *is* derived text — it holds the claim's
       words, case-folded and word-sorted. Keeping it would have satisfied "resurrection is blocked" while
       violating "the text is gone", and the violation would be invisible because no retrieval reads the
-      tombstone table. The same technique `ADR-0018` uses for a decision nonce.
+      tombstone table. The same technique `ADR-0018` uses for an intent digest.
       **"A relationship memory starts as a proposal" is deliberately *not* a table `CHECK`.** A `CHECK`
       applies to every write, not to the insertion, so a constraint reading "a relationship row is never
       `active`" would forbid the *confirmation* it exists to require. The invariant is about creation, and
@@ -6990,6 +6860,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P6-005` Implement sequential and parallel steps, conditions, retries, timeouts, delays, event waits, and cancellation.
 - [ ] `P6-006` Require idempotency or an explicit non-retryable classification for every effectful workflow step.
 - [ ] `P6-007` Implement notifications and proactive suggestion budgets, quiet hours, dedupe, and user controls.
+      > Status 2026-10-06: a pull view exists (`jarvis watch`, the console's waiting panel, the page title count); no push notification, quiet hours or budgets yet.
 - [ ] `P6-008` Add crash-at-every-transition and duplicate-event tests; pass the Phase 6 gate.
 - [ ] `P6-009` Define the skill-candidate and memory-nudge events in the envelope **before `P6-001` freezes
       it**: a complex task that completed, a repeated procedure worth proposing, and a nudge to persist
@@ -7000,6 +6871,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
       (`P7-003`), and parallel workstreams tested for single-effect on duplicate delivery and for
       cancellation. The effect class "starts a run" is named explicitly rather than folded into an existing
       one.
+      > Status 2026-10-06: the starts-a-child-run effect exists as `jarvis.agent.delegate` (`P3-034`, ADR-0134) but not yet as a durable workflow step; a parent/child link is recorded only by the objective marker, and a crash mid-delegation is not resumed.
 
 ## P7: External Runtimes
 
@@ -7019,6 +6891,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P7-010` Add a subagent delegation tool: an ordinary tool whose effect is "starts a run", classified
       with its own risk level and approval policy, so a delegated run is authorized like any other capability
       and a model cannot spawn work the actor was not granted.
+      > Status 2026-10-06: delivered in a first form by `P3-034` (ADR-0134): `jarvis.agent.delegate`/`result`, depth limit one, at most four active, sub-agent answers fenced. Not yet classified with its own effect class, and not routed to external runtimes.
 - [ ] `P7-011` Test delegation: depth limiting, crash isolation between parent and child, cancellation
       propagation, single-effect on duplicate delivery, and canonical audit ownership of a child run's steps.
 
@@ -7034,6 +6907,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P8-008` Verify HMAC signatures against raw webhook bodies, deduplicate events, return promptly, and process durable work asynchronously.
 - [ ] `P8-009` Implement call records, consent/disclosure flags, transcript/audio retention, deletion, and redacted audit events.
 - [ ] `P8-010` Add local wake word, push-to-talk, VAD, STT/TTS provider ports, echo handling, and interruption as client capabilities.
+      > Status 2026-10-06: partly delivered ahead of order by `P3-036`: browser-native push-to-talk, wake word, spoken answers and interruption in the console. Still open: VAD, local (non-cloud) STT/TTS provider ports, echo handling, and a non-browser client.
 - [ ] `P8-011` Pass inbound, outbound, voicemail, no-answer, interruption, latency, replay, privacy, and provider-outage tests.
 - [ ] `P8-012` Implement the turn-detection and interruption port: canonical turn events with confidence, backchannel suppression, false-interruption resume, and a silence setting used only as a maximum cap.
 - [ ] `P8-013` Implement a `flux`-class turn-detecting STT adapter and assert that a pause-heavy request is not cut off at the silence threshold.
@@ -7045,6 +6919,7 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 ## P9: Desktop, Installation, And Releases
 
 - [ ] `P9-001` Scaffold Tauri desktop as a daemon client with generated API bindings and a narrowly scoped command allowlist.
+      > Status 2026-10-06: an interim browser console ships as the daemon's main page (`P3-036`, ADR-0135): it can talk, watch, answer approvals and stop. The Tauri client remains the planned native client.
 - [ ] `P9-002` Implement onboarding, chat, activity, approvals, connections, memory, tasks, models, runtimes, voice, diagnostics, and settings views.
 - [ ] `P9-003` Implement service install/start/stop/restart/uninstall for Linux systemd user, macOS LaunchAgent, and Windows per-user Scheduled Task; document optional system-wide modes.
 - [ ] `P9-004` Build idempotent shell and PowerShell installers with OS/architecture detection, checksum/signature verification, PATH setup, onboarding, and doctor.

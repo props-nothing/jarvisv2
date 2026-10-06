@@ -79,7 +79,7 @@ satisfy a tool whose requirements are a subset and refuse the rest, making the s
 cannot keep.
 
 **The first version of that constructor granted no scopes at all**, on the reasoning that the narrowest grant is
-the safest. Its own test caught the error: `FilesystemReadTool` declares `required_scopes: ScopeSet::single("files.read")`
+the safest. Its own test caught the error: `FilesystemTool` declares `required_scopes: ScopeSet::single("files.read")`
 and the engine requires the actor to cover the **tool's** declared scopes, so an actor holding nothing was refused
 every call with `missing_scope`. The endpoint would have been built, bound, and answered every request with a
 refusal — which an operator would read as a policy misconfiguration rather than as a defect in this constructor.

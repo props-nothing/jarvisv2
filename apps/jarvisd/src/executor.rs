@@ -1809,7 +1809,6 @@ async fn run_tool_round(
         run.workspace_id(),
         run.id(),
         SessionChannel::Cli,
-        jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
         &composed_definitions,
     );
@@ -1890,7 +1889,18 @@ fn tool_result_text(result: &jarvis_tools::ToolCallResult) -> String {
             // A confirmed effect that produced no text is still an outcome the model must know about,
             // so it is stated rather than left empty.
             "confirmed" => "ok (the action was performed)".to_owned(),
-            other => format!("the tool reported: {other}"),
+            // The adapter's reason is what lets the model correct itself (a text that matched twice, a file that
+            // exists), so it is shown — fenced, because an adapter for a third-party server may carry provider text.
+            other => result.record().reason().map_or_else(
+                || format!("the tool reported: {other}"),
+                |reason| {
+                    let clipped: String = reason.chars().take(300).collect();
+                    jarvis_core::IsolatedText::new(&clipped).map_or_else(
+                        |_| format!("the tool reported: {other}"),
+                        |isolated| format!("the tool reported: {other}: {}", isolated.render()),
+                    )
+                },
+            ),
         },
         |output| output.content().to_owned(),
     )
@@ -1984,7 +1994,16 @@ async fn resume_held_call(
     // drop the run.
     let text = match find_tool_call(database, &pending.call_id).await {
         Ok(call) if call.outcome().is_terminal() => call.output().map_or_else(
-            || format!("the tool reported: {}", call.outcome().as_str()),
+            // The reason is what lets the model correct itself, so a failed call carries it (the whole
+            // observation is fenced below).
+            || match call.record().reason() {
+                Some(reason) => format!(
+                    "the tool reported: {}: {}",
+                    call.outcome().as_str(),
+                    truncate(reason, 300)
+                ),
+                None => format!("the tool reported: {}", call.outcome().as_str()),
+            },
             str::to_owned,
         ),
         Ok(_) | Err(_) => {
@@ -3435,22 +3454,18 @@ mod tests {
     /// loop executes is a real adapter's — not a test double's — which is what makes "the effect happened"
     /// an observation about the product rather than about the fixture.
     fn filesystem_pipeline(
-        profile: &TempProfile,
+        _profile: &TempProfile,
         database: &Arc<SqliteDatabase>,
         root: &std::path::Path,
     ) -> Arc<ToolPipeline> {
         let roots = jarvis_tools::WorkspaceRoots::new([root])
             .unwrap_or_else(|error| panic!("workspace roots: {error}"));
-        // The secret store lives inside this test's own profile, never in the shared temp directory:
-        // a fixed path would let two tests' nonce files collide.
-        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
         Arc::new(
             ToolPipeline::with_adapters(
                 Arc::clone(database),
                 Some(roots),
                 jarvis_tools::WorkspacePolicy::default(),
                 Vec::new(),
-                secrets,
             )
             .unwrap_or_else(|error| panic!("compose the pipeline: {error}")),
         )
@@ -3950,13 +3965,12 @@ mod tests {
     /// records every execution, so "the effect happened exactly once" is an observation about the adapter
     /// rather than an inference from a status.
     fn approval_pipeline(
-        profile: &TempProfile,
+        _profile: &TempProfile,
         database: &Arc<SqliteDatabase>,
     ) -> (
         Arc<ToolPipeline>,
         Arc<crate::approval_fixture::RecordingApprovalAdapter>,
     ) {
-        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
         let adapter = Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
         let pipeline = ToolPipeline::with_adapters(
             Arc::clone(database),
@@ -3966,7 +3980,6 @@ mod tests {
                 vec![crate::approval_fixture::approval_declaring_definition()],
                 Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
             )],
-            secrets,
         )
         .unwrap_or_else(|error| panic!("compose the approval pipeline: {error}"));
         (Arc::new(pipeline), adapter)
@@ -4025,11 +4038,10 @@ mod tests {
     /// Decides a held call's approval and resumes it through the pipeline, as the two routes do.
     ///
     /// One helper for the two client steps, so the park/resume test is about the **run** rather than about
-    /// re-deriving the operator's flow each time. It reads the delivered nonce from the profile's private
-    /// store (the decision step) and calls `ToolPipeline::resume` (the resume step, which owns the effect);
-    /// the run continuation that follows only reads the stored outcome.
+    /// re-deriving the operator's flow each time. It records the owner's decision and calls
+    /// `ToolPipeline::resume` (the resume step, which owns the effect); the run continuation that follows
+    /// only reads the stored outcome.
     async fn approve_and_resume(
-        profile: &TempProfile,
         database: &Arc<SqliteDatabase>,
         tools: &Arc<ToolPipeline>,
         run: &StoredRun,
@@ -4040,19 +4052,14 @@ mod tests {
             .approval_id()
             .unwrap_or_else(|| panic!("a held call must link to its approval"))
             .to_owned();
-        let secrets = jarvis_storage::SecretStore::in_state(&profile.0.join("state"));
-        let nonce = secrets
-            .take(&approval_id)
-            .unwrap_or_else(|error| panic!("take the decision nonce: {error}"));
         let decision = jarvis_core::ApprovalDecision::new(
             jarvis_core::ApprovalDecisionOutcome::Approve,
             jarvis_core::ApprovalChannel::Cli,
-            jarvis_core::AuthenticationStrength::Present,
             UtcTimestamp::now(&SystemClock),
             LOCAL_USER_ID,
         )
         .unwrap_or_else(|error| panic!("build the decision: {error}"));
-        jarvis_storage::record_decision(database, &approval_id, nonce.expose(), &decision)
+        jarvis_storage::record_decision(database, &approval_id, &decision)
             .await
             .unwrap_or_else(|error| panic!("record the decision: {error}"));
 
@@ -4060,7 +4067,6 @@ mod tests {
             run.workspace_id(),
             run.id(),
             SessionChannel::Cli,
-            jarvis_tools::AuthenticationStrength::Credential,
             "policy-1",
         )
         .unwrap_or_else(|| panic!("build the actor"));
@@ -4196,7 +4202,7 @@ mod tests {
         );
 
         // The operator decides the approval and the route resumes the call, exactly as the two client
-        // steps do: the decision step takes the nonce, and `ToolPipeline::resume` owns the effect. The run
+        // steps do: the decision step records the answer, and `ToolPipeline::resume` owns the effect. The run
         // continuation that follows only **reads** the stored outcome.
         let held = jarvis_storage::read_run_tool_calls(&database, run.id())
             .await
@@ -4205,7 +4211,6 @@ mod tests {
             .first()
             .unwrap_or_else(|| panic!("the hold must have written a call row"));
         approve_and_resume(
-            &profile,
             &database,
             &tools,
             &parked,

@@ -59,8 +59,8 @@ refused without putting a full digest where anything reading logs can collect th
 
 **4. An entry holds a fingerprint, never a credential.**
 
-The same reasoning `jarvis-tools` applies to an approval nonce: this value is compared on every request,
-formatted into error messages, and held for the process's life — the place least able to protect a bearer token.
+This value is compared on every request, formatted into error messages, and held for the process's life — the place
+least able to protect a bearer token.
 A digest answers the only question the allowlist asks, which is "is this caller one we allow".
 
 **5. `local_only` admits no remote caller, and the two empty states are named for the difference.**

@@ -64,9 +64,8 @@ pub use definition::{
 pub use documents::{DocumentError, DocumentSet, MAX_SUPPLIED_DOCUMENTS};
 pub use effect::{EffectSet, ToolEffect};
 pub use evaluation::{
-    ActorAuthority, ActorStatus, AuthenticationStrength, Decision, DenyReason, EscalationSignal,
-    PolicyDecision, PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, channel_ceiling,
-    effective_risk, evaluate,
+    ActorAuthority, ActorStatus, Decision, DenyReason, EscalationSignal, PolicyDecision,
+    PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, effective_risk, evaluate,
 };
 pub use execution::{
     ApprovalCitation, AuthorizationReceipt, AuthorizationReceiptParts, BoundedOutput,
@@ -79,8 +78,8 @@ pub use executor::{
     ToolExecutor,
 };
 pub use files::{
-    FilesystemReadTool, FilesystemToolError, LIST_TOOL, MAX_LISTED_ENTRIES,
-    MAX_PATH_ARGUMENT_CHARS, READ_TOOL,
+    EDIT_TOOL, FilesystemTool, FilesystemToolError, LIST_TOOL, MAX_EDIT_FIND_CHARS,
+    MAX_LISTED_ENTRIES, MAX_PATH_ARGUMENT_CHARS, MAX_WRITE_CHARS, READ_TOOL, WRITE_TOOL,
 };
 pub use identifier::{
     MAX_TOOL_ID_CHARS, MAX_TOOL_ID_SEGMENT_CHARS, MAX_TOOL_VERSION_CHARS, ToolId, ToolIdError,

@@ -51,11 +51,7 @@ async fn fixture(with_executor: bool) -> Fixture {
     ));
     let credential = must(ClientCredential::generate());
     let presented = credential.expose().to_owned();
-    let mut state = GatewayState::new(
-        Arc::clone(&database),
-        credential,
-        jarvis_storage::SecretStore::in_state(&directory.join("state")),
-    );
+    let mut state = GatewayState::new(Arc::clone(&database), credential);
     if with_executor {
         let executor = must(crate::executor::Executor::build("scripted", None));
         state = state.with_executor(Arc::new(executor));

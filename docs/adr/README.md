@@ -35,7 +35,7 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0015](0015-tool-contract-consistency-and-offline-schemas.md) | Tool contracts derive their source, refuse remote schema references, and validate cross-field consistency at construction | Accepted |
 | [0016](0016-supplied-schema-documents-and-registry-boundaries.md) | A schema composes only against JARVIS-supplied documents; external manifests are self-contained | Accepted |
 | [0017](0017-policy-evaluation-outcomes-and-ownership.md) | Policy evaluation is a pure adapter-crate function with three outcomes, deny overrides, and channel-capped authentication | Accepted |
-| [0018](0018-approvals-bind-to-a-digest-and-store-no-bearer-token.md) | An approval binds to an intent digest and stores a nonce digest rather than a bearer token | Accepted |
+| [0018](0018-an-approval-is-bound-to-the-exact-arguments.md) | An approval is bound to the exact arguments it was asked about (simplified by 0136) | Accepted |
 | [0019](0019-tool-calls-are-a-durable-lifecycle.md) | A tool call is a durable lifecycle row; the idempotency ledger is a unique index and a terminal outcome is final | Accepted |
 | [0020](0020-filesystem-confinement-is-a-handle.md) | Filesystem confinement is a directory handle rather than a validated path | Accepted |
 | [0021](0021-an-authorization-receipt-derives-from-its-decision.md) | An authorization receipt is derived from its policy decision and cannot be built from a refusal | Accepted |
@@ -59,8 +59,7 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0039](0039-a-remote-mcp-call-has-no-run.md) | A remote MCP call has no run, and its enforcement is the same enforcement | Accepted |
 | [0040](0040-conformance-is-measured-against-the-protocol-schema.md) | Conformance is measured against the protocol's schema, not against the SDK | Accepted |
 | [0041](0041-a-sandbox-guarantee-is-named-and-refused-when-unenforceable.md) | A sandbox guarantee is a named capability that is refused when it cannot be enforced | Accepted |
-| [0042](0042-a-decision-nonce-is-delivered-by-file.md) | A decision nonce is delivered through a profile-private file, and taking it consumes it | Accepted |
-| [0043](0043-a-decision-carries-its-approver.md) | An approval decision carries the identity that made it, so a receipt can cite the approver | Accepted |
+| [0043](0043-a-decision-carries-its-approver.md) | An approval decision records who answered and through which surface (simplified by 0136) | Accepted |
 | [0044](0044-a-deleted-memory-stores-a-hash-of-its-key.md) | A deleted memory stores a hash of its key, a claim triple is three columns, and the stored status reaches the constructor | Accepted |
 | [0045](0045-a-correction-is-declared-not-inferred.md) | A correction is declared, because a search key cannot detect one | Accepted |
 | [0046](0046-retrieval-filters-then-explains-itself.md) | Retrieval eligibility is a filter, and the ranking's explanation is its arithmetic | Accepted |
@@ -147,4 +146,5 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0132](0132-a-schedule-is-a-request-to-start-an-ordinary-run.md) | A schedule is a request to start an ordinary run, fired at most once and never piled up | Accepted |
 | [0133](0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md) | Approval is for what can hurt, and the owner can decide once (amends 0129, 0131) | Accepted |
 | [0134](0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md) | A sub-agent is an ordinary run, one level deep | Accepted |
-| [0135](0135-the-heads-up-display-is-a-static-page-it-can-watch-and-stop-not-approve.md) | The heads-up display is a static page the daemon serves; it can watch and stop, not approve | Accepted |
+| [0135](0135-the-console-is-a-static-page-the-daemon-serves.md) | The console is a static page the daemon serves, and it is where you talk, watch, answer and stop | Accepted |
+| [0136](0136-an-approval-is-a-yes-or-no-from-the-owner.md) | An approval is a yes or no from the owner | Accepted |

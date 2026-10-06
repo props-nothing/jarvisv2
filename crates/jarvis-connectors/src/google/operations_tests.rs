@@ -1105,8 +1105,8 @@ fn authorized(
     deadline: UtcTimestamp,
 ) -> jarvis_tools::ToolExecutionRequest {
     use jarvis_tools::{
-        ActorAuthority, AuthenticationStrength, AuthorizationReceipt, AuthorizationReceiptParts,
-        IdempotencyKey, PolicyRequest, Scope, ScopeSet, TargetAssessment, ToolExecutionRequest,
+        ActorAuthority, AuthorizationReceipt, AuthorizationReceiptParts, IdempotencyKey,
+        PolicyRequest, Scope, ScopeSet, TargetAssessment, ToolExecutionRequest,
         ToolExecutionRequestParts, ToolId, WorkspacePolicy, evaluate,
     };
     let definition = must(
@@ -1131,8 +1131,6 @@ fn authorized(
         definition: &definition,
         actor,
         workspace: &workspace,
-        channel: jarvis_core::SessionChannel::Cli,
-        claimed_strength: AuthenticationStrength::Present,
         available: true,
         target: TargetAssessment::none(),
     });

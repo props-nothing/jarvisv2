@@ -10,12 +10,12 @@ use crate::output::ExitStatus;
 
 /// The address a browser is opened at, carrying the credential in the fragment.
 fn address(port: u16, credential: &str) -> String {
-    format!("http://127.0.0.1:{port}/hud#token={credential}")
+    format!("http://127.0.0.1:{port}/#token={credential}")
 }
 
 /// Opens the display, or says how to.
 pub fn open(port: u16, credential: &str, no_open: bool) -> ExitStatus {
-    println!("display: http://127.0.0.1:{port}/hud");
+    println!("display: http://127.0.0.1:{port}/");
     if no_open {
         println!("(not opened; the page needs the credential, which only `jarvis hud` passes)");
         return ExitStatus::Ok;
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn the_credential_travels_in_the_fragment_and_never_in_the_query() {
         let target = address(8765, "abc123");
-        assert_eq!(target, "http://127.0.0.1:8765/hud#token=abc123");
+        assert_eq!(target, "http://127.0.0.1:8765/#token=abc123");
         assert!(!target.contains('?'));
     }
 }

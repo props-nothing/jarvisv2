@@ -21,9 +21,8 @@ The goal of approval is to stand between the model and **effects that can hurt**
    `"jarvis.web.fetch" = "ask"` under `[policy.approval]` and the old behaviour returns.
 2. **The owner may trust a tool in advance:** `[policy] trust = ["jarvis.code.run"]` (`WorkspacePolicy::trusting`). It is
    the one setting that relaxes a tool's declaration, and it is deliberately narrow:
-   - it waives only the tool's own `Ask`, the risk threshold, and the authentication strength a risk level asks for
-     (the owner's advance decision stands in for presence, so a voice or scheduled run is not parked for a strength it
-     cannot supply);
+   - it waives only the tool's own `Ask` and the risk threshold, so a voice or scheduled run is not parked for a
+     question the owner already answered;
    - it does **not** waive the `max_risk` ceiling, a denial, the actor's scopes, or the external-communication rule,
      and it is never consulted for a tool with an external-communication effect — trusting a mail tool changes nothing;
    - a denial or an approval override for the same tool **wins**, in either order of declaration;

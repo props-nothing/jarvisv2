@@ -67,9 +67,9 @@ Every context item, tool input/output, artifact, event, and trace can carry a cl
 | --- | --- |
 | Data leaving in a model-chosen URL | `jarvis.web.fetch` runs by default at risk 1 ([ADR-0133](../adr/0133-approval-is-for-what-can-hurt-and-the-owner-can-decide-once.md)): the URL is capped at 2,048 characters, private addresses are refused, every call is audited with its URL; an operator who does not accept the residual risk sets `"jarvis.web.fetch" = "ask"` under `[policy.approval]` |
 | A model multiplying itself or reading another run | a sub-agent is an ordinary run with the same policy and approvals; delegation is one level deep (the executor withholds the delegation tools and scope from a sub-agent), at most 4 are active, its answer is fenced as untrusted data, and `jarvis.agent.result` reads only sub-agents of the workspace ([ADR-0134](../adr/0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md)) |
-| A browser page reaching the API | the display's two static assets are public by exact path and `GET` only and hold no data; the credential travels in the URL fragment and lives in session storage; every response carries a restrictive content-security policy (own-origin script and style only, microphone-only permissions) and the script never inserts markup, records audio or contacts another origin; the display cannot approve ([ADR-0135](../adr/0135-the-heads-up-display-is-a-static-page-it-can-watch-and-stop-not-approve.md)) |
+| A browser page reaching the API | the display's two static assets are public by exact path and `GET` only and hold no data; the credential travels in the URL fragment and lives in session storage; every response carries a restrictive content-security policy (own-origin script and style only, microphone-only permissions) and the script never inserts markup, records audio or contacts another origin; the console answers with the same authenticated route the CLI uses ([ADR-0135](../adr/0135-the-console-is-a-static-page-the-daemon-serves.md)) |
 | Prompt injection in email/web/docs | mark external content untrusted; isolate instructions; enforce policy outside model; minimize tools/context |
-| Model self-approval/confused deputy | authenticated approval receipt bound to exact intent, actor, policy version, expiry, and state version |
+| A model approving its own action | the model has no tool for answering an approval; a held call becomes a pending approval bound to the exact arguments shown, answered by the owner through the console, the CLI or a spoken yes/no ([ADR-0136](../adr/0136-an-approval-is-a-yes-or-no-from-the-owner.md)); policy, not the model, decides what is asked |
 | Malicious/compromised MCP server | explicit install consent; constrained process/network; schema and output bounds; per-server scopes; no inherited secrets |
 | Compromised external runtime | process isolation; environment allowlist; mediated tools; protocol validation; resource limits; kill/orphan cleanup |
 | Credential exfiltration | `SecretRef`; just-in-time adapter resolution; egress restrictions; structural redaction; no secrets in prompts/URLs |
@@ -81,7 +81,7 @@ Every context item, tool input/output, artifact, event, and trace can carry a cl
 | Cross-workspace leakage | mandatory workspace keys, repository-level filters, authorization tests, retrieval eligibility before ranking |
 | Memory poisoning | provenance/trust, candidate validation, user confirmation for high-impact claims, correction/supersession |
 | Duplicate external effects | intent ledger, idempotency keys, provider receipts, `unknown` reconciliation, no blind retry |
-| Voice impersonation | caller evidence is not proof; restricted guest mode; second factor/trusted-device approval for sensitive actions |
+| Voice impersonation | caller evidence is not proof; an unknown caller gets restricted guest mode with no tool authority; the owner answers anything sensitive |
 | Cost/resource abuse | per-actor/client/workspace budgets, rate/concurrency limits, bounded context/output, circuit breakers |
 | Supply-chain compromise | pinned toolchain/dependencies, lockfiles, provenance/SBOM, signature verification, review of build scripts |
 | Malicious update/downgrade | signed artifacts, trusted root, atomic handoff, schema preflight, backup, rollback and anti-confusion checks |
@@ -98,20 +98,24 @@ Every context item, tool input/output, artifact, event, and trace can carry a cl
 
 ## Approval Security
 
-An approval is a decision record, not a model message. It contains:
+An approval is a plain question to the owner, answered yes or no ([ADR-0136](../adr/0136-an-approval-is-a-yes-or-no-from-the-owner.md)).
+Policy decides what is asked: the risk threshold, per-tool `ask`/`deny` settings, the always-ask rule for tools that
+talk to other people, and `trust` for tools the owner has decided may simply run. The model can request a tool and can
+never change that decision, and it has no tool for answering one.
 
-- approval ID and one-time decision nonce
-- exact canonical intent hash and human-readable preview
-- requesting run/step/tool/version
-- actor/workspace/client and eligible approvers
-- effect/risk and policy version
-- creation/expiry and decision timestamps
-- decision channel and authentication strength
+A pending approval is a decision record, not a model message. It contains:
 
-Before effect, revalidate that the request, target, state, permissions, and connector account still match. Editing the action invalidates the approval.
+- the approval ID and the requesting run and tool call
+- the tool, its version and a digest of the exact arguments, plus a human-readable preview and the arguments themselves
+- the risk level
+- creation and expiry times
+- on decision: the outcome, the surface it came through (`cli`, `desktop`, `api` or `voice`), the instant and a plain
+  approver label
 
-Voice confirmation alone is insufficient for risk-3 actions by default. A trusted desktop/mobile/CLI approval may resume a voice-originated run.
-
+The owner answers from anywhere that holds the local credential: the console's Approve and Deny buttons,
+`jarvis approvals approve|deny`, the inline prompt in `jarvis ask` and `jarvis chat`, or a spoken "yes" or "no" in the
+console. Before the effect runs, the call is recomputed and compared with the digest, so editing the action
+invalidates the approval. An approval expires, is withdrawn when its run is cancelled, and survives a daemon restart.
 ## Secret Architecture
 
 Use providers behind `SecretStore`:

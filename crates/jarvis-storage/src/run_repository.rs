@@ -283,7 +283,7 @@ pub async fn recover_interrupted_runs(
     // `agent_runs_active_idx` covers that predicate, so this scan does not walk the table.
     //
     // A run at `awaiting_approval` is **not** in flight: no process holds it, and none needs to — the approval
-    // row and its nonce file are durable and the person can still decide after a restart. It is also not
+    // row is durable and the person can still decide after a restart. It is also not
     // failable (`RunState::can_transition_to`), so settling it would refuse and, because recovery runs at
     // startup, take the daemon down with it. It is recovered only when cancellation was already requested,
     // which is a legal edge and the operator's stated intent.
@@ -811,7 +811,7 @@ pub async fn request_run_cancellation(
 ///
 /// # What is withdrawn
 ///
-/// A pending approval becomes `expired` with its payload and nonce gone, so it can neither be decided nor listed; an
+/// A pending approval becomes `expired` with its payload cleared, so it can neither be decided nor listed; an
 /// approved-but-unreleased one loses its held arguments, so `resume` cannot run an action for a run the person
 /// cancelled. The run is settled **first**: the guarded transition is what loses a race with a concurrent decision,
 /// and a decision that won leaves the run executing, which this function then refuses to touch.
@@ -856,7 +856,7 @@ pub async fn settle_parked_run_cancelled(
 
 /// Withdraws what every **cancelled** run was waiting on.
 ///
-/// A pending approval becomes `expired` with its payload and nonce gone, so it can neither be decided nor listed; an
+/// A pending approval becomes `expired` with its payload cleared, so it can neither be decided nor listed; an
 /// approved-but-unreleased one loses its held arguments, so `resume` cannot run an action for a run the person
 /// cancelled. Written as a sweep over cancelled runs rather than for one run so the same statement also repairs a run
 /// that was cancelled by [`recover_interrupted_runs`] (a request made while parked, settled at the next start), which
@@ -868,14 +868,11 @@ pub async fn settle_parked_run_cancelled(
 pub async fn withdraw_cancelled_run_approvals(
     database: &SqliteDatabase,
 ) -> Result<(), DatabaseError> {
-    // The empty digest is what a decided approval's nonce is rotated to, so the stored value can never match a
-    // presented nonce again (`ADR-0018`).
     sqlx::query(
-        "UPDATE approvals SET state = 'expired', arguments_json = NULL, nonce_hash = ?1 \
+        "UPDATE approvals SET state = 'expired', arguments_json = NULL \
          WHERE state = 'pending' \
            AND run_id IN (SELECT id FROM agent_runs WHERE state = 'cancelled')",
     )
-    .bind(crate::approval_repository::digest(""))
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -2081,7 +2078,7 @@ mod tests {
     /// Found live: a daemon with a run parked at `awaiting_approval` refused to start at all ("the agent run
     /// transition was refused"), because recovery tried to settle every non-terminal run as `failed` and the
     /// state table deliberately forbids that edge (no machine work is in progress, so nothing can have
-    /// failed). The approval row and its nonce file are durable, so the person can still decide after the
+    /// failed). The approval row is durable, so the person can still decide after the
     /// restart; the right recovery is to leave the run exactly where it is.
     #[tokio::test]
     async fn a_run_waiting_on_approval_survives_a_restart() {

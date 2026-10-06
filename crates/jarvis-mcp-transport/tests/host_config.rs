@@ -59,8 +59,6 @@ fn request_for(
                 .unwrap_or_else(|error| panic!("{error}")),
         )),
         workspace: &jarvis_tools::WorkspacePolicy::default(),
-        channel: jarvis_core::SessionChannel::Cli,
-        claimed_strength: jarvis_tools::AuthenticationStrength::Credential,
         available: true,
         target: jarvis_tools::TargetAssessment::none(),
     });

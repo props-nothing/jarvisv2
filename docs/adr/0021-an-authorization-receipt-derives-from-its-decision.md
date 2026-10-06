@@ -142,8 +142,7 @@ about the seam.
   already makes the association structural, and the constructor's documentation can say why.
 - **Let a `Deny` produce a receipt marked denied, for the audit record.** Rejected: the audit record is
   the call row and the decision, not the receipt. A receipt that can describe a refusal invites an
-  adapter to receive one, and "the adapter was handed a denial" is exactly the confused-deputy shape
-  this refuses.
+  adapter to receive one, and "the adapter was handed a denial" is exactly the shape this refuses.
 - **Require an approval for every receipt.** Rejected: a risk-0 read allowed by policy needs none, and
   inventing one would make `Auto` approval meaningless.
 

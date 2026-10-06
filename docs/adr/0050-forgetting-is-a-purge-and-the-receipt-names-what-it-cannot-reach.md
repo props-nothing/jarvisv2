@@ -65,7 +65,7 @@ The default is `false`. Asking for `true` is a deliberate statement that the use
 re-learnable — an **undo** of a deletion rather than a cleanup — so it removes any existing tombstone *and*
 skips writing a new one. The receipt reports which of the two happened, so the audit trail distinguishes them.
 
-The same reasoning as the nonce decision in `ADR-0042`: a safe default plus an explicit, recorded request. A
+The same reasoning as `ADR-0017`: a safe default plus an explicit, recorded request. A
 flag that merely suppressed a write would leave an older tombstone in place, so the undo would appear to work
 and then not.
 

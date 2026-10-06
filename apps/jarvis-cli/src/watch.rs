@@ -351,7 +351,6 @@ mod tests {
                 tool: "jarvis.code.run".to_owned(),
                 tool_version: "1.0.0".to_owned(),
                 risk_level: 3,
-                required_strength: "credential".to_owned(),
                 preview: "run code".to_owned(),
                 arguments: None,
                 created_at: UtcTimestamp::now(&SystemClock),

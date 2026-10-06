@@ -11,7 +11,6 @@ pub struct ActorContext {
     pub client_id: ClientId,
     pub workspace_id: WorkspaceId,
     pub authenticated_at: DateTime<Utc>,
-    pub auth_strength: AuthStrength,
     pub scopes: ScopeSet,
     pub correlation_id: CorrelationId,
     pub trace_id: Option<TraceId>,
@@ -235,13 +234,13 @@ also carries the workspace's `max_risk` and `approval_threshold`, so a single to
 against the ceiling it sits under.
 
 The preview reports the `decision`, its stable `reason` code, the `effective_risk` **beside** the
-`declared_risk`, the `escalated_by` signals, and the `required_strength` an approval would need. It is a
+`declared_risk` and the `escalated_by` signals. It is a
 **decision and not a prediction**: the daemon computes it with the same pure `evaluate` the tool-call path
 uses, so it is exact for the context supplied. It writes no `tool_calls` row and consumes no idempotency
 key, so an operator cannot fill the ledger by looking at it.
 
-**What a caller may supply, and what it may not.** A preview request carries only the `channel`, the
-`claimed_strength`, and the `escalation` signals — the properties of the call that only the caller knows.
+**What a caller may supply, and what it may not.** A preview request carries only the `channel` and the
+`escalation` signals — the properties of the call that only the caller knows.
 Scopes, the workspace policy, and the tool definition come from the daemon, and `deny_unknown_fields` makes
 an attempt to name them a `422` rather than an ignored value. A preview must not be a way to ask *"what if I
 had different permissions"*.
@@ -278,7 +277,7 @@ refuses a second decision — a version expectation adds no safety, and can only
 plus the state machine already exclude a lost update, so a version token would be an additional way to
 reject a decision that is perfectly valid, which is exactly the defect `ADR-0022` removed from cancellation.
 
-Approval resolution receives `ActorContext`, checks eligibility/auth strength/expiry/nonce, and re-evaluates policy before issuing an authorization receipt.
+Approval resolution receives `ActorContext`, checks that the approval is pending and unexpired and that the call still matches the digest of the arguments shown, and re-evaluates policy before issuing an authorization receipt. A decision is `POST /api/v1/approvals/{id}/decision` with `{ "decision": "approve" | "deny", "resume": bool, "channel": optional }`, authenticated by the bearer credential alone ([ADR-0136](../adr/0136-an-approval-is-a-yes-or-no-from-the-owner.md)).
 
 ## Memory
 

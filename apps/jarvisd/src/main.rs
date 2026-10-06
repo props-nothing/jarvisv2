@@ -673,7 +673,6 @@ async fn compose_tools(
     let agent = executor.map(|executor| {
         Arc::new(crate::delegate::AgentTool::new(
             Arc::clone(&database),
-            jarvis_storage::SecretStore::in_state(paths.state()),
             Arc::clone(executor),
         ))
     });
@@ -695,7 +694,7 @@ async fn compose_tools(
             .unwrap_or_default(),
     );
 
-    let tools = compose_tool_pipeline(config, database, additional, paths)?;
+    let tools = compose_tool_pipeline(config, database, additional)?;
     if let (Some(agent), Some(pipeline)) = (&agent, &tools) {
         agent.bind(pipeline);
     }
@@ -769,7 +768,6 @@ fn compose_tool_pipeline(
         Vec<jarvis_tools::ToolDefinition>,
         Arc<dyn jarvis_tools::ToolExecutor>,
     )>,
-    paths: &AppPaths,
 ) -> Result<Option<Arc<crate::tool_pipeline::ToolPipeline>>, DaemonError> {
     // The workspace policy is built **before** the no-pipeline early return, and that ordering is the
     // point rather than an accident. A malformed policy — a contradictory ceiling, or an identifier that
@@ -795,19 +793,9 @@ fn compose_tool_pipeline(
                 .map_err(|source| DaemonError::ToolWorkspaceRoots { source })?,
         ),
     };
-    let pipeline = crate::tool_pipeline::ToolPipeline::with_adapters(
-        database,
-        roots,
-        workspace,
-        additional,
-        // The plaintext decision nonce goes to a file only this account can read, never into the durable
-        // approval row: `ADR-0018` stores a digest there deliberately, and `SecretStore`'s module
-        // documentation records why the profile's **state** directory is the right home for the plaintext
-        // (a cache may be cleared and a runtime directory is login-lifetime, either of which would make
-        // every pending approval undecidable across a logout).
-        jarvis_storage::SecretStore::in_state(paths.state()),
-    )
-    .map_err(|source| DaemonError::ToolPipeline { source })?;
+    let pipeline =
+        crate::tool_pipeline::ToolPipeline::with_adapters(database, roots, workspace, additional)
+            .map_err(|source| DaemonError::ToolPipeline { source })?;
     Ok(Some(Arc::new(pipeline)))
 }
 
@@ -855,7 +843,6 @@ fn compose_workspace_policy(
         max_risk,
         approval_threshold,
         defaults.requires_approval_for_external_communication(),
-        defaults.requires_strong_authentication_for_high_risk(),
     )
     .map_err(|source| DaemonError::WorkspacePolicy { source })?;
 
@@ -1015,7 +1002,7 @@ impl HttpTransport {
         credential: jarvis_core::ClientCredential,
         executor: Option<Arc<executor::Executor>>,
         tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
-        paths: &AppPaths,
+        _paths: &AppPaths,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
@@ -1024,14 +1011,7 @@ impl HttpTransport {
             .await
             .map_err(|source| DaemonError::HttpBind { port, source })?;
 
-        let mut state = gateway::GatewayState::new(
-            database,
-            credential,
-            // The same store the pipeline writes to, so a hold's nonce is read from the profile state
-            // directory it was written to. Two stores would be two directories, and the approval would be
-            // undecidable in the way that looks like a missing file.
-            jarvis_storage::SecretStore::in_state(paths.state()),
-        );
+        let mut state = gateway::GatewayState::new(database, credential);
         if let Some(executor) = executor {
             state = state.with_executor(executor);
         }
@@ -1556,10 +1536,10 @@ deny = ["not a tool id"]
             .await
             .unwrap_or_else(|error| panic!("open fixture database: {error}")),
         );
-        let paths = jarvis_storage::AppPaths::from_root(&root)
+        let _paths = jarvis_storage::AppPaths::from_root(&root)
             .unwrap_or_else(|error| panic!("resolve paths: {error}"));
 
-        let error = compose_tool_pipeline(&config, database, Vec::new(), &paths)
+        let error = compose_tool_pipeline(&config, database, Vec::new())
             .err()
             .unwrap_or_else(|| {
                 panic!("an unusable policy must be refused even with no tools registered")

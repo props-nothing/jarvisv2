@@ -38,7 +38,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jarvis_core::{IsolatedText, RunOutcome, Sensitivity, SystemClock, UtcTimestamp};
 use jarvis_protocol::StartRunRequest;
-use jarvis_storage::{SecretStore, SqliteDatabase, StoredRun};
+use jarvis_storage::{SqliteDatabase, StoredRun};
 use jarvis_tools::{
     AdapterError, ApprovalPolicy, Availability, BoundedOutput, EffectSet, Idempotency,
     MAX_MODEL_FACING_RESULT_CHARS, ProviderEvidence, RetryDeclaration, SchemaError, Scope,
@@ -184,13 +184,9 @@ pub struct AgentTool {
 impl AgentTool {
     /// Builds the adapter over the daemon's database and executor.
     #[must_use]
-    pub fn new(
-        database: Arc<SqliteDatabase>,
-        secrets: SecretStore,
-        executor: Arc<Executor>,
-    ) -> Self {
+    pub fn new(database: Arc<SqliteDatabase>, executor: Arc<Executor>) -> Self {
         Self {
-            runs: RunService::new(Arc::clone(&database), secrets),
+            runs: RunService::new(Arc::clone(&database)),
             database,
             executor,
             pipeline: OnceLock::new(),

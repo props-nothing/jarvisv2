@@ -31,8 +31,8 @@
 //! "Restart and duplicate delivery do not execute the effect twice" is two claims:
 //!
 //! - a **restart** between the hold and the decision must not change what the decision resumes â€” the
-//!   approval has to outlive the process that requested it, which is why its nonce is delivered through a
-//!   file in the profile's state directory rather than in memory (`ADR-0042`);
+//!   approval has to outlive the process that requested it as durable state the authenticated owner can
+//!   still answer after the daemon restarts;
 //! - a **duplicate resumption** must not run the call twice â€” which is `record_tool_outcome`'s terminal
 //!   guard plus the resume path's own "still `requested`" check.
 //!
@@ -81,11 +81,6 @@ const READY_DEADLINE: Duration = Duration::from_secs(30);
 const STOP_DEADLINE: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for a condition.
 const POLL: Duration = Duration::from_millis(50);
-/// How long to wait for the approval's nonce file to appear.
-///
-/// A file, so the wait is for an `fs` write rather than a network round trip; the deadline is generous
-/// only because a busy CI runner can preempt the daemon.
-const NONCE_DEADLINE: Duration = Duration::from_secs(10);
 /// Environment variable that turns a missing-binary skip into a failure.
 const REQUIRE_BINARIES_ENV: &str = "ACCEPTANCE_REQUIRE_BINARIES";
 /// Environment variable that turns a missing `fixture-peer` skip into a failure.
@@ -210,7 +205,38 @@ fn binary(name: &str) -> Option<PathBuf> {
         directory.pop();
     }
     let candidate = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    if !candidate.is_file() {
+        return None;
+    }
+    if name == "jarvisd" && !binary_is_fresh(&candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn binary_is_fresh(candidate: &Path) -> bool {
+    let Ok(binary_modified) = std::fs::metadata(candidate).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .ok();
+    let Some(repo) = repo else {
+        return false;
+    };
+    let witnesses = [
+        repo.join(r"apps\jarvisd\src\gateway.rs"),
+        repo.join(r"apps\jarvisd\src\run_service.rs"),
+        repo.join(r"apps\jarvisd\src\tool_pipeline.rs"),
+        repo.join(r"crates\jarvis-protocol\src\approval.rs"),
+    ];
+    witnesses.into_iter().all(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| modified <= binary_modified)
+    })
 }
 
 /// Returns the two binaries the gate needs, or skips with an actionable message.
@@ -429,18 +455,13 @@ impl ApiClient {
     }
 
     /// Decides an approval and returns the status and the decoded body.
-    async fn decide(
-        &self,
-        approval_id: &str,
-        decision: &str,
-        nonce: &str,
-    ) -> (u16, serde_json::Value) {
+    async fn decide(&self, approval_id: &str, decision: &str) -> (u16, serde_json::Value) {
         let response = self
             .request(
                 reqwest::Method::POST,
                 &format!("/approvals/{approval_id}/decision"),
             )
-            .json(&serde_json::json!({ "decision": decision, "nonce": nonce }))
+            .json(&serde_json::json!({ "decision": decision }))
             .send()
             .await
             .unwrap_or_else(|error| panic!("decide approval: {error}"));
@@ -465,36 +486,6 @@ impl ApiClient {
         let body = response.json().await.unwrap_or(serde_json::Value::Null);
         (status, body)
     }
-}
-
-/// Reads the delivered nonce for an approval out of the profile's private store.
-///
-/// The gate reads the file directly rather than through `SecretStore`, because that is the channel an
-/// operator's client uses and the whole point is that it is **not** an API. A shared reader would agree
-/// with the writer by construction and could not notice the channel changing shape.
-fn delivered_nonce(root: &TempRoot, approval_id: &str) -> String {
-    let path = root
-        .paths()
-        .state()
-        .join(jarvis_storage::APPROVAL_NONCE_DIRECTORY)
-        .join(approval_id);
-    let deadline = Instant::now() + NONCE_DEADLINE;
-    while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let text = text.trim().to_owned();
-            assert!(
-                !text.is_empty(),
-                "the delivered nonce must not be empty: {}",
-                path.display()
-            );
-            return text;
-        }
-        std::thread::sleep(POLL);
-    }
-    panic!(
-        "the delivered nonce never appeared at {}: the hold was recorded and no secret was delivered",
-        path.display()
-    );
 }
 
 /// The gate: a read-only call succeeds, a write call holds, a restart preserves the hold, and the approved
@@ -535,7 +526,7 @@ async fn phase_3_gate() {
     );
 
     // ---------------------------------------------------------------------------------------------
-    // Step 2: a write call over the run API holds, with a durable approval and a delivered nonce.
+    // Step 2: a write call over the run API holds, with a durable approval.
     // ---------------------------------------------------------------------------------------------
     let run_id = client.start_run("write a file").await;
     let arguments = serde_json::json!({ "q": "the gate" });
@@ -547,15 +538,6 @@ async fn phase_3_gate() {
     assert_eq!(hold["state"], "awaiting_approval", "got {hold}");
     let call_id = string_field(&hold, "call_id");
     let approval_id = string_field(&hold, "approval_id");
-    let required = string_field(&hold, "required_strength");
-    assert_eq!(
-        required, "present",
-        "an unclassified server is risk 3, and the default workspace requires presence for high risk — so \
-         the hold demands the strongest strength an operator can supply rather than a mere credential"
-    );
-
-    // The nonce was **delivered**, and the delivery is the reason a decision is possible at all.
-    let nonce = delivered_nonce(&root, &approval_id);
 
     // ---------------------------------------------------------------------------------------------
     // Step 3: a restart between the hold and the decision preserves both.
@@ -565,9 +547,8 @@ async fn phase_3_gate() {
     running.wait_until_ready(&root.0).await;
 
     // The decision is accepted **after** the restart, which is the property `A05` requires: an approval
-    // outlives the process that requested it. The nonce read before the restart is still the valid one,
-    // because it lives in a file rather than in memory.
-    let (status, decided) = client.decide(&approval_id, "approve", &nonce).await;
+    // outlives the process that requested it and is answerable by the authenticated owner alone.
+    let (status, decided) = client.decide(&approval_id, "approve").await;
     assert_eq!(
         status, 200,
         "an approval must survive a restart and remain decidable, got {status}: {decided}"

@@ -46,17 +46,15 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use jarvis_core::{
-    ApprovalId, ApprovalRequest, ApprovalRequestParts, DecisionNonce, RunId, WorkspaceId,
-};
+use jarvis_core::{ApprovalId, ApprovalRequest, ApprovalRequestParts, RunId, WorkspaceId};
 use jarvis_core::{
     CanonicalIntentHash, CorrelationId, EventSummary, RunEventKind, RunEventPayload, SystemClock,
     UtcTimestamp,
 };
 use jarvis_storage::{
-    CallBinding, CallOrigin, CallTarget, DatabaseError, NewRunEvent, NewToolCall, SecretStore,
-    SqliteDatabase, StoredToolCall, admit_tool_call, advance_tool_call, append_run_event,
-    create_approval, find_approval, find_tool_call, link_tool_call_approval, record_tool_outcome,
+    CallBinding, CallOrigin, CallTarget, DatabaseError, NewRunEvent, NewToolCall, SqliteDatabase,
+    StoredToolCall, admit_tool_call, advance_tool_call, append_run_event, create_approval,
+    find_approval, find_tool_call, link_tool_call_approval, record_tool_outcome,
 };
 use serde_json::Value;
 
@@ -66,17 +64,17 @@ use jarvis_tools::ToolOutcome;
 use jarvis_tools::ToolRegistry;
 use jarvis_tools::{AdapterError, ToolExecutionRequest, ToolExecutionRequestParts};
 use jarvis_tools::{
-    ApprovalPolicy, AuthenticationStrength, PolicyDecision, PolicyRequest, Risk, TargetAssessment,
-    ToolSource, WorkspacePolicy, evaluate,
+    ApprovalPolicy, PolicyDecision, PolicyRequest, Risk, TargetAssessment, ToolSource,
+    WorkspacePolicy, evaluate,
 };
 use jarvis_tools::{
     AuthorizationReceipt, AuthorizationReceiptParts, IdempotencyKey, ToolCallResult,
 };
-use jarvis_tools::{FilesystemReadTool, FilesystemToolError};
+use jarvis_tools::{FilesystemTool, FilesystemToolError};
 use jarvis_tools::{RootError, WorkspaceRoots};
 use jarvis_tools::{SchemaError, SchemaViolation};
 // The port's methods are reached through the trait, so it must be in scope at the call site. Without
-// it, `Arc<FilesystemReadTool>` appears to have no `execute` at all, which reads as a broken adapter
+// it, `Arc<FilesystemTool>` appears to have no `execute` at all, which reads as a broken adapter
 // rather than a missing import.
 use jarvis_tools::ToolExecutor;
 
@@ -131,6 +129,8 @@ pub struct PolicyInventoryEntry {
     pub callable: bool,
     /// Why it cannot, when it cannot.
     pub unavailable_reason: Option<String>,
+    /// Whether a call is held for the owner's yes or no before it runs.
+    pub asks_first: bool,
 }
 
 /// What one pipeline call produced.
@@ -145,9 +145,8 @@ pub enum ToolPipelineOutcome {
     /// The call was **authorized and recorded** but not run, because a human must decide first.
     ///
     /// Carries the three things a caller needs to act: the admitted call the approval would authorize,
-    /// the durable approval that was written so a decision has something to bind to, and the strength
-    /// the approval must be established with — which `P3-003` computed and which a caller must not be
-    /// free to lower.
+    /// the durable approval that was written so a decision has something to bind to, and the reason the
+    /// call is waiting.
     AwaitingApproval {
         /// The admitted call, which is what an approval would bind to.
         call_id: String,
@@ -157,8 +156,6 @@ pub enum ToolPipelineOutcome {
         /// applies to, and reading it back out of the database by run would be guesswork when a run
         /// has held more than one call.
         approval_id: String,
-        /// The authentication strength an approval must carry.
-        required_strength: AuthenticationStrength,
         /// The stable reason code the decision was held at.
         reason_code: &'static str,
     },
@@ -213,6 +210,18 @@ pub enum ToolPipelineError {
     DuplicateCall {
         /// The existing call to adopt.
         existing_call_id: String,
+    },
+    /// A call that needs an answer repeats one this run already asked about.
+    ///
+    /// One approval exists per action per run (`approvals_run_intent_idx`), so a repeat is refused with a
+    /// sentence the model can act on rather than surfacing as a database error.
+    #[error(
+        "this exact call was already asked about in this run and is {state}; it will not be asked again. \
+         Change the arguments if a different action is meant, or tell the user"
+    )]
+    RepeatedRequest {
+        /// The earlier approval's state, such as `approved` or `denied`.
+        state: String,
     },
     /// The adapter's own definitions were rejected, which is an authoring error.
     #[error("the filesystem adapter's definitions are inconsistent: {0}")]
@@ -283,12 +292,6 @@ pub enum ToolPipelineError {
         /// Which identifier was refused.
         field: &'static str,
     },
-    /// A decision nonce could not be generated.
-    ///
-    /// Propagated rather than replaced with a placeholder: the nonce is the control against a forged
-    /// decision, and a fixed value would be a secret every process shares.
-    #[error("a decision nonce could not be generated")]
-    ApprovalSecret,
     /// The domain refused a field of the approval request.
     ///
     /// Carried as the domain's own field-naming error so a reader learns **which** invariant failed
@@ -298,13 +301,6 @@ pub enum ToolPipelineError {
         /// The domain error naming the offending field.
         field: jarvis_core::InvalidApprovalField,
     },
-    /// The decision nonce could not be delivered to the human who must present it.
-    ///
-    /// A fault rather than a decision: the approval row is written and the secret is not, which leaves an
-    /// approval nothing can decide. Reported loudly because a silent failure here would look exactly like
-    /// an approval nobody has answered yet.
-    #[error(transparent)]
-    Secret(#[from] jarvis_storage::SecretStoreError),
     /// A run event's fields were rejected by their own constructors.
     ///
     /// The event log and the call row are written on the same path, and a rejected summary or payload is
@@ -440,8 +436,8 @@ enum Admission {
 /// `RequireApproval` decision with no approval cited (`P3-006a`), because a receipt is what an adapter
 /// treats as permission and no decision has been taken yet. So the value a hold produces carries
 /// **less** than a runnable call — the admitted call, the intent an approval must bind to, and the
-/// strength it must be established with — and giving it the runnable type would mean filling in fields
-/// only the runnable case has.
+/// preview/arguments the owner will review — and giving it the runnable type would mean filling in
+/// fields only the runnable case has.
 struct PreparedHold {
     /// The durable call identifier, which is what a resumption re-reads.
     call_id: String,
@@ -461,8 +457,6 @@ struct PreparedHold {
     intent: CanonicalIntentHash,
     /// The risk the decision was taken at, which is what a stored approval records.
     risk: jarvis_tools::Risk,
-    /// The strength a decision must be supplied with.
-    required_strength: AuthenticationStrength,
     /// A human-readable preview of what is being authorized.
     preview: String,
     /// The arguments the intent was computed over, held on the approval **while it is pending** so the person
@@ -474,72 +468,7 @@ struct PreparedHold {
     issued_at: UtcTimestamp,
 }
 
-/// Converts the **ceiling** a channel can establish into the **observation** an approval records.
-///
-/// # Why this conversion has to exist, and why it is a conversion rather than one shared type
-///
-/// `jarvis-tools::AuthenticationStrength` is what a channel *can* establish; the ordering is the
-/// mechanism behind the voice rule. `jarvis_core::AuthenticationStrength` is what the channel that
-/// answered *did* establish, and `P3-004` says why they are one type apart: "Sharing one type would let
-/// a caller record a ceiling as if it were an observation." So an approval's `required_strength` — what
-/// a decision must **prove** — is the ceiling the channel would have to reach, and that is the only
-/// direction that is true. `required_strength` is a demand, not a measurement.
-///
-/// The match is deliberately exhaustive over all four variants rather than a default arm: a future
-/// channel ceiling that this build did not account for should be a compile error rather than a silent
-/// mapping onto the weakest strength.
-const fn approval_strength(
-    ceiling: jarvis_tools::AuthenticationStrength,
-) -> jarvis_core::AuthenticationStrength {
-    use jarvis_core::AuthenticationStrength as Strength;
-    match ceiling {
-        jarvis_tools::AuthenticationStrength::Absent => Strength::Absent,
-        jarvis_tools::AuthenticationStrength::ChannelEvidence => Strength::ChannelEvidence,
-        jarvis_tools::AuthenticationStrength::Credential => Strength::Credential,
-        jarvis_tools::AuthenticationStrength::Present => Strength::Present,
-    }
-}
-
-/// Converts a stored approval's **demand** back into the tool vocabulary a receipt records.
-///
-/// # Why this is not `approval_strength` reversed by convention
-///
-/// `approval_strength` converts a channel's **ceiling** into the **observation** an approval records, which
-/// is the direction a hold travels. A resume travels the other way: the approval row holds an observation
-/// vocabulary value and the receipt it builds needs the tool vocabulary. The two functions are deliberately
-/// separate and separately exhaustive, because a single bidirectional helper would make it possible to pass
-/// the wrong direction and get a value that type-checks — the failure this pair exists to make impossible.
-///
-/// The wording is worth keeping straight: `P3-004` calls the approval's value a **demand** ("what a decision
-/// must prove") even though it is stored in the observation vocabulary, so the name here says what the
-/// receipt needs rather than reusing "ceiling", which would suggest the hold's direction.
-const fn receipt_strength(
-    required: jarvis_core::AuthenticationStrength,
-) -> jarvis_tools::AuthenticationStrength {
-    use jarvis_core::AuthenticationStrength as Strength;
-    match required {
-        Strength::Absent => jarvis_tools::AuthenticationStrength::Absent,
-        Strength::ChannelEvidence => jarvis_tools::AuthenticationStrength::ChannelEvidence,
-        Strength::Credential => jarvis_tools::AuthenticationStrength::Credential,
-        Strength::Present => jarvis_tools::AuthenticationStrength::Present,
-    }
-}
-
 /// Records the durable approval a held call is waiting on.
-///
-/// # The requester is the run, not the human, and that is the security decision
-///
-/// The domain refuses an approval whose approver equals its requester, and
-/// `docs/architecture/security.md` names the threat this defeats as **model self-approval / confused
-/// deputy**. For that refusal to do any work in a single-owner profile, the requester must be the
-/// **agent acting for the run** rather than the person, because the person is the only identity
-/// eligible to approve anything here. Recording the user as the requester would make the two
-/// identifiers equal by construction and turn the guard into a check that can only refuse real work —
-/// exactly the shape `ADR-0022` removed from cancellation.
-///
-/// So the requester is the run: the tool call reaches this pipeline *because a run is executing*, and a
-/// tool call's own origin already records the run for the same reason. The approver identity is chosen
-/// by the caller of the decide path and never travels in a request body.
 ///
 /// # Errors
 ///
@@ -569,8 +498,6 @@ fn new_approval_request(
         intent: hold.intent,
         preview: hold.preview.clone(),
         risk_level: hold.risk.level(),
-        required_strength: approval_strength(hold.required_strength),
-        nonce: DecisionNonce::generate().map_err(|_| ToolPipelineError::ApprovalSecret)?,
         correlation_id: hold.correlation_id,
         created_at: hold.issued_at,
         expires_at,
@@ -605,12 +532,6 @@ fn describe(violations: &[SchemaViolation]) -> String {
 pub struct ToolPipeline {
     database: Arc<SqliteDatabase>,
     registry: ToolRegistry,
-    /// The profile-private store the plaintext decision nonce is written to.
-    ///
-    /// Held rather than derived from the database, because the nonce's whole point is that it is **not**
-    /// in a durable row (`ADR-0018`): it goes to a file only this account can read, and this field is
-    /// the only writer of it.
-    secrets: SecretStore,
     /// Which adapter runs which tool, resolved by canonical identifier.
     ///
     /// A table rather than one adapter because the pipeline already serves more than one tool area, and the
@@ -649,9 +570,8 @@ impl ToolPipeline {
         database: Arc<SqliteDatabase>,
         roots: WorkspaceRoots,
         workspace: WorkspacePolicy,
-        secrets: SecretStore,
     ) -> Result<Self, ToolPipelineError> {
-        Self::with_adapters(database, Some(roots), workspace, Vec::new(), secrets)
+        Self::with_adapters(database, Some(roots), workspace, Vec::new())
     }
 
     /// Builds the pipeline over granted workspace roots **and any additional adapters**.
@@ -684,7 +604,6 @@ impl ToolPipeline {
         roots: Option<WorkspaceRoots>,
         workspace: WorkspacePolicy,
         additional: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)>,
-        secrets: SecretStore,
     ) -> Result<Self, ToolPipelineError> {
         let mut registry = ToolRegistry::new();
         let mut sources: Vec<(Vec<jarvis_tools::ToolDefinition>, Arc<dyn ToolExecutor>)> =
@@ -694,11 +613,11 @@ impl ToolPipeline {
         // shadow — a collision is refused by the registry either way, but the order makes which one is
         // "already present" deterministic rather than dependent on the caller's list order.
         if let Some(roots) = roots {
-            let filesystem_definitions = FilesystemReadTool::definitions()?;
+            let filesystem_definitions = FilesystemTool::definitions()?;
             registry.define_all(filesystem_definitions.clone())?;
             sources.push((
                 filesystem_definitions,
-                Arc::new(FilesystemReadTool::new(roots)) as Arc<dyn ToolExecutor>,
+                Arc::new(FilesystemTool::new(roots)) as Arc<dyn ToolExecutor>,
             ));
         }
 
@@ -727,7 +646,6 @@ impl ToolPipeline {
         Ok(Self {
             database,
             registry,
-            secrets,
             dispatch,
             workspace,
         })
@@ -798,8 +716,6 @@ impl ToolPipeline {
             definition: &definition,
             actor: actor.authority(),
             workspace: &self.workspace,
-            channel: actor.channel(),
-            claimed_strength: actor.claimed_strength(),
             available: definition.availability().is_available(),
             target: TargetAssessment::none(),
         });
@@ -848,7 +764,6 @@ impl ToolPipeline {
                 return Ok(ToolPipelineOutcome::AwaitingApproval {
                     call_id: hold.call_id,
                     approval_id: hold.approval_id,
-                    required_strength: hold.required_strength,
                     reason_code: decision.reason_code(),
                 });
             }
@@ -1017,14 +932,7 @@ impl ToolPipeline {
         // request was evaluated when the call was held. Re-evaluating here would silently turn a policy
         // edit into a refusal of something an operator already approved — the question this method's own
         // limits section records as deliberately unsettled.
-        //
-        // The strength is converted through the existing ceiling/observation helper rather than mapped
-        // again here: `P3-004` keeps the two vocabularies one type apart, and a second conversion would be a
-        // second place for them to drift.
-        let decision = jarvis_tools::PolicyDecision::held_by_approval(
-            receipt_strength(approval.required_strength()),
-            approval.risk_level(),
-        );
+        let decision = jarvis_tools::PolicyDecision::held_by_approval(approval.risk_level());
 
         let receipt = AuthorizationReceipt::new(AuthorizationReceiptParts {
             receipt_id: stored.id().to_owned(),
@@ -1185,6 +1093,7 @@ impl ToolPipeline {
                 denied: self.workspace.denies(&id),
                 callable: entry.callable,
                 unavailable_reason: entry.unavailable_reason,
+                asks_first: self.workspace.asks_first(&definition),
             });
         }
         Ok(entries)
@@ -1221,8 +1130,6 @@ impl ToolPipeline {
             definition: &definition,
             actor: actor.authority(),
             workspace: &self.workspace,
-            channel: actor.channel(),
-            claimed_strength: actor.claimed_strength(),
             available: definition.availability().is_available(),
             target: target.clone(),
         }))
@@ -1294,8 +1201,6 @@ impl ToolPipeline {
             definition: &definition,
             actor: actor.authority(),
             workspace: &self.workspace,
-            channel: actor.channel(),
-            claimed_strength: actor.claimed_strength(),
             available: definition.availability().is_available(),
             // `none`, deliberately: an MCP request carries no target and this module does not read one out of
             // free-form arguments. A target assessment invented from arguments would be a second classifier
@@ -1412,7 +1317,7 @@ impl ToolPipeline {
     /// # Errors
     ///
     /// Returns [`ToolPipelineError`] for a fault: an uncomputable intent, a rejected receipt, a failed
-    /// key or nonce generation, or a durable write that did not succeed.
+    /// key generation, or a durable write that did not succeed.
     async fn authorize_and_admit(
         &self,
         tool: &str,
@@ -1432,6 +1337,19 @@ impl ToolPipeline {
             })?;
         let now = UtcTimestamp::now(&SystemClock);
         let call_id = correlation_id.to_string();
+
+        if decision.is_held() {
+            let earlier =
+                jarvis_storage::read_run_approvals(&self.database, actor.run_id()).await?;
+            if let Some(previous) = earlier
+                .iter()
+                .find(|approval| approval.intent().to_hex() == intent.to_hex())
+            {
+                return Err(ToolPipelineError::RepeatedRequest {
+                    state: previous.stored_state().as_str().to_owned(),
+                });
+            }
+        }
 
         // The key is generated here rather than derived from the intent: the digest must be
         // deterministic because the receipt binds to it, while the key must be unique per logical
@@ -1478,12 +1396,6 @@ impl ToolPipeline {
                 tool_version: definition.version().to_owned(),
                 intent,
                 risk: decision.effective_risk(),
-                // `required_strength` is present whenever the outcome is `RequireApproval` (`P3-003`),
-                // so a hold always has one. `Present` is the fallback for the unreachable case, and it
-                // is the **strongest** requirement, so a fallback reached by a bug tightens.
-                required_strength: decision
-                    .required_strength()
-                    .unwrap_or(AuthenticationStrength::Present),
                 preview: format!("{tool} {}", definition.version()),
                 arguments: arguments.clone(),
                 correlation_id,
@@ -1539,7 +1451,6 @@ impl ToolPipeline {
     /// # Errors
     ///
     /// Returns [`ToolPipelineError::ApprovalIdentity`] for an identifier that will not parse,
-    /// [`ToolPipelineError::ApprovalSecret`] when a nonce cannot be generated,
     /// [`ToolPipelineError::Approval`] when the domain refuses a field, and
     /// [`ToolPipelineError::Storage`] when the row cannot be written.
     async fn record_hold(&self, mut hold: PreparedHold) -> Result<PreparedHold, ToolPipelineError> {
@@ -1553,21 +1464,14 @@ impl ToolPipeline {
         let approval = ApprovalId::new();
         let request = new_approval_request(&hold, &requester, approval, expiry)?;
 
-        // The digest goes into the durable row; the plaintext goes into a file only this account can read.
-        // The write order matters: the row is written **first**, so a crash between the two leaves an
-        // approval that is undecidable rather than a file for an approval that does not exist. The other
-        // order would leave a secret on disk whose digest no row holds, which is a value nothing can
-        // consume and nothing will ever clean up.
+        // The approval row is written before the call is linked to it, so a crash can leave an approval that
+        // nothing resumes automatically but never a call pointing at an approval that does not exist.
         create_approval(&self.database, &request).await?;
-        self.secrets
-            .store(&request.id().to_string(), request.nonce())?;
 
         // The link is what makes the hold **findable**: without it the decision route can move the
         // approval to `approved` and nothing can tell which call was waiting, because the two rows share
-        // no column. Written after the approval (the identifier does not exist before) and after the
-        // secret (so a crash leaves the safe direction: an approval nothing can decide, rather than a
-        // link to an approval whose nonce was never delivered). It is write-once, so a re-drive cannot
-        // repoint it at a different approval.
+        // no column. Written after the approval (the identifier does not exist before). It is write-once,
+        // so a re-drive cannot repoint it at a different approval.
         link_tool_call_approval(&self.database, &hold.call_id, &request.id().to_string()).await?;
 
         // The arguments are held on the approval so the person deciding can see them, and so the call can be
@@ -1600,10 +1504,9 @@ impl ToolPipeline {
             RunEventKind::ApprovalRequested,
             &format!("Approval needed for {}", hold.tool),
             &format!(
-                r#"{{"approval_id":{},"call_id":{},"required_strength":{}}}"#,
+                r#"{{"approval_id":{},"call_id":{}}}"#,
                 serde_json::Value::String(approval.to_string()),
-                serde_json::Value::String(hold.call_id.clone()),
-                serde_json::Value::String(hold.required_strength.as_str().to_owned())
+                serde_json::Value::String(hold.call_id.clone())
             ),
             hold.correlation_id,
             UtcTimestamp::now(&SystemClock),

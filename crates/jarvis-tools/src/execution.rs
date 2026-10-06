@@ -291,10 +291,8 @@ impl fmt::Display for ProviderEvidence {
 
 /// The key a provider deduplicates on, generated once per logical call.
 ///
-/// 16 random bytes as 32 hexadecimal characters. Shorter than `P3-004`'s nonce because the threat is
-/// different: a nonce is a secret an attacker would try to forge, while this is an identifier a
-/// provider echoes back. 128 bits is far beyond collision range for any plausible number of calls, and
-/// the value is not secret — it is forwarded to a provider by design.
+/// 16 random bytes as 32 hexadecimal characters. 128 bits is far beyond collision range for any
+/// plausible number of calls, and the value is not secret — it is forwarded to a provider by design.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct IdempotencyKey(String);
@@ -908,18 +906,14 @@ mod tests {
     /// from an evaluation. A fixture that could fabricate one would be able to fabricate authority.
     fn allow_decision() -> crate::evaluation::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
-        use jarvis_core::SessionChannel;
 
         let definition = fixture_definition(crate::Risk::Minimal);
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::none()),
             workspace: &WorkspacePolicy::default(),
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });
@@ -1055,10 +1049,8 @@ mod tests {
     /// A decision that denies, produced by a real evaluation.
     fn deny_decision() -> crate::evaluation::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
-        use jarvis_core::SessionChannel;
 
         let definition = fixture_definition(crate::Risk::Minimal);
         let workspace = WorkspacePolicy::default().denying(definition.id().clone());
@@ -1066,8 +1058,6 @@ mod tests {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::none()),
             workspace: &workspace,
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });
@@ -1084,18 +1074,14 @@ mod tests {
     /// A risk-2 tool in the default workspace, which requires approval from risk 2 up.
     fn held_decision() -> crate::evaluation::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
-        use jarvis_core::SessionChannel;
 
         let definition = fixture_definition(crate::Risk::Moderate);
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::none()),
             workspace: &WorkspacePolicy::default(),
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });

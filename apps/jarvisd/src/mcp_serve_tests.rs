@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use jarvis_core::{CorrelationId, ToolOutcome};
 use jarvis_storage::{LOCAL_USER_ID, LOCAL_WORKSPACE_ID, SqliteDatabase, StartRunInput, start_run};
-use jarvis_tools::{AuthenticationStrength, ToolDefinition, WorkspacePolicy, WorkspaceRoots};
+use jarvis_tools::{ToolDefinition, WorkspacePolicy, WorkspaceRoots};
 use serde_json::json;
 
 use super::{POLICY_VERSION, RemoteMcpError, build_endpoint};
@@ -110,7 +110,6 @@ async fn pipeline_over(root: &TempRoot) -> (Arc<SqliteDatabase>, Arc<ToolPipelin
         Arc::clone(&database),
         roots,
         WorkspacePolicy::default(),
-        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     ));
     (database, Arc::new(pipeline))
 }
@@ -173,6 +172,25 @@ async fn a_remote_call_reaches_the_filesystem_adapter() {
         }
         other => panic!("a remote read must execute, got {other:?}"),
     }
+}
+
+/// **The tools that change the owner's files are not offered to a remote caller**, while the read tools are.
+#[tokio::test]
+async fn file_writing_tools_are_not_served_remotely() {
+    let root = TempRoot::new();
+    let (_database, _pipeline, definitions) = served_pipeline_over(&root).await;
+    let ids = |defs: &[ToolDefinition]| -> Vec<String> {
+        defs.iter().map(|d| d.id().to_string()).collect()
+    };
+    assert!(
+        ids(&definitions).contains(&"jarvis.files.write".to_owned()),
+        "the control: they exist"
+    );
+
+    let served = ids(&super::servable_definitions(&definitions));
+    assert!(!served.contains(&"jarvis.files.write".to_owned()));
+    assert!(!served.contains(&"jarvis.files.edit".to_owned()));
+    assert!(served.contains(&"jarvis.files.read".to_owned()));
 }
 
 /// **A traversal is refused through the remote path exactly as through the local one.**
@@ -305,7 +323,6 @@ fn approval_requiring_workspace() -> WorkspacePolicy {
         jarvis_tools::Risk::High,
         jarvis_tools::Risk::Minimal,
         true,
-        true,
     ))
 }
 
@@ -350,7 +367,6 @@ async fn a_workspace_requiring_an_approval_refuses_the_remote_call() {
         Arc::clone(&database),
         roots,
         approval_requiring_workspace(),
-        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     ));
     let served = must(pipeline.definitions());
     let correlation_id = CorrelationId::new();
@@ -532,7 +548,6 @@ async fn a_tool_declaring_an_approval_is_refused_even_where_the_workspace_would_
             vec![approval_declaring_definition()],
             Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
-        jarvis_storage::SecretStore::in_state(&root.path().join("state")),
     )));
 
     let served = must(pipeline.definitions());
@@ -656,7 +671,7 @@ async fn an_endpoint_with_nothing_to_serve_is_refused() {
 
 /// **A remote actor holds exactly what the served tools require, and never `mcp.call`.**
 ///
-/// The first version of this test asserted the actor held **no** scopes, and it failed: `FilesystemReadTool`
+/// The first version of this test asserted the actor held **no** scopes, and it failed: `FilesystemTool`
 /// declares `required_scopes: files.read`, so an actor holding nothing was refused every call with
 /// `missing_scope`. The endpoint would have bound and answered every request with a refusal, which reads to an
 /// operator as a policy misconfiguration rather than as this constructor.
@@ -699,11 +714,6 @@ async fn a_remote_actor_holds_the_served_scopes_and_not_the_outbound_one() {
         actor.channel(),
         jarvis_core::SessionChannel::Api,
         "a remote MCP call must not be recorded as a local CLI invocation"
-    );
-    assert_eq!(
-        actor.claimed_strength(),
-        AuthenticationStrength::Credential,
-        "the allowlist admits against a credential, which is the strength a remote caller has established"
     );
 }
 

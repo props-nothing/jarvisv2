@@ -7,7 +7,7 @@
   is the condition the whole tool/policy/approval pipeline was built for and never exercised through the
   model.
 - **Relates to:** `ADR-0005` (canonical tools and MCP), `ADR-0017` (policy evaluation outcomes), `ADR-0018`
-  (approvals bind to a digest), `ADR-0019` (tool calls are a durable lifecycle), `ADR-0023` (the tool
+  (an approval is bound to the exact arguments), `ADR-0019` (tool calls are a durable lifecycle), `ADR-0023` (the tool
   pipeline composition root), `ADR-0010` (turn detection is model-based), `ADR-0014` (a conversation is runs
   in a session).
 

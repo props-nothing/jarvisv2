@@ -70,7 +70,17 @@ async fn main() -> ExitCode {
             Err(status) => status,
         },
         Some("start") => match resolve_paths(&arguments) {
-            Ok(paths) => init::start(&paths, &arguments),
+            Ok(paths) => {
+                let status = init::start(&paths, &arguments);
+                // Starting JARVIS opens its console, the way launching an app opens its window; `--no-open` skips it.
+                // A browser that cannot be opened is reported by `hud_command` and does not make a started daemon a failure.
+                if status == ExitStatus::Ok
+                    && !arguments.iter().any(|argument| argument == "--no-open")
+                {
+                    let _ = hud_command(&arguments);
+                }
+                status
+            }
             Err(status) => status,
         },
         Some("cancel") => cancel_command(&arguments).await,
@@ -101,7 +111,7 @@ async fn main() -> ExitCode {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis <init|start|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
@@ -239,24 +249,17 @@ async fn cancel_command(arguments: &[String]) -> ExitStatus {
 }
 
 /// Runs one `jarvis approvals` verb over the daemon's HTTP API.
-///
-/// Needs the profile's paths as well as a client: the decision nonce is delivered to a file under the profile's
-/// state directory, and reading it is the one thing here that cannot go through the daemon.
 async fn approvals_command(arguments: &[String]) -> ExitStatus {
     let root = match requested_root(arguments) {
         Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
         Ok(None) => Vec::new(),
         Err(status) => return status,
     };
-    let paths = match resolve_paths(&root) {
-        Ok(paths) => paths,
-        Err(status) => return status,
-    };
     let client = match run_client(&root) {
         Ok(client) => client,
         Err(status) => return status,
     };
-    approvals::run(&client, &paths, arguments).await
+    approvals::run(&client, arguments).await
 }
 
 /// Runs one `jarvis skills` verb over the daemon's HTTP API.
@@ -795,10 +798,6 @@ mod tests {
             "jarvis.files.read".to_owned(),
             "--escalation".to_owned(),
             "bulk".to_owned(),
-            "--channel".to_owned(),
-            "voice".to_owned(),
-            "--strength".to_owned(),
-            "channel_evidence".to_owned(),
         ];
         let request = tools::preview_request_for_test(&arguments)
             .unwrap_or_else(|_| panic!("the flags must parse"));
@@ -806,38 +805,26 @@ mod tests {
             request.escalation,
             vec![jarvis_core::EscalationSignal::Bulk]
         );
-        assert_eq!(request.channel, Some(jarvis_core::SessionChannel::Voice));
-        assert_eq!(
-            request.claimed_strength.as_deref(),
-            Some("channel_evidence")
-        );
     }
 
     /// **An unknown closed-set value is a usage error rather than an ignored flag.**
     ///
-    /// The direction that matters, asserted for all three sets. Silently dropping `--escalation loud` would
-    /// compute the preview for a call without that signal, and a defaulted channel or strength would compute
-    /// one for a different trust boundary — every wrong answer in that direction reads as more permissive
-    /// than the user asked about.
+    /// The direction that matters. Silently dropping `--escalation loud` would compute the preview for a
+    /// call without that signal, which reads as more permissive than the user asked about.
     #[test]
     fn unknown_preview_flags_are_refused() {
-        for (flag, value) in [
-            ("--escalation", "loud"),
-            ("--channel", "telepathy"),
-            ("--strength", "strong"),
-        ] {
-            let arguments = [
-                "tools".to_owned(),
-                "preview".to_owned(),
-                "jarvis.files.read".to_owned(),
-                flag.to_owned(),
-                value.to_owned(),
-            ];
-            assert!(
-                tools::preview_request_for_test(&arguments).is_err(),
-                "{flag} {value} must be refused rather than ignored"
-            );
-        }
+        let (flag, value) = ("--escalation", "loud");
+        let arguments = [
+            "tools".to_owned(),
+            "preview".to_owned(),
+            "jarvis.files.read".to_owned(),
+            flag.to_owned(),
+            value.to_owned(),
+        ];
+        assert!(
+            tools::preview_request_for_test(&arguments).is_err(),
+            "{flag} {value} must be refused rather than ignored"
+        );
     }
 
     /// **`--json` is accepted by the preview parser and contributes nothing to the body.**

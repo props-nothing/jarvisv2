@@ -375,8 +375,7 @@ impl ApiClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::Refused`] when the approval is unknown, already decided, lapsed, or the nonce does
-    /// not match.
+    /// Returns [`ApiError::Refused`] when the approval is unknown, already decided, or lapsed.
     pub async fn decide_approval(
         &self,
         approval_id: &str,
@@ -893,7 +892,7 @@ impl ApiClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::Refused`] with a `409` for a stale counter and a `422` for a self-approval.
+    /// Returns [`ApiError::Refused`] with a `409` for a stale counter and a `422` for an invalid approver.
     pub async fn promote_skill(
         &self,
         revision_id: &str,

@@ -39,16 +39,11 @@ async fn fixture() -> Fixture {
             .await
             .unwrap_or_else(|error| panic!("open database: {error}")),
     );
-    let secrets = SecretStore::in_state(&path.join("state"));
     let executor = Arc::new(
         Executor::build(SCRIPTED_MODEL_NAME, None)
             .unwrap_or_else(|error| panic!("scripted executor: {error}")),
     );
-    let agent = Arc::new(AgentTool::new(
-        Arc::clone(&database),
-        secrets.clone(),
-        Arc::clone(&executor),
-    ));
+    let agent = Arc::new(AgentTool::new(Arc::clone(&database), Arc::clone(&executor)));
     let pipeline = Arc::new(
         ToolPipeline::with_adapters(
             Arc::clone(&database),
@@ -58,14 +53,13 @@ async fn fixture() -> Fixture {
                 AgentTool::definitions().unwrap_or_else(|error| panic!("definitions: {error}")),
                 Arc::clone(&agent) as Arc<dyn ToolExecutor>,
             )],
-            secrets.clone(),
         )
         .unwrap_or_else(|error| panic!("compose the pipeline: {error}")),
     );
     agent.bind(&pipeline);
     Fixture {
         _profile: profile,
-        runs: RunService::new(Arc::clone(&database), secrets),
+        runs: RunService::new(Arc::clone(&database)),
         database,
         pipeline,
         executor,

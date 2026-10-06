@@ -124,7 +124,7 @@ Tool call/request, policy version/hash, inputs summary, decision, reason codes, 
 
 ### `approvals`
 
-Request/tool/workflow, intent hash, display snapshot, eligible approver constraints, required auth strength, status, nonce hash, expiry, decision actor/client/channel, reason, timestamps, version, and `arguments_json` — the call's arguments, held **only while the approval is pending** (at most 8 KiB, cleared by the decision) so the person deciding can see what they approve ([ADR-0130](../adr/0130-a-pending-approval-holds-what-it-is-waiting-on.md)).
+Request/tool/workflow, intent hash, display snapshot, risk level, status, expiry, decision approver/channel, reason, timestamps, version, and `arguments_json` — the call's arguments, held **only while the approval is pending** (at most 8 KiB, cleared by the decision) so the person deciding can see what they approve ([ADR-0130](../adr/0130-a-pending-approval-holds-what-it-is-waiting-on.md)). A few columns left over from an earlier design stay in the table for compatibility, are never read, and are written with fixed values.
 
 An approval can resolve only one unchanged intent and cannot move from a terminal state.
 

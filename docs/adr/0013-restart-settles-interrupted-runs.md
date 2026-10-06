@@ -81,7 +81,7 @@ reviewable. A run that was interrupted is reported as interrupted.
   revisit was overdue: the state table forbids `awaiting_approval → failed` (no machine work is in progress, so
   nothing can have failed), so the settlement was **refused** — and because recovery runs at startup, a daemon
   holding one parked run **would not start**. Found by restarting a daemon with a live model and a held fetch.
-  Recovery now leaves a parked run alone, since its approval row and nonce file are durable and the person can
+  Recovery now leaves a parked run alone, since its approval row is durable and the person can
   still decide; it settles one only when cancellation was already requested (`awaiting_approval → cancelled`
   is legal and is the operator's stated intent). `A13` still owns the workflow version of the same problem.
 - **Partial answers.** The `output_delta` events of an interrupted run remain in its stream and are

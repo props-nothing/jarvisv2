@@ -25,7 +25,7 @@ actor
 client/device
 user when applicable
 workspace
-authentication method and strength
+authentication method
 granted scopes/capabilities
 session/channel
 correlation/trace
@@ -65,12 +65,12 @@ Personal, company, client, development, and home contexts use separate workspace
 Use capabilities/scopes with optional roles as bundles. Evaluate:
 
 - actor status and membership
-- client/device grant and channel ceiling
+- client/device grant
 - workspace policy
 - capability and resource constraint
 - connector account ownership/scope
 - tool effect/risk and target
-- authentication strength/freshness
+- credential freshness
 - approval obligation
 
 Deny overrides allow. A role grants a maximum; a client/channel may have a narrower ceiling. External runtime/MCP/voice identities never inherit the initiating user's entire capability set.
@@ -98,5 +98,5 @@ Caller ID, custom SIP headers, ElevenLabs dynamic variables, and a provider `use
 - delegation cannot broaden scopes
 - OAuth callback cannot bind a different provider account silently
 - forged voice metadata remains guest
-- approval requires eligible actor and sufficient auth strength
+- an approval is answered by the owner (the holder of the local credential)
 - diagnostics never reveal existence of unauthorized workspace resources

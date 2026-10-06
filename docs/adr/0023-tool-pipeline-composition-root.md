@@ -24,14 +24,14 @@ The question is where the composition belongs, and what it may read.
 **1. Composition happens in `apps/jarvisd`, not in `jarvis-application`.**
 `docs/architecture/repository-layout.md` states that no arrow may point from core or application into a
 provider adapter, and that composition happens only in binaries and test harnesses. The pipeline needs a
-concrete `FilesystemReadTool` and a concrete `SqliteDatabase`, so it is composed in the binary.
+concrete `FilesystemTool` and a concrete `SqliteDatabase`, so it is composed in the binary.
 
 **2. The pipeline registers the adapter's own `definitions()`.**
 Not a copy of the schema and risk level. `P3-003` decides about a `ToolDefinition`; if the pipeline
 declared its own, policy would decide about a tool *other than the one being run*, and the two could
 disagree without anything detecting it. This is the same defect class as `P3-006a` (two values that must
 agree, with nothing holding both) applied one level up. An adapter that cannot state its own contract
-therefore cannot be registered at all: `FilesystemReadTool::definitions()` is fallible, and a failure
+therefore cannot be registered at all: `FilesystemTool::definitions()` is fallible, and a failure
 stops startup.
 
 **3. The workspace and the actor are derived, never accepted.**
@@ -66,8 +66,8 @@ row, and a receipt all name the same call without a join.
   → admit → authorize → submit → adapter → recorded outcome. Seven composition tests exercise it,
   including one per refusal path.
 - **A held decision is not an error and does not execute.** `AwaitingApproval` returns `202` carrying
-  `call_id` and `required_strength`, and the call row is left `requested` so an approval has something
-  to bind to. Running it would be the confused-deputy shape `docs/architecture/security.md` refuses.
+  `call_id` and the reason it was held, and the call row is left `requested` so an approval has something
+  to bind to. Running it would let the model decide for itself, which `docs/architecture/security.md` refuses.
 - **The receipt is built with `approval: None` even for a held call**, because the held path returns
   before the receipt is used for anything but the call row. Fabricating an approval citation would be
   inventing authority.
@@ -80,7 +80,7 @@ row, and a receipt all name the same call without a join.
 
 ## Limits, stated rather than implied
 
-- **There is no approval round-trip.** A held call returns `call_id` and `required_strength`, and then
+- **There is no approval round-trip.** A held call returns `call_id` and the reason, and then
   nothing: no `ApprovalRequest` is persisted, no route lets a human decide, and nothing resumes the
   call. The ledger row is truthfully `requested`, and it stays that way. This is a gap, not a design.
 - **No `run_events` row is written for a tool call.** The call row is the audit record; linking calls to
@@ -88,9 +88,6 @@ row, and a receipt all name the same call without a join.
 - **`policy_version` is a label, not a verifiable version.** The handler passes the literal `"policy-1"`.
   Nothing checks it against a published policy revision, so a receipt citing it proves which string was
   supplied, not which rules were applied.
-- **The authentication strength is asserted, not proven.** The handler passes `Credential` because a
-  loopback credential was presented on this transport. No per-call verification of that credential
-  happens at the call site.
 
 ## Alternatives considered and rejected
 

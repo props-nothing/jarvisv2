@@ -23,7 +23,7 @@ Support MCP as client/host/server interoperability. Translate MCP definitions an
 
 ## Alternatives
 
-- Give models raw provider/MCP tools: inconsistent policy and confused-deputy risk.
+- Give models raw provider/MCP tools: inconsistent policy and an unmediated model.
 - Make MCP the internal tool model: couples domain semantics to a changing interoperability protocol.
 - Let each runtime execute its own tools: bypasses canonical approvals, secrets, outcomes, and audit.
 

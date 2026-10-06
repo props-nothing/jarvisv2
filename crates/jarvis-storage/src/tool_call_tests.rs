@@ -24,8 +24,7 @@ use crate::{
     LOCAL_WORKSPACE_ID, NewRun, NewToolCall, SqliteDatabase, create_approval, create_run,
 };
 use jarvis_core::{
-    ApprovalRequest, ApprovalRequestParts, AuthenticationStrength, CanonicalIntentHash,
-    DecisionNonce, ToolOutcomeRecord, WorkspaceId,
+    ApprovalRequest, ApprovalRequestParts, CanonicalIntentHash, ToolOutcomeRecord, WorkspaceId,
 };
 
 const SESSION: &str = "0198f000-0000-7000-8000-000000000003";
@@ -145,8 +144,6 @@ fn approval_for(tool: &str, arguments: &serde_json::Value) -> ApprovalRequest {
         intent,
         preview: "Send a message.".to_owned(),
         risk_level: 2,
-        required_strength: AuthenticationStrength::Credential,
-        nonce: must(DecisionNonce::generate()),
         correlation_id: CorrelationId::new(),
         created_at: at(0),
         expires_at: at(10),

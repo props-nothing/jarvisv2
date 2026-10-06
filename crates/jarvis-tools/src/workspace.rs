@@ -42,7 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, OpenOptions};
 
 /// The reason a set of workspace roots was refused.
 ///
@@ -232,6 +232,144 @@ impl WorkspaceRoots {
         }
         Err(last_error
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no workspace root")))
+    }
+}
+
+impl WorkspaceRoots {
+    /// Creates a file, or appends to one, beneath the granted roots. It can **never destroy content**.
+    ///
+    /// An existing file lives in exactly one root, so each root is asked whether it holds the path: if one does,
+    /// `append` adds to it and anything else is refused (`AlreadyExists`) rather than replacing it. If none does,
+    /// the file is created in the first root that already holds its parent directory, or in the first root
+    /// (creating the missing directories beneath it) when none does. Every step resolves through a root's handle, so
+    /// a path that would leave the root fails here exactly as a read does.
+    ///
+    /// Returns whether the file was created and the label of the root that holds it.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`io::Error`]: `AlreadyExists` for a create over an existing file, `IsADirectory` for a
+    /// directory, and whatever the resolution refused.
+    pub fn write_file(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        append: bool,
+    ) -> Result<(bool, &Path), io::Error> {
+        use std::io::Write;
+
+        for root in &self.roots {
+            match root.handle.metadata(relative) {
+                Ok(metadata) if metadata.is_file() => {
+                    if !append {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "the file already exists; append to it or edit it",
+                        ));
+                    }
+                    let mut options = OpenOptions::new();
+                    options.append(true);
+                    let mut file = root.handle.open_with(relative, &options)?;
+                    file.write_all(bytes)?;
+                    return Ok((false, root.label.as_path()));
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::IsADirectory,
+                        "that path is a directory",
+                    ));
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "that path is not a regular file",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let parent = relative
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let target = self
+            .roots
+            .iter()
+            .find(|root| {
+                parent.is_none_or(|parent| {
+                    root.handle
+                        .metadata(parent)
+                        .is_ok_and(|metadata| metadata.is_dir())
+                })
+            })
+            .or_else(|| self.roots.first())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no workspace root"))?;
+        if let Some(parent) = parent {
+            target.handle.create_dir_all(parent)?;
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = target.handle.open_with(relative, &options)?;
+        file.write_all(bytes)?;
+        Ok((true, target.label.as_path()))
+    }
+
+    /// Replaces the text of an existing file by a function of its current text, atomically.
+    ///
+    /// The file is read (at most `max_bytes`; larger is refused, never truncated), `edit` returns the new text or
+    /// an error that leaves the file untouched, and the result is written to a sibling temporary file and renamed
+    /// over the original, so a failure part-way leaves the original intact rather than half-written.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when no root holds the file, `InvalidData` for a file that is too large or not UTF-8 text, and
+    /// whatever `edit` or the filesystem returned.
+    pub fn replace_text(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+        edit: impl FnOnce(&str) -> Result<String, io::Error>,
+    ) -> Result<&Path, io::Error> {
+        use std::io::Read;
+
+        for root in &self.roots {
+            let file = match root.handle.open(relative) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let mut bytes = Vec::new();
+            file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the file is too large to edit this way",
+                ));
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the file is not valid UTF-8 text",
+                )
+            })?;
+            let replaced = edit(&text)?;
+
+            let name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unusable file name"))?;
+            let temporary = relative.with_file_name(format!(".{name}.jarvis-tmp"));
+            root.handle.write(&temporary, replaced.as_bytes())?;
+            if let Err(error) = root.handle.rename(&temporary, &root.handle, relative) {
+                let _ = root.handle.remove_file(&temporary);
+                return Err(error);
+            }
+            return Ok(root.label.as_path());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no workspace root holds that file",
+        ))
     }
 }
 

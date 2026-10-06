@@ -32,28 +32,16 @@
 //! and [`effective_risk`] takes a **maximum** — so an escalated risk can only move the posture
 //! toward more scrutiny.
 //!
-//! # Why a weak channel asks rather than denies
-//!
-//! `docs/architecture/security.md`: "Voice confirmation alone is insufficient for risk-3 actions by
-//! default. A trusted desktop/mobile/CLI approval may resume a voice-originated run."
-//!
-//! That sentence describes an outcome that is neither allow nor deny, so the decision has three
-//! outcomes rather than two. A voice request for a risk-3 action is **not** refused — it is held
-//! pending an approval that must arrive through a stronger channel. Modelling it as a denial would
-//! make the documented resume path unreachable, and modelling it as an allowance would let a voice
-//! command delete something.
-//!
 //! # What this module deliberately does not do
 //!
 //! It does not persist anything, and it does not know an approval exists. It answers "what would be
-//! required" from declared and supplied facts. Recording an approval obligation, its nonce, and its
-//! expiry is `P3-004`; the execution receipt is `P3-005`. This function is a pure function of its
+//! be required" from declared and supplied facts. Recording an approval obligation, its expiry, and
+//! the later authorization receipt is outside this module. This function is a pure function of its
 //! inputs, which is what makes the policy table testable as a table.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use jarvis_core::SessionChannel;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -63,82 +51,6 @@ use crate::identifier::ToolId;
 use crate::policy::ApprovalPolicy;
 use crate::risk::Risk;
 use crate::scope::ScopeSet;
-
-/// The strongest authentication a channel can establish.
-///
-/// Ordered so a comparison is the whole check. `Voice` is deliberately the weakest: a caller's
-/// identity arrives over a channel whose evidence is a phone number or a provider-supplied
-/// identifier, neither of which is a cryptographic factor.
-///
-/// The ordering is the mechanism behind `docs/architecture/security.md`'s voice rule. It is not a
-/// statement that voice is untrustworthy — a voice session may legitimately read a calendar — but
-/// that a voice channel cannot *establish* the strength a risk-3 action requires. The outcome is an
-/// approval from a stronger channel, which is exactly the documented resume path.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthenticationStrength {
-    /// No authentication evidence at all.
-    Absent,
-    /// Channel evidence only: a caller ID, a provider `user_id`, a pairing code already consumed.
-    ChannelEvidence,
-    /// A verified credential: the profile credential over local IPC, or a device credential.
-    Credential,
-    /// A credential established in this interaction, with user presence.
-    Present,
-}
-
-impl AuthenticationStrength {
-    /// Returns the stable wire and storage name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::ChannelEvidence => "channel_evidence",
-            Self::Credential => "credential",
-            Self::Present => "present",
-        }
-    }
-
-    /// Returns the minimum strength a risk of this level needs **to be auto-allowed**.
-    ///
-    /// Above the level's requirement the decision is an approval, not a refusal, because a stronger
-    /// channel can supply it.
-    #[must_use]
-    pub const fn required_for(risk: Risk) -> Self {
-        match risk {
-            Risk::Minimal | Risk::Low => Self::ChannelEvidence,
-            Risk::Moderate => Self::Credential,
-            Risk::High => Self::Present,
-        }
-    }
-}
-
-impl fmt::Display for AuthenticationStrength {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// The strongest authentication a channel can establish.
-///
-/// This is the "client/channel ceiling" of `docs/architecture/identity-and-workspaces.md`
-/// ("a role grants a maximum; a client/channel may have a narrower ceiling"). It caps what an actor
-/// may *claim* on that channel, so a client cannot raise its own strength by asserting one.
-#[must_use]
-pub const fn channel_ceiling(channel: SessionChannel) -> AuthenticationStrength {
-    match channel {
-        // A local terminal or the desktop view holds the profile credential, and can require user
-        // presence for a specific action.
-        SessionChannel::Cli | SessionChannel::Desktop => AuthenticationStrength::Present,
-        // An API client presents a scoped credential. It cannot establish presence, because there is
-        // no one in front of it to prove it.
-        SessionChannel::Api => AuthenticationStrength::Credential,
-        // Voice: a caller ID or a provider-supplied user identifier is evidence *from the channel*,
-        // and never a credential. See the module comment for why this produces an approval rather
-        // than a refusal for a risk-3 action.
-        SessionChannel::Voice => AuthenticationStrength::ChannelEvidence,
-    }
-}
 
 /// Where an actor stands.
 ///
@@ -208,7 +120,6 @@ pub struct WorkspacePolicy {
     max_risk: Risk,
     approval_threshold: Risk,
     requires_approval_for_external_communication: bool,
-    requires_strong_authentication_for_high_risk: bool,
     denied_tools: BTreeSet<ToolId>,
     /// Per-tool approval overrides, each already verified to be a **tightening**.
     ///
@@ -234,7 +145,6 @@ impl Default for WorkspacePolicy {
             max_risk: Risk::High,
             approval_threshold: Risk::Moderate,
             requires_approval_for_external_communication: true,
-            requires_strong_authentication_for_high_risk: true,
             denied_tools: BTreeSet::new(),
             approval_tools: BTreeMap::new(),
             trusted_tools: BTreeSet::new(),
@@ -254,7 +164,6 @@ impl WorkspacePolicy {
         max_risk: Risk,
         approval_threshold: Risk,
         requires_approval_for_external_communication: bool,
-        requires_strong_authentication_for_high_risk: bool,
     ) -> Result<Self, PolicyError> {
         if approval_threshold > max_risk {
             return Err(PolicyError::ApprovalThresholdAboveMaximum {
@@ -266,7 +175,6 @@ impl WorkspacePolicy {
             max_risk,
             approval_threshold,
             requires_approval_for_external_communication,
-            requires_strong_authentication_for_high_risk,
             denied_tools: BTreeSet::new(),
             approval_tools: BTreeMap::new(),
             trusted_tools: BTreeSet::new(),
@@ -298,8 +206,8 @@ impl WorkspacePolicy {
     /// guard asks. Without this, a tool declaring `Ask` is held for ever, and a product that interrupts its owner
     /// for every calculation is one that owner turns off. So the relaxation exists, and is as narrow as it can be:
     ///
-    /// - it waives **only** the approval obligations (the tool's own `Ask` and the risk threshold) and the
-    ///   authentication strength a risk level asks for, which the owner's advance decision stands in for;
+    /// - it waives **only** the approval obligations (the tool's own `Ask` and the risk threshold), which the
+    ///   owner's advance decision stands in for;
     /// - it does **not** waive the `max_risk` ceiling, a denial, the actor's scopes, or the
     ///   external-communication rule — each is evaluated as before;
     /// - it is **never** consulted for a tool with an external-communication effect, so trusting a mail-sending
@@ -366,16 +274,33 @@ impl WorkspacePolicy {
         self.approval_threshold
     }
 
+    /// Whether a call to this tool at its **declared** risk would be held for the owner's answer.
+    ///
+    /// The same three conditions `evaluate` applies at its approval step (the tool's own `ask`, the risk threshold,
+    /// the external-communication rule, each waived by standing trust except the last), so a screen can say "asks
+    /// first" without running a decision. A parity test pins it to `evaluate`, so the two cannot drift apart. A tool
+    /// that is denied is not "held", it is refused, so this is `false` for one.
+    #[must_use]
+    pub fn asks_first(&self, definition: &ToolDefinition) -> bool {
+        let effective = self.effective_approval(definition.id(), definition.approval());
+        if self.denies(definition.id()) || !effective.is_runnable() {
+            return false;
+        }
+        let externally_communicates = definition
+            .effects()
+            .contains(ToolEffect::ExternalCommunication);
+        let trusted = self.trusts(definition.id()) && !externally_communicates;
+        let by_tool = !trusted && effective == ApprovalPolicy::Ask;
+        let by_risk = !trusted && definition.risk() >= self.approval_threshold;
+        let by_external =
+            self.requires_approval_for_external_communication && externally_communicates;
+        by_tool || by_risk || by_external
+    }
+
     /// Returns whether an external-communication effect always needs approval.
     #[must_use]
     pub const fn requires_approval_for_external_communication(&self) -> bool {
         self.requires_approval_for_external_communication
-    }
-
-    /// Returns whether a high-risk action needs presence-establishing authentication.
-    #[must_use]
-    pub const fn requires_strong_authentication_for_high_risk(&self) -> bool {
-        self.requires_strong_authentication_for_high_risk
     }
 
     /// Returns whether this workspace denies a tool.
@@ -501,10 +426,6 @@ pub struct PolicyRequest<'a> {
     pub actor: ActorAuthority,
     /// The workspace's policy.
     pub workspace: &'a WorkspacePolicy,
-    /// The channel the request arrived on.
-    pub channel: SessionChannel,
-    /// The strength the actor's client claims. Capped by the channel.
-    pub claimed_strength: AuthenticationStrength,
     /// Whether the tool can currently run.
     pub available: bool,
     /// Context that may raise the risk.
@@ -533,8 +454,6 @@ pub enum DenyReason {
     ToolPolicyDenies,
     /// The call's risk requires an approval the request does not carry.
     ApprovalRequired,
-    /// The channel cannot establish enough authentication to satisfy this risk.
-    InsufficientAuthentication,
     /// An external-communication effect in a workspace that requires approval for it.
     ExternalCommunicationRequiresApproval,
 }
@@ -551,7 +470,6 @@ impl DenyReason {
             Self::MissingScope => "missing_scope",
             Self::ToolPolicyDenies => "tool_policy_denies",
             Self::ApprovalRequired => "approval_required",
-            Self::InsufficientAuthentication => "insufficient_authentication",
             Self::ExternalCommunicationRequiresApproval => {
                 "external_communication_requires_approval"
             }
@@ -560,7 +478,7 @@ impl DenyReason {
 
     /// Returns every reason, so a test can sweep them.
     #[must_use]
-    pub const fn all() -> [Self; 9] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::CapabilityUnavailable,
             Self::ActorNotPermitted,
@@ -569,7 +487,6 @@ impl DenyReason {
             Self::MissingScope,
             Self::ToolPolicyDenies,
             Self::ApprovalRequired,
-            Self::InsufficientAuthentication,
             Self::ExternalCommunicationRequiresApproval,
         ]
     }
@@ -624,8 +541,6 @@ pub struct PolicyDecision {
     decision: Decision,
     reason: Option<DenyReason>,
     effective_risk: Risk,
-    /// The strength an approval must be supplied with, when one is required.
-    required_strength: Option<AuthenticationStrength>,
     /// The context signals that raised the risk above the declared level.
     escalated_by: Vec<EscalationSignal>,
 }
@@ -654,20 +569,12 @@ impl PolicyDecision {
     /// in the run event that announced the hold; reproducing it here would be a second copy of a fact the
     /// caller already has, and this value exists to carry the authority rather than the explanation.
     ///
-    /// # Why the strength is required rather than optional
-    ///
-    /// A held decision always has one — `evaluate` sets it on every `RequireApproval` — so taking it as an
-    /// `Option` would let a caller build a held decision that says "an approval is needed" while leaving
-    /// unspecified *how strongly it must be proven*, which is the one thing a resume must not lose. The
-    /// stored level is mapped through `Risk::from_level` and falls back to `High`, which is the **strongest**
-    /// posture: a row this build cannot read fails toward more scrutiny rather than less.
     #[must_use]
-    pub fn held_by_approval(required_strength: AuthenticationStrength, risk_level: u8) -> Self {
+    pub fn held_by_approval(risk_level: u8) -> Self {
         Self {
             decision: Decision::RequireApproval,
             reason: None,
             effective_risk: Risk::from_level(risk_level).unwrap_or(Risk::High),
-            required_strength: Some(required_strength),
             escalated_by: Vec::new(),
         }
     }
@@ -714,16 +621,6 @@ impl PolicyDecision {
         self.effective_risk
     }
 
-    /// Returns the strength an approval must be supplied with.
-    ///
-    /// Present whenever the outcome is `RequireApproval`, so a caller cannot hold a call without
-    /// knowing what would release it. What supplies that strength — an authenticated approval record
-    /// with a nonce and an expiry — is `P3-004`.
-    #[must_use]
-    pub const fn required_strength(&self) -> Option<AuthenticationStrength> {
-        self.required_strength
-    }
-
     /// Returns the context signals that raised the risk.
     #[must_use]
     pub fn escalated_by(&self) -> &[EscalationSignal] {
@@ -764,8 +661,7 @@ pub fn effective_risk(definition: &ToolDefinition, target: &TargetAssessment) ->
 /// 5. the actor is missing a scope the tool requires;
 /// 6. the tool's own policy refuses every call;
 /// 7. the workspace or the tool requires an approval the request does not carry;
-/// 8. the channel cannot establish enough authentication;
-/// 9. otherwise, allow.
+/// 8. otherwise, allow.
 ///
 /// Steps 3, 5, and 6 are the deny-overrides cases, and they are deliberately **before** the approval
 /// steps: a call that is denied and would also need approval must report the denial, or an operator
@@ -780,25 +676,16 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     let risk = effective_risk(definition, &request.target);
     let escalated_by = escalation_signals(&request.target);
 
-    // The channel caps what the actor may claim, so a client cannot raise its own strength by
-    // asserting a value it did not establish.
-    let effective_strength = request
-        .claimed_strength
-        .min(channel_ceiling(request.channel));
-
-    let held =
-        |reason: DenyReason, required_strength: Option<AuthenticationStrength>| PolicyDecision {
-            decision: Decision::RequireApproval,
-            reason: Some(reason),
-            effective_risk: risk,
-            required_strength,
-            escalated_by: escalated_by.clone(),
-        };
+    let held = |reason: DenyReason| PolicyDecision {
+        decision: Decision::RequireApproval,
+        reason: Some(reason),
+        effective_risk: risk,
+        escalated_by: escalated_by.clone(),
+    };
     let denied = |reason: DenyReason| PolicyDecision {
         decision: Decision::Deny,
         reason: Some(reason),
         effective_risk: risk,
-        required_strength: None,
         escalated_by: escalated_by.clone(),
     };
 
@@ -847,9 +734,7 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
         return denied(DenyReason::ToolPolicyDenies);
     }
 
-    // 7. Approval obligations. The risk threshold needs the strength the level requires; the
-    //    external-communication rule does not raise the strength requirement, because the risk
-    //    already carries one.
+    // 7. Approval obligations.
     //
     //    `ApprovalPolicy::Ask` is checked **first and unconditionally**, because that is what its own
     //    documentation says it means: "always ask, whatever policy says". It was previously not consulted
@@ -866,8 +751,8 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
     //    which is exactly the threshold below. Treating it as `Ask` would collapse a distinction the
     //    `ApprovalPolicy` documentation calls out as a real member rather than a synonym.
     //
-    //    The owner's standing trust waives the first two obligations for a tool that does not communicate
-    //    externally, and nothing else (`WorkspacePolicy::trusting`).
+    //    The owner's standing trust waives the tool declaration and threshold obligations for a tool that does
+    //    not communicate externally, and nothing else (`WorkspacePolicy::trusting`).
     let externally_communicates = definition
         .effects()
         .contains(ToolEffect::ExternalCommunication);
@@ -879,45 +764,18 @@ pub fn evaluate(request: &PolicyRequest<'_>) -> PolicyDecision {
         .requires_approval_for_external_communication()
         && externally_communicates;
 
-    if tool_requires_approval || risk_requires_approval || external_requires_approval {
-        // The strength an approval must be supplied with. `Present` for a high-risk action in a
-        // workspace that asks for it, which makes the voice ceiling produce the documented outcome:
-        // a voice-originated risk-3 call is *held*, not refused, and a desktop approval releases it.
-        let required = if request
-            .workspace
-            .requires_strong_authentication_for_high_risk()
-            && risk == Risk::High
-        {
-            AuthenticationStrength::Present
-        } else {
-            // `required_for` is derived from the **risk**, so a risk-0 tool that declares `Ask` asks for
-            // `ChannelEvidence` rather than `Absent`: an obligation with no strength floor could be
-            // satisfied by an unauthenticated caller, which would make "always ask" mean "ask anyone".
-            // The floor is the level's own requirement, and the declaration raises the *obligation*, not
-            // the strength — raising both would demand `Present` for a read, which an operator cannot
-            // supply over the API channel and which would make the tool unusable.
-            AuthenticationStrength::required_for(risk)
-        };
-        return held(DenyReason::ApprovalRequired, Some(required));
+    if external_requires_approval {
+        return held(DenyReason::ExternalCommunicationRequiresApproval);
     }
 
-    // 8. Authentication strength. Reached only when no approval is required, so a request that is
-    //    already held is not reported as under-authenticated — the approval is the stronger
-    //    obligation, and reporting both would give an operator two remedies for one problem.
-    //    Standing trust stands in for the presence a risk level asks for: the owner already decided, so a call
-    //    that arrives by voice or by a background task is not held for a strength it cannot supply.
-    if !trusted && effective_strength < AuthenticationStrength::required_for(risk) {
-        return held(
-            DenyReason::InsufficientAuthentication,
-            Some(AuthenticationStrength::required_for(risk)),
-        );
+    if tool_requires_approval || risk_requires_approval {
+        return held(DenyReason::ApprovalRequired);
     }
 
     PolicyDecision {
         decision: Decision::Allow,
         reason: None,
         effective_risk: risk,
-        required_strength: None,
         escalated_by,
     }
 }
@@ -1016,8 +874,6 @@ mod tests {
             definition,
             actor,
             workspace,
-            channel: SessionChannel::Desktop,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         }
@@ -1036,8 +892,67 @@ mod tests {
         assert_eq!(decision.reason(), None);
         assert_eq!(decision.reason_code(), "allowed");
         assert_eq!(decision.effective_risk(), Risk::Minimal);
-        assert_eq!(decision.required_strength(), None);
         assert!(decision.escalated_by().is_empty());
+    }
+
+    /// **`asks_first` is exactly what `evaluate` decides**, over every combination of effect, risk, declared approval and
+    /// workspace posture (default, an `ask` override, standing trust, a `deny`). A screen that says "asks first" is
+    /// therefore never telling the owner something the policy will not do.
+    #[test]
+    fn asks_first_agrees_with_evaluate_for_every_combination() {
+        let effects = [
+            ToolEffect::ReadOnly,
+            ToolEffect::Write,
+            ToolEffect::ExternalCommunication,
+        ];
+        let approvals = [
+            ApprovalPolicy::Auto,
+            ApprovalPolicy::Policy,
+            ApprovalPolicy::Ask,
+        ];
+        let subject = id("jarvis.fixture.subject");
+        let postures = [
+            WorkspacePolicy::default(),
+            WorkspacePolicy::default().requiring(subject.clone(), ApprovalPolicy::Ask),
+            WorkspacePolicy::default().trusting(subject.clone()),
+            WorkspacePolicy::default().denying(subject.clone()),
+            WorkspacePolicy::new(Risk::High, Risk::High, true)
+                .unwrap_or_else(|error| panic!("{error}")),
+        ];
+        let mut held = 0;
+        let mut allowed = 0;
+        for effect in effects {
+            for risk in 0..=3_u8 {
+                // A definition declaring effects must declare at least the risk those effects require.
+                let risk = if effect == ToolEffect::ReadOnly {
+                    risk
+                } else {
+                    risk.max(2)
+                };
+                for approval in approvals {
+                    let definition = tool(
+                        "jarvis.fixture.subject",
+                        EffectSet::single(effect),
+                        risk,
+                        approval,
+                        ScopeSet::single(scope("fixture.use")),
+                    );
+                    for workspace in &postures {
+                        let actor = ActorAuthority::active(ScopeSet::single(scope("fixture.use")));
+                        let decision = evaluate(&request(&definition, workspace, actor));
+                        assert_eq!(
+                            workspace.asks_first(&definition),
+                            decision.is_held(),
+                            "{effect:?} risk {risk} {approval:?}: {decision:?}"
+                        );
+                        held += i32::from(decision.is_held());
+                        allowed += i32::from(decision.is_allowed());
+                    }
+                }
+            }
+        }
+        // Both answers occur, so the equality above is not vacuous.
+        assert!(held > 0 && allowed > 0, "held {held}, allowed {allowed}");
     }
 
     /// **The deny-overrides test: a workspace denial beats a fully-scoped actor, and beats the
@@ -1091,21 +1006,13 @@ mod tests {
         let decision = evaluate(&request(&definition, &trusted, actor()));
         assert!(decision.is_allowed(), "{decision:?}");
 
-        // It stands in for presence: an actor claiming no authentication strength is not held for it.
-        let mut anonymous = request(&definition, &trusted, actor());
-        anonymous.claimed_strength = AuthenticationStrength::Absent;
-        assert!(
-            evaluate(&anonymous).is_allowed(),
-            "trust must stand in for presence"
-        );
-
         // A missing scope still refuses.
         let unscoped = ActorAuthority::active(ScopeSet::none());
         let decision = evaluate(&request(&definition, &trusted, unscoped));
         assert_eq!(decision.reason(), Some(DenyReason::MissingScope));
 
         // The ceiling still refuses.
-        let low_ceiling = WorkspacePolicy::new(Risk::Moderate, Risk::Moderate, true, true)
+        let low_ceiling = WorkspacePolicy::new(Risk::Moderate, Risk::Moderate, true)
             .unwrap_or_else(|error| panic!("consistent policy: {error}"))
             .trusting(id("jarvis.code.run"));
         let decision = evaluate(&request(&definition, &low_ceiling, actor()));
@@ -1217,7 +1124,7 @@ mod tests {
         let definition = sender();
         // A workspace permitting only risk 1, with the threshold at 1 so the pair is not
         // contradictory.
-        let workspace = WorkspacePolicy::new(Risk::Low, Risk::Low, true, true)
+        let workspace = WorkspacePolicy::new(Risk::Low, Risk::Low, true)
             .unwrap_or_else(|error| panic!("consistent policy: {error}"));
         let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
 
@@ -1230,7 +1137,7 @@ mod tests {
     #[test]
     fn a_contradictory_workspace_policy_is_refused() {
         assert_eq!(
-            WorkspacePolicy::new(Risk::Low, Risk::High, true, true),
+            WorkspacePolicy::new(Risk::Low, Risk::High, true),
             Err(PolicyError::ApprovalThresholdAboveMaximum {
                 approval_threshold: Risk::High,
                 max_risk: Risk::Low
@@ -1238,32 +1145,22 @@ mod tests {
         );
     }
 
-    /// A risk at the workspace threshold is held, and the reason says what would release it.
-    ///
-    /// The required strength is `Credential` for a risk-2 action, not `Present`: `Present` is
-    /// reserved for a high-risk action in a workspace that asks for it. That distinction is what
-    /// keeps the voice rule meaningful — a voice channel's ceiling is `ChannelEvidence`, so it can
-    /// supply neither a `Credential` nor `Present`, and a risk-2 or risk-3 approval must therefore
-    /// arrive through a stronger channel.
+    /// A risk at the workspace threshold is held.
     #[test]
-    fn a_risk_at_the_threshold_is_held_with_a_required_strength() {
-        let definition = sender();
+    fn a_risk_at_the_threshold_is_held() {
+        let definition = tool(
+            "jarvis.files.review",
+            EffectSet::single(ToolEffect::ReadOnly),
+            2,
+            ApprovalPolicy::Auto,
+            ScopeSet::single(scope("files.read")),
+        );
         let workspace = WorkspacePolicy::default();
-        let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
+        let actor = ActorAuthority::active(ScopeSet::single(scope("files.read")));
         let decision = evaluate(&request(&definition, &workspace, actor));
 
         assert!(decision.is_held(), "{decision:?}");
         assert_eq!(decision.reason(), Some(DenyReason::ApprovalRequired));
-        assert_eq!(
-            decision.required_strength(),
-            Some(AuthenticationStrength::Credential)
-        );
-        assert!(
-            decision
-                .required_strength()
-                .is_some_and(|required| { required > channel_ceiling(SessionChannel::Voice) }),
-            "a voice channel must not be able to satisfy the approval it would need"
-        );
         assert!(
             decision.reason().is_some_and(|reason| !reason.is_refusal()),
             "an approval obligation is a hold, not a refusal"
@@ -1282,15 +1179,7 @@ mod tests {
     /// where only the declaration can produce a hold, and it was found by a route test that could not
     /// produce a held call rather than by reading the branch table.
     ///
-    /// The three assertions are the three ways the fix could be wrong:
-    ///
-    /// - the call is **held**, so the declaration is read;
-    /// - the required strength is the **level's own floor** (`ChannelEvidence` at risk 0), not `Absent` —
-    ///   an obligation with no floor would be satisfiable by an unauthenticated caller, making "always ask"
-    ///   mean "ask anyone";
-    /// - it is **not raised to `Present`** either, because the declaration raises the *obligation* rather
-    ///   than the strength, and demanding user presence to read a public file would make the tool unusable
-    ///   over every channel whose ceiling is below it.
+    /// The declaration alone must cause the hold.
     #[test]
     fn a_tool_declaring_always_ask_holds_a_call_the_workspace_would_allow() {
         let definition = tool(
@@ -1317,16 +1206,6 @@ mod tests {
             "a tool declaring `Ask` must be held even when policy would allow it: {decision:?}"
         );
         assert_eq!(decision.reason(), Some(DenyReason::ApprovalRequired));
-        assert_eq!(
-            decision.required_strength(),
-            Some(AuthenticationStrength::ChannelEvidence),
-            "the obligation must carry the level's floor rather than no floor at all"
-        );
-        assert_ne!(
-            decision.required_strength(),
-            Some(AuthenticationStrength::Absent),
-            "an obligation with no strength floor is satisfiable by an unauthenticated caller"
-        );
     }
 
     /// **`ApprovalPolicy::Policy` is not `Ask`.** It defers to the workspace, so a risk below the
@@ -1413,7 +1292,7 @@ mod tests {
         );
         assert_eq!(
             decision.reason(),
-            Some(DenyReason::ApprovalRequired),
+            Some(DenyReason::ExternalCommunicationRequiresApproval),
             "a relaxed override must not change the reason the call is held"
         );
 
@@ -1514,120 +1393,6 @@ mod tests {
         );
     }
 
-    /// **The voice rule: a voice-originated risk-3 call is held, not refused.**
-    ///
-    /// `docs/architecture/security.md`: "Voice confirmation alone is insufficient for risk-3 actions
-    /// by default. A trusted desktop/mobile/CLI approval may resume a voice-originated run." A
-    /// refusal would make the documented resume path unreachable, so this asserts a hold.
-    #[test]
-    fn a_voice_originated_high_risk_call_is_held_not_refused() {
-        let definition = tool(
-            "jarvis.mail.delete_all",
-            EffectSet::single(ToolEffect::Destructive),
-            3,
-            ApprovalPolicy::Ask,
-            ScopeSet::single(scope("mail.delete")),
-        );
-        let workspace = WorkspacePolicy::default();
-        let actor = ActorAuthority::active(ScopeSet::single(scope("mail.delete")));
-
-        let mut request = request(&definition, &workspace, actor);
-        request.channel = SessionChannel::Voice;
-        // The caller claims the strongest strength; the channel caps it.
-        request.claimed_strength = AuthenticationStrength::Present;
-
-        let decision = evaluate(&request);
-        assert!(
-            !decision.is_denied(),
-            "a voice request must not be refused outright: {decision:?}"
-        );
-        assert!(decision.is_held());
-        assert_eq!(
-            decision.required_strength(),
-            Some(AuthenticationStrength::Present),
-            "a desktop or CLI approval must be able to release it"
-        );
-    }
-
-    /// The channel ceiling caps a claimed strength, so a client cannot assert what it did not
-    /// establish.
-    ///
-    /// # The fixture changed when `Ask` started being honoured, and that is the interesting part
-    ///
-    /// This test's intent is to isolate the **strength** check, so its tool must not incur an approval
-    /// obligation. It previously used `sender()`, which declares `Ask` at risk 2, and leaned on a
-    /// workspace whose threshold was `High` to "skip the approval step" — which worked **only because
-    /// `evaluate` ignored `Ask` entirely**. Once the declaration is honoured, that tool is held by its own
-    /// policy whatever the workspace threshold is, so step 8 is never reached and the test asserts a hold
-    /// where it means to assert a strength refusal.
-    ///
-    /// The fixture is therefore an `Auto`-declaring risk-2 tool: a tool whose *declaration* permits an
-    /// automatic decision, so the only thing left to decide is whether the channel established enough. The
-    /// workspace threshold stays `High` for the same reason as before.
-    #[test]
-    fn a_channel_ceiling_caps_a_claimed_strength() {
-        // A voice channel claiming presence still evaluates as channel evidence.
-        let definition = tool(
-            "jarvis.mail.send",
-            EffectSet::single(ToolEffect::ExternalCommunication),
-            2,
-            ApprovalPolicy::Auto,
-            ScopeSet::single(scope("mail.send")),
-        );
-        // A workspace whose threshold is above the tool's risk, so the approval step is skipped and
-        // the strength check is the one that decides.
-        let workspace = WorkspacePolicy::new(Risk::High, Risk::High, false, true)
-            .unwrap_or_else(|error| panic!("consistent policy: {error}"));
-        let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
-
-        let mut voice = request(&definition, &workspace, actor.clone());
-        voice.channel = SessionChannel::Voice;
-        voice.claimed_strength = AuthenticationStrength::Present;
-        let decision = evaluate(&voice);
-        assert_eq!(
-            decision.reason(),
-            Some(DenyReason::InsufficientAuthentication),
-            "a voice channel cannot establish presence: {decision:?}"
-        );
-        assert_eq!(
-            decision.required_strength(),
-            Some(AuthenticationStrength::Credential)
-        );
-
-        // The same claim over the desktop channel is accepted.
-        let mut desktop = request(&definition, &workspace, actor);
-        desktop.claimed_strength = AuthenticationStrength::Present;
-        assert!(evaluate(&desktop).is_allowed());
-    }
-
-    /// The channel ceilings are ordered as documented, and voice is the weakest.
-    #[test]
-    fn the_channel_ceilings_are_ordered() {
-        assert_eq!(
-            channel_ceiling(SessionChannel::Cli),
-            AuthenticationStrength::Present
-        );
-        assert_eq!(
-            channel_ceiling(SessionChannel::Desktop),
-            AuthenticationStrength::Present
-        );
-        assert_eq!(
-            channel_ceiling(SessionChannel::Api),
-            AuthenticationStrength::Credential
-        );
-        assert_eq!(
-            channel_ceiling(SessionChannel::Voice),
-            AuthenticationStrength::ChannelEvidence
-        );
-        for channel in SessionChannel::all() {
-            assert!(channel_ceiling(channel) <= AuthenticationStrength::Present);
-        }
-        assert_eq!(
-            AuthenticationStrength::required_for(Risk::High),
-            AuthenticationStrength::Present
-        );
-    }
-
     /// An external-communication effect needs approval in a workspace that asks for it.
     #[test]
     fn an_external_communication_effect_needs_approval_when_the_workspace_asks() {
@@ -1639,15 +1404,18 @@ mod tests {
             ApprovalPolicy::Auto,
             ScopeSet::single(scope("mail.send")),
         );
-        let workspace = WorkspacePolicy::new(Risk::High, Risk::High, true, true)
+        let workspace = WorkspacePolicy::new(Risk::High, Risk::High, true)
             .unwrap_or_else(|error| panic!("{error}"));
         let actor = ActorAuthority::active(ScopeSet::single(scope("mail.send")));
         let decision = evaluate(&request(&definition, &workspace, actor));
         assert!(decision.is_held(), "{decision:?}");
-        assert_eq!(decision.reason(), Some(DenyReason::ApprovalRequired));
+        assert_eq!(
+            decision.reason(),
+            Some(DenyReason::ExternalCommunicationRequiresApproval)
+        );
 
         // The same workspace with the rule off allows it, so the rule is what held it.
-        let permissive = WorkspacePolicy::new(Risk::High, Risk::High, false, true)
+        let permissive = WorkspacePolicy::new(Risk::High, Risk::High, false)
             .unwrap_or_else(|error| panic!("{error}"));
         let decision = evaluate(&request(
             &definition,
@@ -1832,11 +1600,7 @@ mod tests {
         let definition = sender();
         let workspace = WorkspacePolicy::default();
         let actor = ActorAuthority::active(ScopeSet::none());
-        let mut request = request(&definition, &workspace, actor);
-        request.claimed_strength = AuthenticationStrength::Absent;
-        request.channel = SessionChannel::Api;
-
-        let decision = evaluate(&request);
+        let decision = evaluate(&request(&definition, &workspace, actor));
         assert!(
             !decision.is_allowed(),
             "a request with no scope and no authentication must not be allowed: {decision:?}"

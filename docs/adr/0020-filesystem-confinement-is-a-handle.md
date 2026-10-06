@@ -121,11 +121,11 @@ rather than destruction.
 
 ## Honest limits at the time of this decision
 
-- **No entry point drives the tool.** `FilesystemReadTool` implements `ToolExecutor` and is exercised by
+- **No entry point drives the tool.** `FilesystemTool` implements `ToolExecutor` and is exercised by
   tests only. Nothing in `apps/jarvisd` registers the two definitions, evaluates policy, requests an
   approval, or calls `execute`, so no model can read a file yet. `P3-012` is where the Phase 3 gate
   proves the path end to end.
-- **No registry wiring.** `FilesystemReadTool::definitions()` returns the two canonical definitions, but
+- **No registry wiring.** `FilesystemTool::definitions()` returns the two canonical definitions, but
   nothing inserts them into a `ToolRegistry` in production code — the composition step that joins the
   registry, the policy engine, the approval repository, and this adapter is not written.
 - **Read-only, with no write, move, delete, or trash.** Trash/undo, which the architecture lists, is a

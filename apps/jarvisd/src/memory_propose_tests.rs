@@ -108,10 +108,8 @@ async fn a_subject(database: &SqliteDatabase) -> String {
 /// the arguments — so a fixture cannot invent authority, and a test that ran without a decision would be
 /// testing a path the pipeline cannot produce.
 fn allowing() -> jarvis_tools::PolicyDecision {
-    use jarvis_core::SessionChannel;
     use jarvis_tools::{
-        ActorAuthority, AuthenticationStrength, PolicyRequest, Scope, ScopeSet, TargetAssessment,
-        WorkspacePolicy, evaluate,
+        ActorAuthority, PolicyRequest, Scope, ScopeSet, TargetAssessment, WorkspacePolicy, evaluate,
     };
 
     let definition = must(MemoryProposeTool::definition());
@@ -119,8 +117,6 @@ fn allowing() -> jarvis_tools::PolicyDecision {
         definition: &definition,
         actor: ActorAuthority::active(ScopeSet::new([must(Scope::new(PROPOSE_SCOPE))])),
         workspace: &WorkspacePolicy::default(),
-        channel: SessionChannel::Cli,
-        claimed_strength: AuthenticationStrength::Present,
         available: true,
         target: TargetAssessment::none(),
     });
@@ -464,7 +460,7 @@ fn the_proposal_tool_declares_a_write_at_its_risk_floor() {
 /// valid is a different claim from the registry holding it.
 #[tokio::test]
 async fn the_proposal_tool_is_registered_for_a_model_to_call() {
-    let (directory, database) = database().await;
+    let (_directory, database) = database().await;
     let pipeline = must(crate::tool_pipeline::ToolPipeline::with_adapters(
         Arc::clone(&database),
         None,
@@ -474,7 +470,6 @@ async fn the_proposal_tool_is_registered_for_a_model_to_call() {
             Arc::new(MemoryProposeTool::new(Arc::clone(&database)))
                 as Arc<dyn jarvis_tools::ToolExecutor>,
         )],
-        jarvis_storage::SecretStore::in_state(&directory.join("state")),
     ));
 
     let definitions = must(pipeline.definitions());

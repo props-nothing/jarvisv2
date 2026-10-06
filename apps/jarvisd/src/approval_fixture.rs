@@ -15,7 +15,7 @@
 //! comes from the tool's own declaration, which is a posture a real server can carry, and it holds
 //! regardless of the workspace policy — so the tests do not depend on a policy default that could change.
 //!
-//! The field values are copied from `FilesystemReadTool`'s own definition rather than invented:
+//! The field values are copied from `FilesystemTool`'s own definition rather than invented:
 //! `EffectSet::single(ToolEffect::ReadOnly)` is what makes risk 0 legal, and `ToolSensitivity::new` is the
 //! two-sided constructor rather than a bare enum, so every value here is one the contract accepts.
 

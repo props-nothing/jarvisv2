@@ -149,7 +149,7 @@ against a moving target forever. Removing the bump removes the conflict rather t
 
 - ~~**`expected_version` remains on run *start* and on approval decisions.**~~ **CORRECTION (2026-09-22):
   this claim was FALSE and is struck rather than quietly edited.** Neither case exists in this codebase.
-  `ApprovalDecision` holds `outcome`, `channel`, `strength`, and `decided_at` — there is no version field,
+  `ApprovalDecision` holds `outcome`, `channel`, and `decided_at` — there is no version field,
   and there never was. Starting a run creates a row, so there is no prior version to expect. `grep` for
   `expected_version` across the workspace now finds only this ADR, a doc quotation, and the message of the
   test that replaced the removed cancel field.

@@ -270,8 +270,7 @@ during `P5-001`; the harness therefore restores with `WriteAllText` and bumps `L
 - **No `localhost` support, and no configuration to enable it.** RFC 8252 §8.3 says NOT RECOMMENDED and gives a
   reason that is about the resolver; a caller that needs it must change the type, which is the intended cost.
 - **`AuthError::RandomUnavailable` is untestable here.** The platform random source does not fail on demand, so
-  the branch that propagates its failure is verified by reading rather than by a test. It is a two-line branch
-  and its shape matches `jarvis_core::DecisionNonce::generate`'s, which has the same gap.
+  the branch that propagates its failure is verified by reading rather than by a test. It is a two-line branch.
 - **The token request and the revocation call are not performed.** This module classifies a response the caller
   supplies; the HTTP calls, their timeouts, and their error mapping are the connector's (`P5-005` onward), which
   is what keeps every branch here verifiable as a function of its arguments.

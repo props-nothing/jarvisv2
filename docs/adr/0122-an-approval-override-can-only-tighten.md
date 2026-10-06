@@ -43,12 +43,6 @@ other. `jarvis-core` is the crate both already depend on, and it already holds `
 reason. `jarvis-tools` re-exports both, so every existing `crate::Risk` and `crate::ApprovalPolicy` path
 keeps resolving and there is still exactly one definition.
 
-**This is deliberately not the `AuthenticationStrength` situation.** That type exists twice — in core and
-in `jarvis-tools` — and the duplication is correct there because the two mean different things (what a
-channel *can* establish versus what a channel that answered *did* establish). A duplicate is right when
-the meanings differ and wrong when they do not, and the difference is whether one value could be
-substituted for the other without changing a claim. Here it could not: a risk level is a risk level.
-
 **The floor check moves its argument, not its home.** Core's `Risk::declared_for` takes the effect floor
 as a **number**, because an effect set is `jarvis-tools`'s type. `jarvis-tools::declared_for_effects` is
 the single binding that supplies `EffectSet::risk_floor()`, so "a financial tool cannot be risk 0" still
@@ -137,9 +131,6 @@ where an *invalid* one is reported by name.
 - **Keep `Risk` in `jarvis-tools` and give `jarvis-storage` a `jarvis-tools` dependency.** Rejected: the
   dependency graph forbids an adapter depending on another adapter, and that rule exists because a storage
   crate that can see the tool registry is a storage crate that will eventually read it.
-- **Reuse `jarvis-core`'s `AuthenticationStrength` shape as a model for a duplicated policy type.**
-  Rejected: that duplication is justified by two *different* meanings. A policy or a risk level has one,
-  so duplicating it would be duplication without the justification.
 
 ## Conditions that would justify revisiting
 

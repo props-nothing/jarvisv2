@@ -48,7 +48,7 @@ pub async fn run(client: &ApiClient, arguments: &[String]) -> ExitStatus {
 
 /// The usage line for this group, so an unknown sub-verb names what is accepted.
 pub(crate) const fn usage() -> &'static str {
-    "usage: jarvis tools <list|preview> [...]\n       jarvis tools list [--json]\n       jarvis tools preview <tool> [--escalation external|bulk|sensitive|production] [--channel CHANNEL] [--strength STRENGTH] [--json]"
+    "usage: jarvis tools <list|preview> [...]\n       jarvis tools list [--json]\n       jarvis tools preview <tool> [--escalation external|bulk|sensitive|production] [--json]"
 }
 
 /// Exposes the flag parser to this crate's tests.
@@ -193,10 +193,9 @@ async fn preview(client: &ApiClient, arguments: &[String], json: bool) -> ExitSt
 /// body the daemon's `deny_unknown_fields` would then refuse — the client reporting a `422` for its own
 /// mistake rather than naming the flag.
 ///
-/// An unknown escalation, channel, or strength is a **usage error** rather than an ignored value: silently
-/// dropping an escalation would compute the preview for a call *without* that signal, and a defaulted channel
-/// or strength would compute one for a different trust boundary. Every wrong answer in that direction reads
-/// as more permissive than the user asked about.
+/// An unknown escalation is a **usage error** rather than an ignored value: silently dropping one would
+/// compute the preview for a call *without* that signal, which reads as more permissive than the user
+/// asked about.
 fn preview_request(arguments: &[String]) -> Result<ToolPreviewRequest, ExitStatus> {
     let mut request = ToolPreviewRequest::default();
     let mut index = 3;
@@ -217,40 +216,6 @@ fn preview_request(arguments: &[String]) -> Result<ToolPreviewRequest, ExitStatu
                     return Err(ExitStatus::Usage);
                 };
                 request.escalation.push(signal);
-                index += 1;
-            }
-            "--channel" => {
-                let Some(value) = arguments.get(index + 1) else {
-                    eprintln!("jarvis: --channel requires a value");
-                    return Err(ExitStatus::Usage);
-                };
-                let Ok(channel) = jarvis_core::SessionChannel::parse(value) else {
-                    eprintln!(
-                        "jarvis: unknown channel {value:?}; accepted: cli, desktop, api, voice"
-                    );
-                    return Err(ExitStatus::Usage);
-                };
-                request.channel = Some(channel);
-                index += 1;
-            }
-            "--strength" => {
-                let Some(value) = arguments.get(index + 1) else {
-                    eprintln!("jarvis: --strength requires a value");
-                    return Err(ExitStatus::Usage);
-                };
-                // Validated here against the closed set the daemon accepts, so a typo is a local usage
-                // error naming the flag rather than a `422` whose field name a user has to map back.
-                if !matches!(
-                    value.as_str(),
-                    "absent" | "channel_evidence" | "credential" | "present"
-                ) {
-                    eprintln!(
-                        "jarvis: unknown strength {value:?}; accepted: absent, channel_evidence, \
-                         credential, present"
-                    );
-                    return Err(ExitStatus::Usage);
-                }
-                request.claimed_strength = Some(value.clone());
                 index += 1;
             }
             other => {
@@ -278,9 +243,6 @@ fn render_preview(reply: &ToolPreviewReply) {
     if !reply.escalated_by.is_empty() {
         let signals: Vec<&str> = reply.escalated_by.iter().map(|s| s.code()).collect();
         println!("  escalated by      {}", signals.join(", "));
-    }
-    if let Some(strength) = &reply.required_strength {
-        println!("  approval needs    {strength}");
     }
 }
 

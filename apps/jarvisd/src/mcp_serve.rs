@@ -204,6 +204,21 @@ pub enum RemoteMcpError {
     },
 }
 
+/// The definitions a remote caller may be offered.
+///
+/// The tools that change the owner's own files are never served: an external client reaching them would write
+/// to the owner's folders on the strength of an allowlist entry alone.
+pub(crate) fn servable_definitions(definitions: &[ToolDefinition]) -> Vec<ToolDefinition> {
+    definitions
+        .iter()
+        .filter(|definition| {
+            let id = definition.id().to_string();
+            id != jarvis_tools::WRITE_TOOL && id != jarvis_tools::EDIT_TOOL
+        })
+        .cloned()
+        .collect()
+}
+
 /// Builds the endpoint JARVIS serves, over an already-composed pipeline.
 ///
 /// # Errors
@@ -217,6 +232,8 @@ pub fn build_endpoint(
     workspace_id: impl Into<String>,
     caller_policy: CallerAdmission,
 ) -> Result<(RemoteMcpRunner, ServedEndpoint), RemoteMcpError> {
+    let definitions = servable_definitions(definitions);
+    let definitions = definitions.as_slice();
     if definitions.is_empty() {
         return Err(RemoteMcpError::NoTools);
     }

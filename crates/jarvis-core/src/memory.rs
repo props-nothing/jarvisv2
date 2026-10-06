@@ -1896,7 +1896,7 @@ impl MemoryRecord {
     ///   both carry. Checked here rather than at the writer so a decision the schema would refuse cannot
     ///   exist in memory first.
     ///
-    /// # Why there is no self-approval refusal here
+    /// # Why there is no same-author refusal here
     ///
     /// `ADR-0117` §4 refuses a promotion by a procedure's own author, and the obvious symmetry is to refuse an
     /// admission by a claim's own author. It is **not** done, because for a memory the two cases are not alike:

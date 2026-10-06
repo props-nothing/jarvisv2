@@ -382,14 +382,12 @@ mod tests {
     /// evaluation; a fixture that could build one directly could fabricate authority.
     fn allowing() -> crate::PolicyDecision {
         use crate::evaluation::{
-            ActorAuthority, AuthenticationStrength, PolicyRequest, TargetAssessment,
-            WorkspacePolicy, evaluate,
+            ActorAuthority, PolicyRequest, TargetAssessment, WorkspacePolicy, evaluate,
         };
         use crate::policy::{ApprovalPolicy, Availability, Idempotency, RetryDeclaration};
         use crate::risk::Risk;
         use crate::scope::ScopeSet;
         use crate::{EffectSet, ToolEffect, ToolSource};
-        use jarvis_core::SessionChannel;
 
         let definition = crate::ToolDefinition::new(crate::ToolDefinitionParts {
             id: ToolId::new("jarvis.mail.send").unwrap_or_else(|error| panic!("{error}")),
@@ -427,8 +425,6 @@ mod tests {
             definition: &definition,
             actor: ActorAuthority::active(ScopeSet::none()),
             workspace: &WorkspacePolicy::default(),
-            channel: SessionChannel::Cli,
-            claimed_strength: AuthenticationStrength::Present,
             available: true,
             target: TargetAssessment::none(),
         });

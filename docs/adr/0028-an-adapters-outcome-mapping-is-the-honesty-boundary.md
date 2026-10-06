@@ -92,11 +92,9 @@ needs. A test asserts a maximal reason is *recorded*, not merely short.
   and the test now fails the falsification with the exact wrong claim ("the adapter refused the call
   before reaching a provider: Transport closed"). **A row in a mapping table is a claim until a test
   pins it.**
-- Two fixture mistakes were also instructive and are recorded in the test: an MCP tool requires the
-  `mcp.call` scope (an empty grant is a `MissingScope` denial), and **even a minimal-risk tool requires
-  `ChannelEvidence`**, so an `Absent` strength claim is an `InsufficientAuthentication` hold. Both turned
-  every test into a held call, and both were visible only because the fixture asserts an allowance rather
-  than assuming one.
+- A fixture mistake was also instructive and is recorded in the test: an MCP tool requires the
+  `mcp.call` scope (an empty grant is a `MissingScope` denial). It turned every test into a refusal, and was
+  visible only because the fixture asserts an allowance rather than assuming one.
 - Still **not reachable from `jarvisd`**: nothing composes an `McpToolAdapter` into the pipeline or reads
   a server from `config.toml`, so `P3-009` remains the gate for operator reachability. Nothing writes a
   `run_events` row for an MCP call either — `P3-012` owns linking calls to the event log.

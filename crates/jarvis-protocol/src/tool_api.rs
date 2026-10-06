@@ -32,7 +32,7 @@
 //! Every type here except [`ToolPreviewRequest`] is a response, so the rule from `rest.rs` applies
 //! unchanged: a newer daemon's additive field must not break an older client.
 
-use jarvis_core::{ApprovalPolicy, EscalationSignal, Risk, SessionChannel};
+use jarvis_core::{ApprovalPolicy, EscalationSignal, Risk};
 use serde::{Deserialize, Serialize};
 
 /// One tool as an operator sees it.
@@ -83,6 +83,9 @@ pub struct ToolReply {
     /// Why it cannot, when it cannot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    /// Whether a call is held for the owner's yes or no before it runs, under the policy now in force.
+    #[serde(default)]
+    pub asks_first: bool,
 }
 
 /// Response body for `GET /api/v1/tools`.
@@ -115,31 +118,14 @@ pub struct ToolListReply {
 ///
 /// # What a caller may and may not supply
 ///
-/// The **channel**, the **claimed strength**, and the **context signals** are supplied, because they
-/// are properties of the call being previewed that only the caller knows. The actor's scopes, the
-/// workspace policy, and the tool definition are **not** — they come from the daemon's own state, and
-/// accepting them would make the preview a way to ask "what if I had different permissions", which is
-/// a question an authorization surface must not answer.
+/// Only the **context signals** are supplied, because they are properties of the call being previewed
+/// that only the caller knows. The actor's scopes, the workspace policy, and the tool definition are
+/// **not** — they come from the daemon's own state, and accepting them would make the preview a way to
+/// ask "what if I had different permissions", which is a question an authorization surface must not
+/// answer.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolPreviewRequest {
-    /// The channel the call would arrive on. Absent means `desktop`.
-    ///
-    /// Typed rather than a `String` because the channel **caps** the authentication strength, so a
-    /// defaulted or mistyped channel would compute a preview for a different trust boundary than the
-    /// caller asked about.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<SessionChannel>,
-    /// The authentication strength the caller would present, as its stable name.
-    ///
-    /// Absent means the strongest the channel permits, which answers "would this work for a fully
-    /// authenticated caller" — the question an operator toggling a policy is usually asking.
-    ///
-    /// A name rather than a typed value because the strength vocabulary is `jarvis-tools`': core's
-    /// `AuthenticationStrength` is a **different type** meaning what a channel that answered *did*
-    /// establish, and substituting it here would let a ceiling be recorded as an observation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claimed_strength: Option<String>,
     /// Context signals that would raise the risk.
     ///
     /// Supplied because a preview of "send this to a bulk external list" is a different question from
@@ -178,7 +164,4 @@ pub struct ToolPreviewReply {
     pub declared_risk: Risk,
     /// The context signals that raised the risk.
     pub escalated_by: Vec<EscalationSignal>,
-    /// The authentication strength an approval would require, when one is required.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required_strength: Option<String>,
 }

@@ -14,7 +14,7 @@
 
 use jarvis_core::{CorrelationId, SessionChannel};
 
-use jarvis_tools::{ActorAuthority, AuthenticationStrength};
+use jarvis_tools::ActorAuthority;
 use jarvis_tools::{Scope, ScopeSet};
 
 /// The scope a caller holds to read files inside a workspace.
@@ -42,7 +42,6 @@ pub struct ToolActor {
     run_id: String,
     scopes: ScopeSet,
     channel: SessionChannel,
-    claimed_strength: AuthenticationStrength,
     policy_version: String,
 }
 
@@ -52,7 +51,7 @@ impl ToolActor {
     /// # The scopes are the served tools' own requirements, and that is derived rather than chosen
     ///
     /// The first version of this constructor granted **no** scopes, on the reasoning that the narrowest grant
-    /// is the safest. Its own test caught the error: `FilesystemReadTool::definitions` declares
+    /// is the safest. Its own test caught the error: `FilesystemTool::definitions` declares
     /// `required_scopes: ScopeSet::single("files.read")`, and the policy engine requires the actor to cover the
     /// **tool's** declared scopes — so an actor holding nothing was refused every call with `missing_scope`. The
     /// endpoint would have been built, bound, and answer every request with a refusal, which reads to an
@@ -72,11 +71,9 @@ impl ToolActor {
     /// # The other two fields
     ///
     /// - **`SessionChannel::Api`.** Not a claim about the transport: a remote client is not a JARVIS client, and
-    ///   labelling it `Cli` would say an operator's own local invocation made the call. The policy engine's
-    ///   strength cap reads it.
-    /// - **`AuthenticationStrength::Credential`**, which is what `P3-009g`'s allowlist actually establishes: a
-    ///   caller is admitted only against a configured credential fingerprint. The engine **caps** this by
-    ///   channel, so it is a claim rather than a proof — and the allowlist, not this value, is what admits.
+    ///   labelling it `Cli` would say an operator's own local invocation made the call.
+    /// - **The allowlist admission.** A caller is admitted only against a configured credential fingerprint, and
+    ///   the actor records that this call arrived through the API surface rather than a local terminal.
     ///
     /// `run_id` is the correlation identity of the call: a remote call has **no run**, and a fabricated
     /// identifier that looked like a real one would appear in a receipt as a run an operator could look up and
@@ -93,7 +90,6 @@ impl ToolActor {
             run_id: correlation_id.to_string(),
             scopes: Self::required_scopes_for(served),
             channel: SessionChannel::Api,
-            claimed_strength: AuthenticationStrength::Credential,
             policy_version: policy_version.into(),
         }
     }
@@ -129,8 +125,7 @@ impl ToolActor {
         ScopeSet::new(scopes)
     }
 
-    /// Describes an actor with read access to a workspace **and the ability to call MCP tools**, over a
-    /// channel at a stated strength.
+    /// Describes an actor with read access to a workspace **and the ability to call MCP tools**.
     ///
     /// The second area's constructor, as the doc on [`Self::workspace_reader`] said a second area would add:
     /// its **name says what it grants**, so a call site states which capability it is exercising rather than
@@ -163,7 +158,6 @@ impl ToolActor {
         workspace_id: impl Into<String>,
         run_id: impl Into<String>,
         channel: SessionChannel,
-        claimed_strength: AuthenticationStrength,
         policy_version: impl Into<String>,
     ) -> Option<Self> {
         // Both literals are parsed before either is used, so a rejection yields `None` rather than a partial
@@ -176,7 +170,6 @@ impl ToolActor {
             run_id: run_id.into(),
             scopes: ScopeSet::new([files, mcp]),
             channel,
-            claimed_strength,
             policy_version: policy_version.into(),
         })
     }
@@ -214,7 +207,6 @@ impl ToolActor {
         workspace_id: impl Into<String>,
         run_id: impl Into<String>,
         channel: SessionChannel,
-        claimed_strength: AuthenticationStrength,
         policy_version: impl Into<String>,
         composed: &[jarvis_tools::ToolDefinition],
     ) -> Self {
@@ -239,12 +231,11 @@ impl ToolActor {
             run_id: run_id.into(),
             scopes: ScopeSet::new(scopes),
             channel,
-            claimed_strength,
             policy_version: policy_version.into(),
         }
     }
 
-    /// Describes an actor with read access to a workspace, over a channel at a stated strength.
+    /// Describes an actor with read access to a workspace.
     ///
     /// This constructor grants exactly `files.read`. That is deliberate rather than lazy: a builder with a
     /// `with_scopes` method would invite a caller to grant whatever a task happened to need, and a grant is
@@ -270,7 +261,6 @@ impl ToolActor {
         workspace_id: impl Into<String>,
         run_id: impl Into<String>,
         channel: SessionChannel,
-        claimed_strength: AuthenticationStrength,
         policy_version: impl Into<String>,
     ) -> Self {
         let scopes = match Scope::new(FILES_READ_SCOPE) {
@@ -282,7 +272,6 @@ impl ToolActor {
             run_id: run_id.into(),
             scopes,
             channel,
-            claimed_strength,
             policy_version: policy_version.into(),
         }
     }
@@ -306,19 +295,10 @@ impl ToolActor {
     }
 
     /// Returns the channel the request arrived on.
+    #[cfg(test)]
     #[must_use]
     pub const fn channel(&self) -> SessionChannel {
         self.channel
-    }
-
-    /// Returns the strength the caller's client claims.
-    ///
-    /// A **claim**, which `P3-003` caps by the channel rather than trusting. An actor describing a
-    /// strength it could not have established reaches the same decision as one that claimed less,
-    /// because the cap is applied in the policy engine and not here.
-    #[must_use]
-    pub const fn claimed_strength(&self) -> AuthenticationStrength {
-        self.claimed_strength
     }
 
     /// Borrows the actor in the form the policy engine consumes.
@@ -371,14 +351,9 @@ mod tests {
     /// The combined actor grants **both** areas' scopes, which is what a transport serving both needs.
     #[test]
     fn an_actor_for_both_areas_holds_both_scopes() {
-        let actor = ToolActor::workspace_and_mcp(
-            "workspace",
-            "run",
-            SessionChannel::Cli,
-            AuthenticationStrength::Credential,
-            "policy-1",
-        )
-        .unwrap_or_else(|| panic!("both scope literals must be accepted"));
+        let actor =
+            ToolActor::workspace_and_mcp("workspace", "run", SessionChannel::Cli, "policy-1")
+                .unwrap_or_else(|| panic!("both scope literals must be accepted"));
 
         let authority = actor.authority();
         for literal in [FILES_READ_SCOPE, MCP_CALL_SCOPE] {
@@ -400,14 +375,12 @@ mod tests {
             "local",
             "0198f000-0000-7000-8000-0000000000c3",
             SessionChannel::Cli,
-            AuthenticationStrength::Present,
             "policy-3",
         );
 
         assert_eq!(actor.workspace_id(), "local");
         assert_eq!(actor.run_id(), "0198f000-0000-7000-8000-0000000000c3");
         assert_eq!(actor.policy_version(), "policy-3");
-        assert_eq!(actor.claimed_strength(), AuthenticationStrength::Present);
         assert_eq!(actor.channel(), SessionChannel::Cli);
 
         let authority = actor.authority();
@@ -447,7 +420,6 @@ mod tests {
             "workspace-1",
             "0198f000-0000-7000-8000-0000000000c3",
             SessionChannel::Cli,
-            AuthenticationStrength::Credential,
             "policy-1",
             std::slice::from_ref(&memory),
         );
@@ -475,7 +447,6 @@ mod tests {
             "workspace-1",
             "0198f000-0000-7000-8000-0000000000c3",
             SessionChannel::Cli,
-            AuthenticationStrength::Credential,
             "policy-1",
             &[],
         );

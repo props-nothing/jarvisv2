@@ -6,12 +6,12 @@
 //!
 //! # Three things this repository makes impossible
 //!
-//! 1. **A stored bearer secret.** The one-time decision nonce is stored as a SHA-256 digest and the
-//!    presented value is compared against it in constant time. A leaked database row therefore
-//!    proves a decision happened without yielding the ability to make one.
-//! 2. **A decision that changes an approval twice.** The decision write is one guarded `UPDATE`
+//! 1. **A decision that changes an approval twice.** The decision write is one guarded `UPDATE`
 //!    whose `WHERE` requires `state = 'pending'`, so a second decision affects zero rows. A denial
 //!    cannot be overwritten by a later approval.
+//! 2. **Older schema columns driving policy.** The SQLite table still carries three obsolete columns,
+//!    but this repository writes fixed placeholder values to satisfy historical `CHECK`s and never
+//!    reads them into policy or protocol state.
 //! 3. **An expiry decided in SQL.** `jarvis_core::UtcTimestamp`'s text form is not lexicographically
 //!    sortable (its `Rfc3339` rendering omits the fraction when it is zero, so `"...00Z"` sorts after
 //!    `"...00.5Z"`). Every expiry comparison here is made in Rust from `unix_nanos()`; the migration's
@@ -19,35 +19,27 @@
 //!
 //! # Why recording a decision reads the row first
 //!
-//! The domain's rules for a decision — the nonce, the self-approval refusal, the strength floor, the
-//! expiry — are enforced by [`ApprovalRequest::apply_decision`], which is where they have one home.
-//! Re-implementing them as SQL conditions would mean two copies of a security rule, and the copy in
-//! SQL would be the one a reader trusts without seeing the domain tests.
+//! The domain's rules for a decision — attribution, replay refusal, and expiry — are enforced by
+//! [`ApprovalRequest::apply_decision`], which is where they have one home. Re-implementing them as SQL
+//! conditions would mean two copies of a security rule, and the copy in SQL would be the one a reader
+//! trusts without seeing the domain tests.
 
 use jarvis_core::{
-    ApprovalRequest, ApprovalRequestParts, ApprovalState, AuthenticationStrength,
-    CanonicalIntentHash, DecisionNonce, UtcTimestamp,
+    ApprovalRequest, ApprovalRequestParts, ApprovalState, CanonicalIntentHash, UtcTimestamp,
 };
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::database::{DatabaseError, SqliteDatabase};
 
-/// The digest a presented nonce is compared against.
+/// Fixed placeholders for three older approval columns that migrations still require.
 ///
-/// SHA-256 rather than a password hash: the nonce is 32 bytes of platform randomness, so there is no
-/// dictionary to attack and no need for a work factor. A slow hash would add latency to every
-/// approval decision without adding strength.
-pub(crate) fn digest(text: &str) -> String {
-    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let mut rendered = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        rendered.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        rendered.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-    }
-    rendered
+/// The approval flow no longer uses those columns, so every write goes through this one helper and decoders
+/// ignore the stored values.
+fn unused_column_values() -> (&'static str, &'static str) {
+    (
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "credential",
+    )
 }
 
 /// Acknowledges a stored approval row without decoding the whole record.
@@ -70,22 +62,15 @@ async fn acknowledge(
 /// Maps a domain validation failure to a storage error.
 ///
 /// The variant is preserved as a stable field name rather than a formatted message, because the
-/// message can carry a preview (user-visible text) or a nonce length. `Debug` of the domain error is
-/// deliberately not used for the same reason.
+/// message can carry a preview (user-visible text). `Debug` of the domain error is deliberately not
+/// used for the same reason.
 const fn invalid_field(error: &jarvis_core::InvalidApprovalField) -> DatabaseError {
     use jarvis_core::InvalidApprovalField as Field;
     let field = match error {
         Field::Preview => "preview",
         Field::ExpiryNotAfterCreation | Field::LifetimeTooLong => "expiry",
-        Field::UnknownStrength => "required_strength",
         Field::UnknownChannel => "decision_channel",
-        // Both identify the same column: `SelfApproval` is a usable value the domain refused on a rule, and
-        // `ApproverUnusable` is a value the column could not hold. A caller learns the field either way, and
-        // the reason is in the domain error rather than in this mapping.
-        Field::SelfApproval | Field::ApproverUnusable => "decided_by",
-        Field::InsufficientAuthentication { .. } => "decision_strength",
-        Field::NonceMismatch => "nonce",
-        Field::NonceUnavailable => "nonce_hash",
+        Field::ApproverUnusable => "decided_by",
         Field::AlreadyDecided { .. } => "state",
         Field::Expired { .. } => "expires_at",
     };
@@ -103,6 +88,7 @@ pub async fn create_approval(
     database: &SqliteDatabase,
     request: &ApprovalRequest,
 ) -> Result<(), DatabaseError> {
+    let (unused_hash_value, unused_text_value) = unused_column_values();
     // The row's `state` is the state as of the write, which for a new request is always `pending`: a
     // request is created undecided, so there is no decision to record. A caller holding a decided
     // request must not be able to create the row already decided, because the decision would then
@@ -127,8 +113,8 @@ pub async fn create_approval(
     .bind(request.intent().to_hex())
     .bind(request.preview().as_str())
     .bind(i64::from(request.risk_level()))
-    .bind(request.required_strength().as_str())
-    .bind(digest(request.nonce_for_storage()))
+    .bind(unused_text_value)
+    .bind(unused_hash_value)
     .bind(request.correlation_id().to_string())
     .bind(request.created_at().to_string())
     .bind(request.expires_at().to_string())
@@ -177,9 +163,7 @@ pub async fn find_approval(
 ///
 /// - [`DatabaseError::ApprovalNotFound`] when no approval has that identifier.
 /// - [`DatabaseError::ApprovalAlreadyDecided`] when the stored row already carries a decision.
-/// - [`DatabaseError::ApprovalNonceMismatch`] when the presented nonce digest does not match.
-/// - [`DatabaseError::InvalidApprovalRequest`] when the decision fails a domain rule, such as
-///   insufficient authentication, a lapse, or self-approval.
+/// - [`DatabaseError::InvalidApprovalRequest`] when the decision fails a domain rule, such as a lapse.
 /// - [`DatabaseError::ApprovalConflict`] when the guarded write matched nothing because another
 ///   writer decided the approval first.
 ///
@@ -191,29 +175,18 @@ pub async fn find_approval(
 pub async fn record_decision(
     database: &SqliteDatabase,
     id: &str,
-    presented_nonce: &str,
     decision: &jarvis_core::ApprovalDecision,
 ) -> Result<ApprovalRequest, DatabaseError> {
+    let (unused_hash_value, unused_text_value) = unused_column_values();
     let request = find_approval(database, id).await?;
     if request.decision().is_some() {
         return Err(DatabaseError::ApprovalAlreadyDecided);
     }
 
-    // The nonce's digest is checked here because this is where the digest lives, and then the
-    // *verified* decision path is used: a decoded request cannot compare a nonce itself, since it
-    // holds only a placeholder. Splitting it this way keeps every other rule in the domain.
-    let stored = stored_nonce_digest(database, id).await?;
-    if stored != digest(presented_nonce) {
-        return Err(DatabaseError::ApprovalNonceMismatch);
-    }
-
     let decided = request
-        .apply_verified_decision(decision.clone())
+        .apply_decision(decision.clone())
         .map_err(|error| invalid_field(&error))?;
 
-    // The nonce digest is rotated to the digest of the *empty* string rather than left in place, so
-    // the stored value can never again match a presented nonce. A one-time nonce that stayed valid
-    // would be a bearer token regardless of how it was handled in memory.
     let result = sqlx::query(
         "UPDATE approvals SET \
             state = ?2, decision_channel = ?3, decision_strength = ?4, decided_by = ?5, \
@@ -224,12 +197,10 @@ pub async fn record_decision(
     .bind(id)
     .bind(decided.stored_state().as_str())
     .bind(decision.channel().as_str())
-    .bind(decision.strength().as_str())
-    // From the decision, not a separate parameter: the approver the self-approval guard checked and the
-    // approver this row records are then the same value by construction rather than by a caller's care.
+    .bind(unused_text_value)
     .bind(decision.approver_id())
     .bind(decision.decided_at().to_string())
-    .bind(digest(""))
+    .bind(unused_hash_value)
     .execute(database.pool())
     .await
     .map_err(|source| DatabaseError::Sqlite {
@@ -244,23 +215,6 @@ pub async fn record_decision(
     }
 
     find_approval(database, id).await
-}
-
-/// Reads the stored nonce digest for an approval.
-async fn stored_nonce_digest(database: &SqliteDatabase, id: &str) -> Result<String, DatabaseError> {
-    let row = sqlx::query("SELECT nonce_hash FROM approvals WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(database.pool())
-        .await
-        .map_err(|source| DatabaseError::Sqlite {
-            operation: "read an approval nonce digest",
-            source,
-        })?
-        .ok_or(DatabaseError::ApprovalNotFound)?;
-    row.try_get::<String, _>("nonce_hash")
-        .map_err(|_| DatabaseError::StoredApprovalInvalid {
-            field: "nonce_hash",
-        })
 }
 
 /// Reads a run's approvals, newest first.
@@ -482,8 +436,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
     let tool_version = text("tool_version")?;
     let intent_hash = text("intent_hash")?;
     let preview = text("preview")?;
-    let required_strength = text("required_strength")?;
-    let nonce_hash = text("nonce_hash")?;
     let state = text("state")?;
     let correlation_id = text("correlation_id")?;
     let created_at = text("created_at")?;
@@ -510,9 +462,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
         .parse()
         .map_err(|_| invalid("correlation_id"))?;
     let intent: CanonicalIntentHash = intent_hash.parse().map_err(|_| invalid("intent_hash"))?;
-    let strength: AuthenticationStrength = required_strength
-        .parse()
-        .map_err(|_| invalid("required_strength"))?;
     let created = parse_timestamp(&created_at, "created_at")?;
     let expires = parse_timestamp(&expires_at, "expires_at")?;
     let stored_state: ApprovalState = state.parse().map_err(|_| invalid("state"))?;
@@ -524,7 +473,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
         ApprovalState::Pending | ApprovalState::Expired => None,
         ApprovalState::Approved | ApprovalState::Denied | ApprovalState::Cancelled => {
             let channel = text("decision_channel")?;
-            let decision_strength = text("decision_strength")?;
             let decided_by_text = text("decided_by")?;
             let occurred_at = text("occurred_at")?;
             // The row's own grouping is re-checked, so a hand-edited row with a decision but no
@@ -542,9 +490,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
                         _ => jarvis_core::ApprovalDecisionOutcome::Cancel,
                     },
                     channel.parse().map_err(|_| invalid("decision_channel"))?,
-                    decision_strength
-                        .parse()
-                        .map_err(|_| invalid("decision_strength"))?,
                     parse_timestamp(&occurred_at, "occurred_at")?,
                     decided_by_text,
                 )
@@ -552,16 +497,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
             )
         }
     };
-
-    // The nonce is reconstructed so the record is complete, but the stored value is a DIGEST and not
-    // the nonce — so a decoded request can never be used to decide anything, which is the property
-    // the digest exists for. `parse` on the digest would fail the hexadecimal-length check, so a
-    // placeholder derived from it is used instead: the value is unusable by construction.
-    let nonce_bytes = digest(&nonce_hash);
-    let nonce =
-        DecisionNonce::parse(&nonce_bytes).map_err(|_| DatabaseError::StoredApprovalInvalid {
-            field: "nonce_hash",
-        })?;
 
     let request = ApprovalRequest::from_stored(
         ApprovalRequestParts {
@@ -574,8 +509,6 @@ fn decode_approval(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, Dat
             intent,
             preview,
             risk_level,
-            required_strength: strength,
-            nonce,
             correlation_id: correlation,
             created_at: created,
             expires_at: expires,

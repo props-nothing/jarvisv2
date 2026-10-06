@@ -512,7 +512,10 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
     while Instant::now() < deadline {
         if TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
             println!("started; listening on {address}");
-            println!("next:  jarvis chat");
+            println!(
+                "next:  jarvis hud    # the console (opened for you unless you passed --no-open)"
+            );
+            println!("       jarvis chat   # or talk in the terminal");
             return ExitStatus::Ok;
         }
         // The daemon exiting is the answer, and a far better one than waiting out the clock: it refuses to start

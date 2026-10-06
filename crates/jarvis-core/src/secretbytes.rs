@@ -1,8 +1,8 @@
 //! Shared encoding and comparison for fixed-size secrets.
 //!
-//! Extracted so two security-critical implementations cannot drift. Both [`crate::ClientCredential`]
-//! and [`crate::DecisionNonce`] hold 32 random bytes rendered as lowercase hexadecimal, and both
-//! need a comparison that does not leak where the first difference is. Duplicating either would mean
+//! Extracted so security-critical implementations cannot drift. [`crate::ClientCredential`] holds
+//! 32 random bytes rendered as lowercase hexadecimal and needs a comparison that does not leak where
+//! the first difference is. Duplicating that logic would mean
 //! a fix to one could miss the other — and the comparison is the half where a mistake is silent.
 
 /// Renders bytes as lowercase hexadecimal.

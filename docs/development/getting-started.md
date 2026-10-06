@@ -20,8 +20,19 @@ Phase 1 (`P1-001` through `P1-012`) has delivered a runnable local foundation:
 - per-user service planning and drift detection (no service is installed yet)
 - an automated process-level acceptance gate in `tests/e2e`, run on Windows, macOS, and Linux CI
 
-Not implemented yet: service installation, log rotation, workflows, voice, and the desktop client. Models, tools,
-memory, MCP, and a first connector contract exist; see [TODO.md](../../TODO.md) for exactly which slices are done.
+Since Phase 1 the product slices below were built ahead of their phases, each with an ADR and a live run against a real
+model (see [ROADMAP.md](../../ROADMAP.md), "Current Direction"):
+
+- `jarvis init` / `jarvis start`: first-run setup and a background daemon
+- models (OpenAI-compatible, including a local Ollama), tools under policy, approvals that survive a restart, and standing
+  trust for low-risk tools (`ADR-0130`, `ADR-0133`)
+- file writes and edits in granted folders (`ADR-0137`), a guarded web fetch, code in a disposable container, memory proposals, and sub-agents (`ADR-0129`, `ADR-0131`, `ADR-0134`)
+- scheduled tasks (`ADR-0132`), `jarvis cancel`, `jarvis watch`, and the browser console with browser-native voice
+  (`ADR-0135`)
+
+Not implemented yet: service installation, log rotation, durable workflows, connectors callable by the model, telephony,
+the desktop client and installers, and external agent runtimes. See [TODO.md](../../TODO.md) for exactly which slices
+are done.
 
 The next implementation task is the first unchecked item in [TODO.md](../../TODO.md).
 
@@ -154,7 +165,8 @@ jarvisd --root C:/path/to/a/scratch/profile
 
 ### Tools and approvals
 
-The model is offered the daemon's tools: file read/list inside `daemon.tool_workspace_roots`, memory proposals,
+The model is offered the daemon's tools: file read/list/write inside `daemon.tool_workspace_roots` (a write creates or
+appends and runs without asking; an edit that replaces one exact text is asked about once; see `ADR-0137`), memory proposals,
 any configured MCP servers, and `jarvis.web.fetch` (a guarded read of a public web page, which runs without asking). A
 tool the policy holds — code, anything with an external effect, or anything you set to `ask` — **parks the run** until you
 decide it:
@@ -169,7 +181,7 @@ jarvis approvals deny                                                   # the ru
 `jarvis cancel RUN` (a prefix is enough) or `jarvis cancel --all` is the kill switch: it stops a run that is waiting for you
 at once and one that is working at its next step, and withdraws any approval the run was waiting on.
 
-`approve` shows the arguments and asks; without a terminal it needs `--yes`. A held action survives a daemon
+`approve` shows the arguments and asks; without a terminal it needs `--yes`. In the console, press **Approve**, or say "yes". A held action survives a daemon
 restart. See `ADR-0130`.
 
 **Letting the model run code.** Pull an image once (the sandbox never pulls), then name it and its interpreter:
@@ -195,15 +207,15 @@ Trust is yours to give per tool, never given by default, and never applies to a 
 
 ### Watching it work
 
-`jarvis hud` opens the JARVIS console in your browser: an animated orb (idle, working, listening, speaking, amber when
-something **needs you**), a streaming conversation with the assistant, the same lists as `jarvis watch`, and **Stop**
-buttons. Press the microphone (or `M`) to talk, turn on **Speak answers**, or enable the **wake word** and say
+`jarvis start` opens the JARVIS console in your browser (`--no-open` skips it; `jarvis hud` opens it any time). It is the
+control panel: a holographic head (a real face mesh whose mouth moves when it speaks, whose eyes follow your pointer, and
+that turns amber and raises its brows when something **needs you**), a streaming conversation with the assistant, the
+same lists as `jarvis watch`, **Can do** (every tool and whether it runs, asks first or is off), and **Stop** buttons. Press the microphone (or `M`) to talk, turn on **Speak answers**, or enable the **wake word** and say
 "Jarvis, ..."; "Jarvis, stop" cancels everything running and Escape (or clicking the orb) silences it. Voice uses your
-browser's own speech support (Chrome or Edge); the browser's recognizer may send audio to its vendor's service. It can watch and stop
-work but not approve it (the decision code is delivered to a private file, so the display shows you the command).
-See `ADR-0135`.
+browser's own speech support (Chrome or Edge); the browser's recognizer may send audio to its vendor's service. When something needs a yes or no, it appears with **Approve** and **Deny** buttons, and with spoken answers on it asks out
+loud and listens for "yes" or "no". See `ADR-0135` and `ADR-0136`.
 
-`jarvis watch` is a live screen of the work: what is **waiting for you** (with the exact approve/deny commands), what is
+`jarvis watch` is a live screen of the work: what is **waiting for you**, what is
 **working** (runs and sub-agents, with ages and the cancel commands), what is **scheduled** next, and what just
 **finished**. `jarvis watch --once` prints it once.
 
@@ -422,14 +434,11 @@ deny = ["jarvis.mail.send"]     # refused outright, whatever the grants say
 ```
 
 The four approval values are `auto` (run when scoped), `policy` (the workspace's threshold decides),
-`ask` (always ask, whatever the threshold says), and `deny` (never run, even with an approval a human
-could give). Risk levels are `minimal`, `low`, `moderate`, and `high`.
+`ask` (always ask, whatever the threshold says), and `deny` (never run). Risk levels are `minimal`, `low`, `moderate`, and `high`.
 
-**An override can only tighten, never relax.** `[policy.approval]` is applied as a maximum against the
-tool's own declaration, so `"jarvis.mail.send" = "auto"` cannot remove an `ask` the tool's author
-declared — the entry is inert rather than a removed guard. That is deliberate (`ADR-0017`, `ADR-0122`): a
-configuration file that could relax a tool's own approval policy would be a way to disable a security
-control from a text file. To loosen a tool, change the tool's declaration, not the workspace.
+**An override can only tighten.** `[policy.approval]` is applied as a maximum against the tool's own
+declaration, so `"jarvis.mail.send" = "auto"` cannot remove an `ask` the tool declares (`ADR-0017`, `ADR-0122`). To
+let a tool run without asking, trust it: `[policy] trust = ["jarvis.code.run"]` (`ADR-0133`).
 
 **Two mistakes are refused at startup rather than starting a daemon that misbehaves:**
 
@@ -473,10 +482,9 @@ jarvis tools preview jarvis.mail.send --escalation bulk
 #   reason            approval_required
 #   risk              high (declared moderate)
 #   escalated by      bulk
-#   approval needs    present
 ```
 
-The flags a preview accepts are only the parts of the call the caller knows: `--channel`, `--strength`, and
+The flags a preview accepts are only the parts of the call the caller knows: `--channel` and
 one `--escalation` per signal. Scopes and the workspace policy come from the daemon, so a preview cannot be
 used to ask what a different set of permissions would decide.
 

@@ -76,8 +76,8 @@ why it is composed in the daemon and what it may read.
   fields, so a `failed` outcome cannot be mistaken for a success. A traversal is the second shape:
   confinement refuses it inside the adapter, producing `state: "failed"` with `output: null`, not a
   transport error (ADR-0020's fifth rule).
-- A held decision is `202` with the `call_id` and the `required_strength`. **Nothing lets a human
-  decide it yet**, so the call stays `requested` — see the limits in ADR-0023.
+- A held decision is `202` with the `call_id`, the reason and the `approval_id`; the owner answers it with
+  `POST /api/v1/approvals/{id}/decision` ([ADR-0136](../adr/0136-an-approval-is-a-yes-or-no-from-the-owner.md)).
 - With no `daemon.tool_workspace_roots` there is **no pipeline at all**, and the route is `404` naming
   that key, rather than a tool that fails every call.
 

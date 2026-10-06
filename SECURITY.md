@@ -36,7 +36,7 @@ Only deterministic JARVIS code may grant authority. A successful model response 
 - Enforce least privilege at the final execution boundary, not only during tool discovery.
 - Keep secrets out of prompts, model-visible tool results, URLs where avoidable, logs, traces, crash reports, and database rows that only need a `SecretRef`.
 - Use OS keychains for local secrets and pluggable secret managers for server mode.
-- Require user-interface or authenticated-channel evidence for approvals. The model cannot approve its own action.
+- Approvals are answered by the owner through the console, the CLI or a spoken yes/no. The model has no tool for answering one and cannot approve its own action.
 - Fail closed when policy, identity, approval UI, secret resolution, or audit persistence is unavailable.
 - Sandbox code execution and constrain filesystem/network/process resources.
 - Validate webhook signatures over the raw request body, enforce timestamp/replay windows, persist dedupe keys, and acknowledge only after durable admission.

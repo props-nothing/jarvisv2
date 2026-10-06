@@ -64,7 +64,7 @@ reproducing the decision by hand — the defect `PolicyDecision`'s reason code e
 
 **4. A caller supplies context; the daemon supplies authority.**
 
-A preview body carries only the `channel`, the `claimed_strength`, and the `escalation` signals — the
+A preview body carries only the `channel` and the `escalation` signals — the
 properties of the call only the caller knows. Scopes, the workspace policy, and the definition come from the
 daemon, and `deny_unknown_fields` makes an attempt to name them a `422` rather than an ignored value. A
 preview must not become a way to ask *"what if I had different permissions"*.
@@ -91,10 +91,6 @@ toward. This is the concrete payoff of `ADR-0122`'s move: `jarvis-protocol` depe
 **not on `jarvis-tools`**, so a `String` field plus a hand-written membership check would have been a second
 statement of each set. Three such checks were written and then deleted once the move made the types
 nameable.
-
-`AuthenticationStrength` stays a name on the wire, deliberately: the strength vocabulary belongs to
-`jarvis-tools`, and core's `AuthenticationStrength` is a **different type** meaning what an answering
-channel *did* establish. Substituting it would let a ceiling be recorded as an observation.
 
 ## Consequences
 

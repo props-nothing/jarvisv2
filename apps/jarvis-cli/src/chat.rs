@@ -221,7 +221,8 @@ async fn start_and_render(
     // At a terminal, a run that needs a person is not the end of the turn: the person is asked right here and the
     // run carries on. Without one, the exit status and the `approvals` verbs are the interface.
     if status == ExitStatus::AwaitingApproval && std::io::stdin().is_terminal() {
-        status = crate::approvals::attend(client, paths, &reply.run_id).await;
+        let _ = paths;
+        status = crate::approvals::attend(client, &reply.run_id).await;
     }
     TurnOutcome {
         session_id: Some(reply.session_id.clone()),

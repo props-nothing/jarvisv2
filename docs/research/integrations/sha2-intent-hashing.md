@@ -7,17 +7,13 @@ selected_spec_version: SHA-256 (FIPS 180-4)
 selected_sdk: sha2 0.10.9
 ---
 
-# SHA-256 For Approval Intent Hashing And Nonce Digests
+# SHA-256 For Approval Intent Hashing
 
 ## Scope
 
-In scope: choosing a digest implementation for two uses in durable approvals (`P3-004`).
-
-- the **canonical intent hash** a decision binds to, required by
-  `docs/architecture/security.md` ("exact canonical intent hash and human-readable preview") and by
-  `docs/architecture/events-and-workflows.md` ("an approval stores the exact normalized intent hash");
-- the **nonce digest** stored in place of the one-time decision nonce, so that a leaked row proves a
-  decision happened without yielding the ability to make one.
+In scope: choosing a digest implementation for the **canonical intent hash** a durable approval binds to (`P3-004`),
+required by `docs/architecture/security.md` ("a digest of the exact arguments") and by
+`docs/architecture/events-and-workflows.md` ("an approval stores the exact normalized intent hash").
 
 Out of scope: password hashing (no passwords are involved), signing (an approval is not signed), and
 any content-addressing of memory or documents (`P4`).
@@ -55,17 +51,14 @@ resolved (`P3-002`: `referencing` 0.33.0 and 0.57.0 have different constructors)
 - **Collision resistance** is not relied on as a proof of identity but as a bound on the ability to
   find a second action with the same digest. The threat is a modified action reusing an approval, and
   that requires a second preimage of a specific digest.
-- **No key, no salt.** Both digests are of values that are already high-entropy (the nonce) or not
-  secret (the intent), so the usual reasons to salt or to use a slow KDF do not apply. See "Rejected
-  alternatives".
+- **No key, no salt.** The digest is of a value that is not secret (the intent), so the usual reasons to
+  salt or to use a slow KDF do not apply. See "Rejected alternatives".
 
 ## JARVIS Mapping
 
 - intent hash → `jarvis_core::CanonicalIntentHash`, computed from the tool, its version, and the
   canonicalized argument object, rendered as 64 lowercase hexadecimal characters and stored in
   `approvals.intent_hash`.
-- nonce digest → the same function applied to the nonce, stored in `approvals.nonce_hash`. The nonce
-  itself is never stored.
 - The canonical form is an explicit **sorted-key** JSON rendering rather than `serde_json`'s default
   serialization. `serde_json::Map` is a `BTreeMap` unless the `preserve_order` feature is enabled, so
   the default is already sorted — but that is a property of a feature flag, and a future feature added
@@ -81,15 +74,11 @@ resolved (`P3-002`: `referencing` 0.33.0 and 0.57.0 have different constructors)
    object cannot make the hash computation itself a denial of service.
 4. **Require the arguments to be a JSON object.** A validated tool call's input schema is an object, so
    non-object arguments did not come from a validated call and cannot be canonicalized meaningfully.
-5. **Store the digest, never the nonce.** A digest in a leaked row is inert; the nonce would be a
-   bearer token, which `events-and-workflows.md` explicitly forbids.
+5. **Store the digest next to the preview, not instead of it.** The preview and the held arguments let a person
+   decide; the digest is what binds that decision to exactly those arguments.
 
 ## Rejected Alternatives
 
-- **A password-hashing function (Argon2, bcrypt, scrypt) for the nonce.** Rejected: the nonce is 32
-  bytes of platform randomness, so there is no dictionary and no guessable input; a work factor would
-  add latency to every approval decision without adding strength. A slow hash is the right answer for a
-  human-chosen secret, and this is not one.
 - **A keyed hash (HMAC) for the intent.** Rejected: it would need a key, and the key would become the
   thing to protect. The intent is not a secret — it is the action's description, already stored in the
   preview — so keying it buys nothing. The binding comes from the digest being compared against a
@@ -102,15 +91,13 @@ resolved (`P3-002`: `referencing` 0.33.0 and 0.57.0 have different constructors)
   choice was not otherwise close.
 - **A hand-written digest.** Rejected without consideration: no part of this project needs one, and a
   hand-rolled hash is a category of mistake rather than a trade-off.
-- **`md5` or `sha1` for the nonce digest.** Rejected: collision resistance is the property that is
-  weakened, and there is no reason to accept a weaker primitive when a stronger one is already
-  resolved.
+- **`md5` or `sha1`.** Rejected: collision resistance is the property that is weakened, and there is no reason
+  to accept a weaker primitive when a stronger one is already resolved.
 
 ## Unresolved
 
-- **Length-extension.** SHA-256 is not resistant to it, which does not matter here: neither digest is
-  used as a MAC or over a secret-prefix construction, and both are compared for equality rather than
-  extended. Recorded because a future use of the same function for a MAC would need HMAC, and the
+- **Length-extension.** SHA-256 is not resistant to it, which does not matter here: the digest is not used
+  as a MAC or over a secret-prefix construction, and is compared for equality rather than extended. Recorded because a future use of the same function for a MAC would need HMAC, and the
   reason it is safe today should not be lost.
 - **Which of two `sha2` entries `Cargo.lock` resolves for this project.** The lock file has two
   versions in the graph (0.10.9 via `sqlx` and 0.11.0 another way). The workspace pins `=0.10.9`

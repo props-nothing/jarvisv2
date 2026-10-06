@@ -4,7 +4,7 @@
 - **Date:** 2026-09-27
 - **Slice:** `P5-005` (Google revocation during connection teardown).
 - **Relates to:** `ADR-0055` (the authorization transaction is consumable once), `ADR-0064` (a token answer is
-  read from its body), `ADR-0042` (a decision nonce is delivered by file, and taking it consumes it).
+  read from its body).
 
 ## Context
 

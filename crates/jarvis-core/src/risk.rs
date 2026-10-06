@@ -11,11 +11,7 @@
 //! that must agree with nothing holding both.
 //!
 //! This is the same reasoning that put [`Sensitivity`](crate::Sensitivity) in core rather than in
-//! `jarvis-tools`, and it is deliberately **not** the reasoning behind `AuthenticationStrength`
-//! existing twice: [`crate::AuthenticationStrength`] and `jarvis_tools::AuthenticationStrength` are
-//! two types because they mean two different things (what a channel *can* establish versus what a
-//! channel that answered *did* establish), and the duplicate is the point there. A risk level means
-//! the same thing wherever it is read.
+//! `jarvis-tools`. A risk level means the same thing wherever it is read.
 //!
 //! # Why a type rather than a number
 //!

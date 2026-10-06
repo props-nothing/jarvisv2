@@ -88,13 +88,9 @@ impl GatewayState {
     /// Used by tests that exercise the transport, so a route test cannot accidentally start
     /// spending a model budget.
     #[must_use]
-    pub fn new(
-        database: Arc<SqliteDatabase>,
-        credential: ClientCredential,
-        secrets: jarvis_storage::SecretStore,
-    ) -> Self {
+    pub fn new(database: Arc<SqliteDatabase>, credential: ClientCredential) -> Self {
         Self {
-            runs: RunService::new(Arc::clone(&database), secrets),
+            runs: RunService::new(Arc::clone(&database)),
             database,
             credential,
             executor: None,
@@ -296,7 +292,9 @@ pub fn router(state: GatewayState) -> Router {
         // The heads-up display's two static assets: no data, no secret, served without the credential
         // (`crate::hud::is_public_asset` is the one place that says so).
         .route(crate::hud::PAGE_PATH, get(crate::hud::page))
+        .route(crate::hud::ALIAS_PATH, get(crate::hud::page))
         .route(crate::hud::SCRIPT_PATH, get(crate::hud::script))
+        .route(crate::hud::HEAD_PATH, get(crate::hud::head))
         .route(crate::hud::STYLE_PATH, get(crate::hud::style))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -388,10 +386,10 @@ async fn start_run(
 /// Request body for `POST /api/v1/tools/{tool}/calls`.
 ///
 /// Only two fields, and both are the caller's to choose: **which stored run** the call is attributed
-/// to, and what to pass the tool. The workspace, the actor's scopes, and the authentication strength
-/// are **not** here, because a client that could name its own workspace or grant could widen its own
-/// authority â€” `docs/architecture/identity-and-workspaces.md` requires access to follow from
-/// authentication rather than from a client-supplied identifier.
+/// to, and what to pass the tool. The workspace and the actor's scopes are **not** here, because a
+/// client that could name its own workspace or grant could widen its own authority â€” `docs/architecture
+/// /identity-and-workspaces.md` requires access to follow from authentication rather than from a
+/// client-supplied identifier.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallRequest {
@@ -465,9 +463,6 @@ async fn call_tool(
         run.workspace_id.clone(),
         run.run_id.clone(),
         jarvis_core::SessionChannel::Cli,
-        // The loopback credential over local IPC is a verified credential, which is what an
-        // HTTP client on this transport has actually established.
-        jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
         &composed_definitions,
     );
@@ -487,7 +482,6 @@ async fn call_tool(
         Ok(crate::tool_pipeline::ToolPipelineOutcome::AwaitingApproval {
             call_id,
             approval_id,
-            required_strength,
             reason_code,
         }) => (
             StatusCode::ACCEPTED,
@@ -495,7 +489,6 @@ async fn call_tool(
                 "call_id": call_id,
                 "approval_id": approval_id,
                 "state": "awaiting_approval",
-                "required_strength": required_strength.as_str(),
                 "reason_code": reason_code,
             })),
         )
@@ -623,7 +616,6 @@ async fn resume_core(
         stored.workspace_id().to_owned(),
         stored.run_id().to_owned(),
         jarvis_core::SessionChannel::Cli,
-        jarvis_tools::AuthenticationStrength::Credential,
         "policy-1",
         &composed_definitions,
     );
@@ -756,22 +748,17 @@ async fn continue_parked_run(state: &GatewayState, run_id: &str, call_id: &str) 
 
 /// `POST /api/v1/approvals/{id}/decision`
 ///
-/// # The three things this handler deliberately does not take from the request
+/// # What this handler deliberately does not take from the request
 ///
 /// - **The approver.** It is the profile's seeded local identity, read here, not a field. A caller that
-///   could name its own approver would defeat the self-approval refusal in one request field.
-/// - **The nonce's storage location.** It comes from the daemon's own profile state directory, so a
-///   caller cannot point the daemon at a file of its choosing.
+///   could name its own approver would be overwriting the audit record.
 /// - **The intent.** It is re-read from the stored row inside `record_decision`, because the digest is
 ///   what a decision binds to and a value the request supplied would be a binding to a claim.
 ///
-/// # The order, and why the nonce is taken last
+/// # The order
 ///
-/// The approval is read first so an unknown identifier is a `404` that never reaches the nonce file â€”
-/// otherwise a caller could distinguish "no such approval" from "wrong nonce" only by whether a file was
-/// consumed. Then the nonce is taken, then the decision is recorded. A failure between the take and the
-/// record leaves the approval undecidable, which is `ADR-0042`'s chosen failure direction and is
-/// recoverable by asking for the action again.
+/// The approval is read first so an unknown identifier is a `404` before any write path runs. Then the
+/// decision is recorded against the stored row that the owner is answering.
 async fn decide_approval(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
@@ -906,9 +893,6 @@ async fn continue_declined_run(state: &GatewayState, run_id: &str, approval_id: 
 /// they would be approving** before they decide (`ADR-0130`). The workspace is the profile's own, read from the
 /// seeded identity rather than from a request, for the reason the decision route gives: a client-supplied
 /// workspace is a claim, not proof of access.
-///
-/// The nonce is **not** here and never will be: it reaches a human through the profile-private file, and a
-/// route that returned it would hand it to whatever can call this route.
 async fn list_approvals(State(state): State<GatewayState>) -> Response {
     let now = jarvis_core::UtcTimestamp::now(&jarvis_core::SystemClock);
     let Ok(identity) = jarvis_storage::load_local_identity(state.database()).await else {
@@ -972,7 +956,6 @@ async fn list_approvals(State(state): State<GatewayState>) -> Response {
             tool: request.tool().to_owned(),
             tool_version: request.tool_version().to_owned(),
             risk_level: request.risk_level(),
-            required_strength: request.required_strength().as_str().to_owned(),
             preview: request.preview().as_str().to_owned(),
             arguments,
             created_at: request.created_at(),
@@ -1083,16 +1066,16 @@ fn tool_reply(entry: &crate::tool_pipeline::PolicyInventoryEntry) -> jarvis_prot
         denied: entry.denied,
         callable: entry.callable,
         unavailable_reason: entry.unavailable_reason.clone(),
+        asks_first: entry.asks_first,
     }
 }
 
 /// `POST /api/v1/tools/{tool}/preview`
 ///
 /// Reports the decision a call to this tool **would** produce, without recording or running anything.
-/// The context a caller may supply is the channel, the claimed authentication strength, and the risk
-/// escalation signals, because those describe the call only the caller knows about. The actor's
-/// scopes and the workspace policy are **not** accepted — a preview must not be a way to ask "what if I
-/// had different permissions".
+/// The context a caller may supply is the risk escalation signals, because those describe the call only the
+/// caller knows about. The actor's scopes and the workspace policy are **not** accepted — a preview must
+/// not be a way to ask "what if I had different permissions".
 ///
 /// # The identity is the local profile, and that is the honest reading
 ///
@@ -1133,27 +1116,6 @@ async fn preview_tool(
         }
     };
 
-    // The channel defaults to the desktop view: the caller is a person inspecting their own daemon over
-    // the API, and `desktop` carries the strongest channel ceiling outside presence, so a default cannot
-    // understate what an authenticated operator could do. The strength defaults to the strongest the
-    // channel permits, which answers the question an operator is usually asking.
-    let channel = request
-        .channel
-        .unwrap_or(jarvis_core::SessionChannel::Desktop);
-    let claimed = match request.claimed_strength.as_deref() {
-        Some(name) => match parse_strength(name) {
-            Some(strength) => strength,
-            None => {
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    ErrorCode::Validation,
-                    "claimed_strength must be one of absent, channel_evidence, credential, present",
-                );
-            }
-        },
-        None => jarvis_tools::channel_ceiling(channel),
-    };
-
     // The preview's actor must hold **the same grants a real call would**, or the preview disagrees with
     // reality: an actor with fewer scopes answers `deny / missing_scope` for a call the daemon would allow.
     // That is what happened — `jarvis tools preview jarvis.memory.propose` reported `deny` for a tool a run
@@ -1184,8 +1146,7 @@ async fn preview_tool(
         // call that never happened to a run the caller named. The actor's run field is used for the
         // call-attribution check in the real path, which this does not reach.
         String::new(),
-        channel,
-        claimed,
+        jarvis_core::SessionChannel::Desktop,
         // The policy version label a receipt would carry. A preview builds no receipt, so this is the
         // current label rather than a recorded one: a stored receipt's label is a claim about the policy
         // in force when a call was admitted, and this is not that.
@@ -1210,7 +1171,6 @@ async fn preview_tool(
                 effective_risk: decision.effective_risk(),
                 declared_risk: declared,
                 escalated_by: decision.escalated_by().to_vec(),
-                required_strength: decision.required_strength().map(|s| s.as_str().to_owned()),
             };
             (StatusCode::OK, Json(reply)).into_response()
         }
@@ -1239,24 +1199,6 @@ fn decision_name(decision: jarvis_tools::Decision) -> String {
         jarvis_tools::Decision::Deny => "deny",
     }
     .to_owned()
-}
-
-/// Parses an authentication strength by its stable name.
-///
-/// Hand-written rather than a `FromStr` implementation because `jarvis_tools::AuthenticationStrength`
-/// deliberately has none: it is a **channel ceiling** rather than a recorded observation, and the type
-/// that a client's string becomes is chosen here, at the boundary, so a caller cannot parse its way to
-/// a value the daemon never intended to accept. An unknown name is `None` rather than a default — a
-/// defaulted strength would compute a preview for a weaker caller than the one asked about, and every
-/// wrong answer in that direction is a preview that looks more permissive than reality.
-fn parse_strength(name: &str) -> Option<jarvis_tools::AuthenticationStrength> {
-    match name {
-        "absent" => Some(jarvis_tools::AuthenticationStrength::Absent),
-        "channel_evidence" => Some(jarvis_tools::AuthenticationStrength::ChannelEvidence),
-        "credential" => Some(jarvis_tools::AuthenticationStrength::Credential),
-        "present" => Some(jarvis_tools::AuthenticationStrength::Present),
-        _ => None,
-    }
 }
 
 /// `POST /api/v1/runs/{id}/cancel`
@@ -2163,11 +2105,7 @@ mod tests {
         let credential = ClientCredential::generate()
             .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
         let presented = credential.expose().to_owned();
-        let state = GatewayState::new(
-            Arc::clone(&database),
-            credential,
-            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
-        );
+        let state = GatewayState::new(Arc::clone(&database), credential);
         (router(state), database, presented, profile)
     }
 
@@ -2206,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn the_display_assets_are_public_and_nothing_else_is() {
         let (app, presented, _profile) = test_router().await;
-        for path in ["/hud", "/hud.js", "/hud.css"] {
+        for path in ["/", "/hud", "/hud.js", "/head.js", "/hud.css"] {
             let response = app
                 .clone()
                 .oneshot(get_request(path, None))
@@ -2237,6 +2175,7 @@ mod tests {
             );
         }
         for path in [
+            "/index.html",
             "/hud/",
             "/hudx",
             "/api/v1/runs",
@@ -2254,7 +2193,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/hud")
+                    .uri("/")
                     .body(Body::empty())
                     .unwrap_or_else(|error| panic!("build request: {error}")),
             )
@@ -2763,18 +2702,10 @@ mod tests {
             Arc::clone(&database),
             roots,
             jarvis_tools::WorkspacePolicy::default(),
-            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
         )
         .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
 
-        let app = router(
-            GatewayState::new(
-                database,
-                credential,
-                jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
-            )
-            .with_tools(Arc::new(pipeline)),
-        );
+        let app = router(GatewayState::new(database, credential).with_tools(Arc::new(pipeline)));
 
         // A run is the attribution target: the handler reads its **stored** row for the workspace, so
         // the run has to exist for any of this to be exercised.
@@ -2846,18 +2777,10 @@ mod tests {
                 vec![crate::approval_fixture::approval_declaring_definition()],
                 crate::approval_fixture::approval_adapter(),
             )],
-            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
         )
         .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
 
-        let app = router(
-            GatewayState::new(
-                database,
-                credential,
-                jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
-            )
-            .with_tools(Arc::new(pipeline)),
-        );
+        let app = router(GatewayState::new(database, credential).with_tools(Arc::new(pipeline)));
 
         (app, presented, profile)
     }
@@ -3043,23 +2966,12 @@ mod tests {
         );
     }
 
-    /// A router, a credential, a profile, and **one pending approval with its nonce already delivered**.
+    /// A router, a credential, a profile, and **one pending approval**.
     ///
-    /// The approval is produced by the real pipeline holding a real risk-2 tool, so the row and the
-    /// nonce file are exactly what a live daemon would leave behind. Building the row by hand would be
-    /// the fixture stating its own assumption about what the pipeline writes, which is the thing the
-    /// route test exists to check.
-    ///
-    /// The nonce is read straight out of the profile's private store, because that is what an operator's
-    /// client does. Nothing in this fixture can obtain it from a response, which is `ADR-0042`'s point.
-    async fn approval_router() -> (
-        Router,
-        String,
-        TempProfile,
-        String,
-        String,
-        Arc<SqliteDatabase>,
-    ) {
+    /// The approval is produced by the real pipeline holding a real risk-2 tool, so the row is exactly what
+    /// a live daemon would leave behind. Building it by hand would be the fixture stating its own assumption
+    /// about what the pipeline writes, which is the thing the route test exists to check.
+    async fn approval_router() -> (Router, String, TempProfile, String, Arc<SqliteDatabase>) {
         approval_router_with(crate::approval_fixture::approval_adapter()).await
     }
 
@@ -3068,18 +2980,11 @@ mod tests {
     /// The default fixture's adapter refuses, which is what makes "the held call did not run" observable.
     /// A resume test needs the opposite observation, so it supplies an adapter that succeeds and counts —
     /// and the choice is a parameter rather than a second fixture, because everything else about the setup
-    /// (the profile, the root grant, the pipeline, the held call, the delivered nonce) has to be **identical**
-    /// for the two tests to be about the same thing.
+    /// (the profile, the root grant, the pipeline, the held call) has to be **identical** for the two tests
+    /// to be about the same thing.
     async fn approval_router_with(
         adapter: Arc<dyn jarvis_tools::ToolExecutor>,
-    ) -> (
-        Router,
-        String,
-        TempProfile,
-        String,
-        String,
-        Arc<SqliteDatabase>,
-    ) {
+    ) -> (Router, String, TempProfile, String, Arc<SqliteDatabase>) {
         let profile = TempProfile::new();
         let directory = profile.0.join("workspace");
         std::fs::create_dir_all(&directory)
@@ -3093,9 +2998,6 @@ mod tests {
         let credential = ClientCredential::generate()
             .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
         let presented = credential.expose().to_owned();
-        let state_directory = profile.0.join("state");
-        let secrets = jarvis_storage::SecretStore::in_state(&state_directory);
-
         let roots = jarvis_tools::WorkspaceRoots::new([directory.as_path()])
             .unwrap_or_else(|error| panic!("grant the workspace root: {error}"));
         // The hold is produced by a tool that **declares** `ApprovalPolicy::Ask` at risk 0, so the hold
@@ -3111,13 +3013,11 @@ mod tests {
                 vec![crate::approval_fixture::approval_declaring_definition()],
                 adapter,
             )],
-            secrets.clone(),
         )
         .unwrap_or_else(|error| panic!("compose the tool pipeline: {error}"));
 
         let app = router(
-            GatewayState::new(Arc::clone(&database), credential, secrets.clone())
-                .with_tools(Arc::new(pipeline)),
+            GatewayState::new(Arc::clone(&database), credential).with_tools(Arc::new(pipeline)),
         );
 
         let created = app
@@ -3158,15 +3058,7 @@ mod tests {
             .unwrap_or_else(|| panic!("a hold must carry its approval id: {held_body}"))
             .to_owned();
 
-        // The nonce is read the way an operator's client reads it â€” straight from the file â€” and
-        // **deliberately not** through `SecretStore::take`, because `take` is the daemon's consuming read.
-        // A fixture that took it would leave nothing for the route to consume, which is a property of the
-        // store working rather than of the route failing.
-        let nonce =
-            std::fs::read_to_string(profile.0.join("state").join("approvals").join(&approval_id))
-                .unwrap_or_else(|error| panic!("read the delivered nonce: {error}"));
-
-        (app, presented, profile, approval_id, nonce, database)
+        (app, presented, profile, approval_id, database)
     }
 
     /// Posts an approval decision.
@@ -3191,15 +3083,14 @@ mod tests {
         )
     }
 
-    /// **A person can list what is waiting, and sees the arguments — never the nonce.**
+    /// **A person can list what is waiting, and sees the arguments.**
     ///
     /// `GET /approvals` is how a client learns what a held call would do. The assertions are the three ways it
     /// could be wrong: the arguments the call was made with are shown (so the person knows what they approve),
-    /// the nonce appears nowhere in the reply (it must reach a human only through the private file), and a
-    /// decided approval leaves the list.
+    /// no decision-body-only field appears in the reply, and a decided approval leaves the list.
     #[tokio::test]
-    async fn a_pending_approval_is_listed_with_its_arguments_and_never_its_nonce() {
-        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
+    async fn a_pending_approval_is_listed_with_its_arguments() {
+        let (app, presented, _profile, approval_id, _database) = approval_router().await;
 
         let listed = app
             .clone()
@@ -3209,8 +3100,8 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::OK);
         let text = body_text(listed).await;
         assert!(
-            !text.contains(nonce.trim()),
-            "the nonce must never travel in a reply: {text}"
+            !text.contains("\"nonce\""),
+            "a decision-body-only field leaked into the list reply: {text}"
         );
         let reply: jarvis_protocol::ApprovalListReply = serde_json::from_str(&text)
             .unwrap_or_else(|error| panic!("decode the list: {error}: {text}"));
@@ -3233,7 +3124,7 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "deny", "nonce": nonce }),
+                &serde_json::json!({ "decision": "deny" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3252,7 +3143,7 @@ mod tests {
     /// The approvals list needs the profile credential like every other route.
     #[tokio::test]
     async fn the_approvals_list_refuses_an_unauthenticated_request() {
-        let (app, _presented, _profile, _approval_id, _nonce, _database) = approval_router().await;
+        let (app, _presented, _profile, _approval_id, _database) = approval_router().await;
         let refused = app
             .oneshot(get_request("/api/v1/approvals", None))
             .await
@@ -3260,33 +3151,32 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// **The route that makes a delivered nonce usable: an operator decides a held approval.**
+    /// **An operator can decide a held approval exactly once.**
     ///
-    /// `P3-012a` wrote the approval and `P3-012b` delivered its nonce, and neither made the decision
-    /// reachable. This is the end of that path, and it asserts the three things a route could get wrong:
-    /// the decision lands, the row reports the **effective** state, and the nonce is consumed so a replay
-    /// of the identical request is refused rather than recording a second decision.
+    /// This is the end of that path, and it asserts the three things a route could get wrong:
+    /// the decision lands, the row reports the **effective** state, and a replay of the identical request is
+    /// refused rather than recording a second decision.
     ///
-    /// The replay is the important one. Without a consumed nonce, the second request would be accepted
+    /// The replay is the important one. Without the stored-row guard, the second request would be accepted
     /// and â€” depending on the store â€” could overwrite the first decision. `record_decision` already
     /// refuses an already-decided row; this asserts the *route* does not defeat it.
     #[tokio::test]
     async fn an_operator_can_decide_a_held_approval_exactly_once() {
-        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
+        let (app, presented, _profile, approval_id, _database) = approval_router().await;
 
         let approved = app
             .clone()
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
             approved.status(),
             StatusCode::OK,
-            "a delivered nonce must decide the approval: {}",
+            "an authenticated decision must decide the approval: {}",
             body_text(approved).await
         );
 
@@ -3295,14 +3185,14 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
             decided.status(),
             StatusCode::CONFLICT,
-            "a replayed decision must be refused, and the nonce must be gone: {}",
+            "a replayed decision must be refused: {}",
             body_text(decided).await
         );
     }
@@ -3315,7 +3205,7 @@ mod tests {
     /// only the second one cannot be filled in by a caller that misreads the documentation.
     #[tokio::test]
     async fn a_decision_cannot_name_its_own_approver() {
-        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
+        let (app, presented, _profile, approval_id, _database) = approval_router().await;
 
         let response = app
             .oneshot(decision_request(
@@ -3323,7 +3213,6 @@ mod tests {
                 &approval_id,
                 &serde_json::json!({
                     "decision": "approve",
-                    "nonce": nonce,
                     "approver_id": "0198f000-0000-7000-8000-0000000000c3"
                 }),
             ))
@@ -3341,7 +3230,7 @@ mod tests {
     ///
     /// This is the end-to-end property `P3-012` exists for, exercised through the real routes rather than
     /// through the pipeline: a client asks for an action, a human answers, and the effect happens **exactly
-    /// once** however many times the resumption is delivered.
+    /// once** however many times the resumption is retried.
     ///
     /// The duplicate is the important half. A resumed call that reached the adapter twice would be the
     /// second effect a duplicate decision must never produce, and the refusal has to be observable as a
@@ -3358,7 +3247,7 @@ mod tests {
         // happened once.
         let adapter =
             std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
-        let (app, presented, _profile, approval_id, nonce, database) =
+        let (app, presented, _profile, approval_id, database) =
             approval_router_with(adapter.clone()).await;
 
         // The held call, decided by an operator.
@@ -3367,7 +3256,7 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3455,7 +3344,7 @@ mod tests {
     async fn approving_with_resume_releases_the_held_call_exactly_once() {
         let adapter =
             std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
-        let (app, presented, _profile, approval_id, nonce, database) =
+        let (app, presented, _profile, approval_id, database) =
             approval_router_with(adapter.clone()).await;
 
         let decided = app
@@ -3463,7 +3352,7 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce, "resume": true }),
+                &serde_json::json!({ "decision": "approve", "resume": true }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3509,7 +3398,7 @@ mod tests {
     async fn cancelling_a_parked_run_withdraws_its_approval() {
         let adapter =
             std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
-        let (app, presented, _profile, approval_id, nonce, database) =
+        let (app, presented, _profile, approval_id, database) =
             approval_router_with(adapter.clone()).await;
 
         // The fixture holds a call made directly, so the run is still at its start: walk it to the state a driver
@@ -3567,7 +3456,7 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce, "resume": true }),
+                &serde_json::json!({ "decision": "approve", "resume": true }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3585,7 +3474,7 @@ mod tests {
     async fn an_approved_call_can_be_finished_later_without_resending_its_arguments() {
         let adapter =
             std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
-        let (app, presented, _profile, approval_id, nonce, _database) =
+        let (app, presented, _profile, approval_id, _database) =
             approval_router_with(adapter.clone()).await;
 
         // Not yet approved: there is nothing to release.
@@ -3610,7 +3499,7 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3657,14 +3546,14 @@ mod tests {
     async fn a_denied_approval_cannot_be_released() {
         let adapter =
             std::sync::Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
-        let (app, presented, _profile, approval_id, nonce, _database) =
+        let (app, presented, _profile, approval_id, _database) =
             approval_router_with(adapter.clone()).await;
         let denied = app
             .clone()
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "deny", "nonce": nonce, "resume": true }),
+                &serde_json::json!({ "decision": "deny", "resume": true }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
@@ -3697,8 +3586,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A decision for an identifier that is not an approval is a `404` **before** the nonce store is
-    /// touched, so a caller cannot probe for approvals by watching whether a file was consumed.
+    /// A decision for an identifier that is not an approval is a `404` before the write path runs, so a
+    /// caller cannot probe for approvals by watching for different side effects.
     #[tokio::test]
     async fn a_decision_for_an_unknown_approval_is_not_found() {
         let (app, presented, _profile) = test_router().await;
@@ -3707,33 +3596,22 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 "0198f000-0000-7000-8000-0000000000ff",
-                &serde_json::json!({
-                    "decision": "approve",
-                    "nonce": "0".repeat(64)
-                }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// **A wrong nonce is refused and leaves the delivered nonce usable.**
+    /// **An old-style decision body is refused and the current body still decides the approval.**
     ///
-    /// This is the property that separates "the nonce is a credential" from "the nonce is a one-shot
-    /// token the daemon burns on contact". The domain refuses *after* the digest matches, so a mistyped or
-    /// copied-wrong value must not cost the operator the approval â€” otherwise a typo becomes a fresh tool
-    /// call, which is exactly how an approval flow gets routed around.
-    ///
-    /// It also pins the delivery-channel decision: the daemon verifies what the **caller presents** rather
-    /// than consuming the file it delivered. If the route took the nonce from the file, the first request
-    /// below would *succeed* and this assertion could not tell the difference between "verified" and
-    /// "took whatever was on disk" â€” the two would be indistinguishable because the file's value is
-    /// always the right one.
+    /// This pins `deny_unknown_fields` on the public contract: an older client sending a removed field must
+    /// get a clear `422`, while the current body still works.
     #[tokio::test]
-    async fn a_wrong_nonce_is_refused_and_the_delivered_nonce_still_decides() {
-        let (app, presented, _profile, approval_id, nonce, _database) = approval_router().await;
+    async fn an_old_style_decision_body_is_refused_and_a_modern_body_decides() {
+        let (app, presented, _profile, approval_id, _database) = approval_router().await;
 
-        let forged = app
+        let refused = app
             .clone()
             .oneshot(decision_request(
                 &presented,
@@ -3743,10 +3621,10 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
-            forged.status(),
-            StatusCode::FORBIDDEN,
-            "a nonce that does not match must be refused: {}",
-            body_text(forged).await
+            refused.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an old-style nonce field must be rejected: {}",
+            body_text(refused).await
         );
 
         let approved = app
@@ -3754,14 +3632,14 @@ mod tests {
             .oneshot(decision_request(
                 &presented,
                 &approval_id,
-                &serde_json::json!({ "decision": "approve", "nonce": nonce }),
+                &serde_json::json!({ "decision": "approve" }),
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
             approved.status(),
             StatusCode::OK,
-            "a refused attempt must not consume the delivered nonce: {}",
+            "a modern decision body must still decide the approval: {}",
             body_text(approved).await
         );
     }
@@ -3808,11 +3686,7 @@ mod tests {
         let credential = ClientCredential::generate()
             .unwrap_or_else(|error| panic!("generate fixture credential: {error}"));
         let presented = credential.expose().to_owned();
-        let state = GatewayState::new(
-            Arc::clone(&database),
-            credential,
-            jarvis_storage::SecretStore::in_state(&profile.0.join("state")),
-        );
+        let state = GatewayState::new(Arc::clone(&database), credential);
         (router(state), presented, profile, database)
     }
 
@@ -4225,7 +4099,7 @@ mod tests {
     /// The second staleness case is the subtle one and is asserted deliberately: correcting a claim archives
     /// it, which **advances its version**, so the version the caller read before correcting is stale
     /// immediately afterwards. A guard that only rejected a version the caller never saw would accept this
-    /// second write, and the caller would be deleting a claim on the strength of a version the correction
+    /// second write, and the caller would be deleting a claim on the basis of a version the correction
     /// had already invalidated.
     #[tokio::test]
     async fn the_memory_routes_correct_and_forget_under_a_version_guard() {
@@ -5123,7 +4997,6 @@ mod tests {
         assert_eq!(reply.reason, "allowed");
         assert_eq!(reply.declared_risk, jarvis_tools::Risk::Minimal);
         assert_eq!(reply.effective_risk, jarvis_tools::Risk::Minimal);
-        assert!(reply.required_strength.is_none());
         assert!(reply.escalated_by.is_empty());
     }
 
@@ -5254,27 +5127,26 @@ mod tests {
         );
     }
 
-    /// **An unknown claimed strength is refused rather than defaulted.**
+    /// **Legacy preview auth fields are refused rather than ignored.**
     ///
-    /// The direction that matters: a defaulted strength would compute a preview for a channel that
-    /// established *less* than the caller asked about, and every wrong answer there is a preview that looks
-    /// more permissive than reality.
+    /// The preview contract no longer accepts per-request auth hints, so an old client must get a clear
+    /// validation error instead of a silently changed decision.
     #[tokio::test]
-    async fn the_preview_refuses_an_unknown_strength() {
+    async fn the_preview_refuses_legacy_auth_fields() {
         let (app, presented, _profile) = tool_router_with_policy(|policy| policy).await;
 
         let response = app
             .oneshot(post_json(
                 &format!("/api/v1/tools/{}/preview", reader_id()),
                 &presented,
-                r#"{"claimed_strength":"strong"}"#,
+                r#"{"channel":"voice"}"#,
             ))
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(
             response.status(),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "an unknown strength must be refused: {}",
+            "legacy preview auth fields must be refused: {}",
             body_text(response).await
         );
     }

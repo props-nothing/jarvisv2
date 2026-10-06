@@ -139,8 +139,7 @@ fn request_with(arguments: Value) -> ToolExecutionRequest {
     //
     // Two fixture details were wrong on the first attempt and both are recorded here because each one
     // silently turned every test into a held call: the scope must be granted (`mcp.call`), and the
-    // claimed strength must be at least `Credential` — even a minimal-risk tool requires
-    // `ChannelEvidence`, so an `Absent` claim is an `InsufficientAuthentication` hold.
+    // fixture must otherwise be eligible for an allowance rather than for an approval hold.
     let decision = jarvis_tools::evaluate(&jarvis_tools::PolicyRequest {
         definition: &definition,
         actor: jarvis_tools::ActorAuthority::active(jarvis_tools::ScopeSet::single(
@@ -148,8 +147,6 @@ fn request_with(arguments: Value) -> ToolExecutionRequest {
                 .unwrap_or_else(|error| panic!("{error}")),
         )),
         workspace: &jarvis_tools::WorkspacePolicy::default(),
-        channel: jarvis_core::SessionChannel::Cli,
-        claimed_strength: jarvis_tools::AuthenticationStrength::Credential,
         available: true,
         target: jarvis_tools::TargetAssessment::none(),
     });

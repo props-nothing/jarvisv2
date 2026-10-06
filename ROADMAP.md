@@ -2,28 +2,30 @@
 
 This roadmap is ordered by risk. Each phase must leave a runnable vertical slice. A later phase may start only when the previous phase's exit gate passes or an ADR explains the exception.
 
-## Current Direction (reviewed 2026-10-03)
+## Current Direction (reviewed 2026-10-06)
 
 The phases below remain the dependency order of the *platform*; the order of *product slices* was changed on purpose,
 because a platform that cannot yet be talked to, watched or trusted with a task is not the product. Delivered ahead of
-their phases, each with an ADR and a live run against a real model: web fetch, code in a disposable container, approval
-from the CLI that survives a restart, scheduled tasks, first-run `init`/`start`, a kill switch, standing trust for
-low-risk tools (`ADR-0133`), sub-agents (`ADR-0134`) and `jarvis watch`. `example/` is still not retired (`P9-009`).
+their phases, each with an ADR and a live run against a real model: web fetch (`ADR-0129`), approval from the CLI that
+survives a restart (`ADR-0130`), code in a disposable container (`ADR-0131`), scheduled tasks (`ADR-0132`), first-run
+`init`/`start`, a kill switch, standing trust for low-risk tools (`ADR-0133`), sub-agents (`ADR-0134`), and the browser
+console with its holographic head and browser-native voice, served as the daemon's main page (`ADR-0135`). `example/` is
+still not retired (`P9-009`).
 
 Measured against the four hallmarks of a real J.A.R.V.I.S.:
 
 | Hallmark | State | Next slice |
 | --- | --- | --- |
-| Oversight | Strongest. Approvals, `jarvis cancel`, one-level sub-agents, `jarvis watch`. | Coding agents as supervised runtimes (`P7`, via ACP), notification when something needs you (`P6-007`). |
-| Visual presence | Browser HUD (`jarvis hud`, `ADR-0135`): orb, waiting/working/scheduled/recent, Stop buttons; plus `jarvis watch`. It cannot approve. | Approve from the display through a trusted desktop channel (`P9-001`), and a push stream instead of polling. |
-| Voice | First slice in the browser console: push-to-talk, wake word, spoken answers, interruption (browser-native speech). | Local (non-cloud) recognition, then telephony and ElevenLabs (`P8`). |
-| Hands-free | Spoken "Jarvis, stop" cancels everything; approving is still by terminal. | Spoken approve/deny for low-risk calls with a challenge phrase; risk 3 stays on a trusted surface (`security.md`). |
+| Oversight | Strongest. Approvals, `jarvis cancel`, one-level sub-agents, `jarvis watch`, the console. | Coding agents as supervised runtimes (`P7`, via ACP); a push notification when something needs you (`P6-007`). |
+| Visual presence | The console at `/` (`jarvis hud`): a holographic human head (real face mesh) that speaks, listens and reacts, streaming conversation, waiting/working/scheduled/recent and "can do" panels with Stop, Approve and Deny; `jarvis start` opens it. | A push stream instead of polling; the Tauri desktop client (`P9-001`). |
+| Voice | Browser-native push-to-talk, wake word, spoken answers, interruption (the microphone path is untested here; the browser's recognizer may use a vendor cloud). | Local (non-cloud) recognition and synthesis, then telephony and ElevenLabs (`P8`). |
+| Hands-free | Spoken "Jarvis, stop" cancels everything, and a spoken "yes"/"no" answers a waiting approval (`ADR-0136`). | Always-on local wake word and recognition so it works without the browser tab in front. |
 
-Order of work from here: (1) one real connector callable by the model (Gmail/Calendar read) — `jarvis-connectors` is
-38k lines and nothing in `jarvisd` calls it, so `P5` is time-boxed to that single slice; (2) a file write/edit tool for
-granted folders; (3) ~~the web HUD~~ (done); (4) local voice; (5) coding-agent runtimes; (6) model routing so sub-agents and
-background work can use a cheaper model; (7) the answer-quality harness (`P9-011`) moved forward, because every change
-above needs a measure of whether the assistant got better.
+Order of work from here: (1) one real connector callable by the model (Gmail/Calendar read), because `jarvis-connectors`
+is 38k lines and nothing in `jarvisd` calls it, so `P5` is time-boxed to that single slice; (2) a file write/edit tool for
+granted folders; (3) local voice; (4) coding-agent runtimes; (5) model routing so sub-agents and background work can use a
+cheaper model; (6) the answer-quality harness (`P9-011`) moved forward, because every change needs a measure of whether
+the assistant got better; (7) archive the finished parts of `TODO.md`, which has outgrown being readable as a ledger.
 ## Phase 0: Architecture Baseline
 
 **Outcome:** future contributors share one product definition, trust model, repository map, research method, and testable backlog.

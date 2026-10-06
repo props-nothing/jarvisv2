@@ -38,7 +38,8 @@
     offline: true, needYou: 0, working: 0, thinking: 0,
     listening: false, speaking: false, level: 0,
     speak: localStorage.getItem("jarvis-speak") === "1",
-    wake: false
+    wake: false,
+    pending: [], announced: null
   };
 
   // ---- api ----------------------------------------------------------------------------------------------------
@@ -142,15 +143,7 @@
   }
   function renderEmpty() {
     var empty = el("div", "empty");
-    empty.appendChild(el("p", "", "Nothing here yet."));
-    var list = el("ul");
-    ["Type below, or press the microphone and talk.",
-     "Turn on the wake word and just say \u201CJarvis, \u2026\u201D.",
-     "Say \u201CJarvis, stop\u201D to cancel everything that is running.",
-     "Anything that needs your approval appears on the right."].forEach(function (line) {
-      list.appendChild(el("li", "", line));
-    });
-    empty.appendChild(list);
+    empty.appendChild(el("p", "", "Type, press the microphone (M), or enable the wake word and say \u201CJarvis, \u2026\u201D. Answer questions with yes or no; \u201CJarvis, stop\u201D cancels everything running."));
     chat.appendChild(empty);
   }
   if (transcript.length === 0) renderEmpty();
@@ -175,6 +168,9 @@
         if (!queued) { queued = true; requestAnimationFrame(paint); }
       },
       chip: function (label, waiting) {
+        // The same label twice (a stream can repeat it) is one chip.
+        var existing = view.chips.children;
+        for (var i = 0; i < existing.length; i += 1) { if (existing[i].textContent === label) return; }
         view.chips.hidden = false;
         view.chips.appendChild(el("span", "chip" + (waiting ? " wait" : ""), label));
       },
@@ -268,7 +264,17 @@
     try {
       var body = { objective: text };
       if (S.session) body.session_id = S.session;
-      var reply = await api("/runs", "POST", body);
+      var reply;
+      try {
+        reply = await api("/runs", "POST", body);
+      } catch (error) {
+        // A conversation that no longer exists (a fresh profile, a cleared database) starts a new one rather than failing.
+        if (error.status !== 404 || !S.session) throw error;
+        S.session = null;
+        sessionStorage.removeItem("jarvis-session");
+        delete body.session_id;
+        reply = await api("/runs", "POST", body);
+      }
       S.session = reply.session_id;
       sessionStorage.setItem("jarvis-session", S.session);
       var answer = await follow(reply.run_id, view);
@@ -301,8 +307,8 @@
     var preferred = /(UK English Male|Daniel|Ryan|George|Guy|Aria|Google US English)/i;
     return voices.find(function (voice) { return preferred.test(voice.name); }) || voices[0] || null;
   }
-  function speak(text) {
-    if (!synth) return;
+  function speak(text, after) {
+    if (!synth) { if (after) after(); return; }
     interruptSpeech();
     var sentences = plain(text).slice(0, 1800).match(/[^.!?]+[.!?]*/g) || [];
     if (!sentences.length) return;
@@ -314,7 +320,13 @@
       if (voice) utterance.voice = voice;
       utterance.rate = 1.04;
       utterance.pitch = 0.92;
-      if (index === sentences.length - 1) utterance.onend = utterance.onerror = function () { S.speaking = false; resumeWake(); };
+      if (index === sentences.length - 1) {
+        utterance.onend = utterance.onerror = function () {
+          S.speaking = false;
+          resumeWake();
+          if (after) after();
+        };
+      }
       synth.speak(utterance);
     });
   }
@@ -366,10 +378,34 @@
 
   function say(hint) { $("hint").textContent = hint || ""; }
 
-  // What a spoken utterance means. "stop" is the hands-free kill switch; everything else is a message.
+  // Answering a question: a plain yes or no is an answer, and only while something is actually waiting.
+  var YES = /^(yes|yeah|yep|yup|sure|ok|okay|approve|approved|allow|confirm|proceed|go ahead|do it)( please| jarvis)?$/i;
+  var NO = /^(no|nope|nah|deny|denied|refuse|reject|don't|do not|don't do it)( please| jarvis)?$/i;
+
+  // One click or one word: record the owner's answer and let the run carry on.
+  function decide(approvalId, approve, via) {
+    return api("/approvals/" + encodeURIComponent(approvalId) + "/decision", "POST",
+      { decision: approve ? "approve" : "deny", resume: true, channel: via || "desktop" })
+      .then(function () { say(approve ? "approved" : "denied"); },
+            function (error) { say("could not record that (" + (error.status || "no reply") + ")"); })
+      .then(refresh);
+  }
+
+  function answerPending(approve) {
+    if (S.pending.length === 1) { decide(S.pending[0].approval_id, approve, "voice"); return; }
+    if (S.pending.length === 0) { say("nothing is waiting for an answer"); return; }
+    var message = S.pending.length + " things are waiting, so use the buttons to say which.";
+    say(message);
+    if (S.speak) speak(message);
+  }
+
+  // What a spoken utterance means. "stop" is the hands-free kill switch, a yes or no answers a waiting question, and
+  // everything else is a message.
   function command(text) {
     var spoken = text.trim().replace(/[.!?]+$/, "");
     if (!spoken) return;
+    if (YES.test(spoken)) { answerPending(true); return; }
+    if (NO.test(spoken)) { answerPending(false); return; }
     if (/^(stop|cancel|abort|kill)( that| it| everything| all| now)?$/i.test(spoken)) { say("stopping everything"); stopEverything(); return; }
     if (/^(quiet|be quiet|silence|shut up|enough)$/i.test(spoken)) { interruptSpeech(); return; }
     send(spoken);
@@ -385,6 +421,11 @@
     if (!heard) return;
     say("");
     if (!S.wake) { stopListening(); command(heard); return; }
+    // While something waits for an answer, a bare yes or no needs no wake word.
+    if (S.pending.length && (YES.test(heard.trim().replace(/[.!?]+$/, "")) || NO.test(heard.trim().replace(/[.!?]+$/, "")))) {
+      command(heard);
+      return;
+    }
     // Wake-word mode: only speech that names JARVIS (or follows it within a few seconds) is acted on.
     var match = /\bjarvis\b[\s,.:;!-]*(.*)$/i.exec(heard);
     if (match) {
@@ -516,15 +557,41 @@
     });
     return button;
   }
-  function copyButton(text) {
-    var button = el("button", "", "Copy");
-    button.addEventListener("click", function () {
-      if (navigator.clipboard) navigator.clipboard.writeText(text);
-      button.textContent = "Copied";
-    });
-    return button;
+  function answerButtons(approvalId) {
+    var row = el("div", "row cmd");
+    var yes = el("button", "yes", "Approve");
+    var no = el("button", "danger", "Deny");
+    function answer(approve) {
+      yes.disabled = true;
+      no.disabled = true;
+      decide(approvalId, approve, "desktop");
+    }
+    yes.addEventListener("click", function () { answer(true); });
+    no.addEventListener("click", function () { answer(false); });
+    row.appendChild(yes);
+    row.appendChild(no);
+    return row;
   }
 
+  function paintStats(runs, approvals, schedules) {
+    var done = runs.filter(function (run) { return run.outcome === "succeeded"; }).length;
+    var failed = runs.filter(function (run) { return run.outcome === "failed"; }).length;
+    var rows = [
+      ["Active runs", runs.filter(function (run) { return !run.outcome; }).length, false],
+      ["Needs you", Math.max(approvals.length, runs.filter(function (run) { return run.state === "awaiting_approval"; }).length), approvals.length > 0],
+      ["Scheduled", schedules.filter(function (schedule) { return schedule.enabled; }).length, false],
+      ["Completed", done, false],
+      ["Failed", failed, failed > 0]
+    ];
+    var host = $("stats");
+    host.replaceChildren();
+    rows.forEach(function (row) {
+      var line = el("div", "stat" + (row[2] ? " hot" : ""));
+      line.appendChild(el("span", "", row[0]));
+      line.appendChild(el("b", "", String(row[1])));
+      host.appendChild(line);
+    });
+  }
   function renderPanels(runs, approvals, schedules) {
     var working = runs.filter(function (run) { return !run.outcome && run.state !== "awaiting_approval"; });
     var parked = runs.filter(function (run) { return run.state === "awaiting_approval"; });
@@ -532,6 +599,8 @@
     var upcoming = schedules.filter(function (schedule) { return schedule.enabled; });
     S.needYou = Math.max(approvals.length, parked.length);
     S.working = working.length;
+    S.pending = approvals;
+    paintStats(runs, approvals, schedules);
 
     fill("waiting", approvals.map(function (approval) {
       var item = el("div", "item");
@@ -540,11 +609,7 @@
       row.appendChild(el("strong", "", approval.tool));
       item.appendChild(row);
       item.appendChild(el("div", "obj", clip(approval.arguments ? JSON.stringify(approval.arguments) : approval.preview, 400)));
-      var text = "jarvis approvals approve " + approval.approval_id;
-      var line = el("div", "row cmd");
-      line.appendChild(el("code", "", text));
-      line.appendChild(copyButton(text));
-      item.appendChild(line);
+      item.appendChild(answerButtons(approval.approval_id));
       return item;
     }), "nothing needs you");
 
@@ -579,6 +644,32 @@
       if (run.answer) item.appendChild(el("div", "dim", "=> " + clip(plainLine(run.answer), 300)));
       return item;
     }), "nothing yet");
+  }
+
+  // ---- what it can do: the tools, and which of them it asks about ------------------------------------------------------
+  var abilitiesAt = 0;
+  function renderAbilities(tools) {
+    var host = $("abilities");
+    var asks = 0, off = 0;
+    tools.forEach(function (tool) {
+      if (!tool.callable || tool.denied) off += 1; else if (tool.asks_first) asks += 1;
+    });
+    host.replaceChildren();
+    host.appendChild(el("div", "sum", tools.length + " tools  \u2022  " + asks + " ask first  \u2022  " + off + " off"));
+    tools.slice().sort(function (a, b) { return String(a.title).localeCompare(String(b.title)); }).forEach(function (tool) {
+      var row = el("div", "ability");
+      var blocked = !tool.callable || tool.denied;
+      var asking = !blocked && tool.asks_first;
+      row.appendChild(el("span", "name", tool.title || tool.id));
+      row.appendChild(el("span", "tag " + (blocked ? "bad" : asking ? "wait" : "ok"), blocked ? "off" : asking ? "asks" : "runs"));
+      row.title = tool.id;
+      host.appendChild(row);
+    });
+  }
+  function refreshAbilities() {
+    if (Date.now() - abilitiesAt < 20000) return;
+    abilitiesAt = Date.now();
+    api("/tools").then(function (result) { renderAbilities(result.tools || []); }, function () { abilitiesAt = 0; });
   }
 
   // ---- header and caption ---------------------------------------------------------------------------------------
@@ -616,6 +707,26 @@
     $("clock").textContent = new Date().toLocaleTimeString([], { hour12: false });
   }, 1000);
 
+  // ---- asking out loud -------------------------------------------------------------------------------------------
+  var WORDS = {
+    "jarvis.code.run": "run some code", "jarvis.web.fetch": "fetch a web page",
+    "jarvis.agent.delegate": "hand a task to a sub-agent", "jarvis.files.read": "read a file"
+  };
+  // When something new needs an answer and spoken answers are on, say so and listen for the yes or no, so the whole
+  // exchange needs no hands. Approvals already waiting when the page opens are not announced again.
+  function announce(approvals) {
+    var seen = S.announced;
+    S.announced = {};
+    approvals.forEach(function (approval) { S.announced[approval.approval_id] = true; });
+    if (seen === null || !S.speak) return;
+    var fresh = approvals.filter(function (approval) { return !seen[approval.approval_id]; });
+    if (fresh.length === 0) return;
+    var what = fresh.length === 1 ? (WORDS[fresh[0].tool] || "use " + fresh[0].tool) : fresh.length + " things";
+    speak("I need your permission to " + what + ". Say yes to allow it, or no.", function () {
+      if (!S.wake && Recognition && S.pending.length) startListening(false);
+    });
+  }
+
   // ---- polling --------------------------------------------------------------------------------------------------
   var lastSignature = "";
   function refresh() {
@@ -631,6 +742,8 @@
         lastSignature = signature;
         renderPanels(results[0].runs, results[1].approvals, results[2].schedules);
       }
+      announce(results[1].approvals);
+      refreshAbilities();
       tickAges();
       paintHeader();
     }).catch(function (error) {
@@ -643,106 +756,210 @@
     });
   }
 
-  // ---- the orb --------------------------------------------------------------------------------------------------
+  // ---- the face -------------------------------------------------------------------------------------------------
+  // A film-style interface rather than a blob: concentric rings of ticks and segmented arcs turning against each other,
+  // the system's name running round a ring, a radar sweep, a radial spectrum that is the voice (microphone level while
+  // listening, a synthetic envelope while speaking), and an arc-reactor core. Colour and tempo carry the state.
   var canvas = $("orb");
   var ctx = canvas.getContext("2d");
   var W = 0, H = 0;
   var palette = {
-    idle: [55, 214, 255], working: [55, 214, 255], listening: [107, 226, 160],
-    speaking: [150, 180, 255], waiting: [255, 180, 84], offline: [90, 100, 115]
+    idle: [94, 227, 255], working: [94, 227, 255], listening: [107, 226, 160],
+    speaking: [159, 184, 255], waiting: [255, 180, 84], offline: [90, 100, 115]
   };
   var current = palette.idle.slice();
   var energy = 0.12;
   var calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Where the pointer is, relative to the face, so the eyes and the head turn towards it.
+  var gaze = [0, 0], gazeAim = [0, 0];
+  window.addEventListener("pointermove", function (event) {
+    var box = canvas.getBoundingClientRect();
+    gazeAim[0] = Math.max(-1, Math.min(1, (event.clientX - (box.left + box.width / 2)) / (window.innerWidth * 0.45)));
+    gazeAim[1] = Math.max(-1, Math.min(1, -(event.clientY - (box.top + box.height / 2)) / (window.innerHeight * 0.45)));
+  });
+  var NAME = "J.A.R.V.I.S  \u2022  JUST A RATHER VERY INTELLIGENT SYSTEM  \u2022  ";
+  var TAU = Math.PI * 2;
 
   function resize() {
     var box = canvas.getBoundingClientRect();
     var ratio = Math.min(2, window.devicePixelRatio || 1);
     W = box.width; H = box.height;
-    canvas.width = Math.max(1, W * ratio);
-    canvas.height = Math.max(1, H * ratio);
+    canvas.width = Math.max(1, Math.round(W * ratio));
+    canvas.height = Math.max(1, Math.round(H * ratio));
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   }
-  window.addEventListener("resize", resize);
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(canvas); else window.addEventListener("resize", resize);
   resize();
 
   function targetEnergy(mode, t) {
     switch (mode) {
-      case "listening": return 0.3 + S.level * 0.9;
-      case "speaking": return 0.38 + 0.3 * Math.abs(Math.sin(t * 7.3) * Math.sin(t * 3.1));
-      case "working": return 0.5 + 0.1 * Math.sin(t * 2.2);
-      case "waiting": return 0.45 + 0.15 * Math.sin(t * 5);
-      case "offline": return 0.03;
-      default: return 0.12 + 0.03 * Math.sin(t * 1.2);
+      case "listening": return 0.28 + S.level * 1.1;
+      case "speaking": return 0.4 + 0.35 * Math.abs(Math.sin(t * 7.3) * Math.sin(t * 3.1));
+      case "working": return 0.45 + 0.12 * Math.sin(t * 2.2);
+      case "waiting": return 0.42 + 0.16 * Math.sin(t * 5);
+      case "offline": return 0.02;
+      default: return 0.13 + 0.03 * Math.sin(t * 1.2);
     }
   }
-
   function rgba(alpha) {
     return "rgba(" + Math.round(current[0]) + "," + Math.round(current[1]) + "," + Math.round(current[2]) + "," + alpha + ")";
   }
 
+  function ring(cx, cy, radius, from, to, width, alpha) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, from, to);
+    ctx.lineWidth = width;
+    ctx.strokeStyle = rgba(alpha);
+    ctx.stroke();
+  }
+  function ticks(cx, cy, inner, outer, count, rotation, every, alpha) {
+    ctx.lineWidth = 1;
+    for (var i = 0; i < count; i += 1) {
+      var angle = rotation + (i / count) * TAU;
+      var long = i % every === 0;
+      var r1 = long ? inner - (outer - inner) * 0.6 : inner;
+      ctx.strokeStyle = rgba(long ? alpha * 1.7 : alpha);
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(angle) * r1, cy + Math.sin(angle) * r1);
+      ctx.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
+      ctx.stroke();
+    }
+  }
+  // Text laid along a ring so that it fills exactly one turn: repeated as many whole times as fit, and the
+  // remaining slack spread between the letters, so the end meets the beginning instead of overprinting it.
+  function arcText(text, cx, cy, radius, start, size, alpha) {
+    ctx.font = size + "px Consolas, 'Cascadia Mono', monospace";
+    ctx.fillStyle = rgba(alpha);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    var widths = [], total = 0, i;
+    for (i = 0; i < text.length; i += 1) {
+      widths.push(ctx.measureText(text[i]).width + 3);
+      total += widths[i];
+    }
+    var turn = total / radius;
+    var copies = Math.max(1, Math.floor(TAU / turn));
+    var slack = (TAU / copies - turn) / text.length;
+    var angle = start;
+    for (var c = 0; c < copies; c += 1) {
+      for (i = 0; i < text.length; i += 1) {
+        var step = widths[i] / radius + slack;
+        if (angle - start > TAU) return;
+        ctx.save();
+        ctx.translate(cx + Math.cos(angle + step / 2) * radius, cy + Math.sin(angle + step / 2) * radius);
+        ctx.rotate(angle + step / 2 + Math.PI / 2);
+        ctx.fillText(text[i], 0, 0);
+        ctx.restore();
+        angle += step;
+      }
+    }
+  }
+  function bracket(x, y, dx, dy, size) {
+    ctx.beginPath();
+    ctx.moveTo(x + dx * size, y);
+    ctx.lineTo(x, y);
+    ctx.lineTo(x, y + dy * size);
+    ctx.stroke();
+  }
+
   function draw(t, mode) {
     ctx.clearRect(0, 0, W, H);
-    var cx = W / 2, cy = H / 2 - 6, base = Math.min(W, H) * 0.25;
-    var spin = calm ? 0.1 : (mode === "working" ? 1.6 : mode === "waiting" ? 0.9 : 0.45);
+    var cx = W / 2, cy = H / 2 - 10, R = Math.min(W * 0.5, (H - 24) * 0.5) * 0.96;
+    if (R < 40) return;
+    var speed = calm ? 0.06 : (mode === "working" ? 1.7 : mode === "waiting" ? 1.0 : mode === "offline" ? 0.05 : mode === "idle" ? 0.45 : 0.9);
+    ctx.lineCap = "butt";
 
-    var glow = ctx.createRadialGradient(cx, cy, base * 0.15, cx, cy, base * 2.6);
-    glow.addColorStop(0, rgba(0.30 + energy * 0.45));
-    glow.addColorStop(0.45, rgba(0.07 + energy * 0.12));
-    glow.addColorStop(1, rgba(0));
-    ctx.fillStyle = glow;
+    // halo
+    var halo = ctx.createRadialGradient(cx, cy, R * 0.1, cx, cy, R * 1.25);
+    halo.addColorStop(0, rgba(0.22 + energy * 0.35));
+    halo.addColorStop(0.55, rgba(0.06 + energy * 0.08));
+    halo.addColorStop(1, rgba(0));
+    ctx.fillStyle = halo;
     ctx.fillRect(0, 0, W, H);
 
-    // Three tilted rings, spinning at different rates.
-    ctx.lineWidth = 1.2;
-    for (var ring = 0; ring < 3; ring += 1) {
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(t * spin * (ring % 2 ? -1 : 1) * (0.5 + ring * 0.3) + ring * 1.1);
-      ctx.strokeStyle = rgba(0.22 + energy * 0.35);
-      ctx.beginPath();
-      ctx.ellipse(0, 0, base * (1.25 + ring * 0.22), base * (0.55 + ring * 0.12), 0, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // The waveform ring: its amplitude is the voice (microphone level, or a synthetic one while speaking).
-    var points = 120;
+    // horizontal sight lines with end ticks, and corner brackets
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = rgba(0.22);
     ctx.beginPath();
-    for (var i = 0; i <= points; i += 1) {
-      var angle = (i / points) * Math.PI * 2;
-      var wobble = Math.sin(angle * 7 + t * 3.2) * Math.sin(angle * 3 - t * 1.7);
-      var radius = base * 1.02 + wobble * base * (0.06 + energy * 0.34);
-      var x = cx + Math.cos(angle) * radius, y = cy + Math.sin(angle) * radius;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = rgba(0.55 + energy * 0.4);
-    ctx.shadowColor = rgba(0.9);
-    ctx.shadowBlur = 12 + energy * 22;
+    ctx.moveTo(8, cy); ctx.lineTo(cx - R * 1.06, cy);
+    ctx.moveTo(cx + R * 1.06, cy); ctx.lineTo(W - 8, cy);
     ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Orbiting motes.
-    for (var m = 0; m < 46; m += 1) {
-      var a = (m / 46) * Math.PI * 2 + t * spin * 0.35 * (1 + (m % 3) * 0.2);
-      var r = base * (1.5 + 0.55 * Math.sin(m * 12.9898 + t * 0.4));
-      ctx.fillStyle = rgba(0.15 + 0.5 * ((m % 5) / 5) * (0.4 + energy));
+    for (var k = 0; k < 7; k += 1) {
+      var gap = 10 + k * 14;
       ctx.beginPath();
-      ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.62, 1 + (m % 3) * 0.6, 0, Math.PI * 2);
+      ctx.moveTo(cx - R * 1.06 - gap, cy - (k % 2 ? 3 : 6)); ctx.lineTo(cx - R * 1.06 - gap, cy + (k % 2 ? 3 : 6));
+      ctx.moveTo(cx + R * 1.06 + gap, cy - (k % 2 ? 3 : 6)); ctx.lineTo(cx + R * 1.06 + gap, cy + (k % 2 ? 3 : 6));
+      ctx.stroke();
+    }
+    ctx.strokeStyle = rgba(0.5);
+    ctx.lineWidth = 1.5;
+    bracket(6, 6, 1, 1, 16); bracket(W - 6, 6, -1, 1, 16); bracket(6, H - 6, 1, -1, 16); bracket(W - 6, H - 6, -1, -1, 16);
+    ctx.font = "10px Consolas, monospace";
+    ctx.fillStyle = rgba(0.55);
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    ctx.fillText(S.session ? "SESSION " + String(S.session).slice(-6).toUpperCase() : "NO SESSION", 22, 24);
+    ctx.textAlign = "right";
+    ctx.fillText(S.working + (S.thinking && !S.working ? 1 : 0) + " ACTIVE  \u2022  " + S.needYou + " WAITING", W - 22, 24);
+
+    // outer ticked ring (fine ticks, a long one every 10)
+    ring(cx, cy, R, 0, TAU, 1.5, 0.55 + energy * 0.3);
+    ticks(cx, cy, R * 0.955, R * 0.99, 180, t * speed * 0.05, 10, 0.32);
+
+    // segmented ring turning the other way: eighteen arcs of changing length
+    var seg = R * 0.9;
+    for (var a = 0; a < 18; a += 1) {
+      var start = -t * speed * 0.16 + (a / 18) * TAU;
+      var length = (TAU / 18) * (0.35 + 0.5 * Math.abs(Math.sin(a * 2.399)));
+      ring(cx, cy, seg, start, start + length, 5, 0.18 + 0.4 * Math.abs(Math.sin(a * 1.7 + t * 0.4)));
+    }
+
+    // the system's name, running round
+    arcText(NAME, cx, cy, R * 0.815, t * speed * 0.07, Math.max(9, R * 0.045), 0.55 + energy * 0.25);
+    ring(cx, cy, R * 0.77, 0, TAU, 1, 0.3);
+
+    // three heavy partial arcs, turning at different rates (faster while working)
+    for (var h = 0; h < 3; h += 1) {
+      var base = t * speed * (h % 2 ? -0.7 : 0.5) * (1 + h * 0.35) + h * 2.1;
+      var rad = R * (0.72 - h * 0.055);
+      ring(cx, cy, rad, base, base + 1.15 + 0.5 * Math.sin(t * 0.6 + h), 4 - h * 0.7, 0.6 + energy * 0.3);
+      ring(cx, cy, rad, base + 3.3, base + 3.3 + 0.55, 2, 0.5);
+    }
+
+    // the thin ring and ticks that frame the head, then the voice as a ring of bars just inside the arcs
+    ring(cx, cy, R * 0.58, 0, TAU, 1, 0.3);
+    ticks(cx, cy, R * 0.545, R * 0.575, 72, -t * speed * 0.08, 6, 0.3);
+    var bars = 96, inner = R * 0.6;
+    for (var b = 0; b < bars; b += 1) {
+      var theta = (b / bars) * TAU - Math.PI / 2;
+      var mirror = Math.min(b, bars - b);
+      var shape = Math.abs(Math.sin(mirror * 0.9 + t * 3.3)) * (0.55 + 0.45 * Math.sin(mirror * 0.31 - t * 2.1));
+      var len = R * (0.012 + energy * 0.1 * (0.25 + shape));
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(theta) * inner, cy + Math.sin(theta) * inner);
+      ctx.lineTo(cx + Math.cos(theta) * (inner + len), cy + Math.sin(theta) * (inner + len));
+      ctx.lineWidth = Math.max(1.2, R * 0.01);
+      ctx.strokeStyle = rgba(0.4 + energy * 0.5);
+      ctx.stroke();
+    }
+
+    // the head: a real face mesh, whose mouth follows the voice and whose eyes follow the pointer
+    if (window.JarvisHead) {
+      var mouth = 0;
+      if (mode === "speaking") mouth = 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
+      JarvisHead.draw(ctx, cx, cy, R * 1.42, {
+        rgb: current, energy: energy, mode: mode, mouth: mouth, look: gaze, t: t, calm: calm
+      });
+    }
+    // markers riding the outer rings
+    for (var m = 0; m < 5; m += 1) {
+      var ma = t * speed * (0.12 + m * 0.03) * (m % 2 ? -1 : 1) + m * 1.3;
+      var mr = R * (m % 2 ? 0.9 : 0.99);
+      ctx.fillStyle = rgba(0.95);
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(ma) * mr, cy + Math.sin(ma) * mr, 2.6, 0, TAU);
       ctx.fill();
     }
-
-    // The core.
-    var core = ctx.createRadialGradient(cx - base * 0.25, cy - base * 0.3, base * 0.05, cx, cy, base * (0.8 + energy * 0.25));
-    core.addColorStop(0, "rgba(255,255,255,0.95)");
-    core.addColorStop(0.35, rgba(0.95));
-    core.addColorStop(1, rgba(0.08));
-    ctx.fillStyle = core;
-    ctx.beginPath();
-    ctx.arc(cx, cy, base * (0.78 + energy * 0.2), 0, Math.PI * 2);
-    ctx.fill();
   }
 
   function frame(stamp) {
@@ -752,10 +969,12 @@
     for (var i = 0; i < 3; i += 1) current[i] += (target[i] - current[i]) * 0.08;
     readLevel();
     energy += (targetEnergy(mode, t) - energy) * 0.12;
+    gaze[0] += (gazeAim[0] - gaze[0]) * 0.06;
+    gaze[1] += (gazeAim[1] - gaze[1]) * 0.06;
     draw(t, mode);
     requestAnimationFrame(frame);
   }
-  // The orb is also a button: clicking it silences JARVIS.
+  // The face is also a button: clicking it silences JARVIS.
   canvas.addEventListener("click", interruptSpeech);
   requestAnimationFrame(frame);
 

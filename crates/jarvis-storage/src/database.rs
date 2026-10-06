@@ -383,17 +383,11 @@ pub enum DatabaseError {
     ApprovalConflict,
     /// A decision was presented against an approval that already has one.
     ///
-    /// A **replay**, not a conflict: the nonce is one-time, so a second presentation of a recorded
-    /// decision is either a retried request or an attempt to replace a denial. Both must be refused,
-    /// and distinguishing it from [`Self::ApprovalConflict`] lets the caller report which happened.
+    /// A **replay**, not a conflict: a second presentation of a recorded decision is either a retried
+    /// request or an attempt to replace a denial. Both must be refused, and distinguishing it from
+    /// [`Self::ApprovalConflict`] lets the caller report which happened.
     #[error("this approval already has a recorded decision")]
     ApprovalAlreadyDecided,
-    /// A decision's nonce did not match the stored digest.
-    ///
-    /// The forgery case. The presented value is never echoed, because an error that carried it would
-    /// put a candidate secret into a log.
-    #[error("the presented decision nonce does not match this approval")]
-    ApprovalNonceMismatch,
     /// A stored approval row contradicted the domain's own closed sets.
     ///
     /// A storage-integrity finding: the row was written by another build, restored from a backup, or

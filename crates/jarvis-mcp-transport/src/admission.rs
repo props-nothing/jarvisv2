@@ -31,11 +31,10 @@
 //!
 //! # Why the entries are not a token store
 //!
-//! An entry holds a **fingerprint** of a credential, never the credential, and the same reasoning as
-//! `jarvis-tools`'s approval nonces applies: this value is compared on every request, formatted into
-//! diagnostics, and held for the process's life, so a bearer token here would be a secret in the one place
-//! that is least able to protect it. A fingerprint is enough to answer "is this caller one we allow", which is
-//! the only question the allowlist asks.
+//! An entry holds a **fingerprint** of a credential, never the credential. This value is compared on every
+//! request, formatted into diagnostics, and held for the process's life, so a bearer token here would be a
+//! secret in the one place that is least able to protect it. A fingerprint is enough to answer "is this
+//! caller one we allow", which is the only question the allowlist asks.
 //!
 //! # Rate limits, and which layer owns them
 //!

@@ -65,7 +65,7 @@ tombstone holding the key would satisfy "resurrection is blocked" while violatin
 the violation would be invisible because the tombstone is a different table that no retrieval reads.
 
 A hash satisfies both. It recognises the same claim on a re-ingest and it holds nothing readable, and it is
-the same technique `ADR-0018` uses for the decision nonce and `P3-016` uses for an intent digest.
+the same technique `ADR-0018` and `P3-016` use for an intent digest.
 
 ### 3. "A relationship starts as a proposal" is not a table constraint
 

@@ -1,27 +1,20 @@
 //! Request and reply bodies for the approval decision route.
 //!
-//! # Why the decision carries a nonce and the request does not
+//! # Why the decision is its own document
 //!
-//! An approval exists to stop the party that *asked* for an action from *answering* for it
-//! (`docs/architecture/security.md` names the threat as model self-approval / confused deputy). So the
-//! one-time decision nonce must reach the **human** and must not reach the **requester**. It travels to
-//! the human through a profile-private file — the `ADR-0042` channel — and the human's own client
-//! presents it here.
-//!
-//! That is also why this type is a **separate document** from `StartRunRequest` and the tool-call body
-//! rather than a field on either: both of those are produced on a path the agent drives, and a nonce in
-//! either one would be handed to the party it exists to exclude.
+//! A decision is a different act from requesting or resuming a tool call: it is the owner's answer to a
+//! plain yes/no question. Keeping it as its own body keeps "start this run", "resume this held call", and
+//! "answer this approval" as three distinct contracts.
 //!
 //! # Why the approver is absent
 //!
 //! There is deliberately **no** `approver_id` field. The identity that answers is taken from the
 //! authenticated session, exactly as a tool call's workspace is taken from the stored run rather than
-//! from the request. A caller that could name its own approver would defeat the self-approval refusal in
-//! one field, and `deny_unknown_fields` makes an attempt to supply one a `422` rather than a silently
-//! ignored value — *an ignored field reads as an accepted one*, which is the same reasoning the tool
-//! call body's absent `workspace_id` follows.
+//! from the request. `deny_unknown_fields` makes an attempt to supply one a `422` rather than a silently
+//! ignored value — *an ignored field reads as an accepted one*, which is the same reasoning the tool call
+//! body's absent `workspace_id` follows.
 
-use jarvis_core::UtcTimestamp;
+use jarvis_core::{ApprovalChannel, UtcTimestamp};
 use serde::{Deserialize, Serialize};
 
 /// The stable wire name of a decision, so a client and the daemon cannot disagree about the spelling.
@@ -36,8 +29,6 @@ pub enum ApprovalDecisionRequest {
     Approve,
     /// Refuse the action.
     Deny,
-    /// Withdraw the request without deciding it.
-    Cancel,
 }
 
 /// Request body for `POST /api/v1/approvals/{id}/decision`.
@@ -46,19 +37,17 @@ pub enum ApprovalDecisionRequest {
 pub struct ApprovalDecisionBody {
     /// Which way the decision went.
     pub decision: ApprovalDecisionRequest,
-    /// The one-time nonce delivered through the profile's private nonce file.
-    ///
-    /// Required for every outcome, including a denial. Skipping the check for a denial would let
-    /// anything that can reach this route cancel a pending action — a denial-of-service on the approval
-    /// rather than a decision about it — and "a denial is the safe outcome" is exactly the argument that
-    /// would make a forged one indistinguishable from an ordinary refusal.
-    pub nonce: String,
     /// Whether the daemon should release the approved call as part of the decision, from the arguments it held.
     ///
     /// Opt-in and defaulting to `false`, because clients that predate it decide and then resume the call
     /// themselves, and a resume that already happened is refused. Ignored for a denial.
     #[serde(default)]
     pub resume: bool,
+    /// Which surface the owner answered on.
+    ///
+    /// Optional so older clients remain valid; the daemon treats an absent value as `api`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ApprovalChannel>,
 }
 
 /// Response body for `POST /api/v1/approvals/{id}/decision`.
@@ -91,8 +80,7 @@ pub struct ApprovalReply {
 ///
 /// Returned by `GET /api/v1/approvals`. It carries the **arguments** the call was made with, which is the
 /// reason this type exists beside [`ApprovalReply`]: a decision reply reports that a decision happened, while
-/// this lets a person see **what they are about to approve**. It never carries the nonce — that travels through
-/// the profile-private file (`ADR-0042`), not through a route a requester could also reach.
+/// this lets a person see **what they are about to approve**.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingApprovalReply {
     /// The approval's identifier, which a decision names.
@@ -113,8 +101,6 @@ pub struct PendingApprovalReply {
     pub tool_version: String,
     /// The risk level the call was held at.
     pub risk_level: u8,
-    /// The authentication strength a decision must be made with.
-    pub required_strength: String,
     /// A short description of the action.
     pub preview: String,
     /// The arguments the call was made with, absent when they were too large to hold.

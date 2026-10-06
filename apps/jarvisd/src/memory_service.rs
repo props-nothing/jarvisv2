@@ -213,10 +213,10 @@ impl MemoryService {
     /// claim the real user had submitted, and the rule would have reported no violation because it was
     /// comparing against a name nobody holds.
     ///
-    /// A fabricated identity is the failure mode of every self-approval guard: the check is real, the value is
-    /// not, and the check passes. Reading it from the identity is what makes the comparison meaningful, and it
-    /// is why the value is derived here rather than accepted from the request — a caller able to name its own
-    /// author could name one that differs from its approver and defeat the same guard from the other side.
+    /// A fabricated identity breaks any author/approver comparison: the check is real, the value is not, and
+    /// the check passes. Reading it from the identity is what makes the comparison meaningful, and it is why
+    /// the value is derived here rather than accepted from the request — a caller able to name its own author
+    /// could name one that differs from its approver and defeat the same guard from the other side.
     ///
     /// # Errors
     ///

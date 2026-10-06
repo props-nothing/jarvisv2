@@ -34,9 +34,8 @@ mod tool_outcome;
 
 pub use approval::{
     ApprovalChannel, ApprovalDecision, ApprovalDecisionOutcome, ApprovalRequest,
-    ApprovalRequestParts, ApprovalState, AuthenticationStrength, CanonicalIntentHash,
-    DecisionNonce, IntentError, InvalidApprovalField, MAX_APPROVAL_LIFETIME_SECONDS,
-    MAX_APPROVAL_PREVIEW_CHARS, MAX_CANONICAL_INTENT_CHARS, NonceError,
+    ApprovalRequestParts, ApprovalState, CanonicalIntentHash, IntentError, InvalidApprovalField,
+    MAX_APPROVAL_LIFETIME_SECONDS, MAX_APPROVAL_PREVIEW_CHARS, MAX_CANONICAL_INTENT_CHARS,
 };
 pub use approval_policy::{ApprovalPolicy, ApprovalPolicyError};
 pub use candidate::{

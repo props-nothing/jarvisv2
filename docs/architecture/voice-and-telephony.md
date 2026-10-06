@@ -175,7 +175,7 @@ flowchart TD
     Brain --> End[Persist outcome and retention actions]
 ```
 
-An incoming call has no broad tool authority by default. Sensitive data disclosure and effectful actions may require a second factor or approval on a trusted client.
+An incoming call has no broad tool authority by default. Sensitive data disclosure and effectful actions need the owner's yes.
 
 ## Outbound Calls
 

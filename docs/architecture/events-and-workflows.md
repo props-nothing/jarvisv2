@@ -91,7 +91,7 @@ Parallel branches may complete in any order; joins define deterministic merge ru
 
 ## Approval Waits
 
-An approval stores the exact normalized intent hash, display summary, effect/risk, policy version, eligible approvers, expiry, and run/step version. On approval, execution revalidates current identity, policy, connector/account health, target state, and intent hash. Approval is not a permanent bearer token.
+An approval stores the exact normalized intent hash, display summary, effect/risk, policy version, expiry, and run/step version. On approval, execution revalidates current identity, policy, connector/account health, target state, and intent hash. Approval is not a permanent bearer token.
 
 ## Cancellation And Compensation
 
