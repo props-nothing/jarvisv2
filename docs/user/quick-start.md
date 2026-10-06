@@ -81,6 +81,14 @@ default.
 - **Approvals are a yes or no.** Anything it asks about appears with Approve and Deny; you can also say "yes" or "no", or use
   `jarvis approvals approve|deny`.
 
+## Running it all the time, and on other machines
+
+- `jarvis service install` makes JARVIS start when you log in (a systemd user unit on Linux, a launchd agent on macOS, a login entry
+  on Windows) and `jarvis service uninstall` undoes it.
+- On a server with no screen, `jarvis hud --print-url` prints the console address (with your credential) to open through an SSH
+  tunnel. JARVIS only listens on `127.0.0.1`.
+- [platforms.md](platforms.md) says what is verified on Linux and macOS and what is not, and has the headless-server walkthrough.
+
 ## Stopping and troubleshooting
 
 - `jarvis stop` ends the background program gracefully; `jarvis restart` stops it (if it is running) and starts it again, for example

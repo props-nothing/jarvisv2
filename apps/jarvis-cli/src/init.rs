@@ -630,6 +630,9 @@ fn spawn_daemon(binary: &Path, root: Option<&str>) -> Result<Daemon, String> {
         if let Some(root) = root {
             command.args(["--root", root]);
         }
+        // Its own process group, so closing the terminal (an SSH session ending) does not send it the hangup that
+        // would stop it: `jarvis start` over SSH must still be running after you log out.
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -728,6 +731,16 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
 mod tests {
     use super::*;
 
+    /// An absolute path on the platform running the test: `C:/..` is relative on Unix, and the daemon's own parser
+    /// (which these tests drive) refuses a relative key or folder.
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:/{path}"))
+        } else {
+            PathBuf::from(format!("/{path}"))
+        }
+    }
+
     fn words(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
     }
@@ -771,8 +784,8 @@ mod tests {
         let document = render_config(
             "glm-5.3:cloud",
             "http://localhost:11434/v1",
-            Path::new("C:/Users/me/AppData/jarvis/model.key"),
-            &[PathBuf::from("C:/Users/me/notes")],
+            abs("me/jarvis/model.key").as_path(),
+            &[abs("me/notes")],
             None,
             None,
         )
@@ -801,7 +814,7 @@ mod tests {
         let document = render_config(
             "m",
             "http://h/v1",
-            Path::new("C:/k"),
+            abs("k").as_path(),
             &[],
             Some(&code),
             None,
@@ -823,7 +836,7 @@ mod tests {
         let document = render_config(
             "m",
             "http://h/v1",
-            Path::new("C:/k"),
+            abs("k").as_path(),
             &[],
             Some(&code),
             None,
@@ -867,7 +880,7 @@ mod tests {
     #[test]
     fn a_voice_is_written_into_the_daemon_table_before_the_policy_table() {
         let voice = VoiceSetup {
-            key_file: PathBuf::from("C:/keys/speech.key"),
+            key_file: abs("keys/speech.key"),
             voice_id: Some("abc123".to_owned()),
             model: None,
         };
@@ -879,13 +892,16 @@ mod tests {
         let document = render_config(
             "m",
             "http://h/v1",
-            Path::new("C:/k"),
+            abs("k").as_path(),
             &[],
             Some(&code),
             Some(&voice),
         )
         .unwrap_or_else(|error| panic!("{error}"));
-        assert!(document.contains("speech_api_key_ref = 'C:/keys/speech.key'"));
+        assert!(document.contains(&format!(
+            "speech_api_key_ref = '{}'",
+            abs("keys/speech.key").display()
+        )));
         assert!(document.contains("speech_voice_id = 'abc123'"));
         assert!(!document.contains("speech_model"));
         let voice_at = document.find("speech_api_key_ref").unwrap_or(usize::MAX);

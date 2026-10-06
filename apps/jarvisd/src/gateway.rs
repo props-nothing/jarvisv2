@@ -3787,8 +3787,26 @@ mod tests {
         adapter: &crate::approval_fixture::RecordingApprovalAdapter,
         expected: usize,
     ) {
-        for _ in 0..100 {
+        // A generous ceiling that costs nothing when the task is quick: a loaded CI runner can take many seconds to run a
+        // spawned task, and a flaky deadline here is a test failure that says nothing about the daemon.
+        for _ in 0..600 {
             if adapter.calls() >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until a call's held arguments have been cleared, which the daemon does after the call has run.
+    async fn wait_for_arguments_cleared(
+        database: &jarvis_storage::SqliteDatabase,
+        approval_id: &str,
+    ) {
+        for _ in 0..600 {
+            if matches!(
+                jarvis_storage::read_approval_arguments(database, approval_id).await,
+                Ok(None)
+            ) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3841,6 +3859,7 @@ mod tests {
             1,
             "a second release must not run the tool again"
         );
+        wait_for_arguments_cleared(&database, &approval_id).await;
         assert_eq!(
             jarvis_storage::read_approval_arguments(&database, &approval_id)
                 .await

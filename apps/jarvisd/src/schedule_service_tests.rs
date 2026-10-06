@@ -129,7 +129,8 @@ async fn find(fixture: &Fixture, id: &str) -> jarvis_storage::StoredSchedule {
 }
 
 async fn wait_for_settled(fixture: &Fixture, run_id: &str) {
-    for _ in 0..100 {
+    // A generous ceiling: it returns as soon as the run settles, and a loaded CI runner can be slow.
+    for _ in 0..600 {
         if must(jarvis_storage::find_run(&fixture.database, run_id).await)
             .state()
             .is_terminal()

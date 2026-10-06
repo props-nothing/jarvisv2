@@ -205,44 +205,154 @@ impl ServicePlan {
     /// deterministic: no timestamps, no absolute paths other than the resolved ones.
     #[must_use]
     pub fn render(&self) -> String {
-        let executable = self.binary_path.display();
+        let executable = self.binary_path.display().to_string();
         match self.kind {
             ServiceKind::SystemdUser => format!(
                 "# {OWNERSHIP_MARKER}\n\
                  [Unit]\n\
                  Description=JARVIS personal assistant daemon\n\
-                 After=default.target\n\
+                 Wants=network-online.target\n\
+                 After=network-online.target\n\
                  \n\
                  [Service]\n\
                  Type=simple\n\
-                 ExecStart={executable}\n\
+                 ExecStart={}\n\
                  Restart=on-failure\n\
+                 RestartSec=3\n\
                  \n\
                  [Install]\n\
-                 WantedBy=default.target\n"
+                 WantedBy=default.target\n",
+                systemd_word(&executable)
             ),
+            // The XML declaration must be the first thing in the file, so the ownership marker is a comment after it.
             ServiceKind::LaunchdAgent => format!(
-                "<!-- {OWNERSHIP_MARKER} -->\n\
-                 <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <!-- {OWNERSHIP_MARKER} -->\n\
                  <plist version=\"1.0\">\n\
                  <dict>\n\
                  <key>Label</key><string>dev.jarvis.jarvisd</string>\n\
                  <key>ProgramArguments</key>\n\
-                 <array><string>{executable}</string></array>\n\
+                 <array><string>{}</string></array>\n\
                  <key>RunAtLoad</key><true/>\n\
-                 <key>KeepAlive</key><false/>\n\
+                 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
                  </dict>\n\
-                 </plist>\n"
+                 </plist>\n",
+                xml_escape(&executable)
             ),
             ServiceKind::WindowsUserLauncher => format!(
                 "{{\n\
                  \"marker\": \"{OWNERSHIP_MARKER}\",\n\
-                 \"binary\": \"{executable}\"\n\
-                 }}\n"
+                 \"binary\": \"{}\"\n\
+                 }}\n",
+                executable.replace('\\', "\\\\")
             ),
         }
     }
 
+    /// The commands that make the platform manager run this definition, in order.
+    ///
+    /// Pure data, so what an install would do is testable on every platform. The definition file itself is written by the
+    /// caller **before** these run.
+    #[must_use]
+    pub fn install_steps(&self) -> Vec<ServiceCommand> {
+        match self.kind {
+            ServiceKind::SystemdUser => vec![
+                ServiceCommand::new(
+                    "systemctl",
+                    &["--user", "daemon-reload"],
+                    false,
+                    "reload the user service manager",
+                ),
+                ServiceCommand::new(
+                    "systemctl",
+                    &["--user", "enable", "--now", "jarvisd.service"],
+                    false,
+                    "enable it at login and start it now",
+                ),
+                // Without lingering a user service stops when the last login session ends, which on a server is always.
+                ServiceCommand::new(
+                    "loginctl",
+                    &["enable-linger"],
+                    true,
+                    "keep it running after you log out (needed on a server)",
+                ),
+            ],
+            ServiceKind::LaunchdAgent => vec![ServiceCommand::new(
+                "launchctl",
+                &["load", "-w", &self.definition_path.display().to_string()],
+                false,
+                "load the agent and start it at login",
+            )],
+            ServiceKind::WindowsUserLauncher => {
+                let launcher = format!(
+                    "powershell.exe -NoProfile -WindowStyle Hidden -Command \"Start-Process -FilePath '{}' -WindowStyle Hidden\"",
+                    self.binary_path.display().to_string().replace('\'', "''")
+                );
+                vec![ServiceCommand::new(
+                    "reg",
+                    &[
+                        "add",
+                        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                        "/v",
+                        "JARVIS",
+                        "/t",
+                        "REG_SZ",
+                        "/d",
+                        &launcher,
+                        "/f",
+                    ],
+                    false,
+                    "start it when you log in",
+                )]
+            }
+        }
+    }
+
+    /// The commands that stop the platform manager running this definition, in order. A step that fails because there is
+    /// nothing to undo is tolerated.
+    #[must_use]
+    pub fn uninstall_steps(&self) -> Vec<ServiceCommand> {
+        match self.kind {
+            ServiceKind::SystemdUser => vec![ServiceCommand::new(
+                "systemctl",
+                &["--user", "disable", "--now", "jarvisd.service"],
+                true,
+                "stop it and remove it from login",
+            )],
+            ServiceKind::LaunchdAgent => vec![ServiceCommand::new(
+                "launchctl",
+                &["unload", "-w", &self.definition_path.display().to_string()],
+                true,
+                "stop it and remove it from login",
+            )],
+            ServiceKind::WindowsUserLauncher => vec![ServiceCommand::new(
+                "reg",
+                &[
+                    "delete",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    "/v",
+                    "JARVIS",
+                    "/f",
+                ],
+                true,
+                "stop starting it at login",
+            )],
+        }
+    }
+
+    /// Steps to run after the definition file is removed on uninstall (so a manager does not hold a stale copy).
+    #[must_use]
+    pub fn after_uninstall_steps(&self) -> Vec<ServiceCommand> {
+        match self.kind {
+            ServiceKind::SystemdUser => vec![ServiceCommand::new(
+                "systemctl",
+                &["--user", "daemon-reload"],
+                true,
+                "reload the user service manager",
+            )],
+            ServiceKind::LaunchdAgent | ServiceKind::WindowsUserLauncher => Vec::new(),
+        }
+    }
     /// Returns the ownership marker this plan's definition carries.
     #[must_use]
     pub const fn ownership_marker(&self) -> &'static str {
@@ -250,6 +360,45 @@ impl ServicePlan {
     }
 }
 
+/// One command an install or uninstall runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCommand {
+    /// The program to run.
+    pub program: String,
+    /// Its arguments.
+    pub args: Vec<String>,
+    /// Whether a failure is acceptable (nothing to undo, or an optional nicety).
+    pub tolerate_failure: bool,
+    /// What it is for, in words a person can read.
+    pub purpose: &'static str,
+}
+
+impl ServiceCommand {
+    fn new(program: &str, args: &[&str], tolerate_failure: bool, purpose: &'static str) -> Self {
+        Self {
+            program: program.to_owned(),
+            args: args.iter().map(|argument| (*argument).to_owned()).collect(),
+            tolerate_failure,
+            purpose,
+        }
+    }
+}
+
+/// Quotes a path for a systemd `ExecStart` when it needs it (a space would otherwise split it into arguments).
+fn systemd_word(path: &str) -> String {
+    if path.contains([' ', '\t', '"', '\\']) {
+        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Escapes the characters XML reserves, so a path cannot break out of a plist string.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
 /// Resolves the per-user definition directory for a kind.
 fn definition_root(kind: ServiceKind) -> Option<PathBuf> {
     match kind {
@@ -596,5 +745,92 @@ mod tests {
             ServiceDrift::Current,
             "a CRLF checkout must not be reported as drift"
         );
+    }
+
+    fn plan_with(kind: ServiceKind, binary: &str) -> ServicePlan {
+        ServicePlan {
+            kind,
+            definition_path: PathBuf::from("/home/me/.config/systemd/user/jarvisd.service"),
+            binary_path: PathBuf::from(binary),
+            root: None,
+            root_argument: None,
+        }
+    }
+
+    /// **A launchd plist must start with the XML declaration**, or `launchctl` rejects it; and a path cannot break out of it.
+    #[test]
+    fn the_plist_is_well_formed_at_the_top_and_escapes_the_path() {
+        let plan = plan_with(ServiceKind::LaunchdAgent, "/Applications/A&B <x>/jarvisd");
+        let body = plan.render();
+        assert!(
+            body.starts_with("<?xml version=\"1.0\""),
+            "the declaration must come first:\n{body}"
+        );
+        assert!(body.contains(OWNERSHIP_MARKER));
+        assert!(body.contains("/Applications/A&amp;B &lt;x&gt;/jarvisd"));
+        assert!(!body.contains("A&B <x>"));
+    }
+
+    #[test]
+    fn a_systemd_exec_path_with_spaces_is_quoted_and_a_plain_one_is_not() {
+        let spaced = plan_with(ServiceKind::SystemdUser, "/opt/my apps/jarvisd").render();
+        assert!(
+            spaced.contains("ExecStart=\"/opt/my apps/jarvisd\""),
+            "{spaced}"
+        );
+        let plain = plan_with(ServiceKind::SystemdUser, "/usr/local/bin/jarvisd").render();
+        assert!(plain.contains("ExecStart=/usr/local/bin/jarvisd\n"));
+        assert!(plain.contains("Restart=on-failure") && plain.contains("WantedBy=default.target"));
+    }
+
+    /// What an install and an uninstall would run, per platform, as data: no platform needed to check it.
+    #[test]
+    fn install_and_uninstall_steps_are_what_each_platform_needs() {
+        let linux = plan_with(ServiceKind::SystemdUser, "/usr/local/bin/jarvisd");
+        let install: Vec<String> = linux
+            .install_steps()
+            .iter()
+            .map(|step| format!("{} {}", step.program, step.args.join(" ")))
+            .collect();
+        assert_eq!(
+            install,
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now jarvisd.service",
+                "loginctl enable-linger"
+            ]
+        );
+        let linger = linux
+            .install_steps()
+            .pop()
+            .unwrap_or_else(|| panic!("a linger step"));
+        assert!(
+            linger.tolerate_failure,
+            "lingering is a nicety and must not fail the install"
+        );
+        assert!(
+            linux
+                .uninstall_steps()
+                .iter()
+                .all(|step| step.tolerate_failure)
+        );
+
+        let mac = plan_with(ServiceKind::LaunchdAgent, "/usr/local/bin/jarvisd");
+        assert_eq!(mac.install_steps()[0].program, "launchctl");
+        assert_eq!(mac.install_steps()[0].args[..2], ["load", "-w"]);
+        assert_eq!(mac.uninstall_steps()[0].args[0], "unload");
+
+        let windows = plan_with(
+            ServiceKind::WindowsUserLauncher,
+            r"C:\Users\me\it's\jarvisd.exe",
+        );
+        let step = &windows.install_steps()[0];
+        assert_eq!(step.program, "reg");
+        assert!(
+            step.args
+                .iter()
+                .any(|argument| argument.contains("Start-Process") && argument.contains("it''s"))
+        );
+        assert_eq!(windows.uninstall_steps()[0].args[0], "delete");
     }
 }

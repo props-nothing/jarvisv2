@@ -136,7 +136,9 @@ jobs:
         env:
           ACCEPTANCE_REQUIRE_FIXTURE_PEER: "1"
         shell: bash
-        run: cargo test --workspace --all-features --locked > test.txt 2>&1
+        # --no-fail-fast: one failing crate must not hide the results of every crate after it (on Linux and macOS a failure in an
+        # early crate previously meant the rest were never reported).
+        run: cargo test --workspace --all-features --locked --no-fail-fast > test.txt 2>&1
       - name: Annotate test failures
         if: failure()
         shell: bash

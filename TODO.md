@@ -7008,7 +7008,19 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [ ] `P9-016` `jarvis doctor` that checks the model answers, the keys work, Docker for the code tool, the port, and a browser.
 - [ ] `P9-017` Release archive per platform with both binaries, checksums and a CI release job; `jarvis` locates `jarvisd` beside itself or
   on `PATH`.
-- [ ] `P9-018` `jarvis service install|uninstall` really installs the per-user service (see `P9-003`).
+- [x] `P9-018` `jarvis service install|uninstall` install and remove the per-user service: a systemd user unit (plus `loginctl
+  enable-linger` for servers), a launchd agent, a Windows Run entry; the command sequences are pure data (`ServicePlan::install_steps`)
+  and refuse to touch a definition JARVIS did not write. Also fixed: the launchd plist put its comment before the XML declaration
+  (invalid, `launchctl` would reject it), and systemd paths with spaces are quoted. Live on Windows (install, registry entry,
+  uninstall, nothing left behind); **Linux and macOS paths are unit-tested as data and type-check, but were not run on a real
+  machine** (`P9-022`).
+- [x] `P9-018b` Server readiness: a Unix daemon is started in its own process group so closing an SSH session does not stop it; `jarvis
+  hud --print-url` prints the credentialed address for an SSH tunnel, and a machine with no display is told how to tunnel in instead
+  of failing; `docs/user/platforms.md` states what is verified per platform. CI was red on all three platforms: three CLI init
+  tests used `C:/…` paths (relative on Unix, so the daemon's own parser refused them), and one Windows gateway test had a 5 s ceiling
+  on a background task on a slow runner; both fixed.
+- [ ] `P9-022` First real run on a clean Linux VPS and a Mac (and an aarch64 Linux): install, init, start, tunnel to the console, run a
+  conversation, `service install`, reboot; record what breaks. Prerequisite for calling either platform supported.
 - [ ] `P9-019` Tauri shell with a tray icon over the same console (see `P9-001`).
 
 ## P10: Server And Multi-Device

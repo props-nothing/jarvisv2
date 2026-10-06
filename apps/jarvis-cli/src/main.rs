@@ -21,6 +21,7 @@ mod lifecycle;
 mod memory;
 mod output;
 mod schedule;
+mod service_install;
 mod settings;
 mod skills;
 mod tools;
@@ -161,7 +162,7 @@ async fn launch_command(arguments: &[String]) -> ExitStatus {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|service|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]"
 }
@@ -302,6 +303,7 @@ fn hud_command(arguments: &[String]) -> ExitStatus {
         loaded.config().daemon().http_port(),
         credential.expose(),
         arguments.iter().any(|argument| argument == "--no-open"),
+        arguments.iter().any(|argument| argument == "--print-url"),
     )
 }
 
@@ -442,6 +444,11 @@ fn service(arguments: &[String]) -> ExitStatus {
             return ExitStatus::Rejected;
         }
     };
+    match arguments.get(1).map(String::as_str) {
+        Some("install") => return service_install::install(&plan),
+        Some("uninstall") => return service_install::uninstall(&plan),
+        _ => {}
+    }
     let drift = detect_drift(&plan);
     let finding = drift_finding(&drift);
     if json {

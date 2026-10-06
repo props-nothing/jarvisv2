@@ -7,7 +7,7 @@ This repository is in the **working-assistant stage**: `jarvisd` and `jarvis` ru
 ## Quick start
 
 Build it (`cargo build --release`), keep `jarvis` and `jarvisd` together, and run `jarvis`. The first run asks a few questions,
-starts the assistant and opens its console in your browser. See [docs/user/quick-start.md](docs/user/quick-start.md) and [docs/user/settings.md](docs/user/settings.md) (every setting, its default, and why a few are off until you turn them on); the
+starts the assistant and opens its console in your browser. See [docs/user/quick-start.md](docs/user/quick-start.md), [docs/user/platforms.md](docs/user/platforms.md) (Linux server, macOS, Windows: what is verified) and [docs/user/settings.md](docs/user/settings.md) (every setting, its default, and why a few are off until you turn them on); the
 target onboarding experience (including the console's Settings screen, `jarvis config` and `jarvis keys`) and what is still missing from it is [docs/product/onboarding.md](docs/product/onboarding.md).
 
 ## Product Goal
