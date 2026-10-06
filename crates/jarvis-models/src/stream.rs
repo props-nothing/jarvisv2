@@ -21,6 +21,16 @@ pub enum StreamEventError {
     AlreadyFinished,
 }
 
+/// What a silent stretch of a model call is spent on.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    /// Reasoning ("thinking") before or between answers.
+    Reasoning,
+    /// Writing the arguments of a tool call, which is only delivered whole when finished.
+    ToolCall,
+}
+
 /// One normalized event from a streaming model call.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -36,6 +46,18 @@ pub enum StreamEvent {
     ToolCall {
         /// The requested invocation.
         call: crate::response::ToolCall,
+    },
+    /// The model is working but has produced nothing a person can read yet.
+    ///
+    /// Reasoning models think for a long time before the first word, and a model writing a large tool call sends nothing
+    /// until it is complete. Both are silent on the answer stream, which looks exactly like a hung connection. This says
+    /// the stream is alive and roughly how much it has done, so the console can show it. It carries no content, only a
+    /// count, and a consumer that does not care may ignore it.
+    Progress {
+        /// What the model is doing.
+        kind: ProgressKind,
+        /// Characters produced so far in this phase, for a rough sense of size (about four per token).
+        chars: u64,
     },
     /// Updated token usage, which may arrive more than once.
     Usage {
@@ -56,6 +78,7 @@ impl StreamEvent {
         match self {
             Self::Started => "started",
             Self::TextDelta { .. } => "text_delta",
+            Self::Progress { .. } => "progress",
             Self::ToolCall { .. } => "tool_call",
             Self::Usage { .. } => "usage",
             Self::Finished { .. } => "finished",
@@ -73,6 +96,7 @@ impl StreamEvent {
         match self {
             Self::Started => summary.started = true,
             Self::TextDelta { text } => summary.text.push_str(&text),
+            Self::Progress { .. } => {}
             Self::ToolCall { call } => summary.tool_calls.push(call),
             Self::Usage { usage } => summary.usage = Some(usage),
             Self::Finished { reason } => summary.finish_reason = Some(reason),

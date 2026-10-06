@@ -66,7 +66,9 @@ pub use request::{
 };
 pub use response::{ChatResponse, FinishReason, OutputContent, ToolCall};
 pub use scripted::{SCRIPTED_PROVIDER, ScriptedCancellation, ScriptedModel, Turn, scripted};
-pub use stream::{StreamEnvelope, StreamEvent, StreamEventError, StreamSummary, StreamValidator};
+pub use stream::{
+    ProgressKind, StreamEnvelope, StreamEvent, StreamEventError, StreamSummary, StreamValidator,
+};
 pub use usage::TokenUsage;
 pub use vector::{
     Embedding, EmbeddingDimensions, EmbeddingError, EmbeddingMetadata, EmbeddingVector,

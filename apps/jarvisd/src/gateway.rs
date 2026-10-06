@@ -60,7 +60,7 @@ pub use crate::run_service::RunService;
 ///
 /// Applied as a router layer so it covers every current and future route, rather than relying on
 /// each extractor to apply it correctly.
-pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 
 /// Shared state every route needs.
 #[derive(Clone)]

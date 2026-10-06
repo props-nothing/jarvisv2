@@ -34,7 +34,7 @@
 
   // ---- state --------------------------------------------------------------------------------------------------
   var S = {
-    session: null,
+    session: null, activity: "",
     offline: true, needYou: 0, working: 0, thinking: 0,
     listening: false, speaking: false, voiceBusy: false, preparing: false, voiceKind: "browser", level: 0, voiceLevel: 0,
     speak: localStorage.getItem("jarvis-speak") === "1",
@@ -233,12 +233,46 @@
     if (host.hidden) { renderChats(); host.hidden = false; } else closeChats();
   });
 
+  // What a tool call means in words, for the progress line: "writing app/page.tsx" says more than "Requested jarvis.files.write".
+  var VERBS = {
+    "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing",
+    "jarvis.web.fetch": "fetching a page", "jarvis.agent.delegate": "handing off a task", "jarvis.agent.result": "collecting a result",
+    "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code"
+  };
+  function describeCall(tool, target) {
+    var verb = VERBS[tool] || String(tool || "working").replace(/^jarvis\./, "");
+    return clip(target ? verb + " " + target : verb, 48);
+  }
+  function duration(seconds) {
+    if (seconds < 60) return seconds + "s";
+    return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
+  }
+  // Why a run stopped, in words a person can act on. The daemon sends a code and a message; the message alone ("the run
+  // failed") says nothing.
+  function explainFailure(code, message) {
+    if (code === "too_many_tool_calls" || code === "too_many_model_calls") return "It reached its safety ceiling for one task (a very large number of steps). Say \u201Ccontinue\u201D and it picks up where it stopped.";
+    if (code === "repeating_the_same_call") return "It got stuck repeating the same step, so I stopped it. Say \u201Ccontinue\u201D to try a different way.";
+    return message || "the run failed";
+  }
+
   function pendingAnswer() {
     var view = bubble("jarvis", "jarvis");
     view.body.classList.add("cursor");
     var text = "";
     var queued = false;
     var done = false;
+    // A line that keeps you informed during a long task: the step it is on, what it is doing, and how long it has been.
+    var status = el("div", "progress", "");
+    status.hidden = true;
+    view.node.insertBefore(status, view.chips);
+    var began = Date.now(), steps = 0, doing = "thinking";
+    function tick() {
+      if (done) return;
+      var seconds = Math.round((Date.now() - began) / 1000);
+      status.hidden = steps === 0 && seconds < 8;
+      status.textContent = (steps ? "step " + steps + " \u00B7 " : "") + doing + " \u00B7 " + duration(seconds);
+    }
+    var timer = setInterval(function () { if (done) clearInterval(timer); else tick(); }, 1000);
     function paint() {
       queued = false;
       if (done) return;
@@ -251,6 +285,12 @@
         text += piece;
         if (!queued) { queued = true; requestAnimationFrame(paint); }
       },
+      activity: function (label, isStep) {
+        if (isStep) steps += 1;
+        doing = label;
+        S.activity = label;
+        tick();
+      },
       chip: function (label, waiting) {
         // The same label twice (a stream can repeat it) is one chip.
         var existing = view.chips.children;
@@ -260,6 +300,10 @@
       },
       finish: function (final) {
         done = true;
+        clearInterval(timer);
+        S.activity = "";
+        if (steps > 0) { status.hidden = false; status.textContent = "done \u00B7 " + steps + " step" + (steps === 1 ? "" : "s") + " \u00B7 " + duration(Math.round((Date.now() - began) / 1000)); }
+        else status.hidden = true;
         if (typeof final === "string" && final.length) text = final;
         view.body.classList.remove("cursor");
         view.body.replaceChildren(markdown(text || "(no answer)"));
@@ -267,11 +311,21 @@
         scroll();
         return text;
       },
-      fail: function (message) {
+      fail: function (message, onContinue) {
         done = true;
+        clearInterval(timer);
+        S.activity = "";
+        status.hidden = steps === 0;
+        if (steps > 0) status.textContent = "stopped after " + steps + " step" + (steps === 1 ? "" : "s") + " \u00B7 " + duration(Math.round((Date.now() - began) / 1000));
         view.node.classList.add("error");
         view.body.classList.remove("cursor");
         view.body.replaceChildren(document.createTextNode(message));
+        if (onContinue) {
+          var again = el("button", "yes", "Continue");
+          again.addEventListener("click", function () { again.disabled = true; onContinue(); });
+          view.body.appendChild(document.createElement("br"));
+          view.body.appendChild(again);
+        }
         remember("system", message);
       }
     };
@@ -293,7 +347,7 @@
   var TERMINAL = { run_completed: 1, run_failed: 1, run_cancelled: 1 };
 
   async function follow(runId, view, talker) {
-    var last = 0, finished = false, attempts = 0, finalText = null, failure = null;
+    var last = 0, finished = false, attempts = 0, finalText = null, failure = null, failedCode = "";
     while (!finished && attempts < 4) {
       try {
         var headers = { Authorization: "Bearer " + token };
@@ -317,9 +371,17 @@
             var summary = (frame.body && frame.body.summary) || "";
             if (frame.event === "output_delta") { view.add(payload.text || ""); if (talker) feed(talker, payload.text || ""); }
             else if (frame.event === "output_completed") finalText = payload.text;
-            else if (frame.event === "tool_requested") view.chip(summary || "using a tool");
+            else if (frame.event === "tool_requested") { view.chip(summary || "using a tool"); view.activity(describeCall(payload.tool, payload.target), true); }
+            else if (frame.event === "activity_updated" && payload.phase) {
+              // The model is working but has said nothing yet (reasoning, or writing a large tool call): show that it is alive.
+              var size = Math.round((payload.chars || 0) / 4);
+              var amount = size >= 1000 ? (size / 1000).toFixed(1) + "k" : String(size);
+              view.activity((payload.phase === "reasoning" ? "thinking" : "writing a large call") + " (~" + amount + " tokens)", false);
+            }
+            else if (frame.event === "state_changed" && summary === "interpreting the tool result") view.activity("checking the result", false);
+            else if (frame.event === "state_changed" && summary === "calling the model") view.activity("thinking", false);
             else if (frame.event === "approval_requested") view.chip("waiting for your approval", true);
-            else if (frame.event === "run_failed") failure = summary || "the run failed";
+            else if (frame.event === "run_failed") { failure = explainFailure(payload.error_code, payload.message || summary); failedCode = payload.error_code || ""; }
             else if (frame.event === "run_cancelled") failure = "stopped";
             if (TERMINAL[frame.event]) finished = true;
           }
@@ -331,7 +393,9 @@
       if (!finished) attempts += 1;
     }
     if (failure) {
-      view.fail(failure === "stopped" ? "Stopped." : "That did not complete: " + failure);
+      var resumable = failure !== "stopped";
+      view.fail(failure === "stopped" ? "Stopped." : "That did not complete: " + failure,
+        resumable ? function () { send("Continue where you left off."); } : null);
       if (failure !== "stopped") feel("concerned", 3.5);
       if (talker) interruptSpeech();
       return null;
@@ -1502,7 +1566,7 @@
     var mode = uiState();
     var caption = $("caption");
     var preparing = S.voiceBusy && !S.speaking && !S.thinking && S.working === 0;
-    caption.textContent = preparing ? "preparing voice" : captions[mode];
+    caption.textContent = preparing ? "preparing voice" : mode === "working" && S.activity ? "working \u00B7 " + S.activity : captions[mode];
     caption.className = mode === "waiting" ? "wait" : mode === "idle" || mode === "offline" ? "" : "live";
     var link = $("pill-link");
     link.className = "pill " + (S.offline ? "bad" : "on");

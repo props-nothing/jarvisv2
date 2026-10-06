@@ -66,10 +66,10 @@ pub const EDIT_TOOL: &str = "jarvis.files.edit";
 ///
 /// A held call keeps its arguments so the owner can see them (`ADR-0130`), and a pending approval holds at most
 /// 8 KiB. Keeping a call under that keeps it **decidable**; a larger file is written in several appends.
-pub const MAX_WRITE_CHARS: usize = 4000;
+pub const MAX_WRITE_CHARS: usize = 60_000;
 
 /// The most characters of text to find in an edit.
-pub const MAX_EDIT_FIND_CHARS: usize = 2000;
+pub const MAX_EDIT_FIND_CHARS: usize = 20_000;
 
 /// The largest file an edit will read and rewrite. Larger is refused, never truncated.
 const MAX_EDITABLE_FILE_BYTES: u64 = 512 * 1024;
@@ -163,7 +163,7 @@ const WRITE_INPUT_SCHEMA: &str = r#"{
   "required": ["path", "content"],
   "properties": {
     "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "A file path relative to a granted workspace root. Missing folders are created." },
-    "content": { "type": "string", "maxLength": 4000, "description": "The text to write. Write a longer file in several appends." },
+    "content": { "type": "string", "maxLength": 60000, "description": "The text to write, up to 60000 characters in one call. For a longer file, append the rest in further calls." },
     "mode": { "type": "string", "enum": ["create", "append"], "description": "create (default) makes a NEW file and refuses if it exists; append adds to the end of a file, creating it if missing." }
   }
 }"#;
@@ -176,8 +176,8 @@ const EDIT_INPUT_SCHEMA: &str = r#"{
   "required": ["path", "find", "replace"],
   "properties": {
     "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "An existing file path relative to a granted workspace root." },
-    "find": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "The exact text to replace. It must occur exactly once; include surrounding lines to make it unique." },
-    "replace": { "type": "string", "maxLength": 4000, "description": "The text to put in its place (may be empty to delete the text)." }
+    "find": { "type": "string", "minLength": 1, "maxLength": 20000, "description": "The exact text to replace. It must occur exactly once; include surrounding lines to make it unique." },
+    "replace": { "type": "string", "maxLength": 60000, "description": "The text to put in its place (may be empty to delete the text)." }
   }
 }"#;
 
@@ -292,7 +292,7 @@ impl FilesystemTool {
                 description: "Creates a NEW text file inside a granted workspace root (mode create, the default, \
                               refuses if it exists), or appends text to the end of one (mode append). It never \
                               replaces existing content: use jarvis.files.edit to change a file. Missing folders are \
-                              created. At most 4000 characters per call; write a longer file in several appends.",
+                              created. Up to 60000 characters per call; append a longer file in parts.",
                 input: WRITE_INPUT_SCHEMA,
                 output: WRITE_OUTPUT_SCHEMA,
                 effect: ToolEffect::Write,

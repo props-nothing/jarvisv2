@@ -30,15 +30,19 @@ use super::transport::{
 /// Default time allowed to establish a connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default time allowed for a complete non-streaming request.
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default time allowed for one complete request, **including a streamed answer being written**.
+///
+/// It was 120 seconds, which is shorter than a model needs to write a large file or reason through a hard task, so a long
+/// generation was cut off mid-answer. Fifteen minutes is a ceiling against a hung connection, not a limit on how much a
+/// model may write; the stall bound below is what detects a dead stream.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(15);
 
 /// Default time allowed between streamed bytes.
 ///
 /// Bounds a stalled stream. A model that legitimately pauses before its first token
 /// can exceed a short value, so this is generous relative to the interval between
 /// tokens once generation begins.
-pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// The `reqwest`-backed transport.
 #[derive(Clone, Debug)]

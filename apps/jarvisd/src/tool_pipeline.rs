@@ -59,6 +59,20 @@ use jarvis_storage::{
 use serde_json::Value;
 
 use crate::tool_actor::ToolActor;
+
+/// The payload of a `tool_requested` event: the tool and its version, and, when the call names a file, which one.
+///
+/// The path lets the console say what is happening ("writing app/page.tsx") during a long run instead of repeating one tool
+/// name. Only a `path` string is copied, bounded, and nothing else from the arguments: other tools carry content (a memory, a
+/// piece of code, a URL with a query) that has no business in a progress line.
+fn requested_payload(tool: &str, version: &str, arguments: &Value) -> String {
+    let mut payload = serde_json::json!({ "tool": tool, "tool_version": version });
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        let shown: String = path.chars().take(160).collect();
+        payload["target"] = Value::String(shown);
+    }
+    payload.to_string()
+}
 use jarvis_tools::ToolId;
 use jarvis_tools::ToolOutcome;
 use jarvis_tools::ToolRegistry;
@@ -738,11 +752,7 @@ impl ToolPipeline {
             actor.run_id(),
             RunEventKind::ToolRequested,
             &format!("Requested {tool}"),
-            &format!(
-                r#"{{"tool":{},"tool_version":{}}}"#,
-                serde_json::Value::String(tool.to_owned()),
-                serde_json::Value::String(definition.version().to_owned())
-            ),
+            &requested_payload(tool, definition.version(), &arguments),
             correlation_id,
             UtcTimestamp::now(&SystemClock),
         )

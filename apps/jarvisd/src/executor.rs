@@ -44,8 +44,8 @@ use jarvis_core::{
     select_skills, skill_context_item,
 };
 use jarvis_models::{
-    ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, StreamEvent,
-    StreamValidator, ToolSpec,
+    ChatMessage, ChatRequest, FinishReason, ModelGateway, ModelId, Placement, ProgressKind,
+    StreamEvent, StreamValidator, ToolSpec,
 };
 use jarvis_storage::{
     DatabaseError, NewRunEvent, SqliteDatabase, StoredRun, TerminalTransition, append_run_event,
@@ -83,11 +83,10 @@ const PER_SOURCE_CAP_TOKENS: u32 = 4_096;
 /// and a model's context does not, so an unbounded replay is a request that eventually fails for a
 /// reason nothing in the run explains.
 ///
-/// Twelve rather than a larger number because each turn costs its full text, and the budget below is
-/// what actually constrains the request. When the budget cannot hold all twelve the assembler
-/// excludes the rest **with a recorded reason**, which is what makes a truncated history visible
-/// rather than silent.
-const MAX_HISTORY_TURNS: u32 = 12;
+/// Forty (it was twelve, which made a long conversation forget its own beginning). Each turn costs its full text, and the
+/// budget below is what actually constrains the request: when it cannot hold every turn the assembler excludes the
+/// oldest **with a recorded reason**, which is what makes a truncated history visible rather than silent.
+const MAX_HISTORY_TURNS: u32 = 40;
 
 /// Stored memories read as retrieval candidates for one model call.
 ///
@@ -135,22 +134,29 @@ const MODEL_MEMORY_TYPES: [MemoryType; 5] = [
     MemoryType::Procedural,
 ];
 
-/// Model calls allowed for one run before it is failed rather than looped.
+/// Model calls allowed for one run: a ceiling against a runaway, not a limit on how much work is allowed.
 ///
-/// A run is now an agent loop: the model may request a tool, the loop runs it through the policy
-/// pipeline, feeds the result back, and the model answers. The bound is what makes that loop
-/// **bounded** — a model that keeps requesting tools cannot spin forever, and a run that exhausted the
-/// budget is reported as failed rather than left open. Eight round trips is well above a typical
-/// request (one to decide, one to answer) and small enough that a pathological loop stops quickly and
-/// cheaply.
-const MAX_MODEL_CALLS: u32 = 8;
+/// A run is an agent loop: the model requests tools, the loop runs them through the policy pipeline, feeds the results
+/// back, and the model carries on. The original bound was eight, chosen for "one to decide, one to answer", and it failed a
+/// real request ("create a new Next.js app") at its sixteenth tool call, with the work nearly finished: building a project is
+/// dozens of steps. Real work needs room, so the ceilings are now large enough never to be met by honest work, and what stops
+/// a loop is something else: the repeat guard below (a model stuck on one call) and **you** (Stop, the kill switch, works at
+/// any time). The ceiling stays only so a pathological run cannot spend without end while nobody watches.
+const MAX_MODEL_CALLS: u32 = 400;
 
-/// Tool calls executed for one run before it is failed rather than looped.
+/// Tool calls executed for one run, a ceiling as above.
 ///
-/// Separate from the model-call bound because the two count different things: one model call may
-/// request several tools, so a single call could otherwise drive an unbounded number of executions. The
-/// bound is on **effects**, which is the quantity a runaway loop actually multiplies.
-const MAX_TOOL_CALLS: u32 = 16;
+/// Separate from the model-call bound because one model call may request several tools. The bound is on **effects**, which
+/// is the quantity a runaway loop actually multiplies.
+const MAX_TOOL_CALLS: u32 = 1_200;
+
+/// The same call (same tool, same arguments) this many times in a row is a loop, not progress.
+///
+/// At [`REPEAT_NUDGE`] the call is not run and the model is told it is repeating itself, which is usually enough for it to
+/// change approach; at [`REPEAT_FAIL`] the run is failed with a reason that names the problem, instead of burning the rest of
+/// the ceiling on one call.
+const REPEAT_NUDGE: u32 = 4;
+const REPEAT_FAIL: u32 = 7;
 
 /// Characters of a tool result carried back to the model.
 ///
@@ -159,6 +165,9 @@ const MAX_TOOL_CALLS: u32 = 16;
 /// and the elision is stated, so a model reading a short result knows it was cut rather than assuming
 /// the tool returned little.
 const MAX_TOOL_RESULT_CHARS: usize = jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS;
+
+/// How often a silent model call reports that it is still working.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Events read back when locating a run's completed answer.
 ///
@@ -468,6 +477,9 @@ struct RunLoopState {
     tool_calls: u32,
     /// Model calls performed so far, bounded by [`MAX_MODEL_CALLS`].
     model_calls: u32,
+    /// The previous tool call (name and arguments) and how many times in a row it has been made.
+    last_call: Option<String>,
+    repeats: u32,
     /// A call the run is parked on, consumed when the loop resumes.
     ///
     /// `Some` only when the loop was entered to **continue** a run whose held call has been decided —
@@ -481,6 +493,17 @@ impl RunLoopState {
     ///
     /// Returns `true` when the next call would exceed [`MAX_TOOL_CALLS`], so a caller fails the run
     /// rather than executing it.
+    /// Records a call and returns how many times in a row this exact call has now been made.
+    fn note_call(&mut self, fingerprint: String) -> u32 {
+        if self.last_call.as_deref() == Some(fingerprint.as_str()) {
+            self.repeats += 1;
+        } else {
+            self.last_call = Some(fingerprint);
+            self.repeats = 1;
+        }
+        self.repeats
+    }
+
     fn over_tool_budget(&mut self) -> bool {
         self.tool_calls += 1;
         self.tool_calls > MAX_TOOL_CALLS
@@ -1489,6 +1512,8 @@ async fn consume_stream(
     let mut stream = stream;
     let mut validator = StreamValidator::new();
     let mut text = String::new();
+    // Progress is recorded at most this often: it is for a person watching, not an audit of every token.
+    let mut last_progress: Option<std::time::Instant> = None;
 
     while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
         match item {
@@ -1502,6 +1527,24 @@ async fn consume_stream(
                         })?,
                         message: "the model stream violated its sequence contract".to_owned(),
                     }));
+                }
+                if let StreamEvent::Progress { kind, chars } = envelope.event()
+                    && last_progress.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY)
+                {
+                    last_progress = Some(std::time::Instant::now());
+                    let phase = match kind {
+                        ProgressKind::Reasoning => "reasoning",
+                        ProgressKind::ToolCall => "tool_call",
+                    };
+                    append(
+                        database,
+                        run,
+                        RunEventKind::ActivityUpdated,
+                        Some(phase),
+                        &format!(r#"{{"phase":"{phase}","chars":{chars}}}"#),
+                        correlation_id,
+                    )
+                    .await?;
                 }
                 if let StreamEvent::TextDelta { text: fragment } = envelope.event() {
                     text.push_str(fragment);
@@ -1832,25 +1875,34 @@ async fn run_tool_round(
             .await;
         }
 
-        let result_text = match parse_arguments(call.arguments()) {
-            Some(arguments) => {
-                match run_tool_call(tools, &actor, call.name(), &arguments).await {
-                    StepOutcome::Text(text) => text,
-                    // A held call stops the run here. The assistant turn is already in the transcript,
-                    // so the run's own stream explains that it asked and then parked.
-                    StepOutcome::Held => {
-                        return park_for_approval(database, run, correlation_id).await;
+        // The same call over and over is a loop, not progress: nudge the model, then stop the run with a reason.
+        let repeats = state.note_call(format!("{}\u{1f}{}", call.name(), call.arguments()));
+        if repeats >= REPEAT_FAIL {
+            return fail_repeating(database, run, correlation_id).await;
+        }
+        let result_text = if repeats >= REPEAT_NUDGE {
+            repeat_nudge(repeats)
+        } else {
+            match parse_arguments(call.arguments()) {
+                Some(arguments) => {
+                    match run_tool_call(tools, &actor, call.name(), &arguments).await {
+                        StepOutcome::Text(text) => text,
+                        // A held call stops the run here. The assistant turn is already in the transcript,
+                        // so the run's own stream explains that it asked and then parked.
+                        StepOutcome::Held => {
+                            return park_for_approval(database, run, correlation_id).await;
+                        }
                     }
                 }
+                // Arguments that are not a JSON object cannot be validated or authorized, so the tool is not
+                // run and the model is told why. This is fed back as the result rather than failing the run,
+                // because a malformed call is a model mistake the loop can recover from — the model sees the
+                // refusal and can correct itself.
+                None => format!(
+                    "error: the arguments for {} were not a JSON object and the tool was not run",
+                    call.name()
+                ),
             }
-            // Arguments that are not a JSON object cannot be validated or authorized, so the tool is not
-            // run and the model is told why. This is fed back as the result rather than failing the run,
-            // because a malformed call is a model mistake the loop can recover from — the model sees the
-            // refusal and can correct itself.
-            None => format!(
-                "error: the arguments for {} were not a JSON object and the tool was not run",
-                call.name()
-            ),
         };
 
         state.messages.push(ChatMessage::tool(
@@ -1864,6 +1916,34 @@ async fn run_tool_round(
     // the run interpret a result and decide to reason again, which is the tool round trip.
     let observed = observe_tools(database, run, correlation_id).await?;
     enter_planning(database, &observed, correlation_id).await
+}
+
+/// Fails a run that kept making the same call, with a reason that names the problem.
+async fn fail_repeating(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<StoredRun, DatabaseError> {
+    fail(
+        database,
+        run,
+        RunErrorCode::new("repeating_the_same_call").map_err(|_| {
+            DatabaseError::InvalidRunRequest {
+                field: "error_code",
+            }
+        })?,
+        "the run kept making the same call and was stopped",
+        correlation_id,
+    )
+    .await
+}
+
+/// What the model is told in place of running a call it has now made several times in a row.
+fn repeat_nudge(repeats: u32) -> String {
+    format!(
+        "error: this exact call has been made {repeats} times in a row with the same result, so it was not run again. \
+         Change approach, or finish and tell the user what is blocking you."
+    )
 }
 
 /// What running one tool step produced.
@@ -3618,6 +3698,113 @@ mod tests {
         );
     }
 
+    /// **Honest work is not cut off: a run can take far more than sixteen steps.**
+    ///
+    /// The old budget (8 model calls, 16 tool calls) failed a real request, "create a new Next.js app", at its sixteenth
+    /// tool call with the work nearly done. Thirty steps here, alternating two files so the repeat guard is not what is
+    /// being tested, must complete.
+    #[tokio::test]
+    async fn a_run_can_take_many_more_steps_than_the_old_budget() {
+        let (profile, database) = database().await;
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        std::fs::write(root.join("a.txt"), "alpha")
+            .unwrap_or_else(|error| panic!("write a.txt: {error}"));
+        std::fs::write(root.join("b.txt"), "beta")
+            .unwrap_or_else(|error| panic!("write b.txt: {error}"));
+
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "read both files many times").await;
+        let mut turns = Vec::new();
+        for step in 0..30 {
+            let name = if step % 2 == 0 { "a.txt" } else { "b.txt" };
+            turns.push(Turn::tool_call(
+                &format!("call_{step}"),
+                "jarvis.files.read",
+                &format!(r#"{{"path":"{name}"}}"#),
+            ));
+        }
+        turns.push(Turn::answer("Done."));
+        let model = model(turns);
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded),
+            "thirty tool calls is ordinary work and must not hit a budget: {:?}",
+            settled.error_code()
+        );
+    }
+
+    /// **A model stuck on one call is nudged, then stopped, with a reason that names the problem.**
+    ///
+    /// With the step ceilings raised, this guard is what ends a loop. The same call made four times in a row is not run
+    /// again and the model is told so; the seventh stops the run as `repeating_the_same_call`, not as a generic failure.
+    #[tokio::test]
+    async fn a_model_stuck_on_one_call_is_nudged_then_stopped() {
+        let (profile, database) = database().await;
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        std::fs::write(root.join("note.txt"), "the sky is blue")
+            .unwrap_or_else(|error| panic!("write the fixture file: {error}"));
+
+        let tools = filesystem_pipeline(&profile, &database, &root);
+        let run = start(&database, "read note.txt forever").await;
+        let turns: Vec<Turn> = (0..10)
+            .map(|step| {
+                Turn::tool_call(
+                    &format!("call_{step}"),
+                    "jarvis.files.read",
+                    r#"{"path":"note.txt"}"#,
+                )
+            })
+            .collect();
+        let model = model(turns);
+        let settled = execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Failed)
+        );
+        assert_eq!(settled.error_code(), Some("repeating_the_same_call"));
+
+        // The model was told, in place of a result, that the call was not run again.
+        let requests = model.seen_messages();
+        let last = requests
+            .last()
+            .unwrap_or_else(|| panic!("the model was called"));
+        let results: Vec<String> = last
+            .iter()
+            .filter(|message| message.role() == jarvis_models::Role::Tool)
+            .map(jarvis_models::ChatMessage::text)
+            .collect();
+        assert!(
+            results.iter().any(|text| text.contains("not run again")),
+            "the nudge must reach the model: {results:?}"
+        );
+        assert!(
+            results[..3]
+                .iter()
+                .all(|text| text.contains("the sky is blue")),
+            "the first calls ran normally: {results:?}"
+        );
+    }
     /// **A tool refusal is fed back so the model can answer truthfully, not so the run fails.**
     ///
     /// A model that asks for a tool it may not use is a normal event, not a fault. The loop tells the

@@ -208,6 +208,10 @@ pub(super) struct WireChatResponse {
 pub(super) struct WireDelta {
     #[serde(default)]
     pub(super) content: Option<String>,
+    /// Reasoning tokens, under the name Ollama and several hosts use (`reasoning`) or the one others use
+    /// (`reasoning_content`). Never shown or kept: only counted, so a long silent think is visible as progress.
+    #[serde(default, alias = "reasoning_content")]
+    pub(super) reasoning: Option<String>,
     #[serde(default)]
     pub(super) tool_calls: Vec<WireToolCall>,
 }

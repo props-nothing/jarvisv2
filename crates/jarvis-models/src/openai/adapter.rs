@@ -12,7 +12,7 @@ use crate::identity::{ModelId, ProviderId};
 use crate::port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
 use crate::request::{ChatMessage, ChatRequest};
 use crate::response::ChatResponse;
-use crate::stream::{StreamEnvelope, StreamEvent, StreamValidator};
+use crate::stream::{ProgressKind, StreamEnvelope, StreamEvent, StreamValidator};
 
 use super::config::{ApiKey, BaseUrl};
 use super::retry::RetryPolicy;
@@ -425,6 +425,9 @@ impl ModelGateway for OpenAiCompatibleProvider {
     }
 }
 
+/// How much reasoning or tool-call text accumulates between progress events.
+const PROGRESS_STEP_CHARS: u64 = 240;
+
 /// The state of one streaming response.
 struct StreamState {
     body: Box<dyn ResponseBody>,
@@ -438,6 +441,11 @@ struct StreamState {
     /// as a complete call.
     tool_calls: wire::WireToolAccumulator,
     sequence: u64,
+    /// Characters of reasoning, and of tool-call arguments, seen so far, and how many of each were last reported.
+    reasoning_chars: u64,
+    reasoning_reported: u64,
+    tool_chars: u64,
+    tool_reported: u64,
     /// A terminal event has been accepted.
     terminal: bool,
     /// The stream is over, whether by completion or by a reported error.
@@ -453,6 +461,10 @@ impl StreamState {
             pending: VecDeque::new(),
             tool_calls: wire::WireToolAccumulator::default(),
             sequence: 0,
+            reasoning_chars: 0,
+            reasoning_reported: 0,
+            tool_chars: 0,
+            tool_reported: 0,
             terminal: false,
             exhausted: false,
         }
@@ -500,11 +512,25 @@ impl StreamState {
             });
         }
 
+        // Reasoning is not kept or shown; it is counted, so a long silent think is visible as progress.
+        if let Some(reasoning) = delta.and_then(|delta| delta.reasoning.as_ref()) {
+            self.reasoning_chars += reasoning.chars().count() as u64;
+            self.report_progress(ProgressKind::Reasoning);
+        }
+
         // Tool-call fragments are accumulated rather than emitted. The provider finishes the turn
         // with a finish reason, and the reassembled invocations are emitted then — one event per
         // call — so a partially written invocation never reaches the domain layer.
         if let Some(fragments) = delta.map(|delta| delta.tool_calls.as_slice()) {
             self.tool_calls.observe(fragments);
+            self.tool_chars += fragments
+                .iter()
+                .filter_map(|fragment| fragment.function.as_ref()?.arguments.as_ref())
+                .map(|arguments| arguments.chars().count() as u64)
+                .sum::<u64>();
+            if !fragments.is_empty() {
+                self.report_progress(ProgressKind::ToolCall);
+            }
         }
 
         if let Some(usage) = chunk.usage.as_ref() {
@@ -526,6 +552,20 @@ impl StreamState {
         }
 
         Ok(())
+    }
+
+    /// Queues a progress event once enough has been produced since the last one, so a long silent stretch shows as a
+    /// steady count rather than one event per token.
+    fn report_progress(&mut self, kind: ProgressKind) {
+        let (seen, reported) = match kind {
+            ProgressKind::Reasoning => (self.reasoning_chars, &mut self.reasoning_reported),
+            ProgressKind::ToolCall => (self.tool_chars, &mut self.tool_reported),
+        };
+        if seen.saturating_sub(*reported) >= PROGRESS_STEP_CHARS {
+            *reported = seen;
+            self.pending
+                .push_back(StreamEvent::Progress { kind, chars: seen });
+        }
     }
 
     /// Handles the provider's done sentinel.

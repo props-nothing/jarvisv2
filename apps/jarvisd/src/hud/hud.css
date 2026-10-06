@@ -102,6 +102,7 @@ pre code { background: none; border: none; padding: 0; }
 .chip { font: 10px var(--mono); letter-spacing: 0.06em; padding: 1px 9px; border: 1px solid rgba(94, 227, 255, 0.4); color: var(--cyan); text-transform: uppercase; }
 .chip.wait { border-color: rgba(255, 180, 84, 0.55); color: var(--amber); }
 .chip.done { border-color: rgba(94, 255, 160, 0.55); color: #5effa0; }
+.progress { font: 11px var(--mono); letter-spacing: 0.06em; color: var(--amber); margin-bottom: 6px; }
 .chip.refused { border-color: rgba(255, 94, 94, 0.55); color: #ff5e5e; }
 
 #composer { display: flex; gap: 10px; padding: 10px 0 4px; }

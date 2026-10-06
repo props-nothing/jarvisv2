@@ -377,6 +377,63 @@ async fn a_complete_stream_yields_ordered_events_and_a_terminal_reason() {
     );
 }
 
+/// **A long silent think is visible as progress, and its text is never kept.**
+///
+/// A reasoning model (Ollama sends `reasoning`, other hosts `reasoning_content`) can think for minutes before its first
+/// word, and a model writing a large tool call sends nothing until it is whole. On the answer stream both look exactly like a
+/// hung connection. Each now yields a count-only `Progress` event; the reasoning itself is not in the answer, in the events,
+/// or anywhere else.
+#[tokio::test]
+async fn silent_reasoning_and_tool_writing_show_as_progress_without_leaking_the_text() {
+    let think = "x".repeat(300);
+    let write = "y".repeat(300);
+    let reasoning = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"\",\"reasoning\":\"{think}\"}}}}]}}\n\n"
+    );
+    let alias =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{think}\"}}}}]}}\n\n");
+    let writing = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"function\":{{\"name\":\"jarvis.files.write\",\"arguments\":\"{write}\"}}}}]}}}}]}}\n\n"
+    );
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        reasoning.leak().as_bytes(),
+        alias.leak().as_bytes(),
+        writing.leak().as_bytes(),
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        b"data: [DONE]\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+
+    let mut stream = provider.stream(request()).await.expect("stream starts");
+    let mut validator = StreamValidator::new();
+    let mut progress = Vec::new();
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+        let envelope = item.expect("a healthy stream");
+        if let jarvis_models::StreamEvent::Progress { kind, chars } = envelope.event() {
+            progress.push((*kind, *chars));
+        }
+        validator
+            .accept(envelope)
+            .expect("progress events are in order");
+    }
+    let summary = validator.finish().expect("the stream completed");
+
+    assert_eq!(
+        summary.text(),
+        "done",
+        "reasoning is not part of the answer"
+    );
+    assert_eq!(
+        progress,
+        vec![
+            (jarvis_models::ProgressKind::Reasoning, 300),
+            (jarvis_models::ProgressKind::Reasoning, 600),
+            (jarvis_models::ProgressKind::ToolCall, 300),
+        ],
+        "each silent stretch reports a running count"
+    );
+}
 #[tokio::test]
 async fn several_events_in_one_network_chunk_are_all_delivered() {
     // A fast provider (a local Ollama proxying a cloud model was the one that exposed this) writes many events
