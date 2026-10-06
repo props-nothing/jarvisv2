@@ -172,7 +172,7 @@ const MAX_TOOL_RESULT_CHARS: usize = jarvis_tools::MAX_MODEL_FACING_RESULT_CHARS
 /// how to style a page, with no output at all. That is not a limit on how hard a task may be (this is generous, a few
 /// thousand words of thought), it is a cut-off for a model that has lost the thread. When it is reached the call is dropped and
 /// made again once with the reasoning turned down and a nudge to take the next concrete step.
-const REASONING_BUDGET_CHARS: u64 = 80_000;
+const REASONING_BUDGET_CHARS: u64 = 40_000;
 
 /// What the model is told when its reasoning ran past the budget.
 const ACT_NOW: &str = "You have spent a very long time reasoning without acting. Stop deliberating. Take the next concrete step \
@@ -492,6 +492,9 @@ struct RunLoopState {
     tool_calls: u32,
     /// Model calls performed so far, bounded by [`MAX_MODEL_CALLS`].
     model_calls: u32,
+    /// Reasoning effort for the rest of the run once a call has overrun its budget: a model that rambled once will again, so
+    /// every later call is asked to think less rather than being cut off each time.
+    reasoning_effort: Option<ReasoningEffort>,
     /// The previous tool call (name and arguments) and how many times in a row it has been made.
     last_call: Option<String>,
     repeats: u32,
@@ -1689,7 +1692,7 @@ async fn generate(
         run,
         &specs,
         state.messages.clone(),
-        None,
+        state.reasoning_effort,
         correlation_id,
     )
     .await?;
@@ -1707,6 +1710,7 @@ async fn generate(
             correlation_id,
         )
         .await?;
+        state.reasoning_effort = Some(ReasoningEffort::Low);
         let mut nudged = state.messages.clone();
         nudged.push(ChatMessage::user(ACT_NOW));
         attempt = call_model(

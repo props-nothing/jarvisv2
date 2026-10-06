@@ -393,6 +393,7 @@
             }
             else if (frame.event === "activity_updated" && payload.phase) {
               // The model is working but has said nothing yet (reasoning, or writing a large tool call): show that it is alive.
+              if (payload.phase === "reasoning_limit") { view.activity("it was thinking too long, so I asked it to act", false); continue; }
               var size = Math.round((payload.chars || 0) / 4);
               var amount = size >= 1000 ? (size / 1000).toFixed(1) + "k" : String(size);
               view.activity((payload.phase === "reasoning" ? "thinking" : "writing a large call") + " (~" + amount + " tokens)", false);
