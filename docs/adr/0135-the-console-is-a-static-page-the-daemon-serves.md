@@ -1,6 +1,6 @@
 # ADR-0135: The console is a static page the daemon serves, and it is where you talk, watch, answer and stop
 
-Status: Accepted
+Status: Accepted (layout superseded by ADR-0141: the face is the page, the dashboard is the Ops page)
 Date: 2026-10-03 (amended 2026-10-06)
 
 ## Context

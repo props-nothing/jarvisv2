@@ -7050,6 +7050,14 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   "Denied ...", or a failure), and the "waiting for your approval" chip turns to "approved" or "denied"; before, only a hint under the
   box changed. Checked live with a held `jarvis.web.fetch` and with Keep.
   Not done: keeping a proposal by voice ("Jarvis, keep that") or in one terminal step.
+- [x] `P9-025` The console is a face with a conversation (ADR-0141). The face fills the page and is no longer steered by the pointer: it
+  has a mind of its own (expressions that change by themselves, saccades with the head following, irregular and double blinks, head
+  wander, breathing, sighs, dozing off), reacts to listening, working, speaking (mood of the answer, beats of the voice), waiting and
+  offline, and to events (nod and smile on approve, shake on deny or stop, concern on failure). The head rig gained eye lids, a smile
+  and frown, and independent inner/outer brows. The chat is a panel on the right; the dashboard moved to an Ops page (`O`); approvals
+  and "remember?" cards sit in a tray at the bottom left of the face page. Checked live in the browser (idle, amused, concerned, the
+  approval tray with Approve and Deny). Not done: the face has no ears for the room (it does not turn toward a speaker), and the
+  expressions are tuned by eye on one mesh, not tested.
 - [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

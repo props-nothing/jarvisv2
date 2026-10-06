@@ -74,8 +74,12 @@ default.
 
 ## Using it
 
-- **The console** (opened for you; `jarvis hud` opens it again): talk or type, watch what it is doing, answer anything it asks with
-  one click, **Stop** a run or everything, and see which tools it can use and which it asks about first.
+- **The console** (opened for you; `jarvis hud` opens it again) is a face with a conversation beside it. The face is the page: it has a
+  mind of its own (it looks about, changes expression, blinks, nods off after a long quiet) and reacts to what is happening: it
+  listens, thinks, speaks with the voice, looks worried when something fails and pleased when you approve. Type or talk in the panel on
+  the right. Anything that needs a yes or no appears at the bottom left of the face, with Approve and Deny. **Ops** (or press `O`) opens
+  the operations page: what is running, scheduled and recent, and which tools it can use and which it asks about first. **Stop everything**
+  is always in the header.
 - **Voice:** the microphone button (or `M`) to talk; turn on **Speak answers**; enable the **wake word** and say "Jarvis, ...".
   "Jarvis, stop" cancels everything. Voice recognition is your browser's (Chrome or Edge).
 - **The terminal:** `jarvis chat`, `jarvis ask "..."`, `jarvis watch`, `jarvis approvals`, `jarvis cancel --all`, `jarvis runs`,
