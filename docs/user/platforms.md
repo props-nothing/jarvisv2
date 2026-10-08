@@ -21,6 +21,10 @@ on a server with no screen, and what is still missing. It is deliberately specif
 "Run end to end by a person" is the honest gap: the Linux and macOS code paths compile and lint cleanly and their tests run in CI, but
 nobody has used JARVIS on a real Linux box or Mac yet. Treat the first run there as a test and report what you find (`P9-022`).
 
+The first release workflow run built all five archives on GitHub; its smoke test (unpack, run `jarvis version` and `jarvisd --version`) failed
+on every platform because of a shell glob in the script itself, since fixed and verified by packaging and running the Windows archive locally.
+macOS is the one CI job still red: the Phase 3 gate (a real daemon and an MCP child process) fails there for a reason not yet read.
+
 What running the tests on real Linux and macOS runners has already found (and fixed): a socket path longer than macOS allows
 (103 bytes) failed at bind with a message that named nothing, so JARVIS now refuses it by name and says to use `--root` with a short
 directory; a sandbox test that assumed a delegated cgroup on any Linux host; and three tests that used Windows-style paths. None of

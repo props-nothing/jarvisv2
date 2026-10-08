@@ -7092,8 +7092,28 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   environment variable: JARVIS_MODEL_KEY)", the daemon stay down and the console read "offline". Unknown `JARVIS_*` variables are now
   ignored (the prefix is not ours alone) and named, never with values, by `jarvis doctor --live` and the daemon log; a variable JARVIS
   does define with a bad value is still an error. Tests: an unknown variable is ignored, only names are reported, a bad value for a known
-  one still fails.
-- [ ] `P9-024` Give the model more to do. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  one still fails. **Second half, found by the phase 1 gate on this machine two days later:** a fresh install with *no config file* still
+  took the strict path (`load_with_environment` applied the environment directly), so the stray variable still stopped a first run; fixed
+  with a test for the missing-file case. Also learned: the gates use a prebuilt `jarvisd`, so a gate run before `cargo build --workspace`
+  tests the old daemon.
+- [x] `P9-029` CI after the limits push (run 131): Windows and Ubuntu green. Release workflow (run 7) built all five archives but every smoke test
+  failed: `ls dist/*.zip` exits 2 when nothing matches and `pipefail` turned that into a failed step (now `find`); `package-release.sh` used
+  `Compress-Archive` without 7z, which writes backslash paths (now Windows' bsdtar); verified locally by packaging, unzipping and running both
+  programs. macOS failed the Phase 3 gate with no readable reason (job logs need a login), so `scripts/ci-run-gate.sh` now copies the panic
+  message into `::error::` annotations for the three process-level gates. Still open: the macOS Phase 3 failure itself, until the next run
+  shows its message.
+- [x] `P9-030` A request with a line break no longer breaks a run, and a run that cannot continue is no longer left open. Found live while
+  asking JARVIS to fix a build error pasted into a request: the newline made the context's one-line source reference invalid, the run failed
+  before any model call, and nothing settled it, so it sat in `context_building` for good while the console said "working". The reference
+  now collapses whitespace (the objective itself is untouched), and `fail_if_unfinished` settles any run the executor gives up on as
+  `executor_error` with the reason, for runs and sub-agents. Tests: a multi-line objective is answered and the model receives it intact; an
+  abandoned run is failed, a finished one is not touched. **Live end to end:** the same limits work as intended: "create a Next.js app" now
+  completes in about 2.5 minutes (it failed at 16 calls before), JARVIS wrote 12 files in Dutch, the site failed `next build`
+  (`styled-jsx` in a server component), a pasted error got three approved edits, and the rebuilt site builds (8 static pages).
+  **What this shows is missing:** JARVIS cannot run a build or a test, so it cannot catch its own mistake. That is the next thing to build
+  (`P9-024`: a command-running tool, which needs a decision on where it may run, since `jarvis.code.run` needs Docker).
+- [ ] `P9-024` Give the model more to do. The most valuable next tool is **running a command in a granted folder** (`npm run build`, `cargo
+  test`) with its output fed back, so a coding task can verify itself; today only Docker-isolated snippets run code. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

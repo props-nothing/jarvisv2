@@ -2555,9 +2555,49 @@ fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// Builds a bounded source reference for an objective.
+///
+/// The reference is a one-line pointer, and the context contract refuses control characters in it. An objective is arbitrary
+/// text, and a request with a line break in it (pasted code, an error message, a list) used to be refused here, which failed
+/// the run before the model was called and, worse, left it open (see `fail_if_unfinished`). Whitespace of every kind is
+/// collapsed to single spaces and any other control character is dropped; only the reference is changed, never the objective.
 fn objective_reference(objective: &str) -> String {
-    let bounded = truncate(objective, MAX_OBJECTIVE_REFERENCE_CHARS);
+    let flat: String = objective
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let bounded = truncate(&flat, MAX_OBJECTIVE_REFERENCE_CHARS);
     format!("objective:{bounded}")
+}
+
+/// Settles a run as failed when the executor gave up on it without settling it.
+///
+/// `execute_run_with_tools` returns an error when it cannot persist its progress. Nothing settled the run then, so it stayed
+/// open (`context_building`, forever) while the console showed "working" and the caller saw no error at all. The reason is
+/// recorded now and the run is failed with a code a person can act on. A run that is already settled is left alone.
+pub async fn fail_if_unfinished(database: &Arc<SqliteDatabase>, run_id: &str, reason: &str) {
+    let Ok(run) = find_run(database, run_id).await else {
+        return;
+    };
+    if run.state().is_terminal() {
+        return;
+    }
+    let Ok(code) = RunErrorCode::new("executor_error") else {
+        return;
+    };
+    if let Err(error) = fail(
+        database,
+        &run,
+        code,
+        &format!("the run could not continue: {reason}"),
+        CorrelationId::new(),
+    )
+    .await
+    {
+        tracing::error!(run_id, %error, "a run that could not continue could not be settled either");
+    }
 }
 
 /// Truncates text to a character bound, preserving the beginning.
@@ -3874,6 +3914,67 @@ mod tests {
                 .iter()
                 .all(|text| text.contains("the sky is blue")),
             "the first calls ran normally: {results:?}"
+        );
+    }
+    /// **A request with line breaks in it is answered, and the model gets it exactly as written.**
+    ///
+    /// Found live: an objective containing a newline (an error message pasted into a request) was refused while the context's
+    /// one-line source reference was built, the run failed before any model call, and (see the next test) it was left open.
+    #[tokio::test]
+    async fn an_objective_with_line_breaks_is_answered_unchanged() {
+        let (_profile, database) = database().await;
+        let objective = "Fix this error:\nTypeError: x is not a function\n\tat main (app.ts:3)\r\nthen tell me what changed";
+        let run = start(&database, objective).await;
+        let model = model(vec![Turn::answer("Fixed.")]);
+        let settled =
+            execute_run_with_tools(&database, &model, &fixture_model_id(), None, run.id())
+                .await
+                .unwrap_or_else(|error| panic!("a multi-line request must run: {error}"));
+        assert_eq!(
+            settled.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+        let seen = model.seen_messages();
+        assert!(
+            seen[0].iter().any(|message| message
+                .text()
+                .contains("TypeError: x is not a function\n\tat main")),
+            "the model must receive the objective with its line breaks intact"
+        );
+        assert!(!objective_reference(objective).chars().any(char::is_control));
+    }
+
+    /// **A run the executor gave up on is failed with a reason, not left open forever.**
+    ///
+    /// `execute_run_with_tools` returns an error when it cannot persist its progress, and nothing settled the run: it sat in
+    /// `context_building` while the console said "working". Settled runs are left alone.
+    #[tokio::test]
+    async fn a_run_the_executor_gave_up_on_is_failed_with_a_reason() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "something").await;
+        fail_if_unfinished(&database, run.id(), "the agent run objective is invalid").await;
+        let after = find_run(&database, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("read the run: {error}"));
+        assert_eq!(
+            after.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Failed)
+        );
+        assert_eq!(after.error_code(), Some("executor_error"));
+
+        // A run that already finished is not touched: a late error must not rewrite what happened.
+        let done = start(&database, "finished").await;
+        let model = model(vec![Turn::answer("Done.")]);
+        execute_run_with_tools(&database, &model, &fixture_model_id(), None, done.id())
+            .await
+            .unwrap_or_else(|error| panic!("run: {error}"));
+        fail_if_unfinished(&database, done.id(), "late").await;
+        let still = find_run(&database, done.id())
+            .await
+            .unwrap_or_else(|error| panic!("read the run: {error}"));
+        assert_eq!(
+            still.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
         );
     }
     /// **A file of tens of thousands of characters is written in one call.**

@@ -356,6 +356,7 @@ impl AgentTool {
             .await
             {
                 tracing::error!(run_id, error = %error, "a sub-agent could not persist its progress");
+                crate::executor::fail_if_unfinished(&database, &run_id, &error.to_string()).await;
             }
         });
 

@@ -830,7 +830,7 @@ impl ConfigStore {
         match inspect_config_file(&self.path)? {
             ConfigFileState::Missing => {
                 let mut config = Config::default();
-                apply_environment(&mut config, environment)?;
+                apply_environment(&mut config, recognized_environment(environment))?;
                 config.validate()?;
                 Ok(LoadedConfig {
                     config,
@@ -2064,6 +2064,36 @@ shutdown_timeout_seconds = 20
         assert_eq!(loaded.config().profile().name(), "default");
         assert_eq!(loaded.config().logging().level(), LogLevel::Warn);
         assert!(!store.path().exists());
+    }
+
+    /// **A first run, with no config file yet, is not stopped by another program's `JARVIS_*` variable.**
+    ///
+    /// The strict path was fixed for a present file and missed here: a fresh install with a stray `JARVIS_MODEL_KEY` in the
+    /// environment still failed to start, the one moment a person has no config to fix. Found by the phase 1 gate, which starts
+    /// a daemon on an empty root.
+    #[test]
+    fn config_store_missing_file_ignores_a_stray_prefixed_variable() {
+        let test_directory = TestDirectory::new();
+        let store = test_directory.store();
+
+        let loaded = store
+            .load_with_environment([
+                ("JARVIS_MODEL_KEY", "someone-elses-secret"),
+                ("JARVIS_LOG_LEVEL", "warn"),
+            ])
+            .unwrap_or_else(|error| panic!("a stray variable must not stop a first run: {error}"));
+
+        assert_eq!(
+            loaded.config().logging().level(),
+            LogLevel::Warn,
+            "a real override still applies"
+        );
+        assert!(
+            store
+                .load_with_environment([("JARVIS_LOG_LEVEL", "loud")])
+                .is_err(),
+            "a bad value for a real override is still refused"
+        );
     }
 
     #[test]

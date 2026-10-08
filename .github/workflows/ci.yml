@@ -177,7 +177,7 @@ jobs:
           ACCEPTANCE_REQUIRE_BINARIES: "1"
         run: |
           cargo build --workspace --all-features --locked
-          cargo test -p jarvis-acceptance --test phase1_gate --locked -- --nocapture
+          bash scripts/ci-run-gate.sh phase1_gate
       - name: Phase 2 acceptance gate
         # Same shape as the Phase 1 gate, and the build is repeated deliberately: a
         # stale `jarvisd` beside the test binary would let the gate pass against code
@@ -187,7 +187,7 @@ jobs:
           ACCEPTANCE_REQUIRE_BINARIES: "1"
         run: |
           cargo build --workspace --all-features --locked
-          cargo test -p jarvis-acceptance --test phase2_gate --locked -- --nocapture
+          bash scripts/ci-run-gate.sh phase2_gate
       - name: Phase 3 acceptance gate
         # The Phase 3 gate needs a second artifact: `fixture-peer`, the hand-written MCP
         # server it configures as a real child process. `--all-features` builds it, and
@@ -200,7 +200,7 @@ jobs:
           ACCEPTANCE_REQUIRE_FIXTURE_PEER: "1"
         run: |
           cargo build --workspace --all-features --locked
-          cargo test -p jarvis-acceptance --test phase3_gate --locked -- --nocapture
+          bash scripts/ci-run-gate.sh phase3_gate
 
   dependency-policy:
     name: Dependency policy

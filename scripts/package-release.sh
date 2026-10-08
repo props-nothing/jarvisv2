@@ -54,7 +54,8 @@ if [ "$kind" = "zip" ]; then
   if command -v 7z >/dev/null 2>&1; then
     (cd dist && 7z a -tzip -bso0 "$name.zip" "$name")
   else
-    powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist/$name' -DestinationPath 'dist/$name.zip' -Force"
+    # Windows' own bsdtar writes a portable zip; `Compress-Archive` on Windows PowerShell 5 writes backslash paths that other tools warn about.
+    "${SYSTEMROOT:-C:/Windows}/System32/tar.exe" -a -c -f "dist/$name.zip" -C dist "$name"
   fi
 else
   tar -C dist -czf "dist/$name.tar.gz" "$name"

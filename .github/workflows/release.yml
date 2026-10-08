@@ -101,7 +101,8 @@ jobs:
         shell: bash
         run: |
           rm -rf smoke && mkdir smoke
-          archive="$(ls dist/*.tar.gz dist/*.zip 2>/dev/null | head -n 1)"
+          # `find`, not `ls dist/*.zip`: a glob that matches nothing makes `ls` exit 2, which `pipefail` turns into a failed step.
+          archive="$(find dist -maxdepth 1 \( -name '*.tar.gz' -o -name '*.zip' \) | head -n 1)"
           case "$archive" in
             *.zip) (cd smoke && unzip -q "../$archive" || 7z x -bso0 "../$archive") ;;
             *) tar -C smoke -xzf "$archive" ;;

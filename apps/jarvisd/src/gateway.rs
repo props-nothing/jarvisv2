@@ -204,6 +204,7 @@ impl GatewayState {
                     error = %error,
                     "the run executor could not persist its progress"
                 );
+                crate::executor::fail_if_unfinished(&database, &run_id, &error.to_string()).await;
             }
         });
     }
