@@ -50,7 +50,7 @@ thiserror.workspace = true
 # `unfold` builds the SSE stream without a generator macro, so the stream type stays a plain
 # `Stream` impl and no `async-stream` dependency is introduced for one call site.
 futures-util.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

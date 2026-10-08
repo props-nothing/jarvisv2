@@ -12,6 +12,7 @@ mod paths;
 mod pgvector;
 mod run_event_repository;
 mod run_repository;
+mod run_transcript_repository;
 mod session_repository;
 mod summary_repository;
 
@@ -76,6 +77,9 @@ pub use run_repository::{
     INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition, create_run,
     find_run, read_recent_runs, recover_interrupted_runs, request_run_cancellation,
     settle_parked_run_cancelled, settle_run, transition_run, withdraw_cancelled_run_approvals,
+};
+pub use run_transcript_repository::{
+    MAX_RUN_TRANSCRIPT_BYTES, delete_run_transcript, load_run_transcript, save_run_transcript,
 };
 pub use schedule_repository::{
     StoredSchedule, claim_due_schedules, create_schedule, delete_schedule, find_schedule,

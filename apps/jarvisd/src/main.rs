@@ -2,6 +2,7 @@
 
 mod build_info;
 mod code_run;
+mod command_run;
 mod control;
 mod delegate;
 mod dispatch;
@@ -154,6 +155,13 @@ enum DaemonError {
         /// Which part was rejected, named by the variant.
         #[source]
         source: crate::code_run::CodeRunToolError,
+    },
+    /// The command-running tool could not state its own contract.
+    #[error("the command-running tool could not be defined")]
+    CommandRunTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::command_run::CommandRunToolError,
     },
     /// The configured workspace policy was self-contradictory.
     ///
@@ -722,6 +730,7 @@ async fn compose_tools(
         ),
     ];
     push_code_tool(config, &mut additional)?;
+    push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
     let agent = executor.map(|executor| {
         Arc::new(crate::delegate::AgentTool::new(
@@ -752,6 +761,48 @@ async fn compose_tools(
         agent.bind(pipeline);
     }
     Ok((mcp, tools))
+}
+
+/// Adds the command-running tool to the composition, when a folder has been granted.
+///
+/// Composed **only** when there is a granted folder to run in, for the reason the filesystem adapter is: a tool offered with
+/// nowhere to work would fail every call, which a model reads as a broken tool rather than an absent one. It is held for the
+/// owner by default (`ADR-0143`), so offering it grants the model nothing until a person decides.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::CommandRunTool`] when the tool's own contract is rejected.
+fn push_command_tool(
+    config: &jarvis_storage::Config,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
+    let roots = config.daemon().tool_workspace_roots();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<std::path::PathBuf> = roots.iter().map(std::path::PathBuf::from).collect();
+    match crate::command_run::CommandRunTool::new(&paths) {
+        Ok(tool) => {
+            additional.push((
+                vec![
+                    crate::command_run::CommandRunTool::definition()
+                        .map_err(|source| DaemonError::CommandRunTool { source })?,
+                ],
+                Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+            ));
+            tracing::info!("the command-running tool is available");
+        }
+        Err(crate::command_run::CommandRunToolError::NoFolders) => {
+            tracing::warn!(
+                "no granted folder could be resolved, so the command-running tool is not offered"
+            );
+        }
+        Err(source) => return Err(DaemonError::CommandRunTool { source }),
+    }
+    Ok(())
 }
 
 /// Adds the code-running tool to the composition, when it is configured and this host can run it.

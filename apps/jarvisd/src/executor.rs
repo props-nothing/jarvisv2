@@ -198,7 +198,8 @@ Use the tools you are offered when they are needed, and base your answer on thei
 Do not claim to have performed actions you did not perform: if a tool is unavailable or fails, say so. \
 For a task with several steps, first say in one short sentence what you are about to do, then keep the user informed with a \
 one-line status in plain words whenever you finish a stage (what is done, what is next). Think briefly and start acting rather \
-than planning at length.";
+than planning at length. When you write or change code and a command tool is offered, run the project's build or tests with it \
+and fix what fails before you tell the user it is finished; do not claim code works that you have not run.";
 
 /// Maximum characters of an error message copied into an event payload.
 ///
@@ -495,6 +496,8 @@ struct RunLoopState {
     /// Reasoning effort for the rest of the run once a call has overrun its budget: a model that rambled once will again, so
     /// every later call is asked to think less rather than being cut off each time.
     reasoning_effort: Option<ReasoningEffort>,
+    /// How many messages the assembled context has, so everything after is the run's own turns (what a parked run keeps).
+    base_len: usize,
     /// The previous tool call (name and arguments) and how many times in a row it has been made.
     last_call: Option<String>,
     repeats: u32,
@@ -717,6 +720,7 @@ async fn drive_run(
                 // The assembled request is held across the loop rather than rebuilt in `generate`,
                 // because the manifest is the record of what was selected for **this** call.
                 state.messages = assemble_context_messages(deps, &current, correlation_id).await?;
+                state.base_len = state.messages.len();
                 enter_planning(database, &current, correlation_id).await?
             }
             RunState::Planning => enter_execution(database, &current, correlation_id).await?,
@@ -1880,18 +1884,9 @@ async fn run_tool_round(
         requested.to_vec(),
     ));
 
-    // The actor's authority is derived from the tools the daemon composed, so a model's call is authorized
-    // exactly when the tool it named is part of this daemon's surface. That is what makes `P4-014`'s
-    // `jarvis.memory.propose` reachable: a hand-written grant list omitted `memory.propose`, so the tool was
-    // registered, offered to the model, and refused for every call with `MissingScope`. Deriving it also means a
-    // newly registered adapter is reachable the moment it is composed, rather than when somebody remembers to
-    // widen a list.
-    //
-    // A failure to read the definitions is a composition fault the daemon reports at startup, so it settles the
-    // run as a failure naming the surface rather than as an authorization refusal.
-    let composed_definitions = match tools.definitions() {
-        Ok(definitions) => definitions,
-        Err(error) => {
+    let actor = match tool_actor_for(tools, run) {
+        Ok(actor) => actor,
+        Err(message) => {
             return fail(
                 database,
                 run,
@@ -1900,37 +1895,16 @@ async fn run_tool_round(
                         field: "error_code",
                     }
                 })?,
-                format!("the daemon's tool surface could not be read: {error}").as_str(),
+                &message,
                 correlation_id,
             )
             .await;
         }
     };
-    // A sub-agent's authority is derived from the surface **without** the delegation tools, so a call it makes
-    // to one anyway (a name it was never offered) is refused for a missing scope rather than run.
-    let sub_agent = crate::delegate::is_delegated_objective(run.objective());
-    let composed_definitions: Vec<_> = composed_definitions
-        .into_iter()
-        .filter(|definition| {
-            !(sub_agent
-                && definition
-                    .id()
-                    .to_string()
-                    .starts_with(crate::delegate::AGENT_TOOL_PREFIX))
-        })
-        .collect();
-    let actor = crate::tool_actor::ToolActor::for_composed_tools(
-        run.workspace_id(),
-        run.id(),
-        SessionChannel::Cli,
-        "policy-1",
-        &composed_definitions,
-    );
-
     // Each call is executed in order. A single held call parks the whole run: the effect did not happen,
     // so nothing is fed back, and the approval and resume routes complete it — which keeps the executor
     // from holding a promise `security.md` assigns to those routes.
-    for call in requested {
+    for (position, call) in requested.iter().enumerate() {
         if state.over_tool_budget() {
             return fail(
                 database,
@@ -1961,6 +1935,16 @@ async fn run_tool_round(
                         // A held call stops the run here. The assistant turn is already in the transcript,
                         // so the run's own stream explains that it asked and then parked.
                         StepOutcome::Held => {
+                            // Keep what this run has done so far, so the model can carry on when the owner answers
+                            // instead of starting the task again (`ParkedTranscript`).
+                            keep_parked_transcript(
+                                database,
+                                run,
+                                state,
+                                call.id(),
+                                &requested[position + 1..],
+                            )
+                            .await;
                             return park_for_approval(database, run, correlation_id).await;
                         }
                     }
@@ -1987,6 +1971,160 @@ async fn run_tool_round(
     // the run interpret a result and decide to reason again, which is the tool round trip.
     let observed = observe_tools(database, run, correlation_id).await?;
     enter_planning(database, &observed, correlation_id).await
+}
+
+/// The authority a model's tool calls run under, derived from the tools the daemon composed.
+///
+/// So a model's call is authorized exactly when the tool it named is part of this daemon's surface. That is what makes
+/// `P4-014`'s `jarvis.memory.propose` reachable: a hand-written grant list omitted `memory.propose`, so the tool was registered,
+/// offered to the model, and refused for every call with `MissingScope`. Deriving it also means a newly registered adapter is
+/// reachable the moment it is composed, rather than when somebody remembers to widen a list.
+///
+/// A sub-agent's authority is derived from the surface **without** the delegation tools, so a call it makes to one anyway (a
+/// name it was never offered) is refused for a missing scope rather than run.
+///
+/// # Errors
+///
+/// Returns a message when the tool surface cannot be read: a composition fault the daemon reports at startup, so it settles the
+/// run as a failure naming the surface rather than as an authorization refusal.
+fn tool_actor_for(
+    tools: &Arc<ToolPipeline>,
+    run: &StoredRun,
+) -> Result<crate::tool_actor::ToolActor, String> {
+    let definitions = tools
+        .definitions()
+        .map_err(|error| format!("the daemon's tool surface could not be read: {error}"))?;
+    let sub_agent = crate::delegate::is_delegated_objective(run.objective());
+    let definitions: Vec<_> = definitions
+        .into_iter()
+        .filter(|definition| {
+            !(sub_agent
+                && definition
+                    .id()
+                    .to_string()
+                    .starts_with(crate::delegate::AGENT_TOOL_PREFIX))
+        })
+        .collect();
+    Ok(crate::tool_actor::ToolActor::for_composed_tools(
+        run.workspace_id(),
+        run.id(),
+        SessionChannel::Cli,
+        "policy-1",
+        &definitions,
+    ))
+}
+/// What a run that is waiting for the owner keeps, so it can continue where it stopped.
+///
+/// The in-run turns (the assistant turn that asked for tools, and the result of each call) live in memory. The resume path used
+/// to re-assemble the context from the stored conversation and append the one approved result, which lost every in-run turn:
+/// after each approval the model had forgotten what it had read, written and run, and began the task again (in one session it
+/// approved the same `npm run build` fourteen times). Stored on every park and read when the run resumes, this puts the model
+/// back where it was, with a result for **every** call in the turn the provider is waiting on: the real outcome for the
+/// call that was held and, for any call after it in the same turn (which never ran), an honest "not run".
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ParkedTranscript {
+    /// The messages added since the context was assembled, ending with the assistant turn that asked.
+    messages: Vec<ChatMessage>,
+    /// The provider's id of the call that is waiting for the owner.
+    held: String,
+    /// The provider's ids of calls in the same turn that were not run because that one was held.
+    unrun: Vec<String>,
+}
+
+/// The most JSON bytes of transcript kept (the table allows 1 MiB; this leaves room for the rest of the document).
+const MAX_PARKED_TRANSCRIPT_BYTES: usize = 900_000;
+
+/// The note placed first when the oldest turns had to be dropped to fit.
+const TRANSCRIPT_TRIMMED_NOTE: &str = "(Earlier steps of this task are not shown here to save space. What matters from them is in the files and results below.)";
+
+/// What a call that did not run is told, so the model asks again only if it still needs it.
+const NOT_RUN_BECAUSE_PARKED: &str = "not run: an earlier call in the same turn was waiting for the user's approval. Request it again if you still need it.";
+
+/// Drops the oldest whole turns until the messages serialize within the bound.
+///
+/// Whole turns, never half of one: a provider rejects a `tool` message whose assistant turn is missing, and an assistant turn
+/// with fewer results than calls. A turn starts at an assistant message.
+fn fit_transcript(
+    mut messages: Vec<ChatMessage>,
+    held: &str,
+    unrun: &[String],
+) -> ParkedTranscript {
+    let build = |messages: &Vec<ChatMessage>| ParkedTranscript {
+        messages: messages.clone(),
+        held: held.to_owned(),
+        unrun: unrun.to_vec(),
+    };
+    let mut trimmed = false;
+    loop {
+        let size = serde_json::to_string(&build(&messages)).map_or(usize::MAX, |json| json.len());
+        if size <= MAX_PARKED_TRANSCRIPT_BYTES {
+            break;
+        }
+        // Everything before the second assistant turn is the first turn (and a leading note, if one was added).
+        let Some(next_turn) = messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, message)| message.role() == jarvis_models::Role::Assistant)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        messages.drain(..next_turn);
+        trimmed = true;
+    }
+    if trimmed {
+        messages.insert(0, ChatMessage::user(TRANSCRIPT_TRIMMED_NOTE));
+    }
+    build(&messages)
+}
+
+/// Stores the run's turns so far, as it parks on a held call. Best effort: without it the run resumes the old, lossy way.
+async fn keep_parked_transcript(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    state: &RunLoopState,
+    held: &str,
+    after: &[jarvis_models::ToolCall],
+) {
+    let unrun: Vec<String> = after.iter().map(|call| call.id().to_owned()).collect();
+    let own = state
+        .messages
+        .get(state.base_len..)
+        .unwrap_or_default()
+        .to_vec();
+    let parked = fit_transcript(own, held, &unrun);
+    let Ok(json) = serde_json::to_string(&parked) else {
+        return;
+    };
+    if let Err(error) = jarvis_storage::save_run_transcript(
+        database,
+        run.id(),
+        &json,
+        UtcTimestamp::now(&SystemClock),
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = run.id(),
+            %error,
+            "a parked run's transcript could not be kept, so it will resume without its earlier steps"
+        );
+    }
+}
+
+/// Reads and removes a parked run's transcript, when there is one that can be read.
+async fn take_parked_transcript(
+    database: &Arc<SqliteDatabase>,
+    run_id: &str,
+) -> Option<ParkedTranscript> {
+    let json = jarvis_storage::load_run_transcript(database, run_id)
+        .await
+        .ok()
+        .flatten()?;
+    // Removed once read: it describes one park, and the next park writes a new one.
+    let _ = jarvis_storage::delete_run_transcript(database, run_id).await;
+    serde_json::from_str(&json).ok()
 }
 
 /// Fails a run that kept making the same call, with a reason that names the problem.
@@ -2128,10 +2266,26 @@ async fn resume_held_call(
     correlation_id: CorrelationId,
 ) -> Result<StoredRun, DatabaseError> {
     let database = deps.database;
+    // What the run was doing when it parked, if it was kept: the model continues the task rather than restarting it.
+    let parked = take_parked_transcript(database, run.id()).await;
     if pending.declined {
         // A refusal is this platform's own statement, not retrieved content, so it is not fenced. It says what
         // the person decided and what that means for the model: nothing ran, and asking again is not wanted.
         state.messages = assemble_context_messages(deps, run, correlation_id).await?;
+        if let Some(parked) = parked {
+            state.messages.extend(parked.messages);
+            state.messages.push(ChatMessage::tool(
+                &parked.held,
+                "The person declined to approve this call. It was not run and nothing happened. Do not request it again; \
+                 tell the user plainly that you did not do it and offer another way to help.",
+            ));
+            for id in &parked.unrun {
+                state
+                    .messages
+                    .push(ChatMessage::tool(id, NOT_RUN_BECAUSE_PARKED));
+            }
+            return enter_execution(database, run, correlation_id).await;
+        }
         state.messages.push(ChatMessage::user(format!(
             "The person declined to approve tool call {}. It was not run and nothing happened. Do not \
              request it again; tell the user plainly that you did not do it and offer another way to help.",
@@ -2183,6 +2337,27 @@ async fn resume_held_call(
     // tool with no idea what was asked. `generate` runs once from the `Responding` handling, which reads
     // the message list this function fills.
     state.messages = assemble_context_messages(deps, run, correlation_id).await?;
+    if let Some(parked) = parked {
+        // The turn the model was in is put back whole: its own steps so far, the real result of the call that waited,
+        // and an honest "not run" for any call after it, so the provider sees a result for every call it is waiting on.
+        state.messages.extend(parked.messages);
+        let result = jarvis_core::IsolatedText::new(&text).map_or_else(
+            |_| "completed after approval and produced no reportable output".to_owned(),
+            |isolated| isolated.render(),
+        );
+        state.messages.push(ChatMessage::tool(
+            &parked.held,
+            truncate_tool_result(&format!(
+                "approved and completed. Its output is provided as data:\n\n{result}"
+            )),
+        ));
+        for id in &parked.unrun {
+            state
+                .messages
+                .push(ChatMessage::tool(id, NOT_RUN_BECAUSE_PARKED));
+        }
+        return enter_execution(database, run, correlation_id).await;
+    }
     state
         .messages
         .push(ChatMessage::user(truncate_tool_result(&observation)));
@@ -4016,6 +4191,203 @@ mod tests {
             44_000,
             "the whole file, not a refusal"
         );
+    }
+    /// A pipeline whose workspace holds `note.txt` and which also offers the approval-declaring fixture tool.
+    fn readable_approval_pipeline(
+        profile: &TempProfile,
+        database: &Arc<SqliteDatabase>,
+    ) -> (
+        Arc<ToolPipeline>,
+        Arc<crate::approval_fixture::RecordingApprovalAdapter>,
+    ) {
+        let root = profile.0.join("workspace");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create the workspace root: {error}"));
+        std::fs::write(root.join("note.txt"), "the sky is blue")
+            .unwrap_or_else(|error| panic!("write: {error}"));
+        let adapter = Arc::new(crate::approval_fixture::RecordingApprovalAdapter::default());
+        let tools = ToolPipeline::with_adapters(
+            Arc::clone(database),
+            Some(
+                jarvis_tools::WorkspaceRoots::new([&root])
+                    .unwrap_or_else(|error| panic!("roots: {error}")),
+            ),
+            jarvis_tools::WorkspacePolicy::default(),
+            vec![(
+                vec![crate::approval_fixture::approval_declaring_definition()],
+                Arc::clone(&adapter) as Arc<dyn jarvis_tools::ToolExecutor>,
+            )],
+        )
+        .unwrap_or_else(|error| panic!("compose the pipeline: {error}"));
+        (Arc::new(tools), adapter)
+    }
+    /// **A run that parks on an approval resumes in the middle of its task, not at the start.**
+    ///
+    /// The resume path used to re-assemble the stored conversation and append only the approved result, so the model had
+    /// forgotten every step it had taken in this run: in a real session it approved the same build fourteen times, each time
+    /// starting over. The turn the model was in is now kept when the run parks and put back whole when it resumes: its own
+    /// steps so far, the real result of the call that waited, and an honest "not run" for a call after it in the same turn,
+    /// because a provider requires a result for every call an assistant turn made.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_resumed_run_continues_its_turn_with_a_result_for_every_call() {
+        let (profile, database) = database().await;
+        let (tools, adapter) = readable_approval_pipeline(&profile, &database);
+        let run = start(
+            &database,
+            "read the note, then do the approved action, then read it again",
+        )
+        .await;
+
+        // One turn with three calls: a read that runs, the one that is held, and a read that therefore never runs.
+        let calls = vec![
+            jarvis_models::ToolCall::new("call_1", "jarvis.files.read", r#"{"path":"note.txt"}"#),
+            jarvis_models::ToolCall::new(
+                "call_2",
+                crate::approval_fixture::APPROVAL_TOOL,
+                r#"{"path":"notes.txt"}"#,
+            ),
+            jarvis_models::ToolCall::new("call_3", "jarvis.files.read", r#"{"path":"note.txt"}"#),
+        ];
+        let first = model(vec![Turn::ToolCall {
+            calls,
+            text: "Doing all three.".to_owned(),
+        }]);
+        let parked = execute_run_with_tools(
+            &database,
+            &first,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(parked.state(), RunState::AwaitingApproval);
+        assert!(
+            jarvis_storage::load_run_transcript(&database, run.id())
+                .await
+                .unwrap_or_else(|error| panic!("read: {error}"))
+                .is_some(),
+            "parking must keep the turn the run was in"
+        );
+
+        let held = jarvis_storage::read_run_tool_calls(&database, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("read the run's calls: {error}"));
+        let call = held
+            .iter()
+            .find(|call| call.approval_id().is_some())
+            .unwrap_or_else(|| panic!("the hold must have written a call row"));
+        approve_and_resume(
+            &database,
+            &tools,
+            &parked,
+            call,
+            serde_json::json!({ "path": "notes.txt" }),
+        )
+        .await;
+
+        let second = model(vec![Turn::answer("All done.")]);
+        let resumed = resume_run_with_tools(
+            &database,
+            &second,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+            call.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("resume: {error}"));
+        assert_eq!(
+            resumed.terminal_outcome(),
+            Some(jarvis_core::RunOutcome::Succeeded)
+        );
+
+        let seen = second.seen_messages();
+        let messages = &seen[0];
+        let asked = messages
+            .iter()
+            .find(|message| {
+                message.role() == jarvis_models::Role::Assistant && !message.tool_calls().is_empty()
+            })
+            .unwrap_or_else(|| panic!("the turn the model was in must be put back: {messages:?}"));
+        assert_eq!(asked.tool_calls().len(), 3, "the assistant turn is whole");
+        let result_for = |id: &str| {
+            messages
+                .iter()
+                .find(|message| message.tool_call_id() == Some(id))
+                .map_or_else(
+                    || panic!("a result for {id} is required by the provider: {messages:?}"),
+                    ChatMessage::text,
+                )
+        };
+        assert!(
+            result_for("call_1").contains("the sky is blue"),
+            "what ran before the hold is remembered"
+        );
+        assert!(
+            result_for("call_2").contains("approved and completed"),
+            "the approved call's real outcome"
+        );
+        assert!(
+            result_for("call_2").contains(jarvis_core::FENCE_OPEN),
+            "and fenced as data"
+        );
+        assert!(
+            result_for("call_3").contains("not run"),
+            "a call after the hold is honestly not run"
+        );
+        assert!(
+            jarvis_storage::load_run_transcript(&database, run.id())
+                .await
+                .unwrap_or_else(|error| panic!("read: {error}"))
+                .is_none(),
+            "the kept turn is consumed by the resume"
+        );
+        assert_eq!(adapter.calls(), 1, "the approved effect happened once");
+    }
+
+    /// **The kept turn fits its bound by dropping whole old turns, never half of one.**
+    #[test]
+    fn a_long_transcript_is_trimmed_by_whole_turns() {
+        let big = "x".repeat(200_000);
+        let mut messages = Vec::new();
+        for turn in 0..6 {
+            let id = format!("call_{turn}");
+            messages.push(ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![jarvis_models::ToolCall::new(&id, "jarvis.files.read", "{}")],
+            ));
+            messages.push(ChatMessage::tool(&id, big.clone()));
+        }
+        let fitted = fit_transcript(messages, "call_held", &[]);
+        let json = serde_json::to_string(&fitted).unwrap_or_default();
+        assert!(
+            json.len() <= MAX_PARKED_TRANSCRIPT_BYTES,
+            "{} bytes",
+            json.len()
+        );
+        assert_eq!(
+            fitted.messages[0].text(),
+            TRANSCRIPT_TRIMMED_NOTE,
+            "a trimmed transcript says so"
+        );
+        // After the note the messages are whole turns: an assistant turn, then its result, and so on.
+        for pair in fitted.messages[1..].chunks(2) {
+            assert_eq!(pair.len(), 2);
+            assert_eq!(pair[0].role(), jarvis_models::Role::Assistant);
+            assert_eq!(pair[1].role(), jarvis_models::Role::Tool);
+            assert_eq!(
+                pair[1].tool_call_id(),
+                pair[0]
+                    .tool_calls()
+                    .first()
+                    .map(jarvis_models::ToolCall::id)
+            );
+        }
+        // A transcript that fits is left exactly as it was.
+        let small = fit_transcript(vec![ChatMessage::user("hi")], "c", &[]);
+        assert_eq!(small.messages.len(), 1);
     }
     /// **A model that reasons past its budget without answering is cut off with a reason the loop can act on.**
     ///

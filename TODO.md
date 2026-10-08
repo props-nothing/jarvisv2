@@ -7112,8 +7112,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   (`styled-jsx` in a server component), a pasted error got three approved edits, and the rebuilt site builds (8 static pages).
   **What this shows is missing:** JARVIS cannot run a build or a test, so it cannot catch its own mistake. That is the next thing to build
   (`P9-024`: a command-running tool, which needs a decision on where it may run, since `jarvis.code.run` needs Docker).
-- [ ] `P9-024` Give the model more to do. The most valuable next tool is **running a command in a granted folder** (`npm run build`, `cargo
-  test`) with its output fed back, so a coding task can verify itself; today only Docker-isolated snippets run code. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+- [x] `P9-031` JARVIS can run a command in a granted folder (ADR-0143): `jarvis.command.run` (`npm run build`, `cargo test`), no shell, bare
+  program name on the PATH, directory confined to a granted root, allowlisted environment, whole-process-tree kill on timeout or drop, head and
+  tail of the output fenced as data, asks every time unless trusted. It is host execution, not a sandbox, and the ADR says so. 15 tests run real
+  commands (success, failure, timeout kill, escape attempts, secrets not inherited).
+- [x] `P9-032` A run that waits for an approval remembers its turn (ADR-0143). Found live with the command tool: after each approval the run
+  resumed with no memory of its steps, approved `npm run build` about fourteen times and ended empty; and an identical approved call was refused as
+  a repeat. Migration 0015 makes the repeat guard apply only to pending/denied approvals; migration 0016 stores the run's own turns while it
+  waits and puts them back on resume, with "not run" results for calls after the held one. Tests: a three-call turn resumes with a result for
+  every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

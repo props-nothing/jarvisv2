@@ -366,6 +366,42 @@ async fn a_decided_approval_still_blocks_the_same_intent() {
     );
 }
 
+/// **An approved call that finished may be asked about again; a pending or denied one may not.**
+///
+/// Building a project is a loop (run the build, fix what it reported, run it again), and the second run is a new action in a
+/// changed world. The unique index was `(run, intent)` for every state, so the second `npm run build` was refused and the
+/// model could not verify its own fix (migration 0015). The owner is still asked each time: nothing is carried over.
+#[tokio::test]
+async fn an_approved_intent_can_be_asked_about_again_but_a_pending_or_denied_one_cannot() {
+    let (_directory, database) = seeded_database().await;
+    let _run = live_run(&database).await;
+    let arguments = serde_json::json!({"program": "npm", "arguments": ["run", "build"]});
+
+    // First time: asked, approved.
+    let first = approval_for("jarvis.command.run", &arguments);
+    must(create_approval(&database, &first).await);
+    // While it waits, the same request is refused: the owner is not asked twice at once.
+    let twice = create_approval(&database, &approval_for("jarvis.command.run", &arguments)).await;
+    assert!(
+        matches!(twice, Err(DatabaseError::Sqlite { .. })),
+        "pending blocks: {twice:?}"
+    );
+    must(record_decision(&database, &first.id().to_string(), &approve(1)).await);
+
+    // Approved and done: the same request is a new action, asked about afresh.
+    let second = approval_for("jarvis.command.run", &arguments);
+    must(create_approval(&database, &second).await);
+    // ...and that one, once the owner says no, is not re-asked.
+    must(record_decision(&database, &second.id().to_string(), &deny(2)).await);
+    let third = create_approval(&database, &approval_for("jarvis.command.run", &arguments)).await;
+    assert!(
+        matches!(third, Err(DatabaseError::Sqlite { .. })),
+        "denied blocks: {third:?}"
+    );
+
+    let stored = must(read_run_approvals(&database, RUN).await);
+    assert_eq!(stored.len(), 2, "the approved one and the denied one");
+}
 #[tokio::test]
 async fn a_decided_request_cannot_be_created() {
     let (_directory, database) = seeded_database().await;

@@ -30,7 +30,7 @@ jarvis init --base-url https://api.example.com/v1 --model NAME --api-key-file C:
 jarvis start
 ```
 
-`--workspace` may be repeated. The assistant can read, list and create files in those folders; changing an existing file is
+`--workspace` may be repeated. The assistant can read, list and create files in those folders, and run commands there (such as a build or the tests) after you approve each one; changing an existing file is
 asked about first. Nothing outside them is reachable.
 
 ## Keys

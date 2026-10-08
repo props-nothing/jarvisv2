@@ -70,6 +70,27 @@ fn requested_payload(tool: &str, version: &str, arguments: &Value) -> String {
     if let Some(path) = arguments.get("path").and_then(Value::as_str) {
         let shown: String = path.chars().take(160).collect();
         payload["target"] = Value::String(shown);
+    } else if tool == "jarvis.command.run"
+        && let Some(program) = arguments.get("program").and_then(Value::as_str)
+    {
+        // The command line itself: it is what the owner approved, and it is what makes a long build legible.
+        let rest = arguments
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let line: String = format!("{program} {rest}")
+            .trim()
+            .chars()
+            .take(160)
+            .collect();
+        payload["target"] = Value::String(line);
     }
     payload.to_string()
 }
@@ -231,8 +252,9 @@ pub enum ToolPipelineError {
     },
     /// A call that needs an answer repeats one this run already asked about.
     ///
-    /// One approval exists per action per run (`approvals_run_intent_idx`), so a repeat is refused with a
-    /// sentence the model can act on rather than surfacing as a database error.
+    /// While an approval is pending, or after the owner denied it, the same request in the same run is refused
+    /// (`approvals_run_intent_idx`, partial since migration 0015), with a sentence the model can act on rather than a
+    /// database error. An approved call that finished may be asked about again.
     #[error(
         "this exact call was already asked about in this run and is {state}; it will not be asked again. \
          Change the arguments if a different action is meant, or tell the user"
@@ -1355,10 +1377,12 @@ impl ToolPipeline {
         if decision.is_held() {
             let earlier =
                 jarvis_storage::read_run_approvals(&self.database, actor.run_id()).await?;
-            if let Some(previous) = earlier
-                .iter()
-                .find(|approval| approval.intent().to_hex() == intent.to_hex())
-            {
+            // Only a request still waiting, or one the owner said no to, blocks the same request again. An approved call that
+            // finished is a different action next time (a build run again after a fix), and the owner is asked afresh.
+            if let Some(previous) = earlier.iter().find(|approval| {
+                approval.intent().to_hex() == intent.to_hex()
+                    && matches!(approval.stored_state().as_str(), "pending" | "denied")
+            }) {
                 return Err(ToolPipelineError::RepeatedRequest {
                     state: previous.stored_state().as_str().to_owned(),
                 });
