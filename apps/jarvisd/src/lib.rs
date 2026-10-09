@@ -3,6 +3,7 @@
 //! A library so that the jarvis program can run it (jarvis daemon): one executable for a person to install.
 
 mod build_info;
+mod clock;
 mod code_run;
 mod command_run;
 mod control;
@@ -257,6 +258,8 @@ fn resolve_paths(root: Option<&Path>) -> Result<AppPaths, DaemonError> {
 /// same call kept for scripts and tests that start it by name.
 #[must_use]
 pub fn run_blocking(arguments: Vec<String>) -> ExitCode {
+    // Before the runtime's threads exist: see `clock`.
+    clock::remember_local_offset();
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -453,20 +456,6 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         database.close().await;
         return Err(error.into());
     }
-    if let Err(error) = database
-        .mark_daemon_ready(daemon_id, UtcTimestamp::now(&SystemClock))
-        .await
-    {
-        let _ = database
-            .mark_daemon_stopped(
-                daemon_id,
-                UtcTimestamp::now(&SystemClock),
-                DaemonStopReason::StartupFailed,
-            )
-            .await;
-        database.close().await;
-        return Err(error.into());
-    }
 
     // Recovery runs BEFORE the listener binds, so no client can observe a run in a non-terminal
     // state that no process will ever advance.
@@ -475,7 +464,6 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         return Err(error);
     }
 
-    health.mark_ready()?;
     let endpoint = LocalEndpoint::scoped(paths.runtime(), loaded_config.config().profile().name())?;
     let listener = LocalListener::bind(&endpoint)?;
     let control = Arc::new(ControlPlane::new(
@@ -1311,6 +1299,34 @@ async fn stop_transports(
     }
 }
 
+/// Declares the daemon ready, in the lifecycle table and in the health state.
+///
+/// Ready means every listener is bound, so this is called last: the lifecycle row and the health state are what a client, a
+/// service manager and the acceptance gates wait on, and declaring it before the HTTP port was bound let a client that trusted
+/// it connect to nothing (seen on a slow macOS runner as "error sending request").
+async fn declare_ready(
+    database: &SqliteDatabase,
+    health: &HealthState,
+    daemon_id: DaemonRunId,
+) -> Result<(), DaemonError> {
+    if let Err(error) = database
+        .mark_daemon_ready(daemon_id, UtcTimestamp::now(&SystemClock))
+        .await
+    {
+        let _ = database
+            .mark_daemon_stopped(
+                daemon_id,
+                UtcTimestamp::now(&SystemClock),
+                DaemonStopReason::StartupFailed,
+            )
+            .await;
+        database.close().await;
+        return Err(error.into());
+    }
+    health.mark_ready()?;
+    Ok(())
+}
+
 async fn run<F>(build: BuildInfo, root: Option<PathBuf>, shutdown: F) -> Result<(), DaemonError>
 where
     F: Future<Output = io::Result<()>>,
@@ -1334,25 +1350,6 @@ where
     } = start(build, root.as_deref()).await?;
     warn_about_unused_environment();
 
-    let ready = health.snapshot();
-    tracing::info!(
-        phase = ready.phase,
-        live = ready.live,
-        ready = ready.ready,
-        version = build.version(),
-        target_os = build.target_os(),
-        target_arch = build.target_arch(),
-        config_schema = build.config_schema(),
-        database_schema = build.database_schema(),
-        mode = if root.is_some() { "portable" } else { "native" },
-        secrets_masked = logging.secret_count(),
-        http_port = http_port.unwrap_or(0),
-        mcp_serve_port = serving_mcp
-            .as_ref()
-            .map_or(0, crate::mcp_serve::ServingMcp::port),
-        "daemon ready"
-    );
-
     // The listener is bound before it is served, and binding is what fails fast: an occupied port
     // is reported here rather than becoming a listener nobody notices is dead.
     let (http, http_stop) = match http_port {
@@ -1371,6 +1368,26 @@ where
         }
         None => (None, None),
     };
+
+    declare_ready(&database, &health, daemon_id).await?;
+    let ready = health.snapshot();
+    tracing::info!(
+        phase = ready.phase,
+        live = ready.live,
+        ready = ready.ready,
+        version = build.version(),
+        target_os = build.target_os(),
+        target_arch = build.target_arch(),
+        config_schema = build.config_schema(),
+        database_schema = build.database_schema(),
+        mode = if root.is_some() { "portable" } else { "native" },
+        secrets_masked = logging.secret_count(),
+        http_port = http_port.unwrap_or(0),
+        mcp_serve_port = serving_mcp
+            .as_ref()
+            .map_or(0, crate::mcp_serve::ServingMcp::port),
+        "daemon ready"
+    );
 
     let outcome = wait_for_exit(shutdown, accept_loop, http_stop, mcp_stop).await;
     stop_transports(http, serving_mcp, http_port, &outcome).await;

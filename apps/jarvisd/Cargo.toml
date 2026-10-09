@@ -47,6 +47,8 @@ jarvis-sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The machine's UTC offset, read once at startup so the model knows the local time (clock).
+time = { workspace = true, features = ["local-offset"] }
 # `unfold` builds the SSE stream without a generator macro, so the stream type stays a plain
 # `Stream` impl and no `async-stream` dependency is introduced for one call site.
 futures-util.workspace = true

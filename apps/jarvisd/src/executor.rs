@@ -1398,7 +1398,10 @@ fn messages_from_manifest(
 
     let mut messages = Vec::with_capacity(history.len() + 3);
     if included(ContextSourceKind::IdentityPolicy) {
-        messages.push(ChatMessage::system(SYSTEM_POLICY));
+        messages.push(ChatMessage::system(format!(
+            "{SYSTEM_POLICY} {}",
+            crate::clock::clock_line(UtcTimestamp::now(&SystemClock))
+        )));
     }
 
     // The turns are walked in the order they were loaded, which `read_recent_messages` returns
@@ -3397,11 +3400,14 @@ mod tests {
 
         let requests = model.seen_messages();
         let texts: Vec<String> = requests[0].iter().map(ChatMessage::text).collect();
-        assert_eq!(
-            texts,
-            vec![SYSTEM_POLICY.to_owned(), "a brand new question".to_owned()],
-            "a first turn is policy plus the question, with no history"
+        assert_eq!(texts.len(), 2, "a first turn is policy plus the question");
+        assert!(
+            texts[0].starts_with(SYSTEM_POLICY)
+                && texts[0].contains("The current date and time is"),
+            "the policy carries the clock so relative dates are right: {}",
+            texts[0]
         );
+        assert_eq!(texts[1], "a brand new question", "with no history");
         database.close().await;
     }
 

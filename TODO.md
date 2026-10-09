@@ -7122,7 +7122,15 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   waits and puts them back on resume, with "not run" results for calls after the held one. Tests: a three-call turn resumes with a result for
   every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.- [x] `P9-033` One executable (ADR-0144). `jarvis daemon` runs the daemon (`jarvisd` is now a library plus a thin wrapper binary); `jarvis start`
   and the login service launch the `jarvis` file itself, and release archives, `jarvis path install` and the smoke test carry just `jarvis`.
-  Tests: every service definition launches `<exe> daemon`; the PATH links are one file unless an old `jarvisd` is beside it. Live: see below.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  Tests: every service definition launches `<exe> daemon`; the PATH links are one file unless an old `jarvisd` is beside it. Live: see below.- [x] `P9-034` The daemon is ready only when it listens. CI on macOS failed intermittently (phase 3 in run 132, phase 2 in run 133) with "error sending
+  request" to a freshly started daemon: the gates wait for the lifecycle row `ready`, and the daemon wrote it (and set the health state, and
+  logged "daemon ready") **before** it bound the HTTP port, so a client that trusted it could connect to nothing. `declare_ready` now runs after every
+  listener is bound. This is a real fault, not a test one: `jarvis status` and a service manager read the same state. All 56 test binaries pass on
+  Windows; macOS is confirmed only by the next CI run.- [x] `P9-035` JARVIS knows the date and time. A model has no clock, so "what day is it" or "remind me tomorrow at nine" was a guess. Every run's
+  system message now ends with the current weekday, date and local time with its UTC offset, plus the UTC instant (`clock.rs`). The offset is read
+  once at startup, before the async runtime has threads (the `time` crate only does it soundly then), so a daemon that stays up across a daylight-saving
+  change keeps the old offset until restarted; the UTC time is always right. Tests: the date follows the offset across midnight, negative and unknown
+  offsets are stated honestly, a first turn carries the clock. **Live:** "what day and time is it" answered correctly (Friday 9 October 2026, 18:04, UTC+02:00).- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),
