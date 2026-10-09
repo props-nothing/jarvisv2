@@ -1642,3 +1642,68 @@ async fn a_trusted_code_tool_runs_without_a_hold() {
         "a trusted tool must reach the adapter, not be held: {trusted:?}"
     );
 }
+
+/// **Changing a tool's permission applies to the very next call on the same running pipeline, in both directions.**
+///
+/// The settings handler swaps the policy; nothing restarts. The direction that matters for safety is the tightening: a tool the
+/// owner turns **off** must stop being callable at once, not at the next restart, so that is asserted beside the loosening. And
+/// a call that was already decided keeps the snapshot it was decided with (asserted by the outcome types, not by timing).
+#[tokio::test]
+async fn a_changed_permission_applies_to_the_next_call_without_a_restart() {
+    let (_directory, database) = database_with_run().await;
+    let interpreter = vec!["sh".to_owned(), "-c".to_owned()];
+    let definition = must(crate::code_run::CodeRunTool::definition(&interpreter));
+    let tool = must(crate::code_run::CodeRunTool::new(
+        jarvis_sandbox::ContainerBackend::probe(),
+        "alpine:3".to_owned(),
+        interpreter.clone(),
+    ));
+    let pipeline = must(ToolPipeline::with_adapters(
+        Arc::clone(&database),
+        None,
+        WorkspacePolicy::default(),
+        vec![(
+            vec![definition.clone()],
+            Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+        )],
+    ));
+    let actor = ToolActor::for_composed_tools(
+        LOCAL_WORKSPACE_ID,
+        RUN,
+        SessionChannel::Cli,
+        "policy-1",
+        std::slice::from_ref(&definition),
+    );
+    let id = must(jarvis_tools::ToolId::new(crate::code_run::RUN_TOOL));
+    let call = |code: &'static str| {
+        pipeline.call_tool(
+            crate::code_run::RUN_TOOL,
+            json!({ "code": code }),
+            &actor,
+            CorrelationId::new(),
+        )
+    };
+
+    let before = must(call("echo one").await);
+    assert!(
+        matches!(before, ToolPipelineOutcome::AwaitingApproval { .. }),
+        "{before:?}"
+    );
+
+    pipeline.replace_workspace_policy(WorkspacePolicy::default().trusting(id.clone()));
+    let trusted = call("echo two").await;
+    assert!(
+        matches!(
+            trusted,
+            Ok(ToolPipelineOutcome::Executed(_)) | Err(ToolPipelineError::AdapterCall(_))
+        ),
+        "trusting must apply to the next call: {trusted:?}"
+    );
+
+    pipeline.replace_workspace_policy(WorkspacePolicy::default().denying(id));
+    let denied = must(call("echo three").await);
+    assert!(
+        matches!(denied, ToolPipelineOutcome::Refused { .. }),
+        "turning a tool off must apply to the next call, not the next restart: {denied:?}"
+    );
+}

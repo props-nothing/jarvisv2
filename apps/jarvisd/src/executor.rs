@@ -498,6 +498,9 @@ struct RunLoopState {
     reasoning_effort: Option<ReasoningEffort>,
     /// How many messages the assembled context has, so everything after is the run's own turns (what a parked run keeps).
     base_len: usize,
+    /// Whether an earlier model call of this run already said something, so the next one starts a new paragraph instead of running on
+    /// from it (I'll create it.Now running the tests.). Narrated stages are separate sentences, and a client shows and speaks them as such.
+    spoke: bool,
     /// The previous tool call (name and arguments) and how many times in a row it has been made.
     last_call: Option<String>,
     repeats: u32,
@@ -510,6 +513,11 @@ struct RunLoopState {
 }
 
 impl RunLoopState {
+    /// What starts the next model call's streamed text: a paragraph break once the run has already said something.
+    const fn lead_in(&self) -> &'static str {
+        if self.spoke { "\n\n" } else { "" }
+    }
+
     /// Increments the execution counter and reports whether the run is over budget.
     ///
     /// Returns `true` when the next call would exceed [`MAX_TOOL_CALLS`], so a caller fails the run
@@ -628,6 +636,7 @@ pub async fn resume_run_with_tools(
             call_id: call_id.to_owned(),
             declined: false,
         }),
+        spoke: true,
         ..RunLoopState::default()
     };
     let deps = RunDeps {
@@ -662,6 +671,7 @@ pub async fn resume_run_declined(
             call_id: call_id.to_owned(),
             declined: true,
         }),
+        spoke: true,
         ..RunLoopState::default()
     };
     let deps = RunDeps {
@@ -1530,9 +1540,11 @@ async fn consume_stream(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
     stream: jarvis_models::ModelStream,
+    lead_in: &str,
     correlation_id: CorrelationId,
 ) -> Result<Result<(jarvis_models::StreamSummary, String), StreamFailure>, DatabaseError> {
     let mut stream = stream;
+    let mut lead_in = lead_in;
     let mut validator = StreamValidator::new();
     let mut text = String::new();
     // Progress is recorded at most this often: it is for a person watching, not an audit of every token.
@@ -1590,12 +1602,14 @@ async fn consume_stream(
                     // Each fragment is its own durable event, so a client that reconnects mid-answer
                     // replays the fragments it did not see rather than the whole answer.
                     if !fragment.is_empty() {
+                        // Only the streamed event carries the paragraph break; the answer that settles the run does not.
+                        let shown = format!("{}{fragment}", std::mem::take(&mut lead_in));
                         append(
                             database,
                             run,
                             RunEventKind::OutputDelta,
                             None,
-                            &format!(r#"{{"text":{}}}"#, json_string(fragment)),
+                            &format!(r#"{{"text":{}}}"#, json_string(&shown)),
                             correlation_id,
                         )
                         .await?;
@@ -1636,6 +1650,7 @@ async fn call_model(
     specs: &[ToolSpec],
     messages: Vec<ChatMessage>,
     effort: Option<ReasoningEffort>,
+    lead_in: &str,
     correlation_id: CorrelationId,
 ) -> Result<Result<(jarvis_models::StreamSummary, String), StreamFailure>, DatabaseError> {
     let mut request = ChatRequest::new(deps.model_id.clone(), messages, correlation_id)
@@ -1652,8 +1667,25 @@ async fn call_model(
             }));
         }
     };
-    consume_stream(deps.database, run, stream, correlation_id).await
+    consume_stream(deps.database, run, stream, lead_in, correlation_id).await
 }
+/// Records that a model call reasoned past its budget and is being asked again, for a person watching the run.
+async fn note_reasoning_limit(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    correlation_id: CorrelationId,
+) -> Result<(), DatabaseError> {
+    append(
+        database,
+        run,
+        RunEventKind::ActivityUpdated,
+        Some("reasoning limit"),
+        r#"{"phase":"reasoning_limit"}"#,
+        correlation_id,
+    )
+    .await
+}
+
 /// Calls the model once, records the answer or the failure, and runs any requested tools.
 ///
 /// # What this returns, and which state the run is in afterwards
@@ -1700,6 +1732,7 @@ async fn generate(
         &specs,
         state.messages.clone(),
         state.reasoning_effort,
+        state.lead_in(),
         correlation_id,
     )
     .await?;
@@ -1708,15 +1741,7 @@ async fn generate(
         .err()
         .is_some_and(|failure| failure.code.as_str() == "reasoning_overrun")
     {
-        append(
-            database,
-            run,
-            RunEventKind::ActivityUpdated,
-            Some("reasoning limit"),
-            r#"{"phase":"reasoning_limit"}"#,
-            correlation_id,
-        )
-        .await?;
+        note_reasoning_limit(database, run, correlation_id).await?;
         state.reasoning_effort = Some(ReasoningEffort::Low);
         let mut nudged = state.messages.clone();
         nudged.push(ChatMessage::user(ACT_NOW));
@@ -1726,6 +1751,7 @@ async fn generate(
             &specs,
             nudged,
             Some(ReasoningEffort::Low),
+            state.lead_in(),
             correlation_id,
         )
         .await?;
@@ -1743,6 +1769,7 @@ async fn generate(
             .await;
         }
     };
+    state.spoke |= !text.trim().is_empty();
     // A refusal is a provider decision, and recording it as a failure is what distinguishes "the
     // model would not answer" from "the model had nothing to say".
     if summary
@@ -4353,6 +4380,53 @@ mod tests {
         assert_eq!(adapter.calls(), 1, "the approved effect happened once");
     }
 
+    /// **Narrated stages are separate paragraphs, not one run-on sentence.**
+    ///
+    /// A model that says "I'll create the files." then calls a tool, then says "Now running the tests." produced text that a
+    /// client showed and read out as `files.Now running`. Each model call after the first that spoke now starts its streamed
+    /// text with a paragraph break; the settled answer is only the last turn and is untouched.
+    #[tokio::test]
+    async fn a_later_turns_text_starts_a_new_paragraph() {
+        let (profile, database) = database().await;
+        let (tools, _adapter) = readable_approval_pipeline(&profile, &database);
+        let run = start(&database, "read the note").await;
+        let model = model(vec![
+            Turn::ToolCall {
+                calls: vec![jarvis_models::ToolCall::new(
+                    "call_1",
+                    "jarvis.files.read",
+                    r#"{"path":"note.txt"}"#,
+                )],
+                text: "I will read it.".to_owned(),
+            },
+            Turn::answer("It says the sky is blue."),
+        ]);
+        execute_run_with_tools(
+            &database,
+            &model,
+            &fixture_model_id(),
+            Some(&tools),
+            run.id(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("run: {error}"));
+        let events = jarvis_storage::read_run_events(
+            &database,
+            run.id(),
+            jarvis_core::ReplayRequest::new(jarvis_core::RunEventSequence::first(), 500)
+                .unwrap_or_else(|error| panic!("replay: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("events: {error}"));
+        let streamed: String = events
+            .iter()
+            .filter(|event| event.kind() == RunEventKind::OutputDelta)
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event.payload()).ok())
+            .filter_map(|payload| payload["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(streamed, "I will read it.\n\nIt says the sky is blue.");
+    }
+
     /// **The kept turn fits its bound by dropping whole old turns, never half of one.**
     #[test]
     fn a_long_transcript_is_trimmed_by_whole_turns() {
@@ -4425,7 +4499,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, event)| Ok(StreamEnvelope::new(index as u64, event))),
         ));
-        let outcome = consume_stream(&database, &run, stream, CorrelationId::new())
+        let outcome = consume_stream(&database, &run, stream, "", CorrelationId::new())
             .await
             .unwrap_or_else(|error| panic!("consume: {error}"));
         let failure = outcome
@@ -4453,7 +4527,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, event)| Ok(StreamEnvelope::new(index as u64, event))),
         ));
-        let outcome = consume_stream(&database, &run, stream, CorrelationId::new())
+        let outcome = consume_stream(&database, &run, stream, "", CorrelationId::new())
             .await
             .unwrap_or_else(|error| panic!("consume: {error}"));
         assert!(outcome.is_ok(), "a model already answering is not cut off");

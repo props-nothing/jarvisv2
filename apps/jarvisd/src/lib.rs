@@ -20,6 +20,7 @@ mod memory_propose;
 mod memory_service;
 mod run_service;
 mod schedule_service;
+mod schedule_tool;
 mod settings_service;
 mod singleton;
 mod skill_service;
@@ -144,6 +145,13 @@ enum DaemonError {
         /// Which constant was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebFetchToolError,
+    },
+    /// The schedule tools could not state their own contract.
+    #[error("the schedule tools could not be defined")]
+    ScheduleTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::schedule_tool::ScheduleToolError,
     },
     /// The delegation tools could not state their own contract.
     #[error("the delegation tools could not be defined")]
@@ -736,6 +744,14 @@ async fn compose_tools(
             Arc::new(jarvis_web::WebFetchTool::new()) as Arc<dyn jarvis_tools::ToolExecutor>,
         ),
     ];
+    // Scheduling is native and needs only the database. Adding and removing ask the owner first (`schedule_tool` says why).
+    additional.push((
+        crate::schedule_tool::ScheduleTool::definitions()
+            .map_err(|source| DaemonError::ScheduleTool { source })?,
+        Arc::new(crate::schedule_tool::ScheduleTool::new(Arc::clone(
+            &database,
+        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
     push_code_tool(config, &mut additional)?;
     push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
@@ -938,7 +954,7 @@ fn compose_tool_pipeline(
 /// Returns [`DaemonError::WorkspacePolicy`] when a configured tool identifier is not a valid identifier,
 /// or when [`jarvis_tools::WorkspacePolicy::new`] refuses the ceiling and threshold pair. Both are
 /// configuration faults, so they stop the daemon at startup rather than at the first tool call.
-fn compose_workspace_policy(
+pub(crate) fn compose_workspace_policy(
     config: &jarvis_storage::Config,
 ) -> Result<jarvis_tools::WorkspacePolicy, DaemonError> {
     let configured = config.policy();

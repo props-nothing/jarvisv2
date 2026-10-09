@@ -237,7 +237,8 @@
   var VERBS = {
     "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing",
     "jarvis.web.fetch": "fetching a page", "jarvis.agent.delegate": "handing off a task", "jarvis.agent.result": "collecting a result",
-    "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code", "jarvis.command.run": "running"
+    "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code", "jarvis.command.run": "running",
+    "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
   };
   function describeCall(tool, target) {
     var verb = VERBS[tool] || String(tool || "working").replace(/^jarvis\./, "");
@@ -1138,18 +1139,40 @@
     });
     return button;
   }
-  function answerButtons(approvalId) {
+  function answerButtons(approvalId, tool) {
     var row = el("div", "row cmd");
     var yes = el("button", "yes", "Approve");
     var no = el("button", "danger", "Deny");
     function answer(approve) {
       yes.disabled = true;
       no.disabled = true;
+      if (always) always.disabled = true;
       decide(approvalId, approve, "desktop");
+    }
+    // "Always": the owner's own click trusts this tool from now on (the same setting as Settings, Permissions), then approves.
+    // It applies at once; anything that talks to other people still asks, whatever is chosen.
+    var always = tool ? el("button", "", "Always allow") : null;
+    if (always) {
+      always.title = "Approve, and stop asking for " + tool + ". Change it any time in Settings, Permissions.";
+      always.addEventListener("click", function () {
+        yes.disabled = true;
+        no.disabled = true;
+        always.disabled = true;
+        putJson("/settings/tools/" + encodeURIComponent(tool), "PUT", { posture: "trusted" }).then(function (reply) {
+          notice(tool + " will no longer ask" + (reply.applied ? "." : " after a restart.") + " Change it in Settings, Permissions.");
+          decide(approvalId, true, "desktop");
+        }, function () {
+          notice("Could not change the permission for " + tool + ". Nothing was approved.");
+          yes.disabled = false;
+          no.disabled = false;
+          always.disabled = false;
+        });
+      });
     }
     yes.addEventListener("click", function () { answer(true); });
     no.addEventListener("click", function () { answer(false); });
     row.appendChild(yes);
+    if (always) row.appendChild(always);
     row.appendChild(no);
     return row;
   }
@@ -1190,7 +1213,7 @@
       row.appendChild(el("strong", "", approval.tool));
       item.appendChild(row);
       item.appendChild(el("div", "obj", clip(approval.arguments ? JSON.stringify(approval.arguments) : approval.preview, 400)));
-      item.appendChild(answerButtons(approval.approval_id));
+      item.appendChild(answerButtons(approval.approval_id, approval.tool));
       return item;
     }
     fill("waiting", approvals.map(approvalCard), "nothing needs you");
@@ -1512,7 +1535,7 @@
       });
       select.value = postures[tool.id] || "default";
       select.addEventListener("change", function () {
-        putJson("/settings/tools/" + encodeURIComponent(tool.id), "PUT", { posture: select.value }).then(function () { saved(tool.title + ":"); },
+        putJson("/settings/tools/" + encodeURIComponent(tool.id), "PUT", { posture: select.value }).then(function (reply) { if (reply && reply.applied) { settingsNote(tool.title + ": saved and applied now."); loadSettings(); } else saved(tool.title + ":"); },
           function (error) { settingsNote(explain(error, "That was refused."), true); loadSettings(); });
       });
       row.appendChild(label);
@@ -1633,6 +1656,38 @@
     });
   }
 
+  // ---- scheduled work reports back ---------------------------------------------------------------------------------
+  // A task scheduled to run while you are away is only useful if you hear what it found. When a schedule fires (its last run
+  // changes) and that run finishes, the answer is put in the conversation and, with spoken answers on, said out loud. What was
+  // already fired when the page opened is not announced again.
+  var firedSeen = null;
+  var awaitingResults = {};
+  function watchSchedules(schedules) {
+    var now = {};
+    schedules.forEach(function (schedule) { now[schedule.schedule_id] = schedule.last_run_id || ""; });
+    if (firedSeen !== null) {
+      schedules.forEach(function (schedule) {
+        if (schedule.last_run_id && firedSeen[schedule.schedule_id] !== schedule.last_run_id) awaitingResults[schedule.last_run_id] = schedule.objective;
+      });
+    }
+    firedSeen = now;
+    if (Object.keys(awaitingResults).length === 0) return;
+    api("/runs?limit=30").then(function (reply) {
+      (reply.runs || []).forEach(function (run) {
+        if (!awaitingResults[run.run_id] || !run.outcome) return;
+        var objective = awaitingResults[run.run_id];
+        delete awaitingResults[run.run_id];
+        var text = run.outcome === "succeeded" && run.answer ? run.answer : "A scheduled task did not finish: " + objective;
+        notice("Scheduled: " + objective);
+        show("jarvis", text);
+        remember("jarvis", text);
+        scroll();
+        feel("pleased", 2, "nod");
+        if (S.speak) speak(text);
+      });
+    }, function () {});
+  }
+
   // ---- polling --------------------------------------------------------------------------------------------------
   var lastSignature = "";
   function refresh() {
@@ -1649,6 +1704,7 @@
         renderPanels(results[0].runs, results[1].approvals, results[2].schedules);
       }
       announce(results[1].approvals);
+      watchSchedules(results[2].schedules);
       refreshAbilities();
       refreshProposals();
       tickAges();

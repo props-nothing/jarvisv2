@@ -33,7 +33,7 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 
 | Setting | Default | What unset means |
 | --- | --- | --- |
-| Per tool: default / always ask / run without asking / off | default | The tool's own rule and the risk threshold decide. Nothing is trusted unless you say so (`ADR-0133`). "Run without asking" never waives the rule that anything talking to other people asks, the workspace ceiling, or an "off". Stored as `policy.trust`, `policy.approval` and `policy.deny`. |
+| Per tool: default / always ask / run without asking / off | default | Applies to the very next call, no restart (`ADR-0145`); the approval card's **Always allow** sets the same thing in one click. The tool's own rule and the risk threshold decide. Nothing is trusted unless you say so (`ADR-0133`). "Run without asking" never waives the rule that anything talking to other people asks, the workspace ceiling, or an "off". Stored as `policy.trust`, `policy.approval` and `policy.deny`. |
 
 ## Advanced
 

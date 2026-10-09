@@ -45,4 +45,4 @@ is told to run the project's build or tests and fix what fails before claiming i
 error: the run built, found it, removed the line, rebuilt, and answered in one sentence.
 
 Not done: the command tool on Linux and macOS is checked by type only (tracked in `P9-022`); trusting the tool from the approval
-card still needs a restart to apply; there is no per-program allowlist (the approval is the policy).
+card applies at once since `ADR-0145`; there is no per-program allowlist (the approval is the policy).

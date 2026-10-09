@@ -7130,7 +7130,23 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   system message now ends with the current weekday, date and local time with its UTC offset, plus the UTC instant (`clock.rs`). The offset is read
   once at startup, before the async runtime has threads (the `time` crate only does it soundly then), so a daemon that stays up across a daylight-saving
   change keeps the old offset until restarted; the UTC time is always right. Tests: the date follows the offset across midnight, negative and unknown
-  offsets are stated honestly, a first turn carries the clock. **Live:** "what day and time is it" answered correctly (Friday 9 October 2026, 18:04, UTC+02:00).- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  offsets are stated honestly, a first turn carries the clock. **Live:** "what day and time is it" answered correctly (Friday 9 October 2026, 18:04, UTC+02:00).- [x] `P9-036` A tool's permission changes at once, and the approval card says "Always allow" (ADR-0145). Saving a tool's posture used to need a restart,
+  so "stop asking me for `npm run build`" meant leaving the conversation. The pipeline now holds the policy as a replaceable snapshot, the settings
+  handler rebuilds it from the saved file with the daemon's own function and swaps it (`applied: true`); a file it cannot compose leaves the running
+  policy untouched. Test: on one running pipeline a call asks, then (trusted) runs, then (off) is refused, each on the very next call. **Live** through
+  the API: trusted applied at once, off refused the next call, default restored.
+- [x] `P9-037` Scheduling from conversation (ADR-0145): `jarvis.schedule.add|list|remove` over the existing scheduler and its validation. Adding and removing
+  ask (a schedule persists beyond the chat); listing is free; objectives read back are fenced. Tests on a real database: add/list/remove, and six bad inputs
+  (both cadences, neither, past time, unparseable time, too-short interval, blank objective) each refused and creating nothing. **Live:** "remind me in
+  2 hours" asked, was approved, scheduled for the right UTC time (from the clock, `P9-035`), and was listed back.- [x] `P9-038` Scheduled work reports back in the console. A reminder or recurring check was only readable afterwards in `jarvis runs`. The console now watches
+  the schedules it already polls: when one fires and that run finishes, the answer is put in the conversation ("Scheduled: ..." then the answer) and, with
+  spoken answers on, said aloud; anything already fired when the page opened is not announced again. **Live** (browser): a one-off task scheduled 75 seconds
+  ahead appeared in the open console when it ran. (The first attempt polled a wrong URL and showed nothing; the page's own error log showed the 405, which is
+  why this was verified in a real browser.) Not done: a notification when no console is open (needs the desktop shell, `P9-019`).- [x] `P9-039` A coding task now runs end to end, and its narration reads as paragraphs. Dogfood: "build a dependency-free Node todo CLI with `node:test` tests, run
+  them and fix failures" completed in about two minutes with 10 passing tests and no help (the command tool was trusted, `P9-031`, `P9-036`). It showed one
+  defect: the narrated stages ran together ("...run the test suite.App and tests are written") because each model call's text was streamed with nothing between
+  them. A call after one that already spoke now starts its streamed text with a paragraph break (the settled answer is unchanged, and a resumed run counts as
+  having spoken). Test: the stream of a tool turn plus an answer is `first.\n\nsecond`. **Live:** the same kind of task now prints each stage on its own line.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

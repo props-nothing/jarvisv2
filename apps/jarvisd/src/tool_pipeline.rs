@@ -584,7 +584,10 @@ pub struct ToolPipeline {
     /// Held rather than passed per call because a caller-supplied policy would let the handler that
     /// derives the actor from the stored run also weaken the grants the daemon was configured with —
     /// the two would then be independently negotiable.
-    workspace: WorkspacePolicy,
+    ///
+    /// Replaceable as a whole, and only by the daemon's own settings handler (`replace_workspace_policy`), so an owner's change
+    /// to a tool's permission applies to the next call without a restart. Each call reads one snapshot and decides with it.
+    workspace: std::sync::RwLock<Arc<WorkspacePolicy>>,
 }
 
 impl ToolPipeline {
@@ -687,7 +690,7 @@ impl ToolPipeline {
             database,
             registry,
             dispatch,
-            workspace,
+            workspace: std::sync::RwLock::new(Arc::new(workspace)),
         })
     }
 
@@ -755,7 +758,7 @@ impl ToolPipeline {
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: actor.authority(),
-            workspace: &self.workspace,
+            workspace: &self.workspace_policy(),
             available: definition.availability().is_available(),
             target: TargetAssessment::none(),
         });
@@ -1099,12 +1102,13 @@ impl ToolPipeline {
     /// unreachable for a key the registry itself produced, so it is reported rather than skipped: a
     /// skipped tool would be a hole in the list an operator is reviewing.
     pub fn policy_inventory(&self) -> Result<Vec<PolicyInventoryEntry>, ToolPipelineError> {
+        let policy = self.workspace_policy();
         let mut entries = Vec::new();
         for entry in self.registry.inventory() {
             let id = ToolId::new(&entry.id)?;
             let definition = self.registry.get(&id).cloned()?;
             let declared = definition.approval();
-            let effective = self.workspace.effective_approval(&id, declared);
+            let effective = policy.effective_approval(&id, declared);
             entries.push(PolicyInventoryEntry {
                 id: entry.id,
                 title: definition.title().to_owned(),
@@ -1126,10 +1130,10 @@ impl ToolPipeline {
                 // Derived rather than stored, so the flag cannot disagree with the two policies it
                 // describes — a stored flag would be a third value to keep in step.
                 overridden: effective != declared,
-                denied: self.workspace.denies(&id),
+                denied: policy.denies(&id),
                 callable: entry.callable,
                 unavailable_reason: entry.unavailable_reason,
-                asks_first: self.workspace.asks_first(&definition),
+                asks_first: policy.asks_first(&definition),
             });
         }
         Ok(entries)
@@ -1165,7 +1169,7 @@ impl ToolPipeline {
         Ok(evaluate(&PolicyRequest {
             definition: &definition,
             actor: actor.authority(),
-            workspace: &self.workspace,
+            workspace: &self.workspace_policy(),
             available: definition.availability().is_available(),
             target: target.clone(),
         }))
@@ -1178,8 +1182,24 @@ impl ToolPipeline {
     /// recomposing it from configuration — the two would otherwise be able to disagree, and the one a
     /// client displayed would be the one nothing enforced.
     #[must_use]
-    pub const fn workspace_policy(&self) -> &WorkspacePolicy {
-        &self.workspace
+    pub fn workspace_policy(&self) -> Arc<WorkspacePolicy> {
+        Arc::clone(
+            &self
+                .workspace
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Replaces the workspace policy, so the owner's change to a tool's permission applies from the next call.
+    ///
+    /// Only the settings handler calls this, with a policy it just built from the saved configuration by the same function the
+    /// daemon used at start. A call already running keeps the snapshot it decided with; the next one reads the new one.
+    pub fn replace_workspace_policy(&self, policy: WorkspacePolicy) {
+        *self
+            .workspace
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
     /// Runs one tool call for a **remote MCP caller**, applying every gate a local call gets and recording no
@@ -1236,7 +1256,7 @@ impl ToolPipeline {
         let decision = evaluate(&PolicyRequest {
             definition: &definition,
             actor: actor.authority(),
-            workspace: &self.workspace,
+            workspace: &self.workspace_policy(),
             available: definition.availability().is_available(),
             // `none`, deliberately: an MCP request carries no target and this module does not read one out of
             // free-form arguments. A target assessment invented from arguments would be a second classifier

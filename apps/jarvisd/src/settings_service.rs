@@ -13,8 +13,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jarvis_core::ErrorCode;
-use jarvis_storage::AppPaths;
 use jarvis_storage::settings::{self, SecretKind};
+use jarvis_storage::{AppPaths, ConfigStore};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -196,6 +196,27 @@ pub async fn batch(State(state): State<GatewayState>, Json(body): Json<BatchBody
     }
 }
 
+/// Rebuilds the workspace policy from the saved configuration and hands it to the running pipeline, so a change to a tool's
+/// permission (including "off" and "always ask") applies to the next call. Returns whether it did.
+///
+/// Fails closed in the useful direction: when the saved file cannot be read or composed, the running policy is left exactly as it
+/// was and the caller says a restart is needed, so a half-understood file never loosens anything.
+fn apply_policy_now(state: &GatewayState, context: &SettingsContext) -> bool {
+    let Some(tools) = state.tools() else {
+        return false;
+    };
+    let Ok(loaded) = ConfigStore::from_paths(&context.paths).load() else {
+        return false;
+    };
+    match crate::compose_workspace_policy(loaded.config()) {
+        Ok(policy) => {
+            tools.replace_workspace_policy(policy);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// `PUT /api/v1/settings/tools/{tool}`: what the owner has decided about one tool (default, ask, trusted or off).
 pub async fn set_posture(
     State(state): State<GatewayState>,
@@ -221,9 +242,10 @@ pub async fn set_posture(
     match settings::set_tool_posture(&context.paths, &tool, posture) {
         Ok(()) => {
             tracing::info!(%tool, posture = posture.name(), "a tool's permission was changed from the settings screen");
+            let applied = apply_policy_now(&state, context);
             (
                 StatusCode::OK,
-                Json(json!({ "saved": true, "restart_to_apply": true })),
+                Json(json!({ "saved": true, "restart_to_apply": !applied, "applied": applied })),
             )
                 .into_response()
         }
