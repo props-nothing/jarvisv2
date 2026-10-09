@@ -41,6 +41,9 @@ use crate::findings::{Finding, FindingCode};
 /// without this marker is treated as foreign rather than adopted.
 pub const OWNERSHIP_MARKER: &str = "jarvis-managed-service";
 
+/// The argument that makes the `jarvis` executable run as the daemon (`jarvis daemon`, `ADR-0144`).
+pub const DAEMON_ARGUMENT: &str = "daemon";
+
 /// Platform service manager that a plan targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceKind {
@@ -191,7 +194,10 @@ impl ServicePlan {
     /// Returns the launcher argument list, in the order the manager would use.
     #[must_use]
     pub fn arguments(&self) -> Vec<String> {
-        let mut arguments = vec![self.binary_path.display().to_string()];
+        let mut arguments = vec![
+            self.binary_path.display().to_string(),
+            DAEMON_ARGUMENT.to_owned(),
+        ];
         if let Some(argument) = &self.root_argument {
             arguments.push("--root".to_owned());
             arguments.push(argument.clone());
@@ -216,7 +222,7 @@ impl ServicePlan {
                  \n\
                  [Service]\n\
                  Type=simple\n\
-                 ExecStart={}\n\
+                 ExecStart={} {DAEMON_ARGUMENT}\n\
                  Restart=on-failure\n\
                  RestartSec=3\n\
                  \n\
@@ -232,7 +238,7 @@ impl ServicePlan {
                  <dict>\n\
                  <key>Label</key><string>dev.jarvis.jarvisd</string>\n\
                  <key>ProgramArguments</key>\n\
-                 <array><string>{}</string></array>\n\
+                 <array><string>{}</string><string>{DAEMON_ARGUMENT}</string></array>\n\
                  <key>RunAtLoad</key><true/>\n\
                  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
                  </dict>\n\
@@ -242,7 +248,8 @@ impl ServicePlan {
             ServiceKind::WindowsUserLauncher => format!(
                 "{{\n\
                  \"marker\": \"{OWNERSHIP_MARKER}\",\n\
-                 \"binary\": \"{}\"\n\
+                 \"binary\": \"{}\",\n\
+                 \"arguments\": [\"{DAEMON_ARGUMENT}\"]\n\
                  }}\n",
                 executable.replace('\\', "\\\\")
             ),
@@ -285,7 +292,7 @@ impl ServicePlan {
             )],
             ServiceKind::WindowsUserLauncher => {
                 let launcher = format!(
-                    "powershell.exe -NoProfile -WindowStyle Hidden -Command \"Start-Process -FilePath '{}' -WindowStyle Hidden\"",
+                    "powershell.exe -NoProfile -WindowStyle Hidden -Command \"Start-Process -FilePath '{}' -ArgumentList '{DAEMON_ARGUMENT}' -WindowStyle Hidden\"",
                     self.binary_path.display().to_string().replace('\'', "''")
                 );
                 vec![ServiceCommand::new(
@@ -418,50 +425,6 @@ fn user_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-}
-
-/// Derives the daemon binary that sits beside a client binary.
-///
-/// `jarvis` and `jarvisd` are released together, so the daemon is the sibling of
-/// the client. Using `current_exe()` directly would plan the **client** as the
-/// service and install a launcher that never serves anything, so the sibling is
-/// resolved explicitly and `None` is returned when it is absent.
-#[must_use]
-pub fn daemon_binary_beside(client: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        "jarvisd.exe"
-    } else {
-        "jarvisd"
-    };
-    let candidate = client.parent()?.join(name);
-    candidate.is_file().then_some(candidate)
-}
-
-/// Finds the daemon for a client: beside it first, then on `PATH`.
-///
-/// Beside is preferred because the two are released together and a copy next to the client is the one that matches its version.
-/// `PATH` is the fallback for the common case of only `jarvis` having been put on it. The result is always absolute, which a
-/// service definition requires.
-#[must_use]
-pub fn find_daemon(client: &Path) -> Option<PathBuf> {
-    daemon_binary_beside(client)
-        .or_else(|| find_on_path(daemon_file_name(), std::env::var_os("PATH")))
-}
-
-const fn daemon_file_name() -> &'static str {
-    if cfg!(windows) {
-        "jarvisd.exe"
-    } else {
-        "jarvisd"
-    }
-}
-
-/// The first absolute `name` found in the directories of a `PATH`-style value.
-fn find_on_path(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    std::env::split_paths(&path?)
-        .filter(|directory| directory.is_absolute())
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Explains why a service plan could not be produced.
@@ -630,32 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_binary_is_resolved_beside_the_client_not_as_the_client() {
-        let directory = TempDirectory::new();
-        let client = directory.0.join(if cfg!(windows) {
-            "jarvis.exe"
-        } else {
-            "jarvis"
-        });
-        fs::write(&client, b"client").unwrap_or_else(|error| panic!("write client: {error}"));
-
-        // With no sibling, resolution must fail rather than fall back to the client.
-        assert_eq!(daemon_binary_beside(&client), None);
-
-        let daemon = directory.0.join(if cfg!(windows) {
-            "jarvisd.exe"
-        } else {
-            "jarvisd"
-        });
-        fs::write(&daemon, b"daemon").unwrap_or_else(|error| panic!("write daemon: {error}"));
-
-        let resolved = daemon_binary_beside(&client)
-            .unwrap_or_else(|| panic!("the daemon should resolve beside the client"));
-        assert_eq!(resolved, daemon);
-        assert_ne!(resolved, client, "the service must not launch the client");
-    }
-
-    #[test]
     fn portable_mode_refuses_to_install_a_service() {
         let root = PathBuf::from("/tmp/portable");
         let result = ServicePlan::build(
@@ -689,7 +626,7 @@ mod tests {
         assert_eq!(plan.render(), plan.render());
         assert!(plan.render().contains(OWNERSHIP_MARKER));
         assert!(plan.render().contains("/usr/local/bin/jarvisd"));
-        assert_eq!(plan.arguments(), vec!["/usr/local/bin/jarvisd"]);
+        assert_eq!(plan.arguments(), vec!["/usr/local/bin/jarvisd", "daemon"]);
     }
 
     #[test]
@@ -802,12 +739,42 @@ mod tests {
     fn a_systemd_exec_path_with_spaces_is_quoted_and_a_plain_one_is_not() {
         let spaced = plan_with(ServiceKind::SystemdUser, "/opt/my apps/jarvisd").render();
         assert!(
-            spaced.contains("ExecStart=\"/opt/my apps/jarvisd\""),
+            spaced.contains("ExecStart=\"/opt/my apps/jarvisd\" daemon"),
             "{spaced}"
         );
         let plain = plan_with(ServiceKind::SystemdUser, "/usr/local/bin/jarvisd").render();
-        assert!(plain.contains("ExecStart=/usr/local/bin/jarvisd\n"));
+        assert!(plain.contains("ExecStart=/usr/local/bin/jarvisd daemon\n"));
         assert!(plain.contains("Restart=on-failure") && plain.contains("WantedBy=default.target"));
+    }
+
+    /// **Every platform's definition launches the one executable as `jarvis daemon`.**
+    ///
+    /// The service binary is the `jarvis` program itself (`ADR-0144`); without the argument a login would start the client
+    /// and exit, and the daemon would never be there. Asserted for each kind because each renders its own format.
+    #[test]
+    fn every_definition_launches_the_executable_as_the_daemon() {
+        for kind in [
+            ServiceKind::SystemdUser,
+            ServiceKind::LaunchdAgent,
+            ServiceKind::WindowsUserLauncher,
+        ] {
+            let plan = plan_with(kind, "/opt/jarvis/jarvis");
+            let rendered = plan.render();
+            assert!(rendered.contains("daemon"), "{kind:?}: {rendered}");
+            let installed: Vec<String> = plan
+                .install_steps()
+                .iter()
+                .flat_map(|step| step.args.clone())
+                .collect();
+            if kind == ServiceKind::WindowsUserLauncher {
+                assert!(
+                    installed
+                        .iter()
+                        .any(|argument| argument.contains("-ArgumentList 'daemon'")),
+                    "{installed:?}"
+                );
+            }
+        }
     }
 
     /// What an install and an uninstall would run, per platform, as data: no platform needed to check it.
@@ -859,33 +826,5 @@ mod tests {
                 .any(|argument| argument.contains("Start-Process") && argument.contains("it''s"))
         );
         assert_eq!(windows.uninstall_steps()[0].args[0], "delete");
-    }
-
-    #[test]
-    fn the_daemon_is_found_beside_the_client_then_on_the_path() {
-        let beside = TempDirectory::new();
-        let elsewhere = TempDirectory::new();
-        let name = daemon_file_name();
-        fs::write(elsewhere.0.join(name), b"daemon").unwrap_or_else(|error| panic!("{error}"));
-        let client = beside.0.join(if cfg!(windows) {
-            "jarvis.exe"
-        } else {
-            "jarvis"
-        });
-
-        // Not beside it, but on the path.
-        let path = std::env::join_paths([beside.0.clone(), elsewhere.0.clone()]).ok();
-        assert_eq!(
-            find_on_path(name, path.clone()),
-            Some(elsewhere.0.join(name))
-        );
-        // A relative path entry is ignored: it would resolve against whatever directory the process happens to be in.
-        let relative = std::env::join_paths(["relative-dir"]).ok();
-        assert_eq!(find_on_path(name, relative), None);
-        assert_eq!(find_on_path(name, None), None);
-
-        // A copy beside the client wins over the path.
-        fs::write(beside.0.join(name), b"daemon").unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(daemon_binary_beside(&client), Some(beside.0.join(name)));
     }
 }

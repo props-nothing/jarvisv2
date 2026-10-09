@@ -45,7 +45,7 @@ jobs:
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --prerelease \
                  --title "JARVIS $GITHUB_REF_NAME" \
-                 --notes "Unsigned private build. Unpack, keep jarvis and jarvisd together, run jarvis. See docs/user/quick-start.md."
+                 --notes "Unsigned private build. Unpack and run jarvis (one program). See docs/user/quick-start.md."
 
   package:
     needs: draft
@@ -82,9 +82,9 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.target }}" ]; then
-            cargo build --release --locked --target "${{ matrix.target }}" -p jarvis-cli -p jarvisd
+            cargo build --release --locked --target "${{ matrix.target }}" -p jarvis-cli
           else
-            cargo build --release --locked -p jarvis-cli -p jarvisd
+            cargo build --release --locked -p jarvis-cli
           fi
       - name: Package
         shell: bash
@@ -110,7 +110,7 @@ jobs:
           dir="$(ls -d smoke/jarvis-*)"
           ext=""; [ -f "$dir/jarvis.exe" ] && ext=".exe"
           "$dir/jarvis$ext" version
-          "$dir/jarvisd$ext" --version
+          "$dir/jarvis$ext" daemon --version
       - name: Attach to the draft release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash

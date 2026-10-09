@@ -606,9 +606,10 @@ fn spawn_daemon(binary: &Path, root: Option<&str>) -> Result<Daemon, String> {
     #[cfg(windows)]
     {
         let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
-        let arguments = root.map_or_else(String::new, |root| {
-            format!(" -ArgumentList @('--root',{})", quote(root))
-        });
+        let arguments = root.map_or_else(
+            || " -ArgumentList @('daemon')".to_owned(),
+            |root| format!(" -ArgumentList @('daemon','--root',{})", quote(root)),
+        );
         let script = format!(
             "(Start-Process -FilePath {} -WindowStyle Hidden -PassThru{arguments}).Id",
             quote(&binary.display().to_string())
@@ -627,6 +628,7 @@ fn spawn_daemon(binary: &Path, root: Option<&str>) -> Result<Daemon, String> {
     #[cfg(not(windows))]
     {
         let mut command = std::process::Command::new(binary);
+        command.arg("daemon");
         if let Some(root) = root {
             command.args(["--root", root]);
         }
@@ -686,11 +688,10 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
         return ExitStatus::Ok;
     }
 
-    let Some(binary) = std::env::current_exe()
-        .ok()
-        .and_then(|client| jarvis_diagnostics::find_daemon(&client))
-    else {
-        eprintln!("jarvis: the daemon binary (jarvisd) was not found next to this program");
+    // The daemon is this same executable run as `jarvis daemon` (`ADR-0144`), so there is nothing to find and its
+    // version is always this client's.
+    let Ok(binary) = std::env::current_exe() else {
+        eprintln!("jarvis: could not locate this program to start the daemon with");
         return ExitStatus::Unavailable;
     };
     let mut daemon = match spawn_daemon(&binary, flag_value(arguments, "--root").as_deref()) {
@@ -711,10 +712,10 @@ pub fn start(paths: &AppPaths, arguments: &[String]) -> ExitStatus {
             return ExitStatus::Ok;
         }
         // The daemon exiting is the answer, and a far better one than waiting out the clock: it refuses to start
-        // for a reason (a bad folder, a missing key) that `jarvisd` itself would have printed.
+        // for a reason (a bad folder, a missing key) that `jarvis daemon` itself would have printed.
         if daemon.has_exited() {
             eprintln!(
-                "jarvis: the daemon exited at startup. Run `jarvisd` in a terminal to see why."
+                "jarvis: the daemon exited at startup. Run `jarvis daemon` in a terminal to see why."
             );
             return ExitStatus::Unavailable;
         }

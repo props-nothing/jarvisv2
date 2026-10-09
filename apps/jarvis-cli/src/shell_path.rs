@@ -51,12 +51,14 @@ pub fn windows_script(directory: &str, add: bool) -> String {
     format!("{head}{tail}")
 }
 
-/// The links `install` makes on Linux and macOS: one per program, from `bin_dir` to the real file.
+/// The links `install` makes on Linux and macOS: `jarvis`, from `bin_dir` to the real file, and `jarvisd` too when an older
+/// release left one beside it (the daemon is now `jarvis daemon`, `ADR-0144`).
 #[cfg(any(not(windows), test))]
 #[must_use]
 pub fn unix_links(program_dir: &Path, bin_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     ["jarvis", "jarvisd"]
         .iter()
+        .filter(|name| **name == "jarvis" || program_dir.join(name).exists())
         .map(|name| (bin_dir.join(name), program_dir.join(name)))
         .collect()
 }
@@ -316,16 +318,22 @@ mod tests {
     }
 
     #[test]
-    fn both_programs_are_linked_into_the_bin_directory() {
+    fn only_the_one_executable_is_linked_unless_an_old_daemon_binary_is_beside_it() {
         let links = unix_links(Path::new("/opt/jarvis"), Path::new("/home/me/.local/bin"));
-        assert_eq!(links.len(), 2);
         assert_eq!(
-            links[0],
-            (
+            links,
+            [(
                 PathBuf::from("/home/me/.local/bin/jarvis"),
                 PathBuf::from("/opt/jarvis/jarvis")
-            )
+            )]
         );
-        assert_eq!(links[1].0, PathBuf::from("/home/me/.local/bin/jarvisd"));
+        let old = std::env::temp_dir().join(format!("jarvis-links-{}", std::process::id()));
+        std::fs::create_dir_all(&old).unwrap_or_else(|error| panic!("create: {error}"));
+        std::fs::write(old.join("jarvisd"), b"old")
+            .unwrap_or_else(|error| panic!("write: {error}"));
+        let with_old = unix_links(&old, Path::new("/home/me/.local/bin"));
+        let _ = std::fs::remove_dir_all(&old);
+        assert_eq!(with_old.len(), 2);
+        assert_eq!(with_old[1].0, PathBuf::from("/home/me/.local/bin/jarvisd"));
     }
 }

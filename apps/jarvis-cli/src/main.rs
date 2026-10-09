@@ -48,9 +48,25 @@ const CREDENTIAL_FILE_NAME: &str = "client.credential";
 /// Filename of the daemon log inside the log directory.
 const LOG_FILE_NAME: &str = "jarvisd.jsonl";
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // The daemon is this same executable (`ADR-0144`), and it brings its own multi-threaded runtime.
+    if arguments.first().map(String::as_str) == Some("daemon") {
+        return jarvisd::run_blocking(arguments.into_iter().skip(1).collect());
+    }
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(client_main(arguments)),
+        Err(error) => {
+            eprintln!("jarvis: could not start the async runtime: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn client_main(arguments: Vec<String>) -> ExitCode {
     let status = match arguments.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -426,18 +442,10 @@ fn service(arguments: &[String]) -> ExitStatus {
     let json = json_requested(arguments);
     let kind = ServiceKind::native();
 
-    // The service must launch the daemon, not this client. `current_exe()` is the
-    // client, so the daemon is resolved as its sibling.
-    let client = match std::env::current_exe() {
+    // The service launches this executable as `jarvis daemon` (`ADR-0144`).
+    let binary = match std::env::current_exe() {
         Ok(path) => path,
-        Err(error) => return fail("locate the client binary", &error),
-    };
-    let Some(binary) = jarvis_diagnostics::find_daemon(&client) else {
-        eprintln!(
-            "jarvis: could not find jarvisd beside {}; the service would launch the client",
-            client.display()
-        );
-        return ExitStatus::Unavailable;
+        Err(error) => return fail("locate this program", &error),
     };
 
     // A portable root is deliberately refused: portable mode creates no service.

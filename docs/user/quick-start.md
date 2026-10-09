@@ -8,9 +8,9 @@ The target experience, and what is still missing from it, is in [product/onboard
 - A model. The easiest is [Ollama](https://ollama.com) running on this machine (local models, or Ollama Cloud models through it).
   Any OpenAI-compatible server works too.
 - Optionally Docker, if you want the assistant to run code in a throwaway container.
-- The two programs, `jarvis` and `jarvisd`, **kept in the same folder**. Either unpack a release archive (CI builds one per platform as
-  a workflow artifact, or a draft release for a tagged build; there is no public download until a licence is chosen), or build them with a Rust toolchain:
-  `cargo build --release -p jarvis-cli -p jarvisd`, then take them from `target/release/`.
+- One program, `jarvis` (the assistant it runs in the background is the same file, started as `jarvis daemon`). Either unpack a release archive (CI builds one per platform as
+  a workflow artifact, or a draft release for a tagged build; there is no public download until a licence is chosen), or build it with a Rust toolchain:
+  `cargo build --release -p jarvis-cli`, then take it from `target/release/`.
 
 ## First run
 
@@ -101,7 +101,7 @@ default.
 A built or unpacked JARVIS is a folder, and nothing puts that folder on your PATH, so a terminal says `jarvis: command not found`
 (or "not recognized"). Run it once by its path: `jarvis path install` from inside the folder (for example
 `.\target\release\jarvis.exe path install`). On Windows it adds the folder to your user PATH; on Linux and macOS it links `jarvis`
-and `jarvisd` into `~/.local/bin`. Open a new terminal and `jarvis` works anywhere. `jarvis path status` says whether it does, and
+into `~/.local/bin`. Open a new terminal and `jarvis` works anywhere. `jarvis path status` says whether it does, and
 `jarvis path uninstall` undoes it. `jarvis start` mentions this when it notices.
 
 ## Running it all the time, and on other machines

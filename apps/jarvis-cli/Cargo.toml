@@ -11,6 +11,8 @@ name = "jarvis"
 path = "src/main.rs"
 
 [dependencies]
+# One executable (ADR-0144): jarvis daemon runs the daemon, so a person installs a single file.
+jarvisd = { path = "../jarvisd" }
 jarvis-core.workspace = true
 jarvis-connectors.workspace = true
 jarvis-diagnostics.workspace = true

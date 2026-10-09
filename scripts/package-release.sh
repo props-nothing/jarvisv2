@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Packages the two release programs into one archive and writes its checksum.
+# Packages the release program into one archive and writes its checksum.
 #
 #   scripts/package-release.sh <label> [release-dir]
 #
 # <label> names the platform in the archive (linux-x86_64, macos-aarch64, windows-x86_64, ...). <release-dir> is where
-# `cargo build --release` put `jarvis` and `jarvisd` (default: target/release). The archive is written to dist/.
+# `cargo build --release` put `jarvis` (default: target/release). The archive is written to dist/.
 #
-# The archive holds the two programs side by side (the CLI finds the daemon beside itself), a README that says how to run
-# them, the user docs, and the third-party notices. No licence file is included because none has been chosen yet: see README.md.
+# The archive holds the one program (the daemon is `jarvis daemon`, ADR-0144), a README that says how to run it, the user docs,
+# and the third-party notices. No licence file is included because none has been chosen yet: see README.md.
 set -euo pipefail
 
 label="${1:?usage: package-release.sh <label> [release-dir]}"
@@ -23,22 +23,20 @@ case "$(uname -s)" in
   *) exe=""; kind="tar.gz" ;;
 esac
 
-for program in jarvis jarvisd; do
-  [ -f "$release_dir/$program$exe" ] || { echo "missing $release_dir/$program$exe: build with 'cargo build --release -p jarvis-cli -p jarvisd'" >&2; exit 1; }
-done
+[ -f "$release_dir/jarvis$exe" ] || { echo "missing $release_dir/jarvis$exe: build with 'cargo build --release -p jarvis-cli'" >&2; exit 1; }
 
 name="jarvis-$version-$label"
 stage="dist/$name"
 rm -rf "$stage" "dist/$name.$kind" "dist/$name.$kind.sha256"
 mkdir -p "$stage/docs"
 
-cp "$release_dir/jarvis$exe" "$release_dir/jarvisd$exe" "$stage/"
+cp "$release_dir/jarvis$exe" "$stage/"
 cp docs/user/quick-start.md docs/user/settings.md docs/user/platforms.md "$stage/docs/"
 cp THIRD_PARTY.md "$stage/"
 cat > "$stage/README.txt" <<EOF
 JARVIS $version ($label)
 
-Keep jarvis$exe and jarvisd$exe in the same folder, then run jarvis$exe.
+Run jarvis$exe. It is the whole program: the assistant it starts in the background is the same file.
 The first run asks a few questions, starts the assistant in the background and opens its console in your browser.
 
   docs/quick-start.md   the first run, keys, settings, running all the time
@@ -47,7 +45,7 @@ The first run asks a few questions, starts the assistant in the background and o
   THIRD_PARTY.md        third-party notices
 
 This build is not signed. On macOS, a downloaded copy may be quarantined: run
-  xattr -d com.apple.quarantine jarvis jarvisd
+  xattr -d com.apple.quarantine jarvis
 EOF
 
 if [ "$kind" = "zip" ]; then

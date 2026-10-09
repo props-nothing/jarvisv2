@@ -7120,7 +7120,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   resumed with no memory of its steps, approved `npm run build` about fourteen times and ended empty; and an identical approved call was refused as
   a repeat. Migration 0015 makes the repeat guard apply only to pending/denied approvals; migration 0016 stores the run's own turns while it
   waits and puts them back on resume, with "not run" results for calls after the held one. Tests: a three-call turn resumes with a result for
-  every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.- [x] `P9-033` One executable (ADR-0144). `jarvis daemon` runs the daemon (`jarvisd` is now a library plus a thin wrapper binary); `jarvis start`
+  and the login service launch the `jarvis` file itself, and release archives, `jarvis path install` and the smoke test carry just `jarvis`.
+  Tests: every service definition launches `<exe> daemon`; the PATH links are one file unless an old `jarvisd` is beside it. Live: see below.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

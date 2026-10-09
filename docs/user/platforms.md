@@ -21,7 +21,7 @@ on a server with no screen, and what is still missing. It is deliberately specif
 "Run end to end by a person" is the honest gap: the Linux and macOS code paths compile and lint cleanly and their tests run in CI, but
 nobody has used JARVIS on a real Linux box or Mac yet. Treat the first run there as a test and report what you find (`P9-022`).
 
-The first release workflow run built all five archives on GitHub; its smoke test (unpack, run `jarvis version` and `jarvisd --version`) failed
+The first release workflow run built all five archives on GitHub; its smoke test (unpack, run `jarvis version` and `jarvis daemon --version`) failed
 on every platform because of a shell glob in the script itself, since fixed and verified by packaging and running the Windows archive locally.
 macOS is the one CI job still red: the Phase 3 gate (a real daemon and an MCP child process) fails there for a reason not yet read.
 
@@ -81,7 +81,7 @@ uninstall` removes it. `jarvis start` launches the daemon so that scripts which 
 - Archives are built by CI (Actions, "Release (private artifacts)"). Run it by hand for 14-day workflow artifacts, or push a `v*` tag to
   also attach the archives to a **draft** GitHub release, which only people with write access can see. Nothing is published, because no
   licence has been chosen yet, and there is no installer, signing or update mechanism (`P9-004` to `P9-007`, `P9-017b`). Each archive has
-  `jarvis` and `jarvisd` side by side plus a SHA-256 file; unpack it and run `jarvis`. This workflow has not run on GitHub yet, so the first
+  the single `jarvis` program plus a SHA-256 file; unpack it and run `jarvis`. This workflow has not run on GitHub yet, so the first
   run (`Run workflow`) is also its test.
 - The Linux sandbox backend without a container runtime has no wait-for-exit support recorded in the sandbox research; use the
   Docker-backed code tool.
