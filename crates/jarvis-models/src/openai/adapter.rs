@@ -38,6 +38,8 @@ pub struct OpenAiCompatibleProvider {
     api_key: ApiKey,
     transport: Arc<dyn Transport>,
     retry: RetryPolicy,
+    /// Used for a request that does not choose its own reasoning effort (the owner's configured default).
+    default_effort: Option<crate::request::ReasoningEffort>,
 }
 
 impl std::fmt::Debug for OpenAiCompatibleProvider {
@@ -69,7 +71,18 @@ impl OpenAiCompatibleProvider {
             api_key,
             transport,
             retry,
+            default_effort: None,
         }
+    }
+
+    /// Sets the reasoning effort asked for when a request does not choose one.
+    #[must_use]
+    pub const fn with_default_reasoning_effort(
+        mut self,
+        effort: Option<crate::request::ReasoningEffort>,
+    ) -> Self {
+        self.default_effort = effort;
+        self
     }
 
     /// Returns the configured base URL.
@@ -95,7 +108,11 @@ impl OpenAiCompatibleProvider {
     ///
     /// Local validation runs first so a malformed request fails without a round trip
     /// and without spending a provider call.
-    fn serialize(request: &ChatRequest, streaming: bool) -> Result<String, ModelError> {
+    fn serialize(
+        request: &ChatRequest,
+        streaming: bool,
+        default_effort: Option<crate::request::ReasoningEffort>,
+    ) -> Result<String, ModelError> {
         if !request.messages().iter().all(ChatMessage::is_consistent) {
             return Err(ModelError::from_static(
                 ModelErrorKind::InvalidRequest,
@@ -151,6 +168,7 @@ impl OpenAiCompatibleProvider {
             max_tokens: request.max_output_tokens(),
             reasoning_effort: request
                 .reasoning_effort()
+                .or(default_effort)
                 .map(crate::request::ReasoningEffort::as_str),
             temperature: request
                 .temperature_milli()
@@ -173,7 +191,7 @@ impl OpenAiCompatibleProvider {
         request: &ChatRequest,
         streaming: bool,
     ) -> Result<TransportResponse, ModelError> {
-        let body = Self::serialize(request, streaming)?;
+        let body = Self::serialize(request, streaming, self.default_effort)?;
         let transport_request = TransportRequest::new(
             self.base_url.join(CHAT_COMPLETIONS_PATH),
             body,
@@ -671,6 +689,25 @@ fn sse_stream(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_configured_default_effort_is_sent_unless_the_request_chooses_its_own() {
+        use crate::request::ReasoningEffort;
+        use crate::{ChatMessage, ChatRequest, ModelId};
+        let request = ChatRequest::new(
+            ModelId::new("m").unwrap_or_else(|error| panic!("{error}")),
+            vec![ChatMessage::user("hi")],
+            jarvis_core::CorrelationId::new(),
+        );
+        let body = |request: &ChatRequest, default| {
+            OpenAiCompatibleProvider::serialize(request, true, default)
+                .unwrap_or_else(|error| panic!("serialize: {error}"))
+        };
+        assert!(!body(&request, None).contains("reasoning_effort"));
+        assert!(body(&request, Some(ReasoningEffort::Low)).contains(r#""reasoning_effort":"low""#));
+        // A request that chooses (the loop does, once a model overruns its budget) wins over the owner's default.
+        let chosen = request.with_reasoning_effort(Some(ReasoningEffort::High));
+        assert!(body(&chosen, Some(ReasoningEffort::Low)).contains(r#""reasoning_effort":"high""#));
+    }
     #[test]
     fn a_transport_body_failure_is_not_reported_as_retryable() {
         // The provider may have accepted the request, so an unreadable body is an

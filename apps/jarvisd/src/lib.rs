@@ -18,6 +18,7 @@ mod mcp_host;
 mod mcp_serve;
 mod memory_propose;
 mod memory_service;
+mod notify;
 mod run_service;
 mod schedule_service;
 mod schedule_tool;
@@ -145,6 +146,13 @@ enum DaemonError {
         /// Which constant was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebFetchToolError,
+    },
+    /// The web search tool could not state its own contract.
+    #[error("the web search tool could not be defined")]
+    WebSearchTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: jarvis_web::WebSearchToolError,
     },
     /// The schedule tools could not state their own contract.
     #[error("the schedule tools could not be defined")]
@@ -586,9 +594,18 @@ fn compose_model_provider(
     if key.is_empty() {
         return Err(DaemonError::ModelApiKeyEmpty);
     }
-    Ok(Some(executor::ModelProviderConfig::new(
-        base_url, model, key,
-    )))
+    let effort = daemon
+        .executor_reasoning_effort()
+        .and_then(|word| match word {
+            "none" => Some(jarvis_models::ReasoningEffort::None),
+            "low" => Some(jarvis_models::ReasoningEffort::Low),
+            "medium" => Some(jarvis_models::ReasoningEffort::Medium),
+            "high" => Some(jarvis_models::ReasoningEffort::High),
+            _ => None,
+        });
+    Ok(Some(
+        executor::ModelProviderConfig::new(base_url, model, key).with_reasoning_effort(effort),
+    ))
 }
 
 /// Builds the speech provider, when a key file is configured.
@@ -752,6 +769,7 @@ async fn compose_tools(
             &database,
         ))) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
+    push_search_tool(config, &mut additional)?;
     push_code_tool(config, &mut additional)?;
     push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
@@ -784,6 +802,44 @@ async fn compose_tools(
         agent.bind(pipeline);
     }
     Ok((mcp, tools))
+}
+
+/// Adds the web search tool to the composition, when a search key is configured.
+///
+/// Opt-in: without a key there is no search tool, which is the honest state (the assistant can still fetch a page it is given).
+/// A key file that cannot be used is **not** fatal, unlike the model key: search is an extra, so the daemon starts without it and
+/// says why, once, instead of refusing to serve everything.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::WebSearchTool`] when the tool's own contract is rejected.
+fn push_search_tool(
+    config: &jarvis_storage::Config,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
+    let Some(key_ref) = config.daemon().search_api_key_ref() else {
+        return Ok(());
+    };
+    let Ok(key) = fs::read_to_string(key_ref) else {
+        tracing::warn!("the search key file could not be read, so web search is not offered");
+        return Ok(());
+    };
+    let Ok(tool) = jarvis_web::WebSearchTool::new(&key) else {
+        tracing::warn!("the search key is unusable, so web search is not offered");
+        return Ok(());
+    };
+    additional.push((
+        vec![
+            jarvis_web::WebSearchTool::definition()
+                .map_err(|source| DaemonError::WebSearchTool { source })?,
+        ],
+        Arc::new(tool) as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    tracing::info!("the web search tool is available");
+    Ok(())
 }
 
 /// Adds the command-running tool to the composition, when a folder has been granted.
@@ -1548,8 +1604,43 @@ shutdown_timeout_seconds = 30
         );
     }
 
-    /// **A configured ceiling, threshold, denial, and override all reach the composed policy.**
-    ///
+    /// **Web search is offered only with a usable key, and an unusable one never stops the daemon.**
+    #[test]
+    fn web_search_is_composed_only_from_a_usable_key() {
+        let dir = std::env::temp_dir().join(format!("jws-{}", jarvis_core::scratch_tag()));
+        fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("{error}"));
+        let key = dir.join("search.key");
+        fs::write(&key, "a-key\n").unwrap_or_else(|error| panic!("{error}"));
+        let composed = |section: &str| {
+            let config = config_with_policy(section);
+            let mut additional = Vec::new();
+            push_search_tool(&config, &mut additional)
+                .unwrap_or_else(|error| panic!("composition must not fail: {error}"));
+            additional.len()
+        };
+        let literal = key.display().to_string().replace('\\', "/");
+        assert_eq!(composed(&format!("search_api_key_ref = \"{literal}\"")), 1);
+        assert_eq!(composed(""), 0, "no key, no search tool");
+        let missing = dir
+            .join("missing.key")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        assert_eq!(
+            composed(&format!("search_api_key_ref = \"{missing}\"")),
+            0,
+            "an unreadable key file is skipped, not fatal"
+        );
+        fs::write(&key, "has a space").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            composed(&format!("search_api_key_ref = \"{literal}\"")),
+            0,
+            "a malformed key is skipped, not fatal"
+        );
+        jarvis_core::remove_scratch_dir(&dir);
+    }
+
+    /// **A configured ceiling, threshold, denial, and override all reach the composed policy.**    ///
     /// The end-to-end claim of the slice at the composition seam: each value an operator writes is the
     /// value policy decides with. No call is made — the policy is constructed and read, which is what
     /// the offline suite can establish.

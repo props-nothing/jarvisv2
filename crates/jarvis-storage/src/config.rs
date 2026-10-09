@@ -124,6 +124,10 @@ pub struct DaemonConfig {
     /// provider, refused when it is not — a setting with no consumer is the shape this repository removes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executor_model_name: Option<String>,
+    /// How hard a reasoning model is asked to think by default: `none`, `low`, `medium` or `high`. `None` leaves the choice to the
+    /// model. A run that overruns its thinking budget still drops to `low` for the rest of that run. Needs a live provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_reasoning_effort: Option<String>,
     /// The base URL a **live** provider is called at, including its version path (`https://host/v1`).
     ///
     /// # Why no credential may appear here
@@ -208,7 +212,16 @@ pub struct DaemonConfig {
     /// The provider's speech model, or `None` for the built-in default. Needs [`Self::speech_api_key_ref`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_model: Option<String>,
+    /// Whether a scheduled task's result is shown as a desktop notification when no console is open. Unset means yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notifications: Option<bool>,
+    /// File holding the web search provider's key (an absolute path). Without it there is no web search tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search_api_key_ref: Option<PathBuf>,
 }
+
+/// The words a reasoning effort may be (the same ones providers use).
+const REASONING_EFFORTS: [&str; 4] = ["none", "low", "medium", "high"];
 
 fn default_http_port() -> u16 {
     DEFAULT_HTTP_PORT
@@ -313,6 +326,24 @@ impl DaemonConfig {
     pub fn speech_model(&self) -> Option<&str> {
         self.speech_model.as_deref()
     }
+
+    /// The file holding the web search key, if search is configured.
+    #[must_use]
+    pub fn search_api_key_ref(&self) -> Option<&Path> {
+        self.search_api_key_ref.as_deref()
+    }
+
+    /// Whether scheduled results are shown as desktop notifications when no console is open (on unless turned off).
+    #[must_use]
+    pub fn notifications_enabled(&self) -> bool {
+        self.notifications.unwrap_or(true)
+    }
+
+    /// Returns the configured default reasoning effort (`none`, `low`, `medium` or `high`), if any.
+    #[must_use]
+    pub fn executor_reasoning_effort(&self) -> Option<&str> {
+        self.executor_reasoning_effort.as_deref()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -325,6 +356,7 @@ impl Default for DaemonConfig {
             // model budget nobody enabled.
             executor_model: None,
             executor_model_name: None,
+            executor_reasoning_effort: None,
             executor_base_url: None,
             executor_api_key_ref: None,
             // Empty: no filesystem tool is registered until an operator grants roots.
@@ -336,6 +368,8 @@ impl Default for DaemonConfig {
             speech_api_key_ref: None,
             speech_voice_id: None,
             speech_model: None,
+            notifications: None,
+            search_api_key_ref: None,
         }
     }
 }
@@ -631,6 +665,16 @@ impl Config {
             && !path.is_absolute()
         {
             return Err(ConfigError::RelativeModelApiKeyRef);
+        }
+        if let Some(effort) = &self.daemon.executor_reasoning_effort
+            && (!live || !REASONING_EFFORTS.contains(&effort.as_str()))
+        {
+            return Err(ConfigError::InvalidReasoningEffort);
+        }
+        if let Some(path) = &self.daemon.search_api_key_ref
+            && !path.is_absolute()
+        {
+            return Err(ConfigError::InvalidSearchKey);
         }
         self.validate_code_sandbox()?;
         self.validate_speech()?;
@@ -966,6 +1010,14 @@ pub enum ConfigError {
          with nothing to run, or an interpreter with nowhere to run it, is a tool that would fail every call"
     )]
     IncompleteCodeSandbox,
+    /// The default reasoning effort was not one of the known words, or there is no live model to apply it to.
+    #[error(
+        "daemon.executor_reasoning_effort must be none, low, medium or high, and needs daemon.executor_model = openai-compatible"
+    )]
+    InvalidReasoningEffort,
+    /// The web search key path was not absolute.
+    #[error("daemon.search_api_key_ref must be an absolute path")]
+    InvalidSearchKey,
     /// The speech settings were unusable: a relative key path, or a voice or model with no key.
     #[error(
         "daemon.speech_api_key_ref must be an absolute path, and daemon.speech_voice_id and daemon.speech_model \
@@ -1138,6 +1190,7 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "http_port",
                 "executor_model",
                 "executor_model_name",
+                "executor_reasoning_effort",
                 "executor_base_url",
                 "executor_api_key_ref",
                 "tool_workspace_roots",
@@ -1147,6 +1200,8 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "speech_api_key_ref",
                 "speech_voice_id",
                 "speech_model",
+                "notifications",
+                "search_api_key_ref",
             ],
             &mut unknown,
         );
@@ -1698,6 +1753,48 @@ executor_api_key_ref = "/etc/jarvis/model.key"
     }
 
     /// The API key file path must be absolute, for the same reason the configuration path must be.
+    /// **A default reasoning effort is one of the four known words, and only means something with a live model.**
+    #[test]
+    fn a_default_reasoning_effort_is_a_known_word_and_needs_a_live_model() {
+        let key = if cfg!(windows) {
+            "C:/keys/model.key"
+        } else {
+            "/keys/model.key"
+        };
+        let live = |extra: &str| {
+            format!(
+                "schema_version = 1\n[profile]\nname = \"home\"\n[logging]\nlevel = \"warn\"\n[daemon]\nshutdown_timeout_seconds = 30\n\
+                 executor_model = \"openai-compatible\"\nexecutor_model_name = \"m\"\n\
+                 executor_base_url = \"http://127.0.0.1:11434/v1\"\nexecutor_api_key_ref = \"{key}\"\n{extra}"
+            )
+        };
+        let parse = |document: &str| {
+            Config::parse_with_environment(document, Vec::<(String, String)>::new())
+        };
+        for word in ["none", "low", "medium", "high"] {
+            let loaded = parse(&live(&format!("executor_reasoning_effort = \"{word}\"")))
+                .unwrap_or_else(|error| panic!("{word}: {error}"));
+            assert_eq!(
+                loaded.config().daemon().executor_reasoning_effort(),
+                Some(word)
+            );
+        }
+        // Unset stays unset: the model decides.
+        let unset = parse(&live("")).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(unset.config().daemon().executor_reasoning_effort(), None);
+        // An unknown word is refused at startup rather than ignored.
+        assert_eq!(
+            parse(&live("executor_reasoning_effort = \"maximum\"")).err(),
+            Some(ConfigError::InvalidReasoningEffort)
+        );
+        // With no live model there is nothing to apply it to: a setting with no consumer.
+        let scripted = "schema_version = 1\n[profile]\nname = \"home\"\n[logging]\nlevel = \"warn\"\n[daemon]\nshutdown_timeout_seconds = 30\nexecutor_reasoning_effort = \"low\"\n";
+        assert_eq!(
+            parse(scripted).err(),
+            Some(ConfigError::InvalidReasoningEffort)
+        );
+    }
+
     #[test]
     fn a_relative_api_key_path_is_refused() {
         let document = r#"

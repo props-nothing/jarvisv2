@@ -7146,7 +7146,16 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   them and fix failures" completed in about two minutes with 10 passing tests and no help (the command tool was trusted, `P9-031`, `P9-036`). It showed one
   defect: the narrated stages ran together ("...run the test suite.App and tests are written") because each model call's text was streamed with nothing between
   them. A call after one that already spoke now starts its streamed text with a paragraph break (the settled answer is unchanged, and a resumed run counts as
-  having spoken). Test: the stream of a tool turn plus an answer is `first.\n\nsecond`. **Live:** the same kind of task now prints each stage on its own line.- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  having spoken). Test: the stream of a tool turn plus an answer is `first.\n\nsecond`. **Live:** the same kind of task now prints each stage on its own line.- [x] `P9-040` A default reasoning effort (ADR-0146): `daemon.executor_reasoning_effort` none/low/medium/high, applied in the model adapter when a request does not choose
+  its own (the loop's drop to `low` after an overrun still wins); refused without a live model or with an unknown word. Tests: the four words and both refusals;
+  the adapter sends the default, and a request's own choice wins. **Live:** `jarvis config set` accepted `low`, refused `maximum`; a question answered in 1.5 s with it set.
+- [x] `P9-041` Desktop notifications for scheduled results (ADR-0146): on unless `notifications = off`; shown only when no console polled in the last 15 s; text passed
+  apart from the script on every platform (tested with hostile text), Windows script single-quote-only. **Live:** a scheduled task with no console open logged and
+  showed a notification; the exact toast script was run by hand and shown. macOS/Linux: command construction only.
+- [x] `P9-042` Web search (ADR-0146), contract-tested, success path **not verified live**: `jarvis.web.search` over Ollama's documented endpoint, opt-in by `jarvis keys set search`;
+  research recorded in `docs/research/integrations/ollama-web-search.md` (the local Ollama server does not serve the endpoint, 404). Tests: documented request and fenced results,
+  401/429/500/unreachable, malformed reply, long results, bad arguments, key never in `Debug`, composition skips a missing or malformed key. **Live:** with an invalid key the real
+  service refused it and the assistant said so and fell back to a page fetch. **Needs from the owner:** an Ollama API key to run the positive path (`jarvis keys test search`).- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

@@ -5,6 +5,7 @@
 
 mod address;
 mod fetch;
+mod search;
 mod target;
 mod text;
 
@@ -13,4 +14,5 @@ pub use fetch::{
     FETCH_SCOPE, FETCH_TOOL, MAX_BODY_BYTES, MAX_REDIRECTS, MAX_TEXT_CHARS, WebFetchTool,
     WebFetchToolError,
 };
+pub use search::{SEARCH_ENDPOINT, SEARCH_SCOPE, SEARCH_TOOL, WebSearchTool, WebSearchToolError};
 pub use target::{EgressPolicy, MAX_URL_CHARS, Refusal, Target};

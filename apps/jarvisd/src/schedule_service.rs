@@ -76,8 +76,10 @@ pub fn spawn(state: GatewayState) -> tokio::task::JoinHandle<()> {
         let mut interval = tokio::time::interval(TICK);
         // A tick that overran is not made up for: the scheduler's job is "what is due now".
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut watcher = ResultWatcher::default();
         loop {
             interval.tick().await;
+            watcher.pass(&state).await;
             match tick(&state, UtcTimestamp::now(&SystemClock)).await {
                 Ok(report) if report != TickReport::default() => {
                     tracing::info!(
@@ -92,6 +94,91 @@ pub fn spawn(state: GatewayState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// When a console last asked for the schedules (the console polls every second or two while it is open), in Unix seconds.
+static LAST_CONSOLE_POLL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A console polled this recently is open, and shows a scheduled result itself.
+const CONSOLE_OPEN_WITHIN_SECONDS: i64 = 15;
+
+fn unix_seconds() -> i64 {
+    i64::try_from(UtcTimestamp::now(&SystemClock).unix_nanos() / 1_000_000_000).unwrap_or(0)
+}
+
+/// Notices scheduled runs that finish and, when no console is open to show them, says so with a desktop notification.
+///
+/// It watches the schedules rather than hooking the executor: a schedule's `last_run_id` changes exactly when a run was started
+/// for it, and what existed when the daemon started is recorded first so a restart does not re-announce old results.
+#[derive(Default)]
+struct ResultWatcher {
+    seen: Option<std::collections::HashMap<String, String>>,
+    pending: Vec<(String, String)>,
+}
+
+impl ResultWatcher {
+    async fn pass(&mut self, state: &GatewayState) {
+        let Ok(identity) = jarvis_storage::load_local_identity(state.database()).await else {
+            return;
+        };
+        let Ok(schedules) =
+            jarvis_storage::list_schedules(state.database(), identity.workspace_id()).await
+        else {
+            return;
+        };
+        let first_pass = self.seen.is_none();
+        let seen = self.seen.get_or_insert_with(std::collections::HashMap::new);
+        for schedule in &schedules {
+            let Some(run) = schedule.last_run_id() else {
+                continue;
+            };
+            if seen.get(schedule.id()).map(String::as_str) != Some(run) {
+                seen.insert(schedule.id().to_owned(), run.to_owned());
+                if !first_pass {
+                    self.pending
+                        .push((run.to_owned(), schedule.objective().to_owned()));
+                }
+            }
+        }
+        let mut still_running = Vec::new();
+        for (run_id, task) in std::mem::take(&mut self.pending) {
+            match jarvis_storage::find_run(state.database(), &run_id).await {
+                Ok(run) if run.state().is_terminal() => announce(state, &run, &task).await,
+                Ok(_) => still_running.push((run_id, task)),
+                Err(_) => {}
+            }
+        }
+        self.pending = still_running;
+    }
+}
+
+async fn announce(state: &GatewayState, run: &jarvis_storage::StoredRun, task: &str) {
+    let console_open = unix_seconds()
+        - LAST_CONSOLE_POLL.load(std::sync::atomic::Ordering::Relaxed)
+        < CONSOLE_OPEN_WITHIN_SECONDS;
+    let enabled = state.settings().is_none_or(|context| {
+        jarvis_storage::ConfigStore::from_paths(context.paths())
+            .load()
+            .map_or(true, |loaded| {
+                loaded.config().daemon().notifications_enabled()
+            })
+    });
+    if console_open || !enabled {
+        return;
+    }
+    let answer = if run.terminal_outcome() == Some(jarvis_core::RunOutcome::Succeeded) {
+        crate::executor::last_answer(&state.database_handle(), run)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let body = answer.unwrap_or_else(|| format!("This scheduled task did not finish: {task}"));
+    tracing::info!(
+        "a scheduled task finished with no console open, so it was shown as a desktop notification"
+    );
+    crate::notify::show("JARVIS", &body);
 }
 
 /// Runs one scheduler pass at `now`.
@@ -276,6 +363,7 @@ pub async fn create(
 
 /// `GET /api/v1/schedules`
 pub async fn list(State(state): State<GatewayState>) -> Response {
+    LAST_CONSOLE_POLL.store(unix_seconds(), std::sync::atomic::Ordering::Relaxed);
     let workspace_id = match workspace(&state).await {
         Ok(id) => id,
         Err(response) => return response,

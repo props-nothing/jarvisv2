@@ -12,6 +12,8 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 
 | Setting | Default | What unset means |
 | --- | --- | --- |
+| `executor_reasoning_effort` | unset | The model decides how hard to think. `none`, `low`, `medium` or `high` makes a reasoning model faster and cheaper (`low`) or more thorough (`high`). A run that thinks past its budget is still dropped to `low` for the rest of that run. Needs the live model. |
+| `search_api_key_ref` + search key | none | **Off by design.** Without an Ollama API key (`jarvis keys set search`, from a free ollama.com account) there is no web search tool; JARVIS can still fetch a page you name. `jarvis keys test search` checks the key against the real service (`ADR-0146`). |
 | `executor_model_name`, `executor_base_url`, model key | set by `jarvis init` | No model, so no answers. Setup always sets these. |
 
 ## Voice
@@ -39,6 +41,7 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 
 | Setting | Default | What unset means |
 | --- | --- | --- |
+| `notifications` | on | When a scheduled task finishes and no console is open, its result is shown as a desktop notification (Windows toast, macOS notification, `notify-send` on Linux). While the console is open it shows the result itself, so nothing pops up. `jarvis config set notifications off` turns it off; it applies at once. |
 | `http_port` | 8765 | The default port. |
 | `mcp_serve_port` | none | **Off by design.** JARVIS opens no inbound MCP port unless you ask it to (`ADR-0039`). |
 

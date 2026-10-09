@@ -20,6 +20,7 @@ enum Kind {
     Words,
     Port,
     ToolIds,
+    Flag,
 }
 
 impl Kind {
@@ -31,6 +32,7 @@ impl Kind {
             Self::Words => "words",
             Self::Port => "port",
             Self::ToolIds => "tools",
+            Self::Flag => "flag",
         }
     }
 }
@@ -79,6 +81,26 @@ const SETTINGS: &[Setting] = &[
         group: "brain",
         default: None,
         unset_means: "No key file. Setup writes one (a placeholder for local Ollama).",
+        example: "",
+    },
+    Setting {
+        table: "daemon",
+        field: "executor_reasoning_effort",
+        kind: Kind::Text,
+        help: "how hard a reasoning model thinks: none, low, medium or high",
+        group: "brain",
+        default: None,
+        unset_means: "The model decides how long to think. Lower is faster and cheaper; a run that thinks past its budget is already asked to think less.",
+        example: "low",
+    },
+    Setting {
+        table: "daemon",
+        field: "search_api_key_ref",
+        kind: Kind::File,
+        help: "file holding the web search key (set the key itself with `jarvis keys set search`)",
+        group: "brain",
+        default: None,
+        unset_means: "Opt-in: without an Ollama API key (a free ollama.com account makes one) the assistant has no web search tool; it can still fetch a page you give it.",
         example: "",
     },
     Setting {
@@ -150,6 +172,16 @@ const SETTINGS: &[Setting] = &[
         default: None,
         unset_means: "Nothing is trusted by default: a tool that the policy holds always asks you first.",
         example: "jarvis.files.edit",
+    },
+    Setting {
+        table: "daemon",
+        field: "notifications",
+        kind: Kind::Flag,
+        help: "show a desktop notification when a scheduled task finishes and no console is open: on or off",
+        group: "advanced",
+        default: Some("on"),
+        unset_means: "On: a reminder you asked for reaches you even with the console closed. Nothing is shown while the console is open (it shows the result itself).",
+        example: "off",
     },
     Setting {
         table: "daemon",
@@ -265,6 +297,11 @@ fn convert(kind: Kind, values: &[String]) -> Result<Value, String> {
             }
             Ok(Value::Array(words.into_iter().map(Value::String).collect()))
         }
+        Kind::Flag => match one()?.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Ok(Value::Boolean(true)),
+            "off" | "false" | "no" => Ok(Value::Boolean(false)),
+            _ => Err("say on or off".to_owned()),
+        },
         Kind::Port => one()?
             .parse::<u16>()
             .ok()
@@ -598,6 +635,8 @@ pub enum SecretKind {
     Model,
     /// The speech provider's key.
     Voice,
+    /// The web search provider's key.
+    Search,
 }
 
 impl SecretKind {
@@ -610,7 +649,8 @@ impl SecretKind {
         match word {
             "model" => Ok(Self::Model),
             "voice" => Ok(Self::Voice),
-            _ => Err("name the key: model or voice".to_owned()),
+            "search" => Ok(Self::Search),
+            _ => Err("name the key: model, voice or search".to_owned()),
         }
     }
 
@@ -618,6 +658,7 @@ impl SecretKind {
         match self {
             Self::Model => "executor_api_key_ref",
             Self::Voice => "speech_api_key_ref",
+            Self::Search => "search_api_key_ref",
         }
     }
 
@@ -625,6 +666,7 @@ impl SecretKind {
         match self {
             Self::Model => "model.key",
             Self::Voice => "speech.key",
+            Self::Search => "search.key",
         }
     }
 
@@ -634,6 +676,7 @@ impl SecretKind {
         match self {
             Self::Model => "JARVIS_MODEL_API_KEY",
             Self::Voice => "ELEVENLABS_API_KEY",
+            Self::Search => "OLLAMA_API_KEY",
         }
     }
 }
@@ -718,8 +761,12 @@ pub fn remove_secret(paths: &AppPaths, kind: SecretKind) -> Result<(), String> {
     }
     edit(paths, |table| {
         let daemon = table_mut(table, "daemon")?;
-        for field in ["speech_api_key_ref", "speech_voice_id", "speech_model"] {
-            daemon.remove(field);
+        let dependent: &[&str] = match kind {
+            SecretKind::Search => &["search_api_key_ref"],
+            _ => &["speech_api_key_ref", "speech_voice_id", "speech_model"],
+        };
+        for field in dependent {
+            daemon.remove(*field);
         }
         Ok(())
     })?;

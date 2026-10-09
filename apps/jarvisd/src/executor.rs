@@ -239,6 +239,8 @@ pub struct ModelProviderConfig {
     base_url: String,
     /// The model identifier the provider is asked for.
     model: String,
+    /// The owner's default reasoning effort, when one is configured.
+    reasoning_effort: Option<jarvis_models::ReasoningEffort>,
     /// The API key, read from the file the operator named.
     api_key: String,
 }
@@ -254,8 +256,19 @@ impl ModelProviderConfig {
         Self {
             base_url: base_url.into(),
             model: model.into(),
+            reasoning_effort: None,
             api_key: api_key.into(),
         }
+    }
+
+    /// Sets the reasoning effort every request asks for unless it chooses its own.
+    #[must_use]
+    pub const fn with_reasoning_effort(
+        mut self,
+        effort: Option<jarvis_models::ReasoningEffort>,
+    ) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -369,7 +382,8 @@ impl Executor {
             api_key,
             transport,
             jarvis_models::openai::RetryPolicy::default(),
-        );
+        )
+        .with_default_reasoning_effort(provider.reasoning_effort);
         Ok(Self {
             model: Box::new(model),
             model_id,

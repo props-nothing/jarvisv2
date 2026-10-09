@@ -125,7 +125,7 @@ fn show(paths: &AppPaths, json: bool) -> Result<(), String> {
 
 fn kind_of(word: Option<&String>) -> Result<SecretKind, String> {
     word.map_or_else(
-        || Err("name the key: model or voice".to_owned()),
+        || Err("name the key: model, voice or search".to_owned()),
         |word| SecretKind::parse(word),
     )
 }
@@ -185,6 +185,7 @@ pub async fn keys(
         Some("test") => match kind_of(words.get(2)) {
             Ok(SecretKind::Model) => test_model(paths).await,
             Ok(SecretKind::Voice) => test_voice(paths, credential).await,
+            Ok(SecretKind::Search) => test_search(paths).await,
             Err(message) => Err(message),
         },
         Some(other) => Err(format!(
@@ -196,14 +197,15 @@ pub async fn keys(
 fn status(paths: &AppPaths, json: bool) -> Result<(), String> {
     let model = settings::key_state(paths, SecretKind::Model)?;
     let voice = settings::key_state(paths, SecretKind::Voice)?;
+    let search = settings::key_state(paths, SecretKind::Search)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "model": model.state, "voice": voice.state })
+            serde_json::json!({ "model": model.state, "voice": voice.state, "search": search.state })
         );
         return Ok(());
     }
-    for (name, state) in [("model", model), ("voice", voice)] {
+    for (name, state) in [("model", model), ("voice", voice), ("search", search)] {
         println!(
             "{name:<6} {:<13} {}",
             state.state,
@@ -211,6 +213,36 @@ fn status(paths: &AppPaths, json: bool) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Asks the real search endpoint one question with the configured key, so a person finds out the key works now and not when the
+/// assistant first tries to search.
+async fn test_search(paths: &AppPaths) -> Result<(), String> {
+    let file = settings::get(paths, "search_api_key_ref")
+        .map_err(|_| "no search key is set; use `jarvis keys set search`".to_owned())?;
+    let key = std::fs::read_to_string(&file)
+        .map_err(|_| "the search key file could not be read".to_owned())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(jarvis_web::SEARCH_ENDPOINT)
+        .bearer_auth(key.trim())
+        .json(&serde_json::json!({ "query": "ollama", "max_results": 1 }))
+        .send()
+        .await
+        .map_err(|_| "could not reach the search service".to_owned())?;
+    match response.status().as_u16() {
+        200..=299 => {
+            println!("the search service accepted the key and answered");
+            Ok(())
+        }
+        401 | 403 => Err("the search service rejected the key".to_owned()),
+        429 => Err("the search service is rate limiting this key; try again later".to_owned()),
+        other => Err(format!("the search service answered with status {other}")),
+    }
 }
 
 async fn test_model(paths: &AppPaths) -> Result<(), String> {

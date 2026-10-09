@@ -238,7 +238,7 @@
     "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing",
     "jarvis.web.fetch": "fetching a page", "jarvis.agent.delegate": "handing off a task", "jarvis.agent.result": "collecting a result",
     "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code", "jarvis.command.run": "running",
-    "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
+    "jarvis.web.search": "searching the web", "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
   };
   function describeCall(tool, target) {
     var verb = VERBS[tool] || String(tool || "working").replace(/^jarvis\./, "");

@@ -28,6 +28,12 @@ pub struct SettingsContext {
 }
 
 impl SettingsContext {
+    /// The profile directories the settings are read from.
+    #[must_use]
+    pub const fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
     /// Builds the context from the daemon's resolved paths and its `--root`, if any.
     #[must_use]
     pub fn new(paths: AppPaths, root: Option<PathBuf>) -> Self {
@@ -141,6 +147,7 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
                 "keys": {
                     "model": key_json(&context.paths, SecretKind::Model),
                     "voice": key_json(&context.paths, SecretKind::Voice),
+            "search": key_json(&context.paths, SecretKind::Search),
                 },
             });
             (StatusCode::OK, Json(body)).into_response()
