@@ -90,8 +90,8 @@ default.
   "Jarvis, stop" cancels everything. Voice recognition is your browser's (Chrome or Edge).
 - **The terminal:** `jarvis chat`, `jarvis ask "..."`, `jarvis watch`, `jarvis approvals`, `jarvis cancel --all`, `jarvis runs`,
   `jarvis schedule` (or just ask: "remind me tomorrow at nine" schedules it after you approve), `jarvis memory`, `jarvis tools list`. Every command has `--json` where it prints data.
-- **Watching it work:** while JARVIS works, the left of the face shows each action as it happens (searching, reading a page, running a command, a sub-agent) with the pages it found as links you can open, and the face shows
-  it too. Scheduled tasks and sub-agents appear there as well. Finished answers list their sources. Nothing is sent anywhere for this; it is what the run already reports.
+- **Watching it work:** while JARVIS works, the left of the face lists each action as it happens (searching, reading a page, running a command, a sub-agent) with the pages it found as links you can open, and each action also appears as a node round
+  the face and stays there while the task goes on: point at one to see what it was, press it to jump to its step. After a minute and a half of quiet the list folds to one line. Scheduled tasks and sub-agents appear there as well. Finished answers list their sources. Nothing is sent anywhere for this; it is what the run already reports.
 - **Long-running work:** give it a project (`jarvis project add`, or Ops → Projects): a goal, your standing guidance and a journal that every run of it is told, so a recurring task
   continues instead of restarting. See `docs/user/projects.md`.
 - **Long tasks.** While it works you see a live line (the step it is on, what it is doing, how long, and "thinking (~11k tokens)" during a

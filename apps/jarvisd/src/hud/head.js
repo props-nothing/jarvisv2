@@ -80,44 +80,6 @@
   var sx = new Float32Array(N), sy = new Float32Array(N), sz = new Float32Array(N);
   var rx = new Float32Array(N), ry = new Float32Array(N);
 
-  // A skull and neck, as wire. The mesh is a mask; these close the shape behind it.
-  var SKULL_C = [0, 1.6, -1.2], SKULL_R = [7.7, 10.4, 9.2];
-  var skull = [];
-  (function () {
-    var lat, lon, ring, pts;
-    for (lat = -2; lat <= 9; lat += 1) {
-      var a = (lat / 10) * (Math.PI / 2) * 1.0;
-      ring = [];
-      for (lon = 0; lon <= 36; lon += 1) {
-        var b = (lon / 36) * Math.PI * 2;
-        ring.push([SKULL_C[0] + SKULL_R[0] * Math.cos(a) * Math.sin(b), SKULL_C[1] + SKULL_R[1] * Math.sin(a), SKULL_C[2] + SKULL_R[2] * Math.cos(a) * Math.cos(b)]);
-      }
-      skull.push(ring);
-    }
-    for (lon = 0; lon < 12; lon += 1) {
-      var bb = (lon / 12) * Math.PI * 2;
-      pts = [];
-      for (lat = -2; lat <= 20; lat += 1) {
-        var aa = (lat / 20) * (Math.PI / 2);
-        pts.push([SKULL_C[0] + SKULL_R[0] * Math.cos(aa) * Math.sin(bb), SKULL_C[1] + SKULL_R[1] * Math.sin(aa), SKULL_C[2] + SKULL_R[2] * Math.cos(aa) * Math.cos(bb)]);
-      }
-      skull.push(pts);
-    }
-  })();
-  var neck = [];
-  (function () {
-    var k, s, ring;
-    for (k = 0; k < 9; k += 1) {
-      var yy = -8.2 - k * 1.35, rr = 4.5 + Math.min(k, 3) * 0.25;
-      ring = [];
-      for (s = 0; s <= 28; s += 1) {
-        var b = (s / 28) * Math.PI * 2;
-        ring.push([Math.sin(b) * rr, yy, -2.2 + Math.cos(b) * rr * 0.9]);
-      }
-      neck.push(ring);
-    }
-  })();
-
   var frontFacing = 1;   // sign of the triangle normal that faces the viewer, found once from the rest pose
   var pose = { yaw: 0, pitch: 0, roll: 0, jaw: 0, blink: 0, eyeOpen: 1, look: [0, 0] };
   // What the face is doing, as a handful of channels that ease towards whatever the mind below wants.
@@ -379,6 +341,7 @@
     var rgb = state.rgb;
     function rgba(a) { return "rgba(" + Math.round(rgb[0]) + "," + Math.round(rgb[1]) + "," + Math.round(rgb[2]) + "," + Math.max(0, Math.min(1, a)) + ")"; }
     var dim = mode === "offline" ? 0.4 : 1;
+    var k;
 
     // the mind decides the expression, the gaze, the blinks and the lean of the head
     var live = think(t, mode, state);
@@ -427,22 +390,13 @@
     ctx.globalCompositeOperation = "lighter";
     ctx.lineJoin = "round";
 
-    // a soft backdrop, so the head sits in light rather than on a flat colour
-    var back = ctx.createRadialGradient(cx, cy, size * 0.05, cx, cy, size * 0.62);
-    back.addColorStop(0, rgba(0.16 * dim));
+    // a soft light behind the face, fading to nothing well before any edge, so it reads as glow rather than as a shape
+    var back = ctx.createRadialGradient(cx, cy, size * 0.05, cx, cy, size * 0.8);
+    back.addColorStop(0, rgba(0.14 * dim));
+    back.addColorStop(0.6, rgba(0.04 * dim));
     back.addColorStop(1, rgba(0));
     ctx.fillStyle = back;
-    ctx.beginPath(); ctx.arc(cx, cy, size * 0.62, 0, Math.PI * 2); ctx.fill();
-
-    // the skull and the neck, behind the face
-    ctx.lineWidth = 1;
-    var fade = function (z) { return (0.1 + 0.18 * Math.max(0, Math.min(1, (z + 11) / 22))) * dim; };
-    var k;
-    for (k = 0; k < skull.length; k += 1) polyline(ctx, skull[k], cx, cy, scale, -0.4, fade, rgba);
-    for (k = 0; k < neck.length; k += 1) {
-      var nf = (function (kk) { return function (z) { return (0.2 - kk * 0.022) * dim; }; })(k);
-      polyline(ctx, neck[k], cx, cy, scale, 99, nf, rgba);
-    }
+    ctx.fillRect(cx - size, cy - size, size * 2, size * 2);
 
     // the far side of the face, faint, so the head reads as a volume
     ctx.beginPath();

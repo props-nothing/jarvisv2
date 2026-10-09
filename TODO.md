@@ -7209,6 +7209,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [x] `P9-059` JARVIS can manage projects, memory and schedules itself (ADR-0153). Found in a real conversation: asked to "create this as a project" it wrote a README because the journal tool refused outside a project.
   New tools: `jarvis.project.list|use|create|update|assign_schedule` (create/update/assign ask), `jarvis.memory.correct|forget` (ask; the call quotes the claim and the tool refuses when the quotation is not in the stored claim),
   `jarvis.schedule.pause` (no ask) and `resume` (asks). A run in no project is given an index of the existing ones; `jarvis.memory.search` prints `memory_id`. Tests for each, including the false-quotation and no-move cases.
+- [x] `P9-060` Main page: the face alone (ADR-0154). Rings, ticks, name ring, brackets, canvas text and the wire skull and neck removed; the face is about half its former size with a faint glow, drifting motes and a thin voice line.
+  The live view is a persistent constellation (nodes on orbits that settle outward instead of leaving after five seconds, moons for links, hover names a node, pressing opens its step), the feed keeps the whole run (40 steps, older ones
+  compact), the panel folds to one line after 90 seconds. Chat suggestions no longer overflow. Verified live on a scratch profile with a real research run.
 - [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

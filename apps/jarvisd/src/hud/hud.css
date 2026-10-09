@@ -165,11 +165,11 @@ pre code { background: none; border: none; padding: 0; }
 #main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(340px, 30vw, 460px); }
 #stage { position: relative; min-height: 0; overflow: hidden; }
 #orb { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
-#caption { position: absolute; left: 0; right: 0; bottom: 18px; text-align: center; font: 600 12px var(--mono); letter-spacing: 0.5em; text-transform: uppercase; color: var(--dim); text-shadow: 0 0 10px rgba(94, 227, 255, 0.4); pointer-events: none; }
+#caption { position: absolute; left: 0; right: 0; bottom: 18px; transition: top 0.3s, left 0.3s; text-align: center; font: 600 12px var(--mono); letter-spacing: 0.5em; text-transform: uppercase; color: var(--dim); text-shadow: 0 0 10px rgba(94, 227, 255, 0.4); pointer-events: none; }
 #caption.live { color: var(--cyan); } #caption.wait { color: var(--amber); text-shadow: 0 0 12px rgba(255, 180, 84, 0.6); }
 
 /* what needs you stays on the face page, as a tray at the bottom left, so nothing waits out of sight */
-#tray { position: absolute; left: 20px; bottom: 44px; width: min(360px, calc(100% - 40px)); max-height: 42%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+#tray { position: absolute; right: 20px; bottom: 24px; width: min(360px, calc(100% - 40px)); max-height: 42%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
 #tray > div:empty { display: none; }
 #tray .item { padding: 12px 14px 10px; border: 1px solid rgba(255, 180, 84, 0.55); background: rgba(14, 12, 6, 0.82); backdrop-filter: blur(6px); box-shadow: 0 0 22px rgba(255, 180, 84, 0.18); animation: rise 0.25s ease; }
 #tray .item:first-child { border-top: 1px solid rgba(255, 180, 84, 0.55); padding-top: 12px; }
@@ -210,14 +210,30 @@ kbd { font: 11px var(--mono); border: 1px solid var(--line); padding: 0 5px; col
 }
 
 /* ---- the live mission view (mission.js): what JARVIS is doing, and where it looked ------------------------------------------ */
-#mission { position: absolute; left: 16px; top: 44px; width: min(330px, 38%); max-height: 54%; display: flex; flex-direction: column; gap: 8px; opacity: 0; transform: translateX(-14px); transition: opacity 0.4s, transform 0.4s; pointer-events: none; z-index: 2; }
+#mission { position: absolute; left: 16px; top: 16px; bottom: 16px; width: min(330px, 38%); display: flex; flex-direction: column; gap: 8px; opacity: 0; transform: translateX(-14px); transition: opacity 0.4s, transform 0.4s; pointer-events: none; z-index: 2; }
 #mission.on { opacity: 1; transform: none; }
+#mission .mhead { cursor: pointer; pointer-events: auto; }
+#mission.min { bottom: auto; }
+#mission.min #mfeed, #mission.min #msources { display: none; }
+#mission.min .mhead { padding: 4px 10px; border: 1px solid var(--line); background: rgba(3, 12, 22, 0.7); }
 #mission .mhead { display: flex; align-items: center; gap: 8px; font: 600 10px var(--mono); letter-spacing: 0.3em; color: var(--dim); }
 #mission .mhead i { width: 7px; height: 7px; background: var(--dim); transform: rotate(45deg); }
 #mission.busy .mhead { color: var(--cyan); }
 #mission.busy .mhead i { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: blink 1s infinite; }
 #mission .mhead b { margin-left: auto; font-weight: 500; letter-spacing: 0.1em; color: var(--dim); }
-#mfeed { display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+#mfeed { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; flex: 1 1 auto; min-height: 0; pointer-events: auto; padding-right: 3px; }
+#mclear { padding: 0 8px; font-size: 14px; line-height: 18px; background: transparent; border-color: var(--line); color: var(--dim); pointer-events: auto; clip-path: none; letter-spacing: 0; }
+#mclear:hover { color: #fff; }
+#mission .mhead b { margin-left: auto; }
+.mrow { cursor: pointer; flex: none; }
+.mrow.compact { padding: 4px 10px 4px 12px; box-shadow: none; background: rgba(3, 12, 22, 0.55); }
+.mrow.compact .mlinks { display: none; }
+.mrow.compact .mtarget { -webkit-line-clamp: 1; line-clamp: 1; font-size: 11px; }
+.mrow.compact .mline { font-size: 10px; }
+.mrow.compact .mstate { width: 10px; height: 10px; margin-top: 3px; }
+.mrow.compact .mico svg { width: 13px; height: 13px; }
+.mrow.flash { animation: flash 1.4s ease; }
+@keyframes flash { 0%, 40% { box-shadow: 0 0 0 2px rgba(var(--k), 0.9), 0 0 24px rgba(var(--k), 0.6); } 100% { box-shadow: none; } }
 .mrow { --k: 94, 227, 255; display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px 8px 12px; border: 1px solid rgba(var(--k), 0.28); border-left: 3px solid rgb(var(--k)); background: linear-gradient(90deg, rgba(var(--k), 0.12), rgba(3, 12, 22, 0.8) 62%); backdrop-filter: blur(5px); pointer-events: auto; transition: opacity 0.4s, transform 0.4s; box-shadow: 0 0 18px rgba(var(--k), 0.08); }
 .mrow.enter { opacity: 0; transform: translateX(-18px); }
 .mrow.ok, .mrow.bad { opacity: 0.8; }
@@ -244,7 +260,7 @@ kbd { font: 11px var(--mono); border: 1px solid var(--line); padding: 0 5px; col
 .mchip i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .mchip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mmore { font: 11px var(--mono); color: var(--dim); align-self: center; }
-#msources { pointer-events: auto; padding: 8px 10px; border: 1px solid var(--line); background: rgba(3, 12, 22, 0.82); backdrop-filter: blur(5px); overflow-y: auto; }
+#msources { pointer-events: auto; padding: 8px 10px; border: 1px solid var(--line); background: rgba(3, 12, 22, 0.82); backdrop-filter: blur(5px); overflow-y: auto; flex: 0 1 auto; max-height: 34%; }
 #msources[hidden] { display: none; }
 .mshead { display: flex; justify-content: space-between; font: 600 10px var(--mono); letter-spacing: 0.3em; color: var(--cyan); margin-bottom: 6px; }
 .mshead b { color: var(--dim); font-weight: 500; }
@@ -282,7 +298,8 @@ button { white-space: nowrap; }
 .glabel:first-child { margin-top: 0; }
 .gdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
 .suggest { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 14px; }
-.suggest button { font-size: 12px; padding: 4px 12px; color: var(--cyan); border-color: var(--line-hot); }
+.suggest button { font-size: 12px; padding: 4px 12px; color: var(--cyan); border-color: var(--line-hot); white-space: normal; max-width: 100%; text-align: center; }
+#chat { overflow-x: hidden; }
 .sched-act { display: flex; gap: 6px; margin-top: 6px; }
 .sched-act select { padding: 2px 6px; color: var(--text); background: rgba(2, 10, 20, 0.85); border: 1px solid var(--line); font: 12px var(--mono); max-width: 11em; }
 .sched-act { flex-wrap: wrap; align-items: center; }

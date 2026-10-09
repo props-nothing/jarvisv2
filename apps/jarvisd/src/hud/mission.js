@@ -152,8 +152,11 @@
   }
 
   // ---- state ---------------------------------------------------------------------------------------------------------
-  var MAX_ROWS = 7, MAX_SOURCES = 14, KEEP_DONE_MS = 5000, FADE_MS = 26000, SOURCES_MS = 240000;
-  var M = { items: [], runs: {}, sources: [], seq: 0, lastTouch: 0, onStart: null };
+  // How much is kept, and for how long: a finished action stays as a node while its run goes on and for half a minute after, in the feed
+  // for ten minutes, and a node that has just finished stays bright for a moment so a quick action is still seen.
+  var MAX_ROWS = 40, OPEN_ROWS = 4, MAX_NODES = 26, MAX_SOURCES = 14;
+  var DWELL_MS = 2600, NODE_AFTER_RUN_MS = 30000, IDLE_MS = 600000, SOURCES_MS = 600000, MIN_AFTER_MS = 90000;
+  var M = { items: [], runs: {}, sources: [], seq: 0, lastTouch: 0, onStart: null, hover: null, dismissed: false, pinned: false };
 
   function now() { return Date.now(); }
   function trim(text, limit) {
@@ -179,7 +182,8 @@
     var item = {
       id: ++M.seq, run: run.id, tag: run.tag, tool: payload.tool, kind: info.kind, verb: info.verb, dir: info.dir, fx: info.fx,
       target: trim(payload.target || "", 90), state: "run", born: when, ended: 0, links: [], detail: "",
-      angle: M.seq * 2.399, spin: (M.seq % 2 ? 1 : -1) * (0.22 + (M.seq % 3) * 0.05), burst: false, replay: !live, node: null
+      a: M.seq * 2.399, spin: (M.seq % 2 ? 1 : -1) * (0.22 + (M.seq % 3) * 0.05), lane: 0, laneTarget: 0, burst: false, replay: !live, node: null,
+      open: false, pulse: 0
     };
     M.items.push(item);
     run.pending.push(item);
@@ -220,6 +224,8 @@
     var live = now() - when < 8000;
     run.last = Math.max(run.last, when);
     M.lastTouch = now();
+    M.dismissed = false;
+    M.pinned = false;
     var name = frame.event;
     if (name === "tool_requested" && payload.tool) {
       startItem(run, payload, when, live);
@@ -242,6 +248,7 @@
       run.pending.splice(0).forEach(function (item) { settle(item, name === "run_completed", null, when, live); });
       run.thinking = false;
       run.ended = true;
+      run.endClock = now();
     }
     paintAll();
   }
@@ -275,12 +282,19 @@
     row.appendChild(ico);
     row.appendChild(main);
     row.appendChild(state);
+    // A step is opened and closed by pressing it; opening one also pulses its node on the face.
+    row.addEventListener("click", function (event) {
+      if (event.target.closest("a")) return;
+      item.open = !item.open;
+      if (item.open) item.pulse = now();
+      paintAll();
+    });
     return row;
   }
 
-  function paintRow(item) {
+  function paintRow(item, compact) {
     var row = item.node;
-    row.className = "mrow kind-" + item.kind + " " + item.state;
+    row.className = "mrow kind-" + item.kind + " " + item.state + (compact && !item.open ? " compact" : "") + (item.node.classList.contains("flash") ? " flash" : "") + (item.node.classList.contains("enter") ? " enter" : "");
     var ms = (item.ended || now()) - item.born;
     row.querySelector(".mtime").textContent = item.state === "wait" ? "needs you" : seconds(ms);
     var target = row.querySelector(".mtarget");
@@ -316,16 +330,22 @@
         requestAnimationFrame(function () { if (item.node) item.node.classList.remove("enter"); });
       }
       if (feed.children[position] !== item.node) feed.insertBefore(item.node, feed.children[position] || null);
-      paintRow(item);
+      paintRow(item, position >= OPEN_ROWS);
     });
     var running = M.items.filter(function (item) { return item.state === "run" || item.state === "wait"; }).length;
-    var recent = t - M.lastTouch < FADE_MS;
+    var recent = t - M.lastTouch < IDLE_MS;
     var sourcesAlive = M.sources.length > 0 && t - M.sources[0].at < SOURCES_MS;
-    var on = running > 0 || (recent && visible.length > 0) || sourcesAlive;
+    var on = !M.dismissed && (running > 0 || (recent && visible.length > 0) || sourcesAlive);
+    // A while after the work stops the panel folds down to one line, so the face has the stage back; pressing the line opens it again.
+    var folded = running === 0 && !M.pinned && t - M.lastTouch > MIN_AFTER_MS;
+    root.classList.toggle("min", folded);
     root.classList.toggle("on", on);
     root.classList.toggle("busy", running > 0);
     titleNode.textContent = running > 0 ? "LIVE" : "DONE";
-    countNode.textContent = running > 0 ? running + (running === 1 ? " action" : " actions") : (visible.length ? visible.length + " steps" : "");
+    var finished = visible.length - Math.min(running, visible.length);
+    var tally = running > 0 ? running + " running" + (finished ? " \u00B7 " + finished + " done" : "") : (visible.length ? visible.length + (visible.length === 1 ? " step" : " steps") : "");
+    if (M.sources.length) tally += (tally ? " \u00B7 " : "") + M.sources.length + (M.sources.length === 1 ? " source" : " sources");
+    countNode.textContent = tally;
 
     sourcesBox.hidden = !sourcesAlive;
     if (sourcesAlive) {
@@ -352,7 +372,7 @@
   // How far the face has made room for the feed, 0 to 1, eased so it glides. The page asks once a frame.
   var dockValue = 0;
   function dock(width) {
-    var want = root && root.classList.contains("on") && width >= 760 ? 1 : 0;
+    var want = root && root.classList.contains("on") && !root.classList.contains("min") && width >= 760 ? 1 : 0;
     dockValue += (want - dockValue) * 0.07;
     if (Math.abs(want - dockValue) < 0.003) dockValue = want;
     return dockValue;
@@ -366,8 +386,22 @@
     chipsBox = root.querySelector("#mchips");
     countNode = root.querySelector("#mcount");
     titleNode = root.querySelector("#mtitle");
+    root.querySelector(".mhead").addEventListener("click", function (event) {
+      if (event.target.closest("#mclear")) return;
+      M.pinned = !M.pinned;
+      paintAll();
+    });
+    var clear = root.querySelector("#mclear");
+    if (clear) {
+      // Puts the picture away; the next thing JARVIS does brings it back.
+      clear.addEventListener("click", function () {
+        M.dismissed = true;
+        M.items = M.items.filter(isRunning);
+        M.sources = [];
+        paintAll();
+      });
+    }
     setInterval(function () {
-      M.items.forEach(function (item) { if (item.node && (item.state === "run" || item.state === "wait")) paintRow(item); });
       paintAll();
     }, 500);
     return true;
@@ -404,6 +438,10 @@
   }
 
   // ---- the animation -------------------------------------------------------------------------------------------------
+  // There is no ring to ride any more: the face stands alone and the work gathers round it. Each action is a node on one of a few
+  // soft orbits. A running action is on the inner orbit, bright, with a beam to the face; when it finishes it stays, drifting out one
+  // orbit at a time as newer actions arrive, so a long task leaves a visible constellation of everything it did instead of flashing
+  // past. The constellation is put away some time after the run ends, or when a new request begins.
   var fx = { rings: [], sparks: [], lastT: 0, ringTimer: {}, sparkTimer: 0 };
   var TAU = Math.PI * 2;
   function rgba(rgb, alpha) { return "rgba(" + Math.round(rgb[0]) + "," + Math.round(rgb[1]) + "," + Math.round(rgb[2]) + "," + Math.max(0, Math.min(1, alpha)) + ")"; }
@@ -412,62 +450,80 @@
     if (fx.rings.length < 40) fx.rings.push({ x: x, y: y, from: from, to: to, rgb: rgb, born: t, life: life, width: width || 1.5 });
   }
 
+  function isRunning(item) { return item.state === "run" || item.state === "wait"; }
+
+  // The actions that have a node: the running ones, and the finished ones of a run that is still going or ended moments ago.
+  function nodeItems(clock) {
+    var list = M.items.filter(function (item) {
+      if (isRunning(item)) return true;
+      if (item.replay && clock - (item.ended || item.born) > 90000) return false;
+      var run = M.runs[item.run];
+      return !(run && run.ended && clock - run.endClock > NODE_AFTER_RUN_MS);
+    });
+    return list.slice(-MAX_NODES);
+  }
+
+  // `R` is the face's own radius; everything is measured from it, so the effects follow the face whatever its size.
   function draw(ctx, cx, cy, R, t, baseRgb, calm, W, H, room) {
-    var leftEdge = 8 + (room || 0);
     var dt = Math.min(0.1, Math.max(0, t - fx.lastT));
     fx.lastT = t;
     var clock = now();
-    var active = M.items.filter(function (item) {
-      return item.state === "run" || item.state === "wait" || (item.ended && clock - item.ended < KEEP_DONE_MS && !item.replay);
-    }).slice(-8);
+    var leftEdge = 8 + (room || 0);
+    var nodes = nodeItems(clock);
     var flavours = {};
     var thinkingNow = thinking();
+
+    // which orbit each node is heading for: running ones (and ones that finished a moment ago) the inner one, the rest further out,
+    // newest first
+    var rank = 0;
+    for (var n = nodes.length - 1; n >= 0; n -= 1) {
+      var entry = nodes[n];
+      if (isRunning(entry)) { entry.laneTarget = 0; flavours[entry.fx] = entry; continue; }
+      entry.laneTarget = clock - entry.ended < DWELL_MS ? 0 : 1 + Math.min(2, Math.floor(rank / 6));
+      rank += 1;
+    }
 
     ctx.save();
     ctx.lineCap = "round";
 
     // ---- per-flavour effects over the face -------------------------------------------------------------------------
-    active.forEach(function (item) { if (item.state === "run" || item.state === "wait") flavours[item.fx] = item; });
-
     if (flavours.radar && !calm) {
       var radarRgb = COLORS[flavours.radar.kind];
-      // a rotating sweep and rings that leave the core
       if (ctx.createConicGradient) {
         var sweep = ctx.createConicGradient(t * 2.2, cx, cy);
         sweep.addColorStop(0, rgba(radarRgb, 0.0));
         sweep.addColorStop(0.9, rgba(radarRgb, 0.0));
-        sweep.addColorStop(1, rgba(radarRgb, 0.38));
+        sweep.addColorStop(1, rgba(radarRgb, 0.3));
         ctx.fillStyle = sweep;
         ctx.beginPath();
-        ctx.arc(cx, cy, R * 0.74, 0, TAU);
+        ctx.arc(cx, cy, R * 1.0, 0, TAU);
         ctx.fill();
       }
       fx.ringTimer.radar = (fx.ringTimer.radar || 0) + dt;
-      if (fx.ringTimer.radar > 0.9) { fx.ringTimer.radar = 0; addRing(cx, cy, R * 0.2, R * 0.78, radarRgb, t, 1.6, 1.6); }
+      if (fx.ringTimer.radar > 0.9) { fx.ringTimer.radar = 0; addRing(cx, cy, R * 0.3, R * 1.05, radarRgb, t, 1.6, 1.4); }
     }
     if (flavours.pull && !calm) {
       var pullRgb = COLORS[flavours.pull.kind];
       fx.ringTimer.pull = (fx.ringTimer.pull || 0) + dt;
-      if (fx.ringTimer.pull > 1.0) { fx.ringTimer.pull = 0; addRing(cx, cy, R * 0.8, R * 0.3, pullRgb, t, 1.4, 2); }
+      if (fx.ringTimer.pull > 1.0) { fx.ringTimer.pull = 0; addRing(cx, cy, R * 1.1, R * 0.4, pullRgb, t, 1.4, 1.6); }
     }
     if (flavours.scan) {
       var scanRgb = COLORS[flavours.scan.kind];
       ctx.save();
       ctx.beginPath();
-      ctx.arc(cx, cy, R * 0.6, 0, TAU);
+      ctx.ellipse(cx, cy, R * 0.78, R * 0.98, 0, 0, TAU);
       ctx.clip();
       var phase = calm ? 0.5 : (Math.sin(t * 1.7) * 0.5 + 0.5);
-      var y = cy - R * 0.6 + phase * R * 1.2;
-      var band = ctx.createLinearGradient(0, y - R * 0.2, 0, y + 2);
+      var y = cy - R * 0.98 + phase * R * 1.96;
+      var band = ctx.createLinearGradient(0, y - R * 0.3, 0, y + 2);
       band.addColorStop(0, rgba(scanRgb, 0));
-      band.addColorStop(1, rgba(scanRgb, 0.34));
+      band.addColorStop(1, rgba(scanRgb, 0.3));
       ctx.fillStyle = band;
-      ctx.fillRect(cx - R, y - R * 0.2, R * 2, R * 0.2 + 2);
+      ctx.fillRect(cx - R, y - R * 0.3, R * 2, R * 0.3 + 2);
       ctx.fillStyle = rgba(scanRgb, 0.95);
-      ctx.fillRect(cx - R * 0.6, y, R * 1.2, 1.6);
-      // a few bright "data" ticks riding the line
+      ctx.fillRect(cx - R * 0.8, y, R * 1.6, 1.6);
       for (var d = 0; d < 9; d += 1) {
-        var dx = cx - R * 0.6 + (((d * 0.137 + t * 0.5) % 1) * R * 1.2);
+        var dx = cx - R * 0.8 + (((d * 0.137 + t * 0.5) % 1) * R * 1.6);
         ctx.fillRect(dx, y - 3, 2, 3);
       }
       ctx.restore();
@@ -478,20 +534,19 @@
       while (fx.sparkTimer > 0.03 && fx.sparks.length < 90) {
         fx.sparkTimer -= 0.03;
         var a = Math.random() * TAU;
-        fx.sparks.push({ x: cx + Math.cos(a) * R * 0.5, y: cy + Math.sin(a) * R * 0.5, vx: Math.cos(a), vy: Math.sin(a), s: R * (0.35 + Math.random() * 0.5), born: t, life: 0.5 + Math.random() * 0.5, rgb: sparkRgb });
+        fx.sparks.push({ x: cx + Math.cos(a) * R * 0.7, y: cy + Math.sin(a) * R * 0.8, vx: Math.cos(a), vy: Math.sin(a), s: R * (0.5 + Math.random() * 0.7), born: t, life: 0.5 + Math.random() * 0.5, rgb: sparkRgb });
       }
     }
-    if (thinkingNow && !calm && active.length === 0) drawThoughts(ctx, cx, cy, R, t, baseRgb);
+    if (thinkingNow && !calm && !Object.keys(flavours).length) drawThoughts(ctx, cx, cy, R, t, baseRgb);
 
     // ---- rings and sparks already in flight -----------------------------------------------------------------------
     fx.rings = fx.rings.filter(function (ring) { return t - ring.born < ring.life; });
     fx.rings.forEach(function (ring) {
       var u = (t - ring.born) / ring.life;
-      var radius = ring.from + (ring.to - ring.from) * u;
       ctx.beginPath();
-      ctx.arc(ring.x, ring.y, Math.max(1, radius), 0, TAU);
+      ctx.arc(ring.x, ring.y, Math.max(1, ring.from + (ring.to - ring.from) * u), 0, TAU);
       ctx.lineWidth = ring.width;
-      ctx.strokeStyle = rgba(ring.rgb, 0.7 * (1 - u));
+      ctx.strokeStyle = rgba(ring.rgb, 0.6 * (1 - u));
       ctx.stroke();
     });
     fx.sparks = fx.sparks.filter(function (spark) { return t - spark.born < spark.life; });
@@ -506,103 +561,157 @@
       ctx.stroke();
     });
 
-    // ---- one satellite per action, with its beam -------------------------------------------------------------------
+    // ---- one node per action ---------------------------------------------------------------------------------------
     var labels = 0;
-    active.forEach(function (item) {
+    nodes.forEach(function (item) {
       var rgb = COLORS[item.kind] || COLORS.tool;
-      var done = item.state === "ok" || item.state === "bad";
-      var age = item.ended ? (clock - item.ended) / KEEP_DONE_MS : 0;
-      var fade = done ? 1 - age : 1;
-      var angle = item.angle + (calm ? 0 : t * item.spin);
-      var radius = R * 1.0;
-      var sx = cx + Math.cos(angle) * radius, sy = cy + Math.sin(angle) * radius;
+      var live = isRunning(item);
+      var bright = live || clock - item.ended < DWELL_MS;
+      var done = !live;
+      item.lane += (item.laneTarget - item.lane) * Math.min(1, dt * 2.2);
+      if (!calm) item.a += dt * item.spin * (bright ? 1 : 0.3);
+      var radius = R * (1.14 + 0.17 * item.lane);
+      var sx = cx + Math.cos(item.a) * radius, sy = cy + Math.sin(item.a) * radius * 0.84;
+      item.sx = sx; item.sy = sy;
       var born = Math.min(1, (clock - item.born) / 500);
+      var tone = !done ? (item.state === "wait" ? [255, 180, 84] : rgb) : (item.state === "ok" ? rgb : [255, 107, 107]);
+      var fade = bright ? 1 : Math.max(0.4, 0.75 - item.lane * 0.08);
 
       if (item.burst) {
         item.burst = false;
         var burstRgb = item.state === "ok" ? [107, 226, 160] : [255, 107, 107];
-        addRing(sx, sy, 4, R * 0.16, burstRgb, t, 0.9, 2);
-        addRing(cx, cy, R * 0.45, R * 0.72, burstRgb, t, 0.8, 1.4);
+        addRing(sx, sy, 4, R * 0.18, burstRgb, t, 0.9, 2);
+        addRing(cx, cy, R * 0.6, R * 1.0, burstRgb, t, 0.8, 1.2);
+      }
+      if (item.pulse && clock - item.pulse < 900) {
+        var u2 = (clock - item.pulse) / 900;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 6 + 22 * u2, 0, TAU);
+        ctx.lineWidth = 1.6;
+        ctx.strokeStyle = rgba(tone, 0.8 * (1 - u2));
+        ctx.stroke();
       }
 
-      // the beam, and packets travelling along it
-      var ex = cx + Math.cos(angle) * R * 0.52, ey = cy + Math.sin(angle) * R * 0.52;
-      var beam = ctx.createLinearGradient(sx, sy, ex, ey);
-      beam.addColorStop(0, rgba(rgb, 0.45 * fade * born));
-      beam.addColorStop(1, rgba(rgb, 0.04 * fade));
-      ctx.strokeStyle = beam;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.moveTo(sx, sy);
-      ctx.lineTo(ex, ey);
-      ctx.stroke();
-      if (!done) {
-        for (var k = 0; k < 3; k += 1) {
-          var u = calm ? 0.5 : ((t * 0.7 + k / 3 + item.id * 0.17) % 1);
-          var v = item.dir === "in" ? u : 1 - u;
-          var px = sx + (ex - sx) * v, py = sy + (ey - sy) * v;
-          var glow = Math.sin(Math.PI * u);
-          ctx.fillStyle = rgba(rgb, 0.95 * glow);
-          ctx.beginPath();
-          ctx.arc(px, py, 2.4, 0, TAU);
-          ctx.fill();
-          ctx.fillStyle = rgba(rgb, 0.18 * glow);
-          ctx.beginPath();
-          ctx.arc(px, py, 6, 0, TAU);
-          ctx.fill();
+      // the beam to the face, and packets travelling along it, while the action is live (and for a moment after)
+      if (bright) {
+        var ex = cx + Math.cos(item.a) * R * 0.5, ey = cy + Math.sin(item.a) * R * 0.5 * 0.84;
+        var beam = ctx.createLinearGradient(sx, sy, ex, ey);
+        var beamFade = live ? 1 : 1 - (clock - item.ended) / DWELL_MS;
+        beam.addColorStop(0, rgba(rgb, 0.45 * beamFade * born));
+        beam.addColorStop(1, rgba(rgb, 0.04 * beamFade));
+        ctx.strokeStyle = beam;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        if (live) {
+          for (var k = 0; k < 3; k += 1) {
+            var u = calm ? 0.5 : ((t * 0.7 + k / 3 + item.id * 0.17) % 1);
+            var v = item.dir === "in" ? u : 1 - u;
+            var px = sx + (ex - sx) * v, py = sy + (ey - sy) * v;
+            var glow = Math.sin(Math.PI * u);
+            ctx.fillStyle = rgba(rgb, 0.95 * glow);
+            ctx.beginPath();
+            ctx.arc(px, py, 2.4, 0, TAU);
+            ctx.fill();
+            ctx.fillStyle = rgba(rgb, 0.18 * glow);
+            ctx.beginPath();
+            ctx.arc(px, py, 6, 0, TAU);
+            ctx.fill();
+          }
         }
       }
 
-      // the satellite
-      var size = (item.fx === "twin" ? 8 : 5) * (0.6 + 0.4 * born);
-      var tone = done ? (item.state === "ok" ? [107, 226, 160] : [255, 107, 107]) : item.state === "wait" ? [255, 180, 84] : rgb;
-      var pulse = done || calm ? 1 : 1 + 0.22 * Math.sin(t * 6 + item.id);
-      var halo = ctx.createRadialGradient(sx, sy, 0, sx, sy, size * 3.2 * pulse);
-      halo.addColorStop(0, rgba(tone, 0.55 * fade));
-      halo.addColorStop(1, rgba(tone, 0));
-      ctx.fillStyle = halo;
-      ctx.beginPath();
-      ctx.arc(sx, sy, size * 3.2 * pulse, 0, TAU);
-      ctx.fill();
+      // a short comet tail behind the node, then the node itself
+      if (!calm) {
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, radius, radius * 0.84, 0, item.a - 0.32 * Math.sign(item.spin), item.a, item.spin < 0);
+        ctx.lineWidth = bright ? 1.6 : 1;
+        ctx.strokeStyle = rgba(tone, 0.28 * fade);
+        ctx.stroke();
+      }
+      var size = (item.fx === "twin" && live ? 7 : bright ? 5 : 4) * (0.6 + 0.4 * born);
+      var pulse = !live || calm ? 1 : 1 + 0.22 * Math.sin(t * 6 + item.id);
+      if (bright) {
+        var halo = ctx.createRadialGradient(sx, sy, 0, sx, sy, size * 3.2 * pulse);
+        halo.addColorStop(0, rgba(tone, 0.5 * fade));
+        halo.addColorStop(1, rgba(tone, 0));
+        ctx.fillStyle = halo;
+        ctx.beginPath();
+        ctx.arc(sx, sy, size * 3.2 * pulse, 0, TAU);
+        ctx.fill();
+      }
       ctx.fillStyle = rgba(tone, fade);
       ctx.beginPath();
       ctx.arc(sx, sy, size, 0, TAU);
       ctx.fill();
-      if (item.fx === "twin") {
-        // a small orb of its own: a sub-agent is another worker
+      if (item.fx === "twin" && live) {
         for (var q = 0; q < 3; q += 1) {
           var from = (calm ? 0 : t * 2.4) + q * (TAU / 3);
           ctx.beginPath();
           ctx.arc(sx, sy, size + 6, from, from + 1.2);
           ctx.lineWidth = 1.6;
-          ctx.strokeStyle = rgba(tone, 0.85 * fade);
+          ctx.strokeStyle = rgba(tone, 0.85);
           ctx.stroke();
         }
-      } else if (!done) {
-        ctx.beginPath();
-        ctx.arc(sx, sy, size + 5, angle + Math.PI - 0.5, angle + Math.PI + 0.5);
-        ctx.lineWidth = 1.4;
-        ctx.strokeStyle = rgba(tone, 0.5);
-        ctx.stroke();
       }
-
-      // its label, outside the ring when there is room and inside when there is not
-      if (!done && labels < 5 && W > 520) {
+      // what a search or a page returned: one small moon per link
+      if (done && item.links.length) {
+        var moons = Math.min(4, item.links.length);
+        for (var m = 0; m < moons; m += 1) {
+          var ma = (calm ? 0 : t * 1.6) + m * (TAU / moons);
+          ctx.fillStyle = rgba(tone, 0.8 * fade + 0.1);
+          ctx.beginPath();
+          ctx.arc(sx + Math.cos(ma) * 9, sy + Math.sin(ma) * 9, 1.5, 0, TAU);
+          ctx.fill();
+        }
+      }
+      // a running action says what it is, outside the orbit when there is room and inside when there is not
+      if (live && labels < 5 && W > 520) {
         labels += 1;
-        var text = (item.verb + (item.target ? " \u00B7 " + trim(item.target, 26) : "")).toUpperCase();
-        ctx.font = "10px Consolas, 'Cascadia Mono', monospace";
-        ctx.textBaseline = "middle";
-        var width = ctx.measureText(text).width;
-        var right = Math.cos(angle) >= 0;
-        var tx = right ? sx + size + 10 : sx - size - 10;
-        if (right && tx + width > W - 8) { ctx.textAlign = "right"; tx = sx - size - 10; }
-        else if (!right && tx - width < leftEdge) { ctx.textAlign = "left"; tx = sx + size + 10; }
-        else ctx.textAlign = right ? "left" : "right";
-        ctx.fillStyle = rgba(tone, 0.95);
-        ctx.fillText(text, tx, sy);
+        drawLabel(ctx, item, sx, sy, size, tone, Math.cos(item.a) >= 0, W, leftEdge, false);
       }
     });
+
+    // the node under the pointer says what it is, whatever its age
+    var hover = M.hover;
+    if (hover && hover.sx !== undefined && nodes.indexOf(hover) >= 0) {
+      drawLabel(ctx, hover, hover.sx, hover.sy, 6, COLORS[hover.kind] || COLORS.tool, Math.cos(hover.a) >= 0, W, leftEdge, true);
+    }
     ctx.restore();
+  }
+
+  function labelText(item) {
+    return (item.verb + (item.target ? " \u00B7 " + trim(item.target, 30) : "")).toUpperCase();
+  }
+
+  function drawLabel(ctx, item, sx, sy, size, tone, right, W, leftEdge, boxed) {
+    var text = labelText(item);
+    if (boxed && item.links.length) text += "  \u00B7  " + item.links.length + " LINK" + (item.links.length === 1 ? "" : "S");
+    ctx.font = "10px Consolas, 'Cascadia Mono', monospace";
+    ctx.textBaseline = "middle";
+    // The label goes outwards, away from the face. When the room outside is short it is cut to fit rather than turned back across the face.
+    var tx = right ? sx + size + 10 : sx - size - 10;
+    var align = right ? "left" : "right";
+    var room = right ? W - 8 - tx : tx - leftEdge;
+    var width = ctx.measureText(text).width;
+    if (width > room) {
+      var keep = Math.max(4, Math.floor(text.length * Math.max(0, room) / width) - 1);
+      text = text.slice(0, keep) + "\u2026";
+      width = ctx.measureText(text).width;
+    }
+    ctx.textAlign = align;
+    if (boxed) {
+      var bx = align === "left" ? tx - 6 : tx - width - 6;
+      ctx.fillStyle = "rgba(2, 10, 20, 0.85)";
+      ctx.fillRect(bx, sy - 10, width + 12, 20);
+      ctx.strokeStyle = rgba(tone, 0.6);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx, sy - 10, width + 12, 20);
+    }
+    ctx.fillStyle = rgba(tone, 0.95);
+    ctx.fillText(text, tx, sy);
   }
 
   // A quiet net of thoughts around the head while the model is reasoning and has not asked for anything yet.
@@ -610,17 +719,17 @@
     var points = [];
     for (var i = 0; i < 22; i += 1) {
       var base = i * 2.399;
-      var r = R * (0.4 + 0.2 * ((i * 0.618) % 1));
+      var r = R * (0.62 + 0.5 * ((i * 0.618) % 1));
       var a = base + t * (i % 2 ? 0.07 : -0.05);
-      points.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.92, 0.5 + 0.5 * Math.sin(t * 2 + i)]);
+      points.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.9, 0.5 + 0.5 * Math.sin(t * 2 + i)]);
     }
     ctx.lineWidth = 1;
     for (var m = 0; m < points.length; m += 1) {
       for (var n = m + 1; n < points.length; n += 1) {
         var dx = points[m][0] - points[n][0], dy = points[m][1] - points[n][1];
         var dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < R * 0.3) {
-          ctx.strokeStyle = rgba(rgb, 0.22 * (1 - dist / (R * 0.3)));
+        if (dist < R * 0.5) {
+          ctx.strokeStyle = rgba(rgb, 0.22 * (1 - dist / (R * 0.5)));
           ctx.beginPath();
           ctx.moveTo(points[m][0], points[m][1]);
           ctx.lineTo(points[n][0], points[n][1]);
@@ -636,8 +745,42 @@
     });
   }
 
+  // ---- the node under the pointer ------------------------------------------------------------------------------------
+  function hit(x, y) {
+    var best = null, bestDistance = 15 * 15;
+    nodeItems(now()).forEach(function (item) {
+      if (item.sx === undefined) return;
+      var dx = item.sx - x, dy = item.sy - y;
+      var distance = dx * dx + dy * dy;
+      if (distance < bestDistance) { best = item; bestDistance = distance; }
+    });
+    return best;
+  }
+  function hover(x, y) {
+    M.hover = hit(x, y);
+    return M.hover;
+  }
+  // Pressing a node opens its row in the feed and flashes it: from the picture to the detail.
+  function click(x, y) {
+    var item = hit(x, y);
+    if (!item) return false;
+    focusRow(item);
+    return true;
+  }
+  function focusRow(item) {
+    item.open = true;
+    item.pulse = now();
+    M.dismissed = false;
+    paintAll();
+    if (item.node) {
+      item.node.scrollIntoView({ block: "nearest" });
+      item.node.classList.add("flash");
+      setTimeout(function () { if (item.node) item.node.classList.remove("flash"); }, 1400);
+    }
+  }
+
   window.JarvisMission = {
-    mount: mount, event: event, begin: begin, draw: draw, dock: dock, headline: headline, nowFor: nowFor, running: running, thinking: thinking,
+    mount: mount, event: event, begin: begin, draw: draw, dock: dock, hover: hover, click: click, headline: headline, nowFor: nowFor, running: running, thinking: thinking,
     sourcesOf: sourcesOf, safeHref: safeHref, chip: chip, state: M,
     set onStart(callback) { M.onStart = callback; }
   };

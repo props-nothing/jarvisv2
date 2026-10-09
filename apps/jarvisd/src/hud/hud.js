@@ -2294,9 +2294,7 @@
   }
 
   // ---- the face -------------------------------------------------------------------------------------------------
-  // A film-style interface rather than a blob: concentric rings of ticks and segmented arcs turning against each other,
-  // the system's name running round a ring, a radar sweep, a radial spectrum that is the voice (microphone level while
-  // listening, a synthetic envelope while speaking), and an arc-reactor core. Colour and tempo carry the state.
+  // Just the face (see draw below), and what it is doing.
   var canvas = $("orb");
   var ctx = canvas.getContext("2d");
   var W = 0, H = 0;
@@ -2310,7 +2308,6 @@
   // The face is not steered by the pointer. It has a mind of its own (head.js): it looks about, changes expression, blinks and
   // reacts to what is happening. The console only tells it what happened (JarvisHead.emote, nod, shake, mood).
 
-  var NAME = "J.A.R.V.I.S  \u2022  JUST A RATHER VERY INTELLIGENT SYSTEM  \u2022  ";
   var TAU = Math.PI * 2;
 
   function resize() {
@@ -2338,170 +2335,89 @@
     return "rgba(" + Math.round(current[0]) + "," + Math.round(current[1]) + "," + Math.round(current[2]) + "," + alpha + ")";
   }
 
-  function ring(cx, cy, radius, from, to, width, alpha) {
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, from, to);
-    ctx.lineWidth = width;
-    ctx.strokeStyle = rgba(alpha);
-    ctx.stroke();
+  // The face stands alone. No rings, no frame, no text on the canvas: the face, a soft light behind it, a few motes of dust that drift
+  // faster when it is busy, a thin line of voice under it while someone is talking, and, while it works, the constellation of what it
+  // is doing (mission.js). Colour and tempo carry the state.
+  var FACE = 0.5;           // the face's size, as a share of the room it has
+  var motes = [];
+  for (var moteIndex = 0; moteIndex < 42; moteIndex += 1) {
+    motes.push({ a: moteIndex * 2.399, r: 0.55 + ((moteIndex * 0.618) % 1) * 1.1, sp: (moteIndex % 2 ? 1 : -1) * (0.01 + (moteIndex % 5) * 0.004), size: 0.8 + (moteIndex % 3) * 0.5 });
   }
-  function ticks(cx, cy, inner, outer, count, rotation, every, alpha) {
-    ctx.lineWidth = 1;
-    for (var i = 0; i < count; i += 1) {
-      var angle = rotation + (i / count) * TAU;
-      var long = i % every === 0;
-      var r1 = long ? inner - (outer - inner) * 0.6 : inner;
-      ctx.strokeStyle = rgba(long ? alpha * 1.7 : alpha);
-      ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(angle) * r1, cy + Math.sin(angle) * r1);
-      ctx.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
-      ctx.stroke();
-    }
-  }
-  // Text laid along a ring so that it fills exactly one turn: repeated as many whole times as fit, and the
-  // remaining slack spread between the letters, so the end meets the beginning instead of overprinting it.
-  function arcText(text, cx, cy, radius, start, size, alpha) {
-    ctx.font = size + "px Consolas, 'Cascadia Mono', monospace";
-    ctx.fillStyle = rgba(alpha);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    var widths = [], total = 0, i;
-    for (i = 0; i < text.length; i += 1) {
-      widths.push(ctx.measureText(text[i]).width + 3);
-      total += widths[i];
-    }
-    var turn = total / radius;
-    var copies = Math.max(1, Math.floor(TAU / turn));
-    var slack = (TAU / copies - turn) / text.length;
-    var angle = start;
-    for (var c = 0; c < copies; c += 1) {
-      for (i = 0; i < text.length; i += 1) {
-        var step = widths[i] / radius + slack;
-        if (angle - start > TAU) return;
-        ctx.save();
-        ctx.translate(cx + Math.cos(angle + step / 2) * radius, cy + Math.sin(angle + step / 2) * radius);
-        ctx.rotate(angle + step / 2 + Math.PI / 2);
-        ctx.fillText(text[i], 0, 0);
-        ctx.restore();
-        angle += step;
-      }
-    }
-  }
-  function bracket(x, y, dx, dy, size) {
-    ctx.beginPath();
-    ctx.moveTo(x + dx * size, y);
-    ctx.lineTo(x, y);
-    ctx.lineTo(x, y + dy * size);
-    ctx.stroke();
-  }
+  var voiceShow = 0, captionAt = "";
 
   function draw(t, mode) {
     ctx.clearRect(0, 0, W, H);
     // While the live view is up, the face makes room for it and moves to the right.
     var room = window.JarvisMission ? Math.min(350, W * 0.38) * JarvisMission.dock(W) : 0;
-    var cx = room + (W - room) / 2, cy = H / 2 - 10, R = Math.min((W - room) * 0.5, (H - 24) * 0.5) * 0.96;
-    if (R < 40) return;
-    var speed = calm ? 0.06 : (mode === "working" ? 1.7 : mode === "waiting" ? 1.0 : mode === "offline" ? 0.05 : mode === "idle" ? 0.45 : 0.9);
-    ctx.lineCap = "butt";
+    var avail = W - room;
+    var size = Math.min(avail, H) * FACE;
+    var cx = room + avail / 2, cy = H * 0.46;
+    var reach = size * 0.5;
+    if (reach < 30) return;
+    var speed = calm ? 0.2 : (mode === "working" ? 1.8 : mode === "waiting" ? 1.2 : mode === "offline" ? 0.1 : mode === "idle" ? 0.5 : 1);
 
-    // halo
-    var halo = ctx.createRadialGradient(cx, cy, R * 0.1, cx, cy, R * 1.25);
-    halo.addColorStop(0, rgba(0.22 + energy * 0.35));
-    halo.addColorStop(0.55, rgba(0.06 + energy * 0.08));
+    // light, wide and faint, so the stage has a presence without an edge
+    var halo = ctx.createRadialGradient(cx, cy, size * 0.1, cx, cy, size * 1.5);
+    halo.addColorStop(0, rgba(0.1 + energy * 0.14));
+    halo.addColorStop(0.5, rgba(0.03 + energy * 0.04));
     halo.addColorStop(1, rgba(0));
     ctx.fillStyle = halo;
     ctx.fillRect(0, 0, W, H);
 
-    // horizontal sight lines with end ticks, and corner brackets
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = rgba(0.22);
-    ctx.beginPath();
-    ctx.moveTo(8, cy); ctx.lineTo(cx - R * 1.06, cy);
-    ctx.moveTo(cx + R * 1.06, cy); ctx.lineTo(W - 8, cy);
-    ctx.stroke();
-    for (var k = 0; k < 7; k += 1) {
-      var gap = 10 + k * 14;
+    // dust drifting round the face
+    motes.forEach(function (mote, index) {
+      var angle = mote.a + (calm ? 0 : t * mote.sp * speed);
+      var x = cx + Math.cos(angle) * mote.r * size * 0.95, y = cy + Math.sin(angle) * mote.r * size * 0.72;
+      var twinkle = 0.5 + 0.5 * Math.sin(t * 1.3 + index);
+      ctx.fillStyle = rgba((0.05 + 0.16 * twinkle) * (0.5 + energy));
       ctx.beginPath();
-      ctx.moveTo(cx - R * 1.06 - gap, cy - (k % 2 ? 3 : 6)); ctx.lineTo(cx - R * 1.06 - gap, cy + (k % 2 ? 3 : 6));
-      ctx.moveTo(cx + R * 1.06 + gap, cy - (k % 2 ? 3 : 6)); ctx.lineTo(cx + R * 1.06 + gap, cy + (k % 2 ? 3 : 6));
-      ctx.stroke();
-    }
-    ctx.strokeStyle = rgba(0.5);
-    ctx.lineWidth = 1.5;
-    bracket(6, 6, 1, 1, 16); bracket(W - 6, 6, -1, 1, 16); bracket(6, H - 6, 1, -1, 16); bracket(W - 6, H - 6, -1, -1, 16);
-    ctx.font = "10px Consolas, monospace";
-    ctx.fillStyle = rgba(0.55);
-    ctx.textBaseline = "alphabetic";
-    ctx.textAlign = "left";
-    ctx.fillText(S.session ? "SESSION " + String(S.session).slice(-6).toUpperCase() : "NO SESSION", 22, 24);
-    ctx.textAlign = "right";
-    ctx.fillText(S.working + (S.thinking && !S.working ? 1 : 0) + " ACTIVE  \u2022  " + S.needYou + " WAITING", W - 22, 24);
+      ctx.arc(x, y, mote.size, 0, TAU);
+      ctx.fill();
+    });
 
-    // outer ticked ring (fine ticks, a long one every 10)
-    ring(cx, cy, R, 0, TAU, 1.5, 0.55 + energy * 0.3);
-    ticks(cx, cy, R * 0.955, R * 0.99, 180, t * speed * 0.05, 10, 0.32);
-
-    // segmented ring turning the other way: eighteen arcs of changing length
-    var seg = R * 0.9;
-    for (var a = 0; a < 18; a += 1) {
-      var start = -t * speed * 0.16 + (a / 18) * TAU;
-      var length = (TAU / 18) * (0.35 + 0.5 * Math.abs(Math.sin(a * 2.399)));
-      ring(cx, cy, seg, start, start + length, 5, 0.18 + 0.4 * Math.abs(Math.sin(a * 1.7 + t * 0.4)));
-    }
-
-    // the system's name, running round
-    arcText(NAME, cx, cy, R * 0.815, t * speed * 0.07, Math.max(9, R * 0.045), 0.55 + energy * 0.25);
-    ring(cx, cy, R * 0.77, 0, TAU, 1, 0.3);
-
-    // three heavy partial arcs, turning at different rates (faster while working)
-    for (var h = 0; h < 3; h += 1) {
-      var base = t * speed * (h % 2 ? -0.7 : 0.5) * (1 + h * 0.35) + h * 2.1;
-      var rad = R * (0.72 - h * 0.055);
-      ring(cx, cy, rad, base, base + 1.15 + 0.5 * Math.sin(t * 0.6 + h), 4 - h * 0.7, 0.6 + energy * 0.3);
-      ring(cx, cy, rad, base + 3.3, base + 3.3 + 0.55, 2, 0.5);
-    }
-
-    // the thin ring and ticks that frame the head, then the voice as a ring of bars just inside the arcs
-    ring(cx, cy, R * 0.58, 0, TAU, 1, 0.3);
-    ticks(cx, cy, R * 0.545, R * 0.575, 72, -t * speed * 0.08, 6, 0.3);
-    var bars = 96, inner = R * 0.6;
-    for (var b = 0; b < bars; b += 1) {
-      var theta = (b / bars) * TAU - Math.PI / 2;
-      var mirror = Math.min(b, bars - b);
-      var shape = Math.abs(Math.sin(mirror * 0.9 + t * 3.3)) * (0.55 + 0.45 * Math.sin(mirror * 0.31 - t * 2.1));
-      var len = R * (0.012 + energy * 0.1 * (0.25 + shape));
-      ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(theta) * inner, cy + Math.sin(theta) * inner);
-      ctx.lineTo(cx + Math.cos(theta) * (inner + len), cy + Math.sin(theta) * (inner + len));
-      ctx.lineWidth = Math.max(1.2, R * 0.01);
-      ctx.strokeStyle = rgba(0.4 + energy * 0.5);
-      ctx.stroke();
-    }
-
-    // the head: a real face mesh, whose mouth follows the voice and whose eyes, brows and head move on their own
+    // the face: a real mesh, whose mouth follows the voice and whose eyes, brows and head move on their own
     if (window.JarvisHead) {
       var mouth = 0;
       if (mode === "speaking") {
         // the real audio level when the neural voice is playing; a synthetic syllable rhythm for the browser voice
-        // The neural voice drives the mouth only from the sound actually playing; the synthetic rhythm is for the browser voice.
         mouth = S.voiceKind === "neural"
           ? Math.min(1, S.voiceLevel * 1.6)
           : 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(t * 9.3) * Math.sin(t * 3.7 + 0.8)), 0.7);
       }
-      JarvisHead.draw(ctx, cx, cy, R * 1.62, {
-        rgb: current, energy: energy, mode: mode, mouth: mouth, t: t, calm: calm
-      });
+      JarvisHead.draw(ctx, cx, cy, size, { rgb: current, energy: energy, mode: mode, mouth: mouth, t: t, calm: calm });
     }
-    // what JARVIS is doing right now: satellites, beams and the effect for each kind of work (mission.js)
-    if (window.JarvisMission) JarvisMission.draw(ctx, cx, cy, R, t, current, calm, W, H, room);
-    // markers riding the outer rings
-    for (var m = 0; m < 5; m += 1) {
-      var ma = t * speed * (0.12 + m * 0.03) * (m % 2 ? -1 : 1) + m * 1.3;
-      var mr = R * (m % 2 ? 0.9 : 0.99);
-      ctx.fillStyle = rgba(0.95);
-      ctx.beginPath();
-      ctx.arc(cx + Math.cos(ma) * mr, cy + Math.sin(ma) * mr, 2.6, 0, TAU);
-      ctx.fill();
+
+    // the voice, as a thin line of bars under the face, only while someone is talking
+    voiceShow += ((mode === "speaking" || mode === "listening" ? 1 : 0) - voiceShow) * 0.1;
+    if (voiceShow > 0.02) {
+      var baseline = cy + size * 0.6, half = size * 0.4, bars = 56;
+      ctx.lineWidth = Math.max(1.4, size * 0.006);
+      ctx.lineCap = "round";
+      for (var b = 0; b < bars; b += 1) {
+        var u = b / (bars - 1);
+        var bell = Math.sin(Math.PI * u);
+        var wave = Math.abs(Math.sin(b * 0.9 + t * 7.3) * Math.sin(b * 0.37 - t * 3.1));
+        var len = (1.5 + wave * energy * size * 0.12) * (0.25 + 0.75 * bell);
+        var x = cx - half + u * half * 2;
+        ctx.strokeStyle = rgba((0.18 + 0.6 * bell) * voiceShow);
+        ctx.beginPath();
+        ctx.moveTo(x, baseline - len);
+        ctx.lineTo(x, baseline + len);
+        ctx.stroke();
+      }
+    }
+
+    // what JARVIS is doing right now: nodes, beams and the effect for each kind of work (mission.js)
+    if (window.JarvisMission) JarvisMission.draw(ctx, cx, cy, reach, t, current, calm, W, H, room);
+
+    // the caption sits just under the face, wherever the face is
+    var place = Math.round(cy + size * 0.8) + "|" + Math.round(room);
+    if (place !== captionAt) {
+      captionAt = place;
+      var label = $("caption");
+      label.style.top = Math.round(cy + size * 0.8) + "px";
+      label.style.bottom = "auto";
+      label.style.left = Math.round(room) + "px";
     }
   }
 
@@ -2516,8 +2432,22 @@
     draw(t, mode);
     requestAnimationFrame(frame);
   }
-  // The face is also a button: clicking it silences JARVIS.
-  canvas.addEventListener("click", interruptSpeech);
+  // The face is a button: clicking it silences JARVIS. A node of the live view under the pointer is named, and pressing it opens its step.
+  function canvasPoint(event) {
+    var box = canvas.getBoundingClientRect();
+    return [event.clientX - box.left, event.clientY - box.top];
+  }
+  canvas.addEventListener("mousemove", function (event) {
+    if (!window.JarvisMission) return;
+    var at = canvasPoint(event);
+    canvas.style.cursor = JarvisMission.hover(at[0], at[1]) ? "pointer" : "";
+  });
+  canvas.addEventListener("mouseleave", function () { if (window.JarvisMission) JarvisMission.hover(-99, -99); canvas.style.cursor = ""; });
+  canvas.addEventListener("click", function (event) {
+    var at = canvasPoint(event);
+    if (window.JarvisMission && JarvisMission.click(at[0], at[1])) return;
+    interruptSpeech();
+  });
   requestAnimationFrame(frame);
 
   refresh();
