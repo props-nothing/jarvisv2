@@ -19,6 +19,7 @@ mod health;
 mod hud;
 mod mcp_host;
 mod mcp_serve;
+mod memory_manage;
 mod memory_propose;
 mod memory_search;
 mod memory_service;
@@ -175,6 +176,13 @@ enum DaemonError {
         /// Which part was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebSearchToolError,
+    },
+    /// The memory correction tools could not state their own contract.
+    #[error("the memory correction tools could not be defined")]
+    MemoryManageTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::memory_manage::MemoryManageToolError,
     },
     /// The project note tool could not state its own contract.
     #[error("the project note tool could not be defined")]
@@ -899,12 +907,19 @@ fn push_project_tool(
     )>,
 ) -> Result<(), DaemonError> {
     additional.push((
-        vec![
-            crate::project_tool::ProjectTool::definition()
-                .map_err(|source| DaemonError::ProjectTool { source })?,
-        ],
+        crate::project_tool::ProjectTool::definitions()
+            .map_err(|source| DaemonError::ProjectTool { source })?,
         Arc::new(crate::project_tool::ProjectTool::new(Arc::clone(database)))
             as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    // Correcting and forgetting a memory ask the owner, and are composed beside the projects because both are the model keeping the
+    // owner's long-lived state straight.
+    additional.push((
+        crate::memory_manage::MemoryManageTool::definitions()
+            .map_err(|source| DaemonError::MemoryManageTool { source })?,
+        Arc::new(crate::memory_manage::MemoryManageTool::new(Arc::clone(
+            database,
+        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
     Ok(())
 }

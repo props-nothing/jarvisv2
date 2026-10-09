@@ -35,6 +35,8 @@
     "jarvis.web.fetch": ["web", "Reading a page", "in", "scan"],
     "jarvis.memory.search": ["memory", "Recalling", "in", "pull"],
     "jarvis.memory.propose": ["memory", "Noting a memory", "out", "pull"],
+    "jarvis.memory.correct": ["memory", "Correcting a memory", "out", "pull"],
+    "jarvis.memory.forget": ["memory", "Forgetting a memory", "out", "pull"],
     "jarvis.files.read": ["file", "Reading", "in", "scan"],
     "jarvis.files.list": ["file", "Listing", "in", "scan"],
     "jarvis.files.search": ["file", "Searching files", "in", "radar"],
@@ -52,7 +54,14 @@
     "jarvis.schedule.add": ["time", "Scheduling", "out", "pull"],
     "jarvis.schedule.list": ["time", "Checking the schedule", "in", "pull"],
     "jarvis.schedule.remove": ["time", "Removing a schedule", "out", "pull"],
-    "jarvis.project.note": ["project", "Writing the journal", "out", "pull"]
+    "jarvis.schedule.pause": ["time", "Pausing a schedule", "out", "pull"],
+    "jarvis.schedule.resume": ["time", "Resuming a schedule", "out", "pull"],
+    "jarvis.project.note": ["project", "Writing the journal", "out", "pull"],
+    "jarvis.project.list": ["project", "Checking projects", "in", "pull"],
+    "jarvis.project.use": ["project", "Joining a project", "out", "pull"],
+    "jarvis.project.create": ["project", "Creating a project", "out", "spark"],
+    "jarvis.project.update": ["project", "Updating a project", "out", "pull"],
+    "jarvis.project.assign_schedule": ["project", "Filing a schedule", "out", "pull"]
   };
   function describe(tool) {
     var known = TOOLS[tool];

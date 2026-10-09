@@ -40,6 +40,10 @@ pub const ADD_TOOL: &str = "jarvis.schedule.add";
 pub const LIST_TOOL: &str = "jarvis.schedule.list";
 /// Removes a scheduled task.
 pub const REMOVE_TOOL: &str = "jarvis.schedule.remove";
+/// Pauses a scheduled task.
+pub const PAUSE_TOOL: &str = "jarvis.schedule.pause";
+/// Resumes a paused scheduled task.
+pub const RESUME_TOOL: &str = "jarvis.schedule.resume";
 /// The scope a caller must hold for the schedule tools.
 pub const SCHEDULE_SCOPE: &str = "schedule.manage";
 
@@ -136,6 +140,24 @@ impl ScheduleTool {
                 ToolEffect::ReadOnly,
                 0,
                 ApprovalPolicy::Auto,
+            )?,
+            Self::definition(
+                PAUSE_TOOL,
+                "Pause a scheduled task",
+                "Pauses one scheduled task by the id jarvis.schedule.list gave, so it stops firing until it is resumed. Nothing is deleted.",
+                REMOVE_INPUT,
+                ToolEffect::Write,
+                1,
+                ApprovalPolicy::Auto,
+            )?,
+            Self::definition(
+                RESUME_TOOL,
+                "Resume a scheduled task",
+                "Resumes a paused scheduled task by its id, so it fires again from now on, unattended. The user is asked first.",
+                REMOVE_INPUT,
+                ToolEffect::Write,
+                2,
+                ApprovalPolicy::Ask,
             )?,
             Self::definition(
                 REMOVE_TOOL,
@@ -247,6 +269,30 @@ impl ScheduleTool {
         Ok(json!({ "schedules": schedules.iter().map(describe).collect::<Vec<_>>() }))
     }
 
+    async fn set_enabled(
+        &self,
+        arguments: &Value,
+        enabled: bool,
+        now: UtcTimestamp,
+    ) -> Result<Value, AdapterError> {
+        let id = arguments
+            .get("schedule_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("a schedule_id is required"))?;
+        let workspace = self.workspace().await?;
+        let stored =
+            jarvis_storage::set_schedule_enabled(&self.database, &workspace, id, enabled, now)
+                .await
+                .map_err(|error| match error {
+                    DatabaseError::ScheduleNotFound => refused("no scheduled task has that id"),
+                    DatabaseError::ScheduleFinished => refused(
+                        "a one-off task that already ran cannot be resumed; schedule a new one",
+                    ),
+                    _ => refused("the schedule could not be changed"),
+                })?;
+        Ok(json!({ "schedule": describe(&stored) }))
+    }
+
     async fn remove(&self, arguments: &Value) -> Result<Value, AdapterError> {
         let id = arguments
             .get("schedule_id")
@@ -317,6 +363,8 @@ impl ToolExecutor for ScheduleTool {
             }
             LIST_TOOL => self.list().await?,
             REMOVE_TOOL => self.remove(request.arguments()).await?,
+            PAUSE_TOOL => self.set_enabled(request.arguments(), false, now).await?,
+            RESUME_TOOL => self.set_enabled(request.arguments(), true, now).await?,
             _ => return Err(AdapterError::NotImplemented { tool }),
         };
         let evidence = ProviderEvidence::new("schedule:store").ok();

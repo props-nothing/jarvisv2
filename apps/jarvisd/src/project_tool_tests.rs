@@ -85,18 +85,30 @@ async fn make_project(database: &SqliteDatabase) -> jarvis_storage::StoredProjec
 }
 
 #[test]
-fn the_contract_takes_no_approval_and_no_project_argument() {
-    let definition = must(ProjectTool::definition());
-    assert_eq!(definition.approval(), ApprovalPolicy::Auto);
-    assert!(definition.effects().contains(ToolEffect::Write));
-    let schema = INPUT.to_owned();
+fn the_note_takes_no_approval_and_no_project_argument_and_the_managing_tools_ask_where_they_persist()
+ {
+    let definitions = must(ProjectTool::definitions());
+    let by_id = |id: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.id().to_string() == id)
+            .unwrap_or_else(|| panic!("{id} must be defined"))
+    };
+    assert_eq!(by_id(NOTE_TOOL).approval(), ApprovalPolicy::Auto);
+    assert!(by_id(NOTE_TOOL).effects().contains(ToolEffect::Write));
     assert!(
-        !schema.contains("project"),
-        "the project is never an argument"
+        !NOTE_INPUT.contains("project"),
+        "a note never names its project"
     );
-    assert!(schema.contains(r#""additionalProperties": false"#));
+    assert!(NOTE_INPUT.contains(r#""additionalProperties": false"#));
+    // Standing instructions that every later run is given are planted only with the owner's yes.
+    for tool in [CREATE_TOOL, UPDATE_TOOL, ASSIGN_TOOL] {
+        assert_eq!(by_id(tool).approval(), ApprovalPolicy::Ask, "{tool}");
+    }
+    for tool in [LIST_TOOL, USE_TOOL] {
+        assert_eq!(by_id(tool).approval(), ApprovalPolicy::Auto, "{tool}");
+    }
 }
-
 /// **An entry lands in the project of the conversation that made the call, and records the run.**
 #[tokio::test]
 async fn a_note_is_written_to_the_calling_conversations_project() {
@@ -205,4 +217,150 @@ async fn a_task_scheduled_inside_a_project_joins_it() {
         .to_owned();
     let linked = must(jarvis_storage::project_for(&database, LinkKind::Schedule, &id).await);
     assert_eq!(linked.map(|p| p.name), Some("Prospecting".to_owned()));
+}
+
+/// **Asked to make a project, a model can: the project exists, the conversation belongs to it, and the journal works at once.**
+#[tokio::test]
+async fn a_model_can_create_a_project_and_then_journal_in_it() {
+    let (_scratch, database) = database().await;
+    let (session, call) = run_with_call(&database).await;
+    let tool = ProjectTool::new(Arc::clone(&database));
+
+    let reply = must(
+        tool.create(
+            &call,
+            &json!({ "name": "Prospecting", "goal": "Book demos", "guidance": "Write in Dutch.", "folder": "sales" }),
+            now(),
+        )
+        .await,
+    );
+    assert_eq!(reply["this_conversation_now_belongs_to_it"], true);
+    let linked = must(jarvis_storage::project_for(&database, LinkKind::Session, &session).await);
+    assert_eq!(linked.map(|p| p.name), Some("Prospecting".to_owned()));
+    must(
+        tool.note(
+            &call,
+            &json!({ "kind": "progress", "text": "Created." }),
+            now(),
+        )
+        .await,
+    );
+
+    // A second project with the same name is refused and says what to do instead.
+    let again = tool
+        .create(&call, &json!({ "name": "prospecting" }), now())
+        .await;
+    assert!(
+        matches!(again, Err(AdapterError::RefusedBeforeReaching { .. })),
+        "{again:?}"
+    );
+}
+
+/// **A conversation already in a project is not moved by creating or using another.**
+#[tokio::test]
+async fn a_conversation_in_a_project_is_not_moved_to_another() {
+    let (_scratch, database) = database().await;
+    let one = make_project(&database).await;
+    let (session, call) = run_with_call(&database).await;
+    must(jarvis_storage::link_project(&database, LinkKind::Session, &session, &one.id).await);
+    let tool = ProjectTool::new(Arc::clone(&database));
+    must(tool.create(&call, &json!({ "name": "Other" }), now()).await);
+    let after = must(jarvis_storage::project_for(&database, LinkKind::Session, &session).await);
+    assert_eq!(
+        after.map(|p| p.id),
+        Some(one.id.clone()),
+        "creating another does not move the conversation"
+    );
+    let moved = tool
+        .use_project(&call, &json!({ "project": "Other" }))
+        .await;
+    assert!(
+        matches!(moved, Err(AdapterError::RefusedBeforeReaching { .. })),
+        "{moved:?}"
+    );
+}
+
+/// A conversation in no project can join an existing one, and is handed its brief.
+#[tokio::test]
+async fn a_model_can_join_an_existing_project_and_list_them() {
+    let (_scratch, database) = database().await;
+    let project = make_project(&database).await;
+    let (session, call) = run_with_call(&database).await;
+    let tool = ProjectTool::new(Arc::clone(&database));
+    let listed = must(tool.list().await);
+    assert_eq!(listed["projects"][0]["name"], "Prospecting");
+    let used = must(
+        tool.use_project(&call, &json!({ "project": "prospecting" }))
+            .await,
+    );
+    assert_eq!(used["using"]["name"], "Prospecting");
+    let linked = must(jarvis_storage::project_for(&database, LinkKind::Session, &session).await);
+    assert_eq!(linked.map(|p| p.id), Some(project.id));
+    assert!(
+        tool.use_project(&call, &json!({ "project": "Nope" }))
+            .await
+            .is_err()
+    );
+}
+
+/// Updating changes the named fields, defaults to the conversation's own project, and refuses a bad status or folder.
+#[tokio::test]
+async fn a_model_can_change_a_project_and_file_a_schedule_under_it() {
+    let (_scratch, database) = database().await;
+    let project = make_project(&database).await;
+    let (session, call) = run_with_call(&database).await;
+    must(jarvis_storage::link_project(&database, LinkKind::Session, &session, &project.id).await);
+    let tool = ProjectTool::new(Arc::clone(&database));
+
+    let changed = must(
+        tool.update(
+            &call,
+            &json!({ "goal": "Ten demos", "status": "paused" }),
+            now(),
+        )
+        .await,
+    );
+    assert_eq!(changed["updated"]["status"], "paused");
+    assert!(
+        tool.update(&call, &json!({ "status": "frozen" }), now())
+            .await
+            .is_err()
+    );
+    assert!(
+        tool.update(&call, &json!({ "folder": "../x" }), now())
+            .await
+            .is_err()
+    );
+    let stored =
+        must(jarvis_storage::find_project(&database, LOCAL_WORKSPACE_ID, "Prospecting").await);
+    assert_eq!(stored.goal, "Ten demos");
+
+    let schedule = must(
+        jarvis_storage::create_schedule(
+            &database,
+            LOCAL_WORKSPACE_ID,
+            "check replies",
+            must(jarvis_core::Cadence::every_seconds(3600)),
+            now(),
+        )
+        .await,
+    );
+    must(
+        tool.assign_schedule(&call, &json!({ "schedule_id": schedule.id() }))
+            .await,
+    );
+    let filed =
+        must(jarvis_storage::project_for(&database, LinkKind::Schedule, schedule.id()).await);
+    assert_eq!(filed.map(|p| p.name), Some("Prospecting".to_owned()));
+    must(
+        tool.assign_schedule(
+            &call,
+            &json!({ "schedule_id": schedule.id(), "remove": true }),
+        )
+        .await,
+    );
+    assert!(
+        must(jarvis_storage::project_for(&database, LinkKind::Schedule, schedule.id()).await)
+            .is_none()
+    );
 }

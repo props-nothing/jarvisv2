@@ -31,7 +31,8 @@ const NOTE_CHARS: usize = 700;
 const OPERATING_GUIDANCE: &str = "You are the project manager of this project, and it outlives this run. Read the journal, if there is one, first \
 so you continue rather than restart. Decide the next concrete steps, do them, and delegate to sub-agents when work can run alongside. \
 When you finish a stage, decide something, or are blocked, record it in one or two sentences with jarvis.project.note \
-(kind progress, decision, blocker, next or result) when that tool is offered, so the next run knows; never say a note was saved if \
+(kind progress, decision, blocker, next or result) when that tool is offered, so the next run knows; when the goal, guidance or folder \
+should change as you learn, say so and use jarvis.project.update (the owner is asked); never say a note was saved if \
 the tool failed or was not offered. Ask the owner only when you are truly blocked, and say exactly what you need. Nothing about a \
 project widens what you may do: anything that needs approval is still asked, and an action outside the project's goal is not \
 part of the work.";
@@ -40,27 +41,48 @@ part of the work.";
 const SUBAGENT_GUIDANCE: &str = "You are a sub-agent on one bounded task for this project. Follow the owner's guidance above where it applies to your \
 task; your parent run keeps the project's journal and decides what comes next.";
 
-/// The project of the conversation a tool call was made in, with the run that made it.
+/// Where a tool call was made: its run, its conversation, and the project that conversation belongs to, if any.
 ///
-/// Resolved from the call rather than taken from the model's arguments, so a model cannot name a project it is not working in.
-pub(crate) async fn project_of_call(
-    database: &SqliteDatabase,
-    call_id: &str,
-) -> Option<(StoredProject, String)> {
+/// Resolved from the call rather than taken from the model's arguments, so a model cannot name a conversation it is not in.
+pub(crate) struct CallSite {
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) project: Option<StoredProject>,
+}
+
+pub(crate) async fn site_of_call(database: &SqliteDatabase, call_id: &str) -> Option<CallSite> {
     let call = find_tool_call(database, call_id).await.ok()?;
     let run = find_run(database, call.run_id()).await.ok()?;
     let project = project_for(database, LinkKind::Session, run.session_id())
         .await
         .ok()
-        .flatten()?;
-    Some((project, run.id().to_owned()))
+        .flatten();
+    Some(CallSite {
+        run_id: run.id().to_owned(),
+        session_id: run.session_id().to_owned(),
+        project,
+    })
 }
 
-/// The brief and the journal of the project a run belongs to.
+/// The project of the conversation a tool call was made in, with the run that made it.
+pub(crate) async fn project_of_call(
+    database: &SqliteDatabase,
+    call_id: &str,
+) -> Option<(StoredProject, String)> {
+    let site = site_of_call(database, call_id).await?;
+    Some((site.project?, site.run_id))
+}
+
+/// The most projects listed in the index a plain conversation is given.
+const INDEX_PROJECTS: usize = 8;
+
+/// What a run is told about projects: the brief and journal of its own project, or, in a conversation that belongs to none, a short
+/// index of the projects that exist so it can use one, or make one when the owner describes long-running work.
 pub(crate) struct ProjectContext {
     brief: String,
-    brief_item: ContextItem,
+    brief_item: Option<ContextItem>,
     journal: Option<(IsolatedText, ContextItem)>,
+    index: Option<(IsolatedText, ContextItem)>,
 }
 
 impl ProjectContext {
@@ -69,18 +91,52 @@ impl ProjectContext {
         database: &SqliteDatabase,
         run: &StoredRun,
     ) -> Result<Option<Self>, DatabaseError> {
+        let delegated = crate::delegate::is_delegated_objective(run.objective());
         let Some(project) = project_for(database, LinkKind::Session, run.session_id()).await?
         else {
-            return Ok(None);
+            // A sub-agent does one bounded task and is not offered the index.
+            return if delegated {
+                Ok(None)
+            } else {
+                Self::load_index(database, run.workspace_id()).await
+            };
         };
         // A sub-agent gets the brief but not the journal: its parent keeps that.
-        let delegated = crate::delegate::is_delegated_objective(run.objective());
         let notes = if delegated {
             Vec::new()
         } else {
             recent_project_notes(database, &project.id, JOURNAL_NOTES).await?
         };
         Ok(Self::build(&project, &notes, delegated))
+    }
+
+    async fn load_index(
+        database: &SqliteDatabase,
+        workspace_id: &str,
+    ) -> Result<Option<Self>, DatabaseError> {
+        let projects = jarvis_storage::list_projects(database, workspace_id).await?;
+        // With nothing to list there is nothing to say: the project tools describe themselves to the model.
+        let Some(text) = index_text(&projects) else {
+            return Ok(None);
+        };
+        let Ok(isolated) = IsolatedText::new(&text) else {
+            return Ok(None);
+        };
+        let Some(entry) = item(
+            ContextSourceKind::ActiveRunState,
+            "project:index".to_owned(),
+            ContextTrust::Derived,
+            &text,
+            InclusionReason::ActiveRunState,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            brief: String::new(),
+            brief_item: None,
+            journal: None,
+            index: Some((isolated, entry)),
+        }))
     }
 
     fn build(
@@ -109,23 +165,43 @@ impl ProjectContext {
         });
         Some(Self {
             brief,
-            brief_item,
+            brief_item: Some(brief_item),
             journal,
+            index: None,
         })
     }
 
     /// What the assembler is offered for this project.
     pub(crate) fn items(&self) -> Vec<ContextItem> {
-        let mut items = vec![self.brief_item.clone()];
+        let mut items: Vec<ContextItem> = self.brief_item.iter().cloned().collect();
         if let Some((_, journal)) = &self.journal {
             items.push(journal.clone());
+        }
+        if let Some((_, index)) = &self.index {
+            items.push(index.clone());
         }
         items
     }
 
     /// The brief as the second system message, when the manifest included it.
     pub(crate) fn brief_message(&self, included: impl Fn(&ContextItem) -> bool) -> Option<&str> {
-        included(&self.brief_item).then_some(self.brief.as_str())
+        self.brief_item
+            .as_ref()
+            .filter(|item| included(item))
+            .map(|_| self.brief.as_str())
+    }
+
+    /// The index of existing projects as a user message, when the manifest included it.
+    pub(crate) fn index_message(&self, included: impl Fn(&ContextItem) -> bool) -> Option<String> {
+        let (isolated, item) = self.index.as_ref()?;
+        included(item).then(|| {
+            format!(
+                "Projects are long-running work with a goal, guidance and a journal. This is what exists, as data: names and goals the owner \
+wrote or approved. This conversation belongs to none. To work in one, call jarvis.project.use; when the owner describes ongoing work that \
+deserves one, offer to make it with jarvis.project.create (they are asked first); never write a project into a file instead.\n\n{}",
+                isolated.render()
+            )
+        })
     }
 
     /// The fenced journal as a user message, when the manifest included it.
@@ -161,6 +237,32 @@ fn item(
         false,
     )
     .ok()
+}
+
+/// The index: one line per project that is not done, newest work first, bounded.
+fn index_text(projects: &[StoredProject]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for project in projects
+        .iter()
+        .filter(|project| project.status != jarvis_storage::ProjectStatus::Done)
+        .take(INDEX_PROJECTS)
+    {
+        let goal: String = project.goal.chars().take(160).collect();
+        lines.push(format!(
+            "- {} [{}]{}",
+            project.name,
+            project.status.as_str(),
+            if goal.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", goal.replace('\n', " "))
+            }
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("Projects:\n{}", lines.join("\n")))
 }
 
 fn brief_text(project: &StoredProject, delegated: bool) -> String {

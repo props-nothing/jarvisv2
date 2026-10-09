@@ -7206,6 +7206,9 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   scrolling sheets with a fixed footer, dark scrollbars and focus outlines, a tidier chat header, starting points in an empty chat. Fixed a real failure found on the way: search replies over 512 KiB (ordinary) were refused; bound now 8 MiB.
 - [x] `P9-058` An existing schedule can be filed under a project (or taken out): `POST /api/v1/schedules/{id}/project`, `jarvis schedule project ID NAME|--none`, a selector on the Ops card; `set_project_link`. The Ops page
   puts finished one-off tasks behind a toggle. The finished event is also emitted when a call that waited for an approval completes (the resume path). Tests: re-filing in storage and through the route.
+- [x] `P9-059` JARVIS can manage projects, memory and schedules itself (ADR-0153). Found in a real conversation: asked to "create this as a project" it wrote a README because the journal tool refused outside a project.
+  New tools: `jarvis.project.list|use|create|update|assign_schedule` (create/update/assign ask), `jarvis.memory.correct|forget` (ask; the call quotes the claim and the tool refuses when the quotation is not in the stored claim),
+  `jarvis.schedule.pause` (no ask) and `resume` (asks). A run in no project is given an index of the existing ones; `jarvis.memory.search` prints `memory_id`. Tests for each, including the false-quotation and no-move cases.
 - [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

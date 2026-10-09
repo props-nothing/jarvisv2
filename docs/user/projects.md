@@ -26,6 +26,11 @@ jarvis project add Prospecting --goal "Book five demos with Dutch logistics firm
 | On a schedule | `jarvis schedule add check replies and follow up --every 6h --project Prospecting` |
 | By JARVIS | A task it schedules from inside a project joins it, and a sub-agent it starts there gets the project's brief. |
 
+## Let JARVIS make one
+
+Just ask: "make this a project". JARVIS creates it (you see the goal and guidance it wrote on an approval card and answer yes or no), the conversation joins it, and the journal works straight away. It can also
+change a project, file a schedule under one, and join an existing one with `jarvis.project.use`. In a chat that belongs to no project it is told which projects exist.
+
 ## The journal
 
 JARVIS is asked to record a line when it finishes a stage, decides something, is blocked, or knows what comes next (`jarvis.project.note`; it needs no approval, because it only writes one
@@ -34,7 +39,7 @@ project window. Journal entries are shown to the model as data to read, never as
 
 ## Pause, finish, delete
 
-`jarvis project pause|resume|done NAME`. While a project is paused or done its scheduled tasks stop firing (you can still chat in it). `jarvis project remove NAME` deletes the project and its
+`jarvis project pause|resume|done NAME`. While a project is paused or done its scheduled tasks stop firing (you can still chat in it). (JARVIS can pause a project too, with your yes.) `jarvis project remove NAME` deletes the project and its
 journal; its conversations and schedules stay.
 
 ## Moving existing work into a project

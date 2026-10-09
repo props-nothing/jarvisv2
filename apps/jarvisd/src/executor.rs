@@ -1455,6 +1455,9 @@ fn messages_from_manifest(
         if let Some(journal) = project.journal_message(in_manifest) {
             messages.push(ChatMessage::user(journal));
         }
+        if let Some(index) = project.index_message(in_manifest) {
+            messages.push(ChatMessage::user(index));
+        }
     }
 
     // The turns are walked in the order they were loaded, which `read_recent_messages` returns
@@ -3570,10 +3573,27 @@ mod tests {
             .iter()
             .map(ChatMessage::text)
             .collect();
+        // It sees no brief and no guidance, only the index of what exists, as fenced data in a user message.
         assert_eq!(
             other_texts.len(),
-            2,
-            "a run in no project sees no brief: {other_texts:?}"
+            3,
+            "a run in no project sees the index and nothing else: {other_texts:?}"
+        );
+        assert!(
+            !other_texts
+                .iter()
+                .any(|text| text.contains("PROJECT BRIEF"))
+        );
+        assert!(
+            !other_texts
+                .iter()
+                .any(|text| text.contains("Write in Dutch"))
+        );
+        assert!(
+            other_texts[1].contains("Prospecting [active]: Book five demos")
+                && other_texts[1].contains(jarvis_core::FENCE_OPEN)
+                && other_texts[1].contains("jarvis.project.use"),
+            "{other_texts:?}"
         );
         database.close().await;
     }

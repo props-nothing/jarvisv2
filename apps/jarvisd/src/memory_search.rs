@@ -159,7 +159,9 @@ impl MemorySearchTool {
         let mut rendered = String::new();
         let mut shown = Vec::new();
         for (_, memory) in matches.into_iter().take(limit) {
-            let block = memory.isolated().render();
+            // The id sits outside the fence (this daemon wrote it), so jarvis.memory.correct and jarvis.memory.forget can name the claim.
+            let id = memory.reference().split(':').nth(1).unwrap_or_default();
+            let block = format!("memory_id: {id}\n{}", memory.isolated().render());
             if rendered.chars().count() + block.chars().count() > MAX_RENDERED_CHARS {
                 break;
             }

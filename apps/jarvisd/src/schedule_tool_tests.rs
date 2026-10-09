@@ -138,3 +138,47 @@ async fn bad_input_is_refused_and_creates_nothing() {
         Err(AdapterError::RefusedBeforeReaching { .. })
     ));
 }
+
+/// **A model can pause a task without asking and resume it only with the owner's yes; a finished one-off cannot be resumed.**
+#[tokio::test]
+async fn a_task_can_be_paused_and_resumed_and_resuming_asks() {
+    let definitions = ScheduleTool::definitions().unwrap_or_else(|error| panic!("{error}"));
+    let approval = |id: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.id().to_string() == id)
+            .map(jarvis_tools::ToolDefinition::approval)
+    };
+    assert_eq!(approval(PAUSE_TOOL), Some(ApprovalPolicy::Auto));
+    assert_eq!(approval(RESUME_TOOL), Some(ApprovalPolicy::Ask));
+
+    let (_scratch, tool) = tool().await;
+    let now = UtcTimestamp::now(&SystemClock);
+    let added = tool
+        .add(
+            "no-call",
+            &json!({ "objective": "Check the build", "every": "6h" }),
+            now,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let id = added["scheduled"]["schedule_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let paused = tool
+        .set_enabled(&json!({ "schedule_id": id }), false, now)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(paused["schedule"]["enabled"], false);
+    let resumed = tool
+        .set_enabled(&json!({ "schedule_id": id }), true, now)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(resumed["schedule"]["enabled"], true);
+    assert!(
+        tool.set_enabled(&json!({ "schedule_id": "nope" }), false, now)
+            .await
+            .is_err()
+    );
+}
