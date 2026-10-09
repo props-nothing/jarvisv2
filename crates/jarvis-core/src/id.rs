@@ -205,6 +205,14 @@ typed_id!(
     ScheduleId
 );
 typed_id!(
+    /// Identifies one project: a long-running piece of work with a goal, standing guidance and a journal.
+    ProjectId
+);
+typed_id!(
+    /// Identifies one entry in a project's journal.
+    ProjectNoteId
+);
+typed_id!(
     /// Identifies one durable memory record.
     ///
     /// Distinct from every other identifier: a memory outlives the run that produced it and the

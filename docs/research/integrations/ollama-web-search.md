@@ -1,6 +1,6 @@
 ---
 integration: ollama-web-search
-status: implemented-contract-tested
+status: implemented-live-verified
 last_verified: 2026-10-09
 owners: []
 selected_spec_version: "REST, undated; docs.ollama.com as of 2026-10-09"
@@ -45,7 +45,9 @@ and are revoked in the same settings page. The local server at `localhost:11434`
 
 Not documented: rate limits, error bodies, status codes, query length, result size, retention. Observed (2026-10-09, live): an invalid
 key is refused with a 401 or 403 (the adapter treats both as "key rejected"). Nothing else was observed because no valid key was
-available to the author.
+available to the author. Observed later with a valid key (2026-10-10, live): a reply carries each hit's whole page text and is often
+several megabytes, so the adapter's reply bound was raised from 512 KiB to 8 MiB (a real search had been refused as "larger than
+expected"); the model is still given only a few hundred characters per hit.
 
 ### Data And Compliance
 
@@ -85,8 +87,10 @@ another host. Without a key there is no search tool.
   reach the network, the key never appears in `Debug`)
 - live negative path (done 2026-10-09): `jarvis keys test search` with a deliberately invalid key reaches the real endpoint and is
   refused; the assistant reported "the search service rejected the key" and fell back to a page fetch
-- live positive path (**not done**): needs a valid Ollama API key. Until one is used, the success shape is verified only against the
-  documented example, so this record's status is `implemented-contract-tested`, not verified.
+- live positive path (done 2026-10-09, with the owner's key): `jarvis keys test search` answered "accepted the key and answered"; a direct
+  call returned `{"results":[{title,url,content}]}` exactly as documented; a run asked for the current Node.js LTS used `jarvis.web.search`
+  and answered from it. Observed: `content` can be very long (one result was 40,349 characters, which the adapter clips to 500), and
+  `max_results: 50` was not refused by the service (the adapter still asks for at most 10).
 
 ## Open Questions
 

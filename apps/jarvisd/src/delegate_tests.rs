@@ -73,6 +73,7 @@ async fn start(fixture: &Fixture, objective: &str) -> jarvis_protocol::RunReply 
             objective: objective.to_owned(),
             session_id: None,
             idempotency_key: None,
+            project_id: None,
         })
         .await
         .unwrap_or_else(|error| panic!("start: {error:?}"))

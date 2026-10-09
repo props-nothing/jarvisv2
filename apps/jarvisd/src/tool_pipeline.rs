@@ -91,6 +91,8 @@ fn requested_payload(tool: &str, version: &str, arguments: &Value) -> String {
             .take(160)
             .collect();
         payload["target"] = Value::String(line);
+    } else if let Some(target) = crate::tool_activity::target_for(tool, arguments) {
+        payload["target"] = Value::String(target);
     }
     payload.to_string()
 }

@@ -42,16 +42,18 @@ use jarvis_core::LoopbackHost;
 // be a new direct dependency for a name.
 
 use jarvis_protocol::{
-    AddAliasRequest, ApprovalDecisionBody, ApprovalListReply, ApprovalReply, ConfirmMemoryRequest,
-    CorrectMemoryRequest, CreateEntityRequest, CreateScheduleRequest, CreateSkillRequest,
-    DeletionReceipt, EntityDetailReply, EntityListReply, EntityLookupReply, ForgetMemoryRequest,
-    ForgetSkillRequest, JSON_BODY_CONTENT_TYPE, MemoryDetailReply, MemoryExportReply,
-    MemoryListReply, MemoryReply, MemorySearchReply, MemorySearchRequest, MergeEntityRequest,
-    PromoteSkillRequest, RememberRequest, RunListReply, RunPathError, RunReply, RunStreamDecoder,
-    RunStreamFrame, SSE_ACCEPT, ScheduleListReply, ScheduleReply, SkillDeletionReceipt,
-    SkillDetailReply, SkillExportReply, SkillListReply, SkillReply, SkillTransitionRequest,
-    StartRunRequest, ToolListReply, ToolPreviewReply, ToolPreviewRequest, WireError,
-    dotted_path_segment, path_segment, run_path, run_stream_path, runs_path,
+    AddAliasRequest, AddProjectNoteRequest, ApprovalDecisionBody, ApprovalListReply, ApprovalReply,
+    ConfirmMemoryRequest, CorrectMemoryRequest, CreateEntityRequest, CreateProjectRequest,
+    CreateScheduleRequest, CreateSkillRequest, DeletionReceipt, EntityDetailReply, EntityListReply,
+    EntityLookupReply, ForgetMemoryRequest, ForgetSkillRequest, JSON_BODY_CONTENT_TYPE,
+    MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReply, MemorySearchReply,
+    MemorySearchRequest, MergeEntityRequest, ProjectDetailReply, ProjectListReply,
+    ProjectNoteReply, ProjectReply, PromoteSkillRequest, RememberRequest, RunListReply,
+    RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT, ScheduleListReply,
+    ScheduleReply, SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply,
+    SkillReply, SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply,
+    ToolPreviewRequest, UpdateProjectRequest, WireError, dotted_path_segment, path_segment,
+    run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -125,6 +127,8 @@ fn skill_path(revision_id: &str) -> Result<String, RunPathError> {
 
 /// The scheduled-task collection's path.
 const SCHEDULES_PATH: &str = "/api/v1/schedules";
+/// The project collection's path.
+const PROJECTS_PATH: &str = "/api/v1/projects";
 
 /// The approval collection's path.
 const APPROVALS_PATH: &str = "/api/v1/approvals";
@@ -244,6 +248,8 @@ pub struct ApiClient {
     host: LoopbackHost,
     credential: String,
     client: reqwest::Client,
+    /// The project new runs belong to (ADR-0151), when the command named one.
+    project: Option<String>,
 }
 
 impl ApiClient {
@@ -272,7 +278,15 @@ impl ApiClient {
             host,
             credential,
             client,
+            project: None,
         })
+    }
+
+    /// Makes the runs this client starts belong to a project, by name or identifier.
+    #[must_use]
+    pub fn in_project(mut self, project: Option<String>) -> Self {
+        self.project = project;
+        self
     }
 
     /// Returns the endpoint this client targets.
@@ -308,6 +322,7 @@ impl ApiClient {
             // because no deduplication ledger exists, and sending one would be claiming a
             // guarantee this build does not provide.
             idempotency_key: None,
+            project_id: self.project.clone(),
         };
 
         let response = self
@@ -450,6 +465,84 @@ impl ApiClient {
             return Ok(());
         }
         Err(self.refusal(response).await)
+    }
+
+    /// Creates a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` for a name already taken and a `422` for a field that is not acceptable.
+    pub async fn create_project(
+        &self,
+        request: &CreateProjectRequest,
+    ) -> Result<ProjectReply, ApiError> {
+        self.send_json(reqwest::Method::POST, PROJECTS_PATH, request)
+            .await
+    }
+
+    /// Lists the workspace's projects, active first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the transport fails or the daemon refuses.
+    pub async fn list_projects(&self) -> Result<ProjectListReply, ApiError> {
+        self.get_json(PROJECTS_PATH).await
+    }
+
+    /// Reads a project with its latest journal entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when there is no such project.
+    pub async fn read_project(&self, project_id: &str) -> Result<ProjectDetailReply, ApiError> {
+        let path = format!("{PROJECTS_PATH}/{}", path_segment(project_id)?);
+        self.get_json(&path).await
+    }
+
+    /// Changes the given fields of a project.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_project`], and a `404` for an unknown project.
+    pub async fn update_project(
+        &self,
+        project_id: &str,
+        request: &UpdateProjectRequest,
+    ) -> Result<ProjectReply, ApiError> {
+        let path = format!("{PROJECTS_PATH}/{}", path_segment(project_id)?);
+        self.send_json(reqwest::Method::PATCH, &path, request).await
+    }
+
+    /// Deletes a project with its journal; its conversations stay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when there is no such project.
+    pub async fn remove_project(&self, project_id: &str) -> Result<(), ApiError> {
+        let path = format!("{PROJECTS_PATH}/{}", path_segment(project_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::DELETE, &path)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Writes an entry in a project's journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] for an unknown project, kind or an unacceptable text.
+    pub async fn add_project_note(
+        &self,
+        project_id: &str,
+        request: &AddProjectNoteRequest,
+    ) -> Result<ProjectNoteReply, ApiError> {
+        let path = format!("{PROJECTS_PATH}/{}/notes", path_segment(project_id)?);
+        self.send_json(reqwest::Method::POST, &path, request).await
     }
 
     /// Asks the daemon to stop a run: the kill switch.

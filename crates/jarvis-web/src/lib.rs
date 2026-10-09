@@ -14,5 +14,8 @@ pub use fetch::{
     FETCH_SCOPE, FETCH_TOOL, MAX_BODY_BYTES, MAX_REDIRECTS, MAX_TEXT_CHARS, WebFetchTool,
     WebFetchToolError,
 };
-pub use search::{SEARCH_ENDPOINT, SEARCH_SCOPE, SEARCH_TOOL, WebSearchTool, WebSearchToolError};
+pub use search::{
+    SEARCH_ENDPOINT, SEARCH_SCOPE, SEARCH_TOOL, WebSearchTool, WebSearchToolError,
+    links_from_results,
+};
 pub use target::{EgressPolicy, MAX_URL_CHARS, Refusal, Target};

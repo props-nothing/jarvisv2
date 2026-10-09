@@ -290,7 +290,8 @@ impl ToolExecutor for AgentTool {
             });
         }
         let body = if tool == DELEGATE_TOOL {
-            self.delegate(request.arguments()).await?
+            self.delegate(request.call_id(), request.arguments())
+                .await?
         } else {
             self.result(request.arguments()).await?
         };
@@ -299,7 +300,7 @@ impl ToolExecutor for AgentTool {
 }
 
 impl AgentTool {
-    async fn delegate(&self, arguments: &Value) -> Result<Value, AdapterError> {
+    async fn delegate(&self, call_id: &str, arguments: &Value) -> Result<Value, AdapterError> {
         let Some(task) = arguments.get("task").and_then(Value::as_str) else {
             return Err(refused("the task argument is missing or is not a string"));
         };
@@ -332,12 +333,17 @@ impl AgentTool {
             }));
         }
 
+        // A sub-agent works in its parent's project, so it knows the folder and the owner's guidance (ADR-0151).
+        let project_id = crate::project_context::project_of_call(&self.database, call_id)
+            .await
+            .map(|(project, _)| project.id);
         let started = self
             .runs
             .start(&StartRunRequest {
                 objective: format!("{DELEGATED_NOTICE}{task}"),
                 session_id: None,
                 idempotency_key: None,
+                project_id,
             })
             .await
             .map_err(|_| refused("the sub-agent could not be started"))?;

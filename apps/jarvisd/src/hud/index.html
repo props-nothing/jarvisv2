@@ -28,6 +28,11 @@
     <section id="stage">
       <canvas id="orb" aria-hidden="true"></canvas>
       <div id="caption">standing by</div>
+      <div id="mission" aria-live="off">
+        <div class="mhead"><i></i><span id="mtitle">LIVE</span><b id="mcount"></b></div>
+        <div id="mfeed"></div>
+        <div id="msources" hidden><div class="mshead"><span>SOURCES</span><b>0</b></div><div id="mchips"></div></div>
+      </div>
       <div id="tray" aria-live="polite">
         <div id="tray-waiting"></div>
         <div id="tray-remember"></div>
@@ -36,7 +41,8 @@
 
     <aside id="side">
       <div id="chathead">
-        <span class="title">Conversation</span>
+        <span class="title">Chat</span>
+        <select id="project-pick" title="The project this conversation belongs to: JARVIS is told its goal and guidance, and keeps its journal" hidden></select>
         <span class="spacer"></span>
         <button type="button" id="chats-btn" title="Earlier conversations">History</button>
         <button type="button" id="new-chat" title="Start a new conversation (N, or say &ldquo;new chat&rdquo;)">New chat</button>
@@ -71,6 +77,7 @@
       <div class="opscol">
         <section class="frame"><h2>Waiting for you</h2><div id="waiting"></div><div id="remember"></div></section>
         <section class="frame"><h2>Working</h2><div id="working"></div></section>
+        <section class="frame"><h2>Projects</h2><div id="projects"></div><div class="row cmd"><button id="project-new" title="Long-running work with its own goal, guidance and journal">New project</button></div></section>
         <section class="frame"><h2>Scheduled</h2><div id="scheduled"></div></section>
       </div>
       <div class="opscol">
@@ -96,7 +103,18 @@
       <button id="settings-close">Close</button>
     </div>
   </div>
+</div><div id="project-sheet" class="overlay" hidden>
+  <div class="sheet frame" role="dialog" aria-label="Project">
+    <h2 id="project-title">Project</h2>
+    <div id="project-note" role="status"></div>
+    <div id="project-body"></div>
+    <div class="foot">
+      <span class="dim">A project is told to every run that belongs to it. Schedule a task in a project with <code>jarvis schedule add ... --project NAME</code>.</span>
+      <button id="project-close">Close</button>
+    </div>
+  </div>
 </div><script src="/head.js"></script>
+<script src="/mission.js"></script>
 <script src="/hud.js"></script>
 </body>
 </html>

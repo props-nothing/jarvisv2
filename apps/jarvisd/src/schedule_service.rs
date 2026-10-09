@@ -203,10 +203,32 @@ pub async fn tick(state: &GatewayState, now: UtcTimestamp) -> Result<TickReport,
             report.skipped += 1;
             continue;
         }
+        // A paused or finished project does not get fires: the task stays, waiting, and is counted as skipped.
+        let project = jarvis_storage::project_for(
+            state.database(),
+            jarvis_storage::LinkKind::Schedule,
+            schedule.id(),
+        )
+        .await
+        .ok()
+        .flatten();
+        if project
+            .as_ref()
+            .is_some_and(|project| project.status != jarvis_storage::ProjectStatus::Active)
+        {
+            if let Err(error) =
+                jarvis_storage::record_schedule_skip(state.database(), schedule.id()).await
+            {
+                tracing::warn!(%error, "a skipped fire could not be recorded");
+            }
+            report.skipped += 1;
+            continue;
+        }
         let request = StartRunRequest {
             objective: format!("{UNATTENDED_NOTICE}{}", schedule.objective()),
             session_id: schedule.session_id().map(str::to_owned),
             idempotency_key: None,
+            project_id: project.map(|project| project.id),
         };
         if let Ok(reply) = state.start_and_drive(&request).await {
             if let Err(error) = jarvis_storage::record_schedule_run(
@@ -257,7 +279,20 @@ fn shown_objective(objective: &str) -> String {
     objective.to_owned()
 }
 
-fn schedule_reply(schedule: &StoredSchedule) -> ScheduleReply {
+/// The name of the project a schedule belongs to, if any.
+async fn project_name(state: &GatewayState, schedule: &StoredSchedule) -> Option<String> {
+    jarvis_storage::project_for(
+        state.database(),
+        jarvis_storage::LinkKind::Schedule,
+        schedule.id(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|project| project.name)
+}
+
+fn schedule_reply(schedule: &StoredSchedule, project: Option<String>) -> ScheduleReply {
     let (cadence, interval) = match schedule.cadence() {
         Cadence::Every(seconds) => ("every", Some(seconds)),
         Cadence::Once(_) => ("once", None),
@@ -268,6 +303,7 @@ fn schedule_reply(schedule: &StoredSchedule) -> ScheduleReply {
         cadence: cadence.to_owned(),
         interval_seconds: interval,
         enabled: schedule.enabled(),
+        project,
         next_run_at: schedule.enabled().then_some(schedule.next_run()),
         session_id: schedule.session_id().map(str::to_owned),
         last_run_id: schedule.last_run_id().map(str::to_owned),
@@ -290,6 +326,11 @@ fn storage_response(error: &DatabaseError) -> Response {
             StatusCode::CONFLICT,
             ErrorCode::Conflict,
             "this workspace already holds the maximum number of scheduled tasks",
+        ),
+        DatabaseError::ProjectNotFound => error_response(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no project has that name or identifier",
         ),
         DatabaseError::ScheduleFinished => error_response(
             StatusCode::CONFLICT,
@@ -353,10 +394,34 @@ pub async fn create(
         Ok(id) => id,
         Err(response) => return response,
     };
+    let project = match &request.project_id {
+        Some(name) => {
+            match jarvis_storage::find_project(state.database(), &workspace_id, name).await {
+                Ok(project) => Some(project),
+                Err(error) => return storage_response(&error),
+            }
+        }
+        None => None,
+    };
     match jarvis_storage::create_schedule(state.database(), &workspace_id, &objective, cadence, now)
         .await
     {
-        Ok(schedule) => (StatusCode::CREATED, Json(schedule_reply(&schedule))).into_response(),
+        Ok(schedule) => {
+            if let Some(project) = &project {
+                let linked = jarvis_storage::link_project(
+                    state.database(),
+                    jarvis_storage::LinkKind::Schedule,
+                    schedule.id(),
+                    &project.id,
+                )
+                .await;
+                if let Err(error) = linked {
+                    return storage_response(&error);
+                }
+            }
+            let reply = schedule_reply(&schedule, project.map(|project| project.name));
+            (StatusCode::CREATED, Json(reply)).into_response()
+        }
         Err(error) => storage_response(&error),
     }
 }
@@ -370,9 +435,16 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
     };
     match jarvis_storage::list_schedules(state.database(), &workspace_id).await {
         Ok(schedules) => {
+            let mut replies = Vec::with_capacity(schedules.len());
+            for schedule in &schedules {
+                replies.push(schedule_reply(
+                    schedule,
+                    project_name(&state, schedule).await,
+                ));
+            }
             let reply = ScheduleListReply {
-                total: schedules.len(),
-                schedules: schedules.iter().map(schedule_reply).collect(),
+                total: replies.len(),
+                schedules: replies,
             };
             (StatusCode::OK, Json(reply)).into_response()
         }
@@ -406,7 +478,10 @@ async fn set_enabled(state: &GatewayState, id: &str, enabled: bool) -> Response 
     )
     .await
     {
-        Ok(schedule) => (StatusCode::OK, Json(schedule_reply(&schedule))).into_response(),
+        Ok(schedule) => {
+            let project = project_name(state, &schedule).await;
+            (StatusCode::OK, Json(schedule_reply(&schedule, project))).into_response()
+        }
         Err(error) => storage_response(&error),
     }
 }

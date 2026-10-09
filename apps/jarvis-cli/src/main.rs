@@ -18,9 +18,11 @@ mod connector;
 mod entity;
 mod hud;
 mod init;
+mod install;
 mod lifecycle;
 mod memory;
 mod output;
+mod project;
 mod schedule;
 mod service_install;
 mod settings;
@@ -120,6 +122,8 @@ async fn client_main(arguments: Vec<String>) -> ExitCode {
         // where you read what they said.
         Some("schedule") => schedule_command(&arguments, false).await,
         Some("runs") => schedule_command(&arguments, true).await,
+        // Projects: the goal, guidance, folder and journal of long-running work (`ADR-0151`).
+        Some("project") => project_command(&arguments).await,
         // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
         // stored procedure, which before this verb group was reachable only from a test.
         Some("skills") => skills_command(&arguments).await,
@@ -128,6 +132,9 @@ async fn client_main(arguments: Vec<String>) -> ExitCode {
         Some("service") => service(&arguments),
         // `path` puts `jarvis` on the search path, so the commands JARVIS suggests work from any terminal.
         Some("path") => shell_path::run(&arguments),
+        // `install` puts the one program in a per-user folder and on the path; `uninstall` takes it back out (`ADR-0147`).
+        Some("install") => install::install(&arguments),
+        Some("uninstall") => install::uninstall(&arguments),
         // No arguments (or `launch`) is the one command that gets a person to a working console: set up on the first
         // run, then start, then open. Without a terminal to ask questions on it still just explains itself.
         Some("--help" | "-h" | "help") => {
@@ -187,9 +194,10 @@ async fn launch_command(arguments: &[String]) -> ExitStatus {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|skills|connector|doctor|path|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|project|skills|connector|doctor|path|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
-       jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]\n       jarvis path <install|uninstall|status>      # make `jarvis` work from any terminal"
+       jarvis project <add|list|show|set|pause|resume|done|note|remove> [...]   # long-running work with its own goal, guidance and journal; `jarvis ask --project NAME ...`
+       jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]\n       jarvis path <install|uninstall|status>      # make `jarvis` work from any terminal\n       jarvis stop|restart [--wait] [--force]      # a stop that would interrupt working tasks is refused unless --force (or waits with --wait)\n       jarvis install [--service] [--dir DIR]      # install this one program for the current user (and start it at login)\n       jarvis uninstall                            # remove it again (your settings and memory stay)"
 }
 
 /// Runs one `jarvis memory` verb against the daemon's HTTP API.
@@ -248,6 +256,37 @@ async fn tools_command(arguments: &[String]) -> ExitStatus {
     tools::run(&client, arguments).await
 }
 
+/// Runs one `jarvis project` verb over the daemon's HTTP API.
+async fn project_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    project::run_project(&client, arguments).await
+}
+
+/// Takes `--project NAME` out of the arguments, so `ask` and `chat` can start runs inside a project.
+fn take_project(arguments: &[String]) -> (Vec<String>, Option<String>) {
+    let mut rest = Vec::with_capacity(arguments.len());
+    let mut project = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--project" && index + 1 < arguments.len() {
+            project = Some(arguments[index + 1].clone());
+            index += 2;
+            continue;
+        }
+        rest.push(arguments[index].clone());
+        index += 1;
+    }
+    (rest, project)
+}
+
 /// Runs one `jarvis schedule` or `jarvis runs` verb over the daemon's HTTP API.
 async fn schedule_command(arguments: &[String], runs: bool) -> ExitStatus {
     let root = match requested_root(arguments) {
@@ -286,11 +325,35 @@ async fn stop_command(arguments: &[String], restart: bool) -> ExitStatus {
         }
         Err(status) => return status,
     };
-    match lifecycle::stop(port, credential.expose()).await {
-        Ok(lifecycle::Stopped::NotRunning) if !restart => println!("not running"),
-        Ok(lifecycle::Stopped::NotRunning) => {}
-        Ok(lifecycle::Stopped::Stopped) => println!("stopped"),
-        Err(status) => return status,
+    let force = arguments.iter().any(|argument| argument == "--force");
+    let wait = arguments.iter().any(|argument| argument == "--wait");
+    // A stop never silently throws away work: tasks the daemon is driving are named, and the daemon is left running unless the
+    // caller says `--force` (interrupt them) or `--wait` (go ahead once they have finished, for up to an hour).
+    let patience = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut last_told = None::<std::time::Instant>;
+    loop {
+        match lifecycle::stop(port, credential.expose(), force).await {
+            Ok(lifecycle::StopOutcome::NotRunning) if !restart => println!("not running"),
+            Ok(lifecycle::StopOutcome::NotRunning) => {}
+            Ok(lifecycle::StopOutcome::Stopped) => println!("stopped"),
+            Ok(lifecycle::StopOutcome::Busy(message)) => {
+                if !wait || std::time::Instant::now() >= patience {
+                    eprintln!("jarvis: {message}.");
+                    eprintln!(
+                        "        Wait with `--wait`, or interrupt them with `--force`; `jarvis runs` lists what is working."
+                    );
+                    return ExitStatus::Rejected;
+                }
+                if last_told.is_none_or(|told| told.elapsed().as_secs() >= 60) {
+                    eprintln!("jarvis: {message}; waiting for them to finish (Ctrl-C to give up)");
+                    last_told = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(status) => return status,
+        }
+        break;
     }
     if restart {
         // The console is usually already open in a tab, so a restart does not open another.
@@ -762,7 +825,8 @@ fn load_credential(paths: &AppPaths) -> Result<ClientCredential, ExitStatus> {
 /// same profile configuration the daemon does and targets whatever the daemon was told to bind. A
 /// hard-coded port would work on a default install and silently target nothing on a configured one.
 async fn ask(arguments: &[String]) -> ExitStatus {
-    let Some((objective, root)) = split_ask_arguments(arguments) else {
+    let (arguments, project) = take_project(arguments);
+    let Some((objective, root)) = split_ask_arguments(&arguments) else {
         eprintln!("jarvis: ask requires an objective, for example: jarvis ask summary of my inbox");
         return ExitStatus::Usage;
     };
@@ -772,7 +836,7 @@ async fn ask(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     let client = match run_client(&root) {
-        Ok(client) => client,
+        Ok(client) => client.in_project(project),
         Err(status) => return status,
     };
     chat::drive(&client, &paths, &objective).await
@@ -785,6 +849,8 @@ async fn ask(arguments: &[String]) -> ExitStatus {
 /// no orchestration for the same reason `ask` does not: what history a model sees is the daemon's
 /// context assembly, and its result is the manifest the daemon records.
 async fn chat(arguments: &[String]) -> ExitStatus {
+    let (arguments, project) = take_project(arguments);
+    let arguments = arguments.as_slice();
     let root = match requested_root(arguments) {
         Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
         Ok(None) => Vec::new(),
@@ -796,7 +862,7 @@ async fn chat(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     let client = match run_client(&root) {
-        Ok(client) => client,
+        Ok(client) => client.in_project(project),
         Err(status) => return status,
     };
     chat::converse(&client, &paths).await

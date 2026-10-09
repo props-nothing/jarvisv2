@@ -26,6 +26,6 @@ the fact); a reminder that fired with no console open was seen nowhere; and the 
 
 ## Consequences
 
-Not verified: a successful search against the real service (needs a valid key; the invalid-key path was exercised live, and the assistant
-fell back to fetching a page). The toast was shown by running the exact script by hand on Windows; macOS and Linux notifiers are checked by
+A successful search was verified live afterwards with the owner's key (see the research record); before that the invalid-key path was exercised
+and the assistant fell back to fetching a page. The toast was shown by running the exact script by hand on Windows; macOS and Linux notifiers are checked by
 their command construction only. A daemon with several consoles open elsewhere counts any of them as "open".

@@ -41,6 +41,7 @@
     wake: false,
     pending: [], announced: null
   };
+  var projects = [], projectsAt = 0;
 
   // ---- api ----------------------------------------------------------------------------------------------------
   function api(path, method, body) {
@@ -62,11 +63,25 @@
 
   // ---- markdown-lite, as DOM nodes ------------------------------------------------------------------------------
   function inline(text, parent) {
-    var re = /(`[^`]+`|\*\*[^*]+\*\*)/g, last = 0, match;
+    var re = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<>)\]]+)/g, last = 0, match;
     while ((match = re.exec(text))) {
       if (match.index > last) parent.appendChild(document.createTextNode(text.slice(last, match.index)));
       var piece = match[0];
-      parent.appendChild(piece[0] === "`" ? el("code", "", piece.slice(1, -1)) : el("strong", "", piece.slice(2, -2)));
+      if (piece[0] === "`") parent.appendChild(el("code", "", piece.slice(1, -1)));
+      else if (piece[0] === "*") parent.appendChild(el("strong", "", piece.slice(2, -2)));
+      else {
+        // A link in an answer is model text: only a plain web address is ever offered, in a new tab, with no opener or referrer.
+        var inner = piece[0] === "[" ? /^\[([^\]]+)\]\((.*)\)$/.exec(piece) : null;
+        var href = window.JarvisMission ? JarvisMission.safeHref(inner ? inner[2] : piece.replace(/[.,;:!?]+$/, "")) : null;
+        if (href) {
+          var anchor = el("a", "alink", inner ? inner[1] : piece.replace(/[.,;:!?]+$/, ""));
+          anchor.href = href;
+          anchor.target = "_blank";
+          anchor.rel = "noopener noreferrer";
+          parent.appendChild(anchor);
+          if (!inner) parent.appendChild(document.createTextNode(piece.slice(piece.replace(/[.,;:!?]+$/, "").length)));
+        } else parent.appendChild(document.createTextNode(piece));
+      }
       last = match.index + piece.length;
     }
     if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
@@ -117,7 +132,7 @@
   try { chats = JSON.parse(localStorage.getItem(CHATS_KEY) || "[]"); } catch (ignored) { chats = []; }
   if (!Array.isArray(chats)) chats = [];
   function newChatRecord() {
-    return { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), session: null, title: "", updated: Date.now(), transcript: [] };
+    return { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), session: null, project: null, title: "", updated: Date.now(), transcript: [] };
   }
   var currentChat = chats.filter(function (item) { return item.id === localStorage.getItem(CURRENT_KEY); })[0] || chats[0] || null;
   if (!currentChat) { currentChat = newChatRecord(); chats.unshift(currentChat); }
@@ -170,6 +185,17 @@
   function renderEmpty() {
     var empty = el("div", "empty");
     empty.appendChild(el("p", "", "Type, press the microphone (M), or enable the wake word and say \u201CJarvis, \u2026\u201D. Answer questions with yes or no; \u201CJarvis, stop\u201D cancels everything running."));
+    var ideas = currentChat.project
+      ? ["Where does this project stand?", "Plan the next steps and start on the first", "Research this and give me sources"]
+      : ["What can you do for me?", "Research the latest news on AI agents and give me sources", "Help me plan a project"];
+    var row = el("div", "suggest");
+    ideas.forEach(function (idea) {
+      var button = el("button", "", idea);
+      button.type = "button";
+      button.addEventListener("click", function () { send(idea); });
+      row.appendChild(button);
+    });
+    empty.appendChild(row);
     chat.appendChild(empty);
   }
   function renderChat() {
@@ -191,6 +217,7 @@
     saveChats();
     renderChat();
     closeChats();
+    paintProjectPick();
     return true;
   }
   function newChat() {
@@ -210,7 +237,7 @@
     if (!shown.length) host.appendChild(el("div", "none", "no earlier conversations"));
     shown.forEach(function (item) {
       var row = el("div", "chatrow" + (item === currentChat ? " on" : ""));
-      var open = el("button", "chatopen", item.title || "(untitled)");
+      var open = el("button", "chatopen", (item.project ? "[" + item.project + "] " : "") + (item.title || "(untitled)"));
       open.addEventListener("click", function () { switchChat(item); });
       row.appendChild(open);
       row.appendChild(el("span", "dim", age(new Date(item.updated).toISOString())));
@@ -219,7 +246,7 @@
       drop.addEventListener("click", function () {
         if (item === currentChat) { if (busy) { say("one moment: it is still answering."); return; } }
         chats = chats.filter(function (other) { return other !== item; });
-        if (item === currentChat) { var fresh = newChatRecord(); chats.unshift(fresh); currentChat = fresh; transcript = []; S.session = null; renderChat(); }
+        if (item === currentChat) { var fresh = newChatRecord(); chats.unshift(fresh); currentChat = fresh; transcript = []; S.session = null; renderChat(); paintProjectPick(); }
         saveChats();
         renderChats();
       });
@@ -235,10 +262,10 @@
 
   // What a tool call means in words, for the progress line: "writing app/page.tsx" says more than "Requested jarvis.files.write".
   var VERBS = {
-    "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing",
+    "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing", "jarvis.files.search": "searching files",
     "jarvis.web.fetch": "fetching a page", "jarvis.agent.delegate": "handing off a task", "jarvis.agent.result": "collecting a result",
     "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code", "jarvis.command.run": "running",
-    "jarvis.web.search": "searching the web", "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
+    "jarvis.web.search": "searching the web", "jarvis.memory.search": "checking memory", "jarvis.gmail.search": "searching your mail", "jarvis.gmail.read": "reading an email", "jarvis.calendar.events": "checking your calendar", "jarvis.gmail.send": "sending an email", "jarvis.calendar.create": "adding a calendar event", "jarvis.project.note": "writing a project note", "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
   };
   function describeCall(tool, target) {
     var verb = VERBS[tool] || String(tool || "working").replace(/^jarvis\./, "");
@@ -314,6 +341,17 @@
           more.textContent = "+" + hidden + " earlier";
         }
       },
+      sources: function (links) {
+        if (!links.length) return;
+        var strip = el("div", "asources");
+        strip.appendChild(el("span", "dim", "sources"));
+        links.slice(0, 8).forEach(function (link) {
+          var node = JarvisMission.chip(link, "mchip");
+          if (node) strip.appendChild(node);
+        });
+        view.node.appendChild(strip);
+        scroll();
+      },
       finish: function (final) {
         done = true;
         clearInterval(timer);
@@ -385,6 +423,7 @@
             if (frame.id) last = Number(frame.id) || last;
             var payload = (frame.body && frame.body.payload) || {};
             var summary = (frame.body && frame.body.summary) || "";
+            if (window.JarvisMission) JarvisMission.event(runId, "", frame);
             if (frame.event === "output_delta") { view.add(payload.text || ""); if (talker) feed(talker, payload.text || ""); }
             else if (frame.event === "output_completed") finalText = payload.text;
             else if (frame.event === "tool_requested") {
@@ -421,7 +460,9 @@
       if (talker) interruptSpeech();
       return null;
     }
-    return view.finish(finalText);
+    var finished = view.finish(finalText);
+    if (window.JarvisMission) view.sources(JarvisMission.sourcesOf(runId));
+    return finished;
   }
 
   var busy = false;
@@ -444,29 +485,44 @@
       });
     }
     feel("attentive", 1.2, "nod");
+    if (window.JarvisMission) JarvisMission.begin();
     busy = true;
     S.thinking = 1;
     try {
       var body = { objective: text };
       if (S.session) body.session_id = S.session;
+      if (currentChat.project) body.project_id = currentChat.project;
       var reply;
       try {
         reply = await api("/runs", "POST", body);
       } catch (error) {
         // A conversation that no longer exists (a fresh profile, a cleared database) starts a new one rather than failing.
-        if (error.status !== 404 || !S.session) throw error;
-        setSession(null);
-        delete body.session_id;
-        reply = await api("/runs", "POST", body);
+        if (error.status !== 404 || !(S.session || body.project_id)) throw error;
+        if (S.session) { setSession(null); delete body.session_id; }
+        try {
+          reply = await api("/runs", "POST", body);
+        } catch (second) {
+          // A project that was deleted: carry on without it rather than failing.
+          if (second.status !== 404 || !body.project_id) throw second;
+          currentChat.project = null;
+          delete body.project_id;
+          saveChats();
+          paintProjectPick();
+          notice("That project no longer exists, so this conversation continues without it.");
+          reply = await api("/runs", "POST", body);
+        }
       }
       setSession(reply.session_id);
+      S.runId = reply.run_id;
       var answer = await follow(reply.run_id, view, talker);
       if (answer) react(answer, !!talker);
       if (talker) { if (answer) endFeed(talker, answer); else interruptSpeech(); }
       else if (answer && S.speak) speak(answer);
     } catch (error) {
       if (talker) interruptSpeech();
-      view.fail(error.status === 401 ? "The daemon rejected the credential. Open this page with `jarvis hud`." : "Could not reach the assistant.");
+      view.fail(error.status === 401 ? "The daemon rejected the credential. Open this page with `jarvis hud`."
+        : error.status === 409 ? "This conversation already belongs to another project. Start a new chat to use a different one."
+        : "Could not reach the assistant.");
     } finally {
       busy = false;
       S.thinking = 0;
@@ -1100,7 +1156,7 @@
   // ---- the Ops page: everything that is not the face or the conversation --------------------------------------------
   function setOps(open) {
     $("ops").hidden = !open;
-    if (open) { abilitiesAt = 0; if (typeof refreshAbilities === "function") refreshAbilities(); }
+    if (open) { abilitiesAt = 0; if (typeof refreshAbilities === "function") refreshAbilities(); loadProjects(); }
   }
   $("open-ops").addEventListener("click", function () { setOps($("ops").hidden); });
   $("ops-close").addEventListener("click", function () { setOps(false); });
@@ -1123,6 +1179,12 @@
   function tickAges() {
     document.querySelectorAll("[data-since]").forEach(function (span) {
       span.textContent = age(span.dataset.since) + span.dataset.suffix;
+    });
+    document.querySelectorAll("[data-until]").forEach(function (span) { span.textContent = until(span.dataset.until); });
+    document.querySelectorAll("[data-now]").forEach(function (line) {
+      var doing = window.JarvisMission ? JarvisMission.nowFor(line.dataset.now) : "";
+      line.textContent = doing;
+      line.hidden = !doing;
     });
   }
   function fill(id, nodes, empty) {
@@ -1184,6 +1246,7 @@
       ["Active runs", runs.filter(function (run) { return !run.outcome; }).length, false],
       ["Needs you", Math.max(approvals.length, runs.filter(function (run) { return run.state === "awaiting_approval"; }).length), approvals.length > 0],
       ["Scheduled", schedules.filter(function (schedule) { return schedule.enabled; }).length, false],
+      ["Projects", projects.filter(function (project) { return project.status === "active"; }).length, false],
       ["Completed", done, false],
       ["Failed", failed, failed > 0]
     ];
@@ -1196,11 +1259,103 @@
       host.appendChild(line);
     });
   }
+  // ---- the cards on the Ops page ------------------------------------------------------------------------------------
+  function plainObjective(text) { return String(text || "").replace(/^\[(scheduled|sub-agent)\]\s*/, ""); }
+  function span(from, to) {
+    var seconds = Math.max(0, Math.round((Date.parse(to) - Date.parse(from)) / 1000));
+    return duration(seconds);
+  }
+  function until(iso) {
+    var seconds = Math.round((Date.parse(iso) - Date.now()) / 1000);
+    if (seconds <= 0) return "due now";
+    if (seconds < 90) return "in " + seconds + "s";
+    if (seconds < 5400) return "in " + Math.round(seconds / 60) + "m";
+    if (seconds < 172800) return "in " + Math.round(seconds / 3600) + "h";
+    return "in " + Math.round(seconds / 86400) + "d";
+  }
+  function every(seconds) {
+    if (seconds % 86400 === 0) return "every " + seconds / 86400 + "d";
+    if (seconds % 3600 === 0) return "every " + seconds / 3600 + "h";
+    if (seconds % 60 === 0) return "every " + seconds / 60 + "m";
+    return "every " + seconds + "s";
+  }
+  function scheduleCard(schedule) {
+    var item = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("span", "tag" + (schedule.enabled ? " work" : ""), schedule.interval_seconds ? every(schedule.interval_seconds) : schedule.cadence));
+    if (!schedule.enabled) row.appendChild(el("span", "tag", schedule.fire_count > 0 && schedule.cadence === "once" ? "done" : "paused"));
+    if (schedule.project) row.appendChild(el("span", "tag ok", schedule.project));
+    if (schedule.next_run_at) {
+      var next = el("span", "dim", until(schedule.next_run_at));
+      next.dataset.until = schedule.next_run_at;
+      row.appendChild(next);
+    }
+    item.appendChild(row);
+    item.appendChild(el("div", "obj", clip(schedule.objective, 220)));
+    var meta = el("div", "meta");
+    meta.appendChild(el("span", "dim", "ran " + schedule.fire_count + (schedule.fire_count === 1 ? " time" : " times")
+      + (schedule.skipped_count ? ", skipped " + schedule.skipped_count : "")));
+    if (schedule.last_fired_at) meta.appendChild(ageSpan(schedule.last_fired_at, " ago"));
+    item.appendChild(meta);
+    var acts = el("div", "sched-act");
+    if (schedule.enabled || schedule.cadence !== "once") {
+      var toggle = el("button", "", schedule.enabled ? "Pause" : "Resume");
+      toggle.addEventListener("click", function () {
+        toggle.disabled = true;
+        api("/schedules/" + encodeURIComponent(schedule.schedule_id) + "/" + (schedule.enabled ? "pause" : "resume"), "POST").then(refresh, refresh);
+      });
+      acts.appendChild(toggle);
+    }
+    var drop = el("button", "danger", "Remove");
+    drop.addEventListener("click", function () {
+      if (drop.textContent === "Remove") { drop.textContent = "Really remove?"; setTimeout(function () { drop.textContent = "Remove"; }, 4000); return; }
+      drop.disabled = true;
+      api("/schedules/" + encodeURIComponent(schedule.schedule_id), "DELETE").then(refresh, refresh);
+    });
+    acts.appendChild(drop);
+    item.appendChild(acts);
+    return item;
+  }
+  var openRuns = {};
+  function recentCard(run) {
+    var item = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("span", "tag " + (run.outcome === "succeeded" ? "ok" : run.outcome === "cancelled" ? "" : "bad"), run.outcome));
+    if (tagOf(run.objective)) row.appendChild(el("span", "tag", tagOf(run.objective)));
+    row.appendChild(ageSpan(run.started_at, " ago"));
+    if (run.completed_at) row.appendChild(el("span", "dim", "took " + span(run.started_at, run.completed_at)));
+    item.appendChild(row);
+    item.appendChild(el("div", "obj", clip(plainObjective(run.objective), 140)));
+    if (!run.answer) return item;
+    var preview = el("div", "dim", "=> " + clip(plainLine(run.answer), 300));
+    item.appendChild(preview);
+    item.dataset.open = "1";
+    item.title = "Click to read the whole answer";
+    var full = null;
+    function toggle(open) {
+      if (open && !full) {
+        full = el("div", "full");
+        full.appendChild(markdown(run.answer));
+        item.appendChild(full);
+      } else if (!open && full) {
+        full.remove();
+        full = null;
+      }
+      preview.hidden = open;
+      item.classList.toggle("open", open);
+      openRuns[run.run_id] = open;
+    }
+    item.addEventListener("click", function (event) {
+      if (event.target.closest("a, button")) return;
+      toggle(!full);
+    });
+    if (openRuns[run.run_id]) toggle(true);
+    return item;
+  }
   function renderPanels(runs, approvals, schedules) {
     var working = runs.filter(function (run) { return !run.outcome && run.state !== "awaiting_approval"; });
     var parked = runs.filter(function (run) { return run.state === "awaiting_approval"; });
     var finished = runs.filter(function (run) { return run.outcome; }).slice(0, 8);
-    var upcoming = schedules.filter(function (schedule) { return schedule.enabled; });
     S.needYou = Math.max(approvals.length, parked.length);
     S.working = working.length;
     S.pending = approvals;
@@ -1227,35 +1382,222 @@
     fill("working", working.concat(parked).map(function (run) {
       var item = el("div", "item");
       var row = el("div", "row");
-      row.appendChild(el("span", "tag " + (run.state === "awaiting_approval" ? "wait" : "work"), run.state));
+      row.appendChild(el("span", "tag " + (run.state === "awaiting_approval" ? "wait" : "work"), run.state === "awaiting_approval" ? "needs you" : "working"));
+      if (tagOf(run.objective)) row.appendChild(el("span", "tag", tagOf(run.objective)));
       row.appendChild(ageSpan(run.started_at));
+      row.appendChild(el("span", "spacer"));
       row.appendChild(stopButton(run.run_id));
       item.appendChild(row);
-      item.appendChild(el("div", "obj", clip(run.objective, 220)));
+      item.appendChild(el("div", "obj", clip(plainObjective(run.objective), 220)));
+      // What it is doing this second, kept fresh by the page (see tickAges).
+      var now = el("div", "nowline", "");
+      now.dataset.now = run.run_id;
+      item.appendChild(now);
       return item;
     }), "nothing running");
 
-    fill("scheduled", upcoming.map(function (schedule) {
-      var item = el("div", "item");
-      var row = el("div", "row");
-      row.appendChild(el("span", "tag", schedule.interval_seconds ? "every " + Math.round(schedule.interval_seconds / 60) + "m" : schedule.cadence));
-      if (schedule.next_run_at) row.appendChild(el("span", "dim", "next " + new Date(schedule.next_run_at).toLocaleTimeString()));
-      item.appendChild(row);
-      item.appendChild(el("div", "obj", clip(schedule.objective, 220)));
-      return item;
-    }), "nothing scheduled");
+    fill("scheduled", schedules.map(scheduleCard), "nothing scheduled: ask JARVIS to \u201Cdo this every morning\u201D");
 
-    fill("recent", finished.map(function (run) {
-      var item = el("div", "item");
-      var row = el("div", "row");
-      row.appendChild(el("span", "tag " + (run.outcome === "succeeded" ? "ok" : run.outcome === "cancelled" ? "" : "bad"), run.outcome));
-      row.appendChild(ageSpan(run.started_at, " ago"));
-      item.appendChild(row);
-      item.appendChild(el("div", "obj", clip(run.objective, 140)));
-      if (run.answer) item.appendChild(el("div", "dim", "=> " + clip(plainLine(run.answer), 300)));
-      return item;
-    }), "nothing yet");
+    fill("recent", finished.map(recentCard), "nothing yet");
   }
+
+  // ---- projects (ADR-0151) ----------------------------------------------------------------------------------------------
+  // A project is long-running work with a goal, the owner's standing guidance, a working folder and a journal. A conversation that
+  // belongs to one is told all of that on every run, so it is written once here instead of pasted into each request. A project
+  // changes what JARVIS is told, never what it may do: approvals and permissions are unchanged.
+  function projectNamed(name) {
+    return projects.filter(function (project) { return project.name === name || project.project_id === name; })[0] || null;
+  }
+  function loadProjects() {
+    projectsAt = Date.now();
+    return api("/projects").then(function (reply) {
+      projects = reply.projects || [];
+      paintProjects();
+      paintProjectPick();
+    }, function () {});
+  }
+  function paintProjectPick() {
+    var pick = $("project-pick");
+    var wanted = currentChat.project || "";
+    pick.replaceChildren();
+    var none = el("option", "", "No project");
+    none.value = "";
+    pick.appendChild(none);
+    var names = projects.filter(function (project) { return project.status !== "done" || project.name === wanted; })
+      .map(function (project) { return project.name; });
+    if (wanted && names.indexOf(wanted) < 0) names.push(wanted);
+    names.forEach(function (name) {
+      var option = el("option", "", name);
+      option.value = name;
+      pick.appendChild(option);
+    });
+    pick.value = wanted;
+    pick.hidden = projects.length === 0 && !wanted;
+  }
+  function startProjectChat(name) {
+    if (busy) { say("one moment: it is still answering. Press Stop to cut it short."); return; }
+    setOps(false);
+    $("project-sheet").hidden = true;
+    if (transcript.length) newChat();
+    currentChat.project = name;
+    saveChats();
+    paintProjectPick();
+    $("input").focus();
+    say("this conversation belongs to " + name);
+  }
+  $("project-pick").addEventListener("change", function () {
+    var name = $("project-pick").value;
+    if (busy) { paintProjectPick(); say("one moment: it is still answering."); return; }
+    // A conversation already bound to a project cannot move to another, so choosing one starts a fresh conversation.
+    if (transcript.length) newChat();
+    currentChat.project = name || null;
+    saveChats();
+    paintProjectPick();
+    say(name ? "new messages here belong to " + name : "no project");
+  });
+  function projectCard(project) {
+    var item = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("span", "tag " + (project.status === "active" ? "work" : project.status === "done" ? "ok" : ""), project.status));
+    row.appendChild(el("strong", "", project.name));
+    var open = el("button", "", "Open");
+    open.addEventListener("click", function () { openProject(project.project_id); });
+    var talk = el("button", "", "Chat");
+    talk.title = "Start a conversation in this project";
+    talk.addEventListener("click", function () { startProjectChat(project.name); });
+    row.appendChild(open);
+    row.appendChild(talk);
+    item.appendChild(row);
+    if (project.goal) item.appendChild(el("div", "obj", clip(project.goal, 160)));
+    return item;
+  }
+  function paintProjects() {
+    fill("projects", projects.map(projectCard), "no projects yet: press New project to give JARVIS a goal, guidance and a journal");
+  }
+  function projectNote(text, bad) {
+    var line = $("project-note");
+    line.textContent = text || "";
+    line.className = bad ? "bad" : "ok";
+  }
+  function closeProject() { $("project-sheet").hidden = true; }
+  function formRow(label, field, help) {
+    var row = el("div", "set-row");
+    row.appendChild(el("span", "name", label));
+    row.appendChild(field);
+    if (help) row.appendChild(el("span", "help", help));
+    return row;
+  }
+  function textField(value, placeholder) {
+    var field = el("input");
+    field.type = "text";
+    field.value = value || "";
+    field.placeholder = placeholder || "";
+    return field;
+  }
+  function areaField(value, rows, placeholder) {
+    var field = el("textarea");
+    field.rows = rows;
+    field.value = value || "";
+    field.placeholder = placeholder || "";
+    return field;
+  }
+  function openProject(id) {
+    $("project-sheet").hidden = false;
+    projectNote("");
+    if (!id) { paintProjectSheet(null, []); return; }
+    api("/projects/" + encodeURIComponent(id)).then(function (detail) { paintProjectSheet(detail.project, detail.notes || []); },
+      function () { projectNote("Could not open that project.", true); });
+  }
+  function paintProjectSheet(project, notes) {
+    var body = $("project-body");
+    body.replaceChildren();
+    $("project-title").textContent = project ? project.name : "New project";
+    var name = textField(project && project.name, "e.g. Prospecting");
+    var goal = areaField(project && project.goal, 3, "What done looks like, in a sentence or two.");
+    var folder = textField(project && project.folder, "e.g. sales (inside a folder JARVIS may use)");
+    var guidance = areaField(project && project.guidance, 9, "How you want the work done: tone, language, limits, who it may contact, what to avoid. Every run of this project is told this.");
+    body.appendChild(formRow("Name", name));
+    body.appendChild(formRow("Goal", goal));
+    body.appendChild(formRow("Folder", folder, "Where its files live, relative to a folder you granted in Settings, Files. Empty means that folder itself."));
+    body.appendChild(formRow("Guidance", guidance, "Your standing instructions. The project cannot widen what JARVIS may do: approvals and permissions stay as they are."));
+    var status = null;
+    if (project) {
+      status = el("select");
+      ["active", "paused", "done"].forEach(function (value) {
+        var option = el("option", "", value);
+        option.value = value;
+        status.appendChild(option);
+      });
+      status.value = project.status;
+      body.appendChild(formRow("Status", status, "Paused or done: its scheduled tasks stop firing. You can still chat in it."));
+    }
+    var acts = el("div", "acts");
+    var save = el("button", "yes", project ? "Save" : "Create");
+    save.addEventListener("click", function () {
+      var fields = { name: name.value, goal: goal.value, folder: folder.value, guidance: guidance.value };
+      if (status) fields.status = status.value;
+      save.disabled = true;
+      putJson(project ? "/projects/" + encodeURIComponent(project.project_id) : "/projects", project ? "PATCH" : "POST", fields).then(function (saved) {
+        projectNote(project ? "Saved." : "Created.");
+        loadProjects();
+        openProject(saved.project_id);
+        projectNote(project ? "Saved." : "Created.");
+      }, function (error) { projectNote(explain(error, "That was refused."), true); save.disabled = false; });
+    });
+    acts.appendChild(save);
+    if (project) {
+      var talk = el("button", "", "Chat in it");
+      talk.addEventListener("click", function () { startProjectChat(project.name); });
+      acts.appendChild(talk);
+      var drop = el("button", "danger", "Delete");
+      drop.addEventListener("click", function () {
+        if (drop.textContent === "Delete") { drop.textContent = "Really delete?"; return; }
+        api("/projects/" + encodeURIComponent(project.project_id), "DELETE").then(function () { closeProject(); loadProjects(); },
+          function () { projectNote("Could not delete it.", true); });
+      });
+      acts.appendChild(drop);
+    }
+    body.appendChild(el("div", "set-row")).appendChild(acts);
+    if (!project) return;
+    var card = el("div", "card");
+    card.appendChild(el("h4", "", "Journal"));
+    card.appendChild(el("p", "dim", "What happened, written by JARVIS as it works and by you. The newest entries are shown to every run."));
+    if (!notes.length) card.appendChild(el("div", "none", "no entries yet"));
+    notes.forEach(function (entry) {
+      var line = el("div", "jline");
+      line.appendChild(el("span", "tag", entry.kind));
+      line.appendChild(el("span", "dim", entry.created_at.slice(0, 10)));
+      line.appendChild(el("span", "jtext", entry.text));
+      card.appendChild(line);
+    });
+    var text = textField("", "Add an entry for JARVIS to read next time");
+    var kind = el("select");
+    ["owner", "decision", "blocker", "next"].forEach(function (value) {
+      var option = el("option", "", value);
+      option.value = value;
+      kind.appendChild(option);
+    });
+    var add = el("button", "", "Add");
+    add.addEventListener("click", function () {
+      if (!text.value.trim()) { projectNote("Write the entry first.", true); return; }
+      putJson("/projects/" + encodeURIComponent(project.project_id) + "/notes", "POST", { text: text.value, kind: kind.value }).then(function () {
+        openProject(project.project_id);
+      }, function (error) { projectNote(explain(error, "That entry was refused."), true); });
+    });
+    var write = el("div", "jwrite");
+    write.appendChild(kind);
+    write.appendChild(text);
+    write.appendChild(add);
+    card.appendChild(write);
+    body.appendChild(card);
+  }
+  $("project-new").addEventListener("click", function () { openProject(null); });
+  $("project-close").addEventListener("click", closeProject);
+  $("project-sheet").addEventListener("click", function (event) { if (event.target === $("project-sheet")) closeProject(); });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !$("project-sheet").hidden) { closeProject(); event.stopPropagation(); }
+  }, true);
+  loadProjects();
 
   // ---- things JARVIS offers to remember --------------------------------------------------------------------------------
   // The model may only *propose* a memory (a page it read could say "remember this"), so a proposal waits here until you keep
@@ -1319,6 +1661,33 @@
 
   // ---- what it can do: the tools, and which of them it asks about ------------------------------------------------------
   var abilitiesAt = 0;
+  // Tools in families, so sixteen of them read as eight things: the same order and colours on the Ops page and in Settings.
+  var FAMILIES = [
+    ["Web", /^jarvis\.web\./, "94,227,255"], ["Files", /^jarvis\.files\./, "107,226,160"], ["Memory", /^jarvis\.memory\./, "176,150,255"],
+    ["Sub-agents", /^jarvis\.agent\./, "255,120,214"], ["Commands & code", /^jarvis\.(command|code)\./, "255,138,92"],
+    ["Mail & calendar", /^jarvis\.(gmail|calendar)\./, "255,180,84"], ["Schedule", /^jarvis\.schedule\./, "120,240,214"],
+    ["Projects", /^jarvis\.project\./, "150,200,255"]
+  ];
+  function families(tools) {
+    var groups = FAMILIES.map(function (family) { return { name: family[0], rgb: family[2], tools: [] }; });
+    var other = { name: "Other", rgb: "170,200,220", tools: [] };
+    tools.forEach(function (tool) {
+      var at = -1;
+      FAMILIES.forEach(function (family, index) { if (at < 0 && family[1].test(String(tool.id))) at = index; });
+      (at < 0 ? other : groups[at]).tools.push(tool);
+    });
+    groups.push(other);
+    groups.forEach(function (group) { group.tools.sort(function (a, b) { return String(a.title).localeCompare(String(b.title)); }); });
+    return groups.filter(function (group) { return group.tools.length; });
+  }
+  function familyLabel(group) {
+    var label = el("div", "glabel");
+    var dot = el("i", "gdot");
+    dot.style.background = "rgb(" + group.rgb + ")";
+    label.appendChild(dot);
+    label.appendChild(el("span", "", group.name));
+    return label;
+  }
   function renderAbilities(tools) {
     var host = $("abilities");
     var asks = 0, off = 0;
@@ -1327,14 +1696,17 @@
     });
     host.replaceChildren();
     host.appendChild(el("div", "sum", tools.length + " tools  \u2022  " + asks + " ask first  \u2022  " + off + " off"));
-    tools.slice().sort(function (a, b) { return String(a.title).localeCompare(String(b.title)); }).forEach(function (tool) {
-      var row = el("div", "ability");
-      var blocked = !tool.callable || tool.denied;
-      var asking = !blocked && tool.asks_first;
-      row.appendChild(el("span", "name", tool.title || tool.id));
-      row.appendChild(el("span", "tag " + (blocked ? "bad" : asking ? "wait" : "ok"), blocked ? "off" : asking ? "asks" : "runs"));
-      row.title = tool.id;
-      host.appendChild(row);
+    families(tools).forEach(function (group) {
+      host.appendChild(familyLabel(group));
+      group.tools.forEach(function (tool) {
+        var row = el("div", "ability");
+        var blocked = !tool.callable || tool.denied;
+        var asking = !blocked && tool.asks_first;
+        row.appendChild(el("span", "name", tool.title || tool.id));
+        row.appendChild(el("span", "tag " + (blocked ? "bad" : asking ? "wait" : "ok"), blocked ? "off" : asking ? "asks" : "runs"));
+        row.title = tool.id;
+        host.appendChild(row);
+      });
     });
   }
   function refreshAbilities() {
@@ -1351,6 +1723,7 @@
     ["voice", "Voice", "How JARVIS sounds. Without a voice key it speaks with your browser's own voice."],
     ["files", "Folders & code", "What JARVIS may touch. Both are off until you turn them on, so nothing is reachable by accident."],
     ["permissions", "Permissions", "For each tool: let the rules decide, always ask, run without asking, or switch it off."],
+    ["google", "Google", "Sign in with your Google account so JARVIS can read your mail and calendar. Read-only: it can never send, change or delete anything."],
     ["advanced", "Advanced", "Ports. The defaults are right for almost everyone."]
   ];
   var sview = { reply: null, tools: [], tab: "brain" };
@@ -1406,9 +1779,17 @@
     return el("span", "badge " + (set && !atDefault ? "on" : "off"), atDefault ? "default" : set ? "set" : setting.default ? "default" : "off");
   }
   // One setting: its field, Save (and Unset when set), and either its help (when set) or what "unset" means (when not).
+  var LABELS = {
+    "daemon.executor_model_name": "Model", "daemon.executor_base_url": "Model server", "daemon.executor_reasoning_effort": "Thinking effort",
+    "daemon.tool_workspace_roots": "Folders", "daemon.code_sandbox_image": "Sandbox image", "daemon.code_sandbox_interpreter": "Interpreter",
+    "daemon.speech_voice_id": "Voice", "daemon.speech_model": "Voice model", "daemon.http_port": "Console port",
+    "daemon.mcp_serve_port": "MCP port", "daemon.notifications": "Notifications", "daemon.google_client_id": "Client ID",
+    "daemon.google_actions": "Send mail & events", "policy.trust": "Runs without asking"
+  };
   function settingRow(setting, label) {
     var row = el("div", "set-row");
-    var name = el("span", "name", label || setting.key.replace(/^(daemon|policy)\./, ""));
+    var name = el("span", "name", label && label !== "folders" ? label : LABELS[setting.key] || setting.key.replace(/^(daemon|policy)\./, ""));
+    name.title = setting.key;
     name.appendChild(stateBadge(setting));
     var field = el("input");
     field.type = "text";
@@ -1458,10 +1839,10 @@
         function (error) { settingsNote(explain(error, "That key was refused."), true); });
     });
     acts.appendChild(save);
-    if (which === "voice" && state === "set") {
+    if ((which === "voice" || which === "search") && state === "set") {
       var remove = el("button", "", "Remove");
       remove.addEventListener("click", function () {
-        putJson("/settings/keys/voice", "DELETE").then(function () { saved("Voice key removed;"); },
+        putJson("/settings/keys/" + which, "DELETE").then(function () { saved(label + " removed;"); },
           function (error) { settingsNote(explain(error, "Could not remove it."), true); });
       });
       acts.appendChild(remove);
@@ -1469,9 +1850,13 @@
     row.appendChild(name);
     row.appendChild(field);
     row.appendChild(acts);
-    row.appendChild(el("span", "help", which === "model"
-      ? "Stored in a private file on this machine and never shown again. Local Ollama needs no real key."
-      : "An ElevenLabs API key. Stored in a private file and never shown again; what JARVIS says is sent to ElevenLabs to be spoken."));
+    var helps = {
+      model: "Stored in a private file on this machine and never shown again. Local Ollama needs no real key.",
+      google: "The client secret of your Google OAuth Desktop client. Stored in a private file and never shown again.",
+      voice: "An ElevenLabs API key. Stored in a private file and never shown again; what JARVIS says is sent to ElevenLabs to be spoken.",
+      search: "An Ollama API key (a free ollama.com account makes one) that turns on web search. Stored in a private file and never shown again; what JARVIS searches for is sent to ollama.com. Check it with `jarvis keys test search`."
+    };
+    row.appendChild(el("span", "help", helps[which] || ""));
     return row;
   }
   // Two settings that only make sense together are saved together.
@@ -1522,27 +1907,115 @@
   function permissionsPanel(into) {
     var postures = (sview.reply && sview.reply.postures) || {};
     if (!sview.tools.length) { into.appendChild(el("p", "lead", "No tools are available to configure yet.")); return; }
-    sview.tools.slice().sort(function (a, b) { return String(a.title).localeCompare(String(b.title)); }).forEach(function (tool) {
-      var row = el("div", "perm");
-      var label = el("div");
-      label.appendChild(el("div", "tname", tool.title || tool.id));
-      label.appendChild(el("div", "tid", tool.id + "  \u2022  risk " + tool.risk + (tool.asks_first ? "  \u2022  asks by default" : "  \u2022  runs by default")));
-      var select = el("select");
-      POSTURES.forEach(function (option) {
-        var node = el("option", "", option[1]);
-        node.value = option[0];
-        select.appendChild(node);
-      });
-      select.value = postures[tool.id] || "default";
-      select.addEventListener("change", function () {
-        putJson("/settings/tools/" + encodeURIComponent(tool.id), "PUT", { posture: select.value }).then(function (reply) { if (reply && reply.applied) { settingsNote(tool.title + ": saved and applied now."); loadSettings(); } else saved(tool.title + ":"); },
-          function (error) { settingsNote(explain(error, "That was refused."), true); loadSettings(); });
-      });
-      row.appendChild(label);
-      row.appendChild(select);
-      into.appendChild(row);
+    families(sview.tools).forEach(function (group) {
+      into.appendChild(familyLabel(group));
+      group.tools.forEach(function (tool) { into.appendChild(permissionRow(tool, postures)); });
     });
     into.appendChild(el("p", "lead", "Anything that talks to other people always asks, and nothing runs above the workspace ceiling, whatever is chosen here."));
+  }
+  function permissionRow(tool, postures) {
+    var row = el("div", "perm");
+    var label = el("div");
+    label.appendChild(el("div", "tname", tool.title || tool.id));
+    label.appendChild(el("div", "tid", tool.id + "  \u2022  risk " + tool.risk + (tool.asks_first ? "  \u2022  asks by default" : "  \u2022  runs by default")));
+    var select = el("select");
+    POSTURES.forEach(function (option) {
+      var node = el("option", "", option[1]);
+      node.value = option[0];
+      select.appendChild(node);
+    });
+    select.value = postures[tool.id] || "default";
+    select.addEventListener("change", function () {
+      putJson("/settings/tools/" + encodeURIComponent(tool.id), "PUT", { posture: select.value }).then(function (reply) { if (reply && reply.applied) { settingsNote(tool.title + ": saved and applied now."); loadSettings(); } else saved(tool.title + ":"); },
+        function (error) { settingsNote(explain(error, "That was refused."), true); loadSettings(); });
+    });
+    row.appendChild(label);
+    row.appendChild(select);
+    return row;
+  }
+  // ---- Google: set up once, then one button -----------------------------------------------------------------------------------
+  // Google needs an OAuth client the owner makes in their own Google Cloud project (a few minutes, once). After that, signing in is
+  // a button: the browser goes to Google, Google returns to this daemon, and the status below turns to "Connected".
+  var googlePoll = 0;
+  function googlePanel(body) {
+    var idSetting = byKey("daemon.google_client_id");
+    var help = el("div", "card");
+    help.appendChild(el("h4", "", "One-time setup"));
+    var steps = el("ol");
+    ["Open console.cloud.google.com, create a project, and enable the Gmail API and the Google Calendar API.",
+     "In Google Auth platform, set up the consent screen (External is fine), add your own Google address as a test user, and press Publish app (otherwise Google ends the sign-in after 7 days).",
+     "Create credentials, OAuth client ID, application type Desktop app. Copy the client ID and the client secret into the two fields below.",
+     "Press Sign in with Google. Google warns that the app is unverified: that is expected for your own client; choose Continue."].forEach(function (text) {
+      steps.appendChild(el("li", "", text));
+    });
+    help.appendChild(steps);
+    help.appendChild(el("p", "lead", "Details and the reasoning are in docs/user/google.md. Nothing is sent to Google until you press Sign in."));
+    body.appendChild(help);
+    if (idSetting) body.appendChild(settingRow(idSetting));
+    body.appendChild(keyRow("google", "Client secret"));
+    var actionsSetting = byKey("daemon.google_actions");
+    if (actionsSetting) body.appendChild(settingRow(actionsSetting));
+    var card = el("div", "card");
+    card.appendChild(el("h4", "", "Account"));
+    var line = el("p", "lead", "Checking...");
+    var acts = el("div", "acts");
+    card.appendChild(line);
+    card.appendChild(acts);
+    body.appendChild(card);
+    function paint(status) {
+      acts.replaceChildren();
+      if (status.connected) {
+        line.textContent = "Connected as " + (status.email || "your Google account") + ". Restart once if the mail and calendar tools are not listed yet."
+          + (status.actions && !status.can_act ? " Sending and calendar changes are switched on but not granted yet: sign in again." : "")
+          + (status.actions && status.can_act ? " JARVIS may send mail and add events, asking you every time." : "");
+        if (status.actions && !status.can_act) {
+          var again = el("button", "yes", "Sign in again to grant it");
+          again.addEventListener("click", function () {
+            again.disabled = true;
+            putJson("/google/connect", "POST").then(function (reply) { window.open(reply.auth_url, "_blank", "noopener"); waitForGoogle(); },
+              function (error) { settingsNote(explain(error, "Could not start the sign-in."), true); again.disabled = false; });
+          });
+          acts.appendChild(again);
+        }
+        var out = el("button", "danger", "Disconnect");
+        out.addEventListener("click", function () {
+          out.disabled = true;
+          putJson("/google/disconnect", "POST").then(function () { settingsNote("Google disconnected."); loadGoogle(); },
+            function (error) { settingsNote(explain(error, "Could not disconnect."), true); out.disabled = false; });
+        });
+        acts.appendChild(out);
+      } else if (!status.configured) {
+        line.textContent = "Not set up yet: save the client ID and client secret above first.";
+      } else {
+        line.textContent = status.pending ? "Waiting for you to finish in the Google tab..." : "Not connected.";
+        var go = el("button", "yes", status.pending ? "Open Google again" : "Sign in with Google");
+        go.addEventListener("click", function () {
+          go.disabled = true;
+          putJson("/google/connect", "POST").then(function (reply) {
+            window.open(reply.auth_url, "_blank", "noopener");
+            settingsNote("Finish signing in in the Google tab. This page notices by itself.");
+            waitForGoogle();
+          }, function (error) { settingsNote(explain(error, "Could not start the sign-in."), true); go.disabled = false; });
+        });
+        acts.appendChild(go);
+      }
+    }
+    function loadGoogle() {
+      api("/google").then(paint, function () { line.textContent = "Google sign-in is not available on this daemon."; });
+    }
+    function waitForGoogle() {
+      clearInterval(googlePoll);
+      var tries = 0;
+      googlePoll = setInterval(function () {
+        tries += 1;
+        if (tries > 90 || $("settings").hidden || sview.tab !== "google") { clearInterval(googlePoll); return; }
+        api("/google").then(function (status) {
+          if (status.connected) { clearInterval(googlePoll); settingsNote("Google is connected."); paint(status); }
+          else paint(status);
+        }, function () {});
+      }, 2000);
+    }
+    loadGoogle();
   }
   function renderSettings() {
     var tabs = $("settings-tabs"), body = $("settings-body");
@@ -1557,9 +2030,10 @@
     body.appendChild(el("p", "lead", current[2]));
     if (!sview.reply) return;
     var settings = sview.reply.settings || [];
-    var inGroup = function (name) { return settings.filter(function (s) { return s.group === name && !/_api_key_ref$/.test(s.key); }); };
+    var inGroup = function (name) { return settings.filter(function (s) { return s.group === name && !/(_api_key_ref|_secret_ref)$/.test(s.key); }); };
     if (sview.tab === "brain") {
       body.appendChild(keyRow("model", "Model key"));
+      body.appendChild(keyRow("search", "Search key"));
       inGroup("brain").forEach(function (s) { body.appendChild(settingRow(s)); });
     } else if (sview.tab === "voice") {
       var voiceKey = sview.reply.keys && sview.reply.keys.voice ? sview.reply.keys.voice.state : "";
@@ -1571,6 +2045,8 @@
       if (byKey("daemon.code_sandbox_image")) body.appendChild(codeCard());
     } else if (sview.tab === "permissions") {
       permissionsPanel(body);
+    } else if (sview.tab === "google") {
+      googlePanel(body);
     } else {
       inGroup("advanced").forEach(function (s) { body.appendChild(settingRow(s)); });
     }
@@ -1592,12 +2068,25 @@
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape" && !$("settings").hidden) { closeSettings(); event.stopPropagation(); }
   }, true);
+  // A restart that would interrupt working tasks is refused by the daemon, which says how many; the button then offers to do it anyway.
+  var restartForce = false;
   $("settings-restart").addEventListener("click", function () {
+    var button = $("settings-restart");
     settingsNote("Restarting. This page reconnects by itself in a few seconds.");
-    putJson("/restart", "POST").then(function () {
-      $("settings-restart").className = "";
+    putJson("/restart" + (restartForce ? "?force=true" : ""), "POST").then(function () {
+      button.className = "";
+      restartForce = false;
+      button.textContent = "Restart to apply";
       setTimeout(closeSettings, 1500);
-    }, function (error) { settingsNote(explain(error, "Could not restart from here; run `jarvis restart`."), true); });
+    }, function (error) {
+      if (error.status === 409) {
+        restartForce = true;
+        button.textContent = "Restart anyway";
+        settingsNote((error.body || "Tasks are still working") + ". Wait for them to finish, or press Restart anyway to interrupt them.", true);
+      } else {
+        settingsNote(explain(error, "Could not restart from here; run `jarvis restart`."), true);
+      }
+    });
   });
   // ---- header and caption ---------------------------------------------------------------------------------------
   function uiState() {
@@ -1617,7 +2106,8 @@
     var mode = uiState();
     var caption = $("caption");
     var preparing = S.voiceBusy && !S.speaking && !S.thinking && S.working === 0;
-    caption.textContent = preparing ? "preparing voice" : mode === "working" && S.activity ? "working \u00B7 " + S.activity : captions[mode];
+    var doing = window.JarvisMission ? JarvisMission.headline() : "";
+    caption.textContent = preparing ? "preparing voice" : mode === "working" && (doing || S.activity) ? "working \u00B7 " + (doing || S.activity) : captions[mode];
     caption.className = mode === "waiting" ? "wait" : mode === "idle" || mode === "offline" ? "" : "live";
     var link = $("pill-link");
     link.className = "pill " + (S.offline ? "bad" : "on");
@@ -1688,6 +2178,58 @@
     }, function () {});
   }
 
+  // ---- watching the work you did not start from here ---------------------------------------------------------------------
+  // A scheduled task or a sub-agent has no conversation on this page, but its run still has a stream. Following it feeds the live view
+  // (mission.js) so you see what it is doing, with the same links. At most three at once, none for a run waiting on an answer (its
+  // stream would sit open), and each stops when the run leaves the working list.
+  var observers = {};
+  function tagOf(objective) {
+    var text = String(objective || "");
+    if (text.indexOf("[scheduled]") === 0) return "scheduled";
+    if (text.indexOf("[sub-agent]") === 0) return "sub-agent";
+    return "";
+  }
+  async function observe(run) {
+    var controller = new AbortController();
+    observers[run.run_id] = controller;
+    var tag = tagOf(run.objective);
+    try {
+      var response = await fetch("/api/v1/runs/" + encodeURIComponent(run.run_id) + "/stream", { headers: { Authorization: "Bearer " + token }, cache: "no-store", signal: controller.signal });
+      if (!response.ok) return;
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      for (;;) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+        var cut;
+        while ((cut = buffer.indexOf("\n\n")) >= 0) {
+          var frame = parseBlock(buffer.slice(0, cut));
+          buffer = buffer.slice(cut + 2);
+          if (!frame) continue;
+          JarvisMission.event(run.run_id, tag, frame);
+          if (TERMINAL[frame.event]) return;
+        }
+      }
+    } catch (ignored) { /* the next poll starts it again if the run is still working */ }
+    finally { if (observers[run.run_id] === controller) delete observers[run.run_id]; }
+  }
+  function observeRuns(runs) {
+    if (!window.JarvisMission) return;
+    var wanted = {};
+    runs.filter(function (run) { return !run.outcome && run.state !== "awaiting_approval" && run.run_id !== S.runId; })
+      .slice(0, 3).forEach(function (run) { wanted[run.run_id] = run; });
+    Object.keys(observers).forEach(function (id) { if (!wanted[id]) { observers[id].abort(); delete observers[id]; } });
+    Object.keys(wanted).forEach(function (id) { if (!observers[id]) observe(wanted[id]); });
+  }
+  if (window.JarvisMission) {
+    // The face takes an interest in what is being done.
+    JarvisMission.onStart = function (item) {
+      feel(item.kind === "web" || item.kind === "memory" ? "curious" : item.kind === "agent" ? "attentive" : "focused", 1.8);
+    };
+  }
+
   // ---- polling --------------------------------------------------------------------------------------------------
   var lastSignature = "";
   function refresh() {
@@ -1704,9 +2246,11 @@
         renderPanels(results[0].runs, results[1].approvals, results[2].schedules);
       }
       announce(results[1].approvals);
+      observeRuns(results[0].runs);
       watchSchedules(results[2].schedules);
       refreshAbilities();
       refreshProposals();
+      if (Date.now() - projectsAt > 15000) loadProjects();
       tickAges();
       paintHeader();
     }).catch(function (error) {
@@ -1823,7 +2367,9 @@
 
   function draw(t, mode) {
     ctx.clearRect(0, 0, W, H);
-    var cx = W / 2, cy = H / 2 - 10, R = Math.min(W * 0.5, (H - 24) * 0.5) * 0.96;
+    // While the live view is up, the face makes room for it and moves to the right.
+    var room = window.JarvisMission ? Math.min(350, W * 0.38) * JarvisMission.dock(W) : 0;
+    var cx = room + (W - room) / 2, cy = H / 2 - 10, R = Math.min((W - room) * 0.5, (H - 24) * 0.5) * 0.96;
     if (R < 40) return;
     var speed = calm ? 0.06 : (mode === "working" ? 1.7 : mode === "waiting" ? 1.0 : mode === "offline" ? 0.05 : mode === "idle" ? 0.45 : 0.9);
     ctx.lineCap = "butt";
@@ -1916,6 +2462,8 @@
         rgb: current, energy: energy, mode: mode, mouth: mouth, t: t, calm: calm
       });
     }
+    // what JARVIS is doing right now: satellites, beams and the effect for each kind of work (mission.js)
+    if (window.JarvisMission) JarvisMission.draw(ctx, cx, cy, R, t, current, calm, W, H, room);
     // markers riding the outer rings
     for (var m = 0; m < 5; m += 1) {
       var ma = t * speed * (0.12 + m * 0.03) * (m % 2 ? -1 : 1) + m * 1.3;

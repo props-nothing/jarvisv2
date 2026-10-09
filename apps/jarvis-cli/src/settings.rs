@@ -125,7 +125,7 @@ fn show(paths: &AppPaths, json: bool) -> Result<(), String> {
 
 fn kind_of(word: Option<&String>) -> Result<SecretKind, String> {
     word.map_or_else(
-        || Err("name the key: model, voice or search".to_owned()),
+        || Err("name the key: model, voice, search or google".to_owned()),
         |word| SecretKind::parse(word),
     )
 }
@@ -186,6 +186,10 @@ pub async fn keys(
             Ok(SecretKind::Model) => test_model(paths).await,
             Ok(SecretKind::Voice) => test_voice(paths, credential).await,
             Ok(SecretKind::Search) => test_search(paths).await,
+            Ok(SecretKind::Google) => Err(
+                "the Google secret is checked by signing in: open the console, Settings, Google"
+                    .to_owned(),
+            ),
             Err(message) => Err(message),
         },
         Some(other) => Err(format!(
@@ -198,14 +202,20 @@ fn status(paths: &AppPaths, json: bool) -> Result<(), String> {
     let model = settings::key_state(paths, SecretKind::Model)?;
     let voice = settings::key_state(paths, SecretKind::Voice)?;
     let search = settings::key_state(paths, SecretKind::Search)?;
+    let google = settings::key_state(paths, SecretKind::Google)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "model": model.state, "voice": voice.state, "search": search.state })
+            serde_json::json!({ "model": model.state, "voice": voice.state, "search": search.state, "google": google.state })
         );
         return Ok(());
     }
-    for (name, state) in [("model", model), ("voice", voice), ("search", search)] {
+    for (name, state) in [
+        ("model", model),
+        ("voice", voice),
+        ("search", search),
+        ("google", google),
+    ] {
         println!(
             "{name:<6} {:<13} {}",
             state.state,

@@ -29,6 +29,7 @@ use axum::response::{IntoResponse, Response};
 const PAGE: &str = include_str!("hud/index.html");
 const SCRIPT: &str = include_str!("hud/hud.js");
 const HEAD: &str = include_str!("hud/head.js");
+const MISSION: &str = include_str!("hud/mission.js");
 const STYLE: &str = include_str!("hud/hud.css");
 
 /// The path of the page.
@@ -43,6 +44,9 @@ pub const SCRIPT_PATH: &str = "/hud.js";
 
 /// The path of the head: the face mesh and the code that draws it.
 pub const HEAD_PATH: &str = "/head.js";
+
+/// The path of the live mission view: the feed of what JARVIS is doing, its sources, and the animation around the face.
+pub const MISSION_PATH: &str = "/mission.js";
 
 /// The path of the page's stylesheet.
 pub const STYLE_PATH: &str = "/hud.css";
@@ -66,6 +70,7 @@ pub fn is_public_asset(method: &Method, path: &str) -> bool {
             || path == ALIAS_PATH
             || path == SCRIPT_PATH
             || path == HEAD_PATH
+            || path == MISSION_PATH
             || path == STYLE_PATH)
 }
 
@@ -108,6 +113,11 @@ pub async fn head() -> Response {
     asset(HEAD, "text/javascript; charset=utf-8")
 }
 
+/// `GET /mission.js`
+pub async fn mission() -> Response {
+    asset(MISSION, "text/javascript; charset=utf-8")
+}
+
 /// `GET /hud.css`
 pub async fn style() -> Response {
     asset(STYLE, "text/css; charset=utf-8")
@@ -123,6 +133,7 @@ mod tests {
         assert!(is_public_asset(&Method::GET, "/hud"));
         assert!(is_public_asset(&Method::GET, "/hud.js"));
         assert!(is_public_asset(&Method::GET, "/head.js"));
+        assert!(is_public_asset(&Method::GET, "/mission.js"));
         assert!(is_public_asset(&Method::GET, "/hud.css"));
         for path in [
             "/hud/",
@@ -140,6 +151,7 @@ mod tests {
         assert!(!is_public_asset(&Method::POST, "/"));
         assert!(!is_public_asset(&Method::DELETE, "/hud.js"));
         assert!(!is_public_asset(&Method::POST, "/head.js"));
+        assert!(!is_public_asset(&Method::POST, "/mission.js"));
     }
 
     #[test]
@@ -153,7 +165,9 @@ mod tests {
             "new Function",
         ] {
             assert!(
-                !SCRIPT.contains(forbidden) && !HEAD.contains(forbidden),
+                !SCRIPT.contains(forbidden)
+                    && !HEAD.contains(forbidden)
+                    && !MISSION.contains(forbidden),
                 "the scripts must not use {forbidden}"
             );
         }
@@ -161,6 +175,16 @@ mod tests {
             !PAGE.contains("<script>"),
             "the page must not carry inline script, which the policy forbids"
         );
+    }
+
+    /// Links the mission view offers come from a model or a page, so they are plain web addresses, open in a new tab, and carry no
+    /// referrer or opener.
+    #[test]
+    fn the_mission_view_only_links_plain_web_addresses_safely() {
+        assert!(MISSION.contains("rel = \"noopener noreferrer\""));
+        assert!(MISSION.contains("\"http:\" && url.protocol !== \"https:\""));
+        assert!(MISSION.contains("url.username || url.password"));
+        assert!(PAGE.contains("/mission.js"));
     }
 
     #[test]
@@ -173,7 +197,10 @@ mod tests {
             "sendBeacon",
         ] {
             assert!(
-                !SCRIPT.contains(external) && !HEAD.contains(external) && !PAGE.contains(external),
+                !SCRIPT.contains(external)
+                    && !HEAD.contains(external)
+                    && !MISSION.contains(external)
+                    && !PAGE.contains(external),
                 "the page must load and send nothing outside this origin: {external}"
             );
         }

@@ -12,13 +12,20 @@ mod dispatch;
 mod entity_service;
 mod executor;
 mod gateway;
+mod google_account;
+mod google_service;
+mod google_tools;
 mod health;
 mod hud;
 mod mcp_host;
 mod mcp_serve;
 mod memory_propose;
+mod memory_search;
 mod memory_service;
 mod notify;
+mod project_context;
+mod project_service;
+mod project_tool;
 mod run_service;
 mod schedule_service;
 mod schedule_tool;
@@ -28,6 +35,7 @@ mod skill_service;
 mod speech_service;
 mod sse;
 mod stop;
+mod tool_activity;
 mod tool_actor;
 mod tool_pipeline;
 
@@ -147,12 +155,33 @@ enum DaemonError {
         #[source]
         source: jarvis_web::WebFetchToolError,
     },
+    /// The Google tools could not state their own contract.
+    #[error("the Google tools could not be defined")]
+    GoogleTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::google_tools::GoogleToolError,
+    },
+    /// The memory search tool could not state its own contract.
+    #[error("the memory search tool could not be defined")]
+    MemorySearchTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::memory_search::MemorySearchToolError,
+    },
     /// The web search tool could not state its own contract.
     #[error("the web search tool could not be defined")]
     WebSearchTool {
         /// Which part was rejected, named by the variant.
         #[source]
         source: jarvis_web::WebSearchToolError,
+    },
+    /// The project note tool could not state its own contract.
+    #[error("the project note tool could not be defined")]
+    ProjectTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::project_tool::ProjectToolError,
     },
     /// The schedule tools could not state their own contract.
     #[error("the schedule tools could not be defined")]
@@ -769,7 +798,18 @@ async fn compose_tools(
             &database,
         ))) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
+    push_project_tool(&database, &mut additional)?;
+    additional.push((
+        vec![
+            crate::memory_search::MemorySearchTool::definition()
+                .map_err(|source| DaemonError::MemorySearchTool { source })?,
+        ],
+        Arc::new(crate::memory_search::MemorySearchTool::new(Arc::clone(
+            &database,
+        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
     push_search_tool(config, &mut additional)?;
+    push_google_tools(config, paths, &mut additional)?;
     push_code_tool(config, &mut additional)?;
     push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
@@ -802,6 +842,71 @@ async fn compose_tools(
         agent.bind(pipeline);
     }
     Ok((mcp, tools))
+}
+
+/// Adds the Gmail and Calendar read tools, when a Google client id is configured.
+///
+/// Opt-in, and offered whether or not anyone is signed in yet: the owner signs in from Settings while the daemon runs, and the tools
+/// answer "Google is not connected" until then. Without a client id there is no sign-in to offer, so there are no tools.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::GoogleTool`] when the tools' own contract is rejected.
+fn push_google_tools(
+    config: &jarvis_storage::Config,
+    paths: &AppPaths,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
+    if config.daemon().google_client_id().is_none() {
+        return Ok(());
+    }
+    let Ok(account) = google_account::GoogleAccount::shared(paths) else {
+        tracing::warn!(
+            "Google sign-in could not start, so the mail and calendar tools are not offered"
+        );
+        return Ok(());
+    };
+    let mut definitions = google_tools::GoogleTool::definitions()
+        .map_err(|source| DaemonError::GoogleTool { source })?;
+    // Sending mail and creating events exist only when the owner switched Google actions on (and signed in again to grant them).
+    if config.daemon().google_actions_enabled() {
+        definitions.extend(
+            google_tools::GoogleTool::action_definitions()
+                .map_err(|source| DaemonError::GoogleTool { source })?,
+        );
+    }
+    additional.push((
+        definitions,
+        Arc::new(google_tools::GoogleTool::new(account)) as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    tracing::info!("the Gmail and Calendar tools are available");
+    Ok(())
+}
+
+/// Registers the project journal tool: it needs only the database, and it refuses outside a project (`ADR-0151`).
+///
+/// # Errors
+///
+/// Returns [`DaemonError::ProjectTool`] when the tool's own contract is rejected.
+fn push_project_tool(
+    database: &Arc<SqliteDatabase>,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
+    additional.push((
+        vec![
+            crate::project_tool::ProjectTool::definition()
+                .map_err(|source| DaemonError::ProjectTool { source })?,
+        ],
+        Arc::new(crate::project_tool::ProjectTool::new(Arc::clone(database)))
+            as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    Ok(())
 }
 
 /// Adds the web search tool to the composition, when a search key is configured.
@@ -1204,6 +1309,11 @@ impl HttpTransport {
         }
         if let Some(speech) = speech {
             state = state.with_speech(speech);
+        }
+        // Google sign-in lives beside the settings: it reads its client id and secret from the same saved configuration.
+        match google_account::GoogleAccount::shared(settings.paths()) {
+            Ok(google) => state = state.with_google(google),
+            Err(error) => tracing::warn!(%error, "Google sign-in is not available"),
         }
         state = state.with_settings(settings);
         // Scheduled tasks fire through the same state the routes use, so a scheduled run is an ordinary run. Only

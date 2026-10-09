@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -407,6 +407,21 @@ pub enum DatabaseError {
     /// A finished one-off cannot be resumed: its moment has passed.
     #[error("a one-off task that has already fired cannot be resumed")]
     ScheduleFinished,
+    /// No project has that name or identifier in this workspace.
+    #[error("no project has that name or identifier")]
+    ProjectNotFound,
+    /// Another project of this workspace already has that name.
+    #[error("a project with that name already exists")]
+    ProjectNameTaken,
+    /// A project field was refused (blank, too long, or not a relative folder).
+    #[error("the project's {field} is not acceptable")]
+    InvalidProject {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// The session or schedule already belongs to a different project.
+    #[error("that conversation or schedule already belongs to a different project")]
+    ProjectConflict,
     /// A stored schedule row contradicts the domain's rules (another build, a backup, a hand edit).
     #[error("the stored schedule has an invalid {field}")]
     StoredScheduleInvalid {

@@ -4,6 +4,7 @@ mod approval;
 mod entity_api;
 mod frame;
 mod memory_api;
+mod project_api;
 mod rest;
 mod run_api;
 mod schedule_api;
@@ -27,6 +28,10 @@ pub use memory_api::{
     ForgetMemoryRequest, MemoryDetailReply, MemoryExportReply, MemoryListReply, MemoryReference,
     MemoryReply, MemorySearchHit, MemorySearchReply, MemorySearchRequest, RememberRequest,
     SequenceRange, SignalContribution, SummarizeSessionRequest, SummaryListReply, SummaryReply,
+};
+pub use project_api::{
+    AddProjectNoteRequest, CreateProjectRequest, ProjectDetailReply, ProjectListReply,
+    ProjectNoteReply, ProjectReply, UpdateProjectRequest,
 };
 pub use rest::{
     JSON_CONTENT_TYPE, MAX_STREAM_PAGE, RESYNC_HINT_SECONDS, RunEventPageReply, RunEventReply,

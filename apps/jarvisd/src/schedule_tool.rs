@@ -186,7 +186,12 @@ impl ScheduleTool {
             .map_err(|_| refused("the local database is not available"))
     }
 
-    async fn add(&self, arguments: &Value, now: UtcTimestamp) -> Result<Value, AdapterError> {
+    pub(crate) async fn add(
+        &self,
+        call_id: &str,
+        arguments: &Value,
+        now: UtcTimestamp,
+    ) -> Result<Value, AdapterError> {
         let objective = arguments
             .get("objective")
             .and_then(Value::as_str)
@@ -216,6 +221,21 @@ impl ScheduleTool {
                     ),
                     _ => refused("the schedule could not be saved"),
                 })?;
+        // A task scheduled from inside a project belongs to it, so its runs carry the project's brief and pause with it.
+        if let Some((project, _)) =
+            crate::project_context::project_of_call(&self.database, call_id).await
+        {
+            let linked = jarvis_storage::link_project(
+                &self.database,
+                jarvis_storage::LinkKind::Schedule,
+                stored.id(),
+                &project.id,
+            )
+            .await;
+            if linked.is_err() {
+                tracing::warn!("a scheduled task could not be linked to its project");
+            }
+        }
         Ok(json!({ "scheduled": describe(&stored) }))
     }
 
@@ -291,7 +311,10 @@ impl ToolExecutor for ScheduleTool {
             return Err(refused("the call was already past its deadline"));
         }
         let body = match tool.as_str() {
-            ADD_TOOL => self.add(request.arguments(), now).await?,
+            ADD_TOOL => {
+                self.add(request.call_id(), request.arguments(), now)
+                    .await?
+            }
             LIST_TOOL => self.list().await?,
             REMOVE_TOOL => self.remove(request.arguments()).await?,
             _ => return Err(AdapterError::NotImplemented { tool }),

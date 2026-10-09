@@ -95,6 +95,36 @@ const SETTINGS: &[Setting] = &[
     },
     Setting {
         table: "daemon",
+        field: "google_client_id",
+        kind: Kind::Text,
+        help: "the Google OAuth client id (a Desktop app client you create in Google Cloud Console; see docs/user/google.md)",
+        group: "google",
+        default: None,
+        unset_means: "Opt-in: without your own Google OAuth client there is no Google sign-in, so no mail or calendar tools. Nothing is shared with Google until you sign in.",
+        example: "1234-abc.apps.googleusercontent.com",
+    },
+    Setting {
+        table: "daemon",
+        field: "google_actions",
+        kind: Kind::Flag,
+        help: "also let JARVIS send email and create calendar events: on or off (each one still asks you first; you sign in again to grant it)",
+        group: "google",
+        default: Some("off"),
+        unset_means: "Off: signing in asks only for read permissions, so JARVIS can read mail and calendar but never send or change anything.",
+        example: "on",
+    },
+    Setting {
+        table: "daemon",
+        field: "google_client_secret_ref",
+        kind: Kind::File,
+        help: "file holding the Google client secret (set the secret itself with `jarvis keys set google`)",
+        group: "google",
+        default: None,
+        unset_means: "Needed with the client id: Google issues a secret to Desktop app clients and exchanging the sign-in code requires it.",
+        example: "",
+    },
+    Setting {
+        table: "daemon",
         field: "search_api_key_ref",
         kind: Kind::File,
         help: "file holding the web search key (set the key itself with `jarvis keys set search`)",
@@ -217,7 +247,7 @@ pub struct SettingView {
     pub value: Option<String>,
     /// For a file setting: `present` or `missing`.
     pub file_state: Option<&'static str>,
-    /// The tab it lives on: `brain`, `voice`, `files`, `permissions` or `advanced`.
+    /// The tab it lives on: `brain`, `voice`, `files`, `permissions`, `google` or `advanced`.
     pub group: &'static str,
     /// The value in force when it is not set, if there is one.
     pub default: Option<&'static str>,
@@ -637,6 +667,8 @@ pub enum SecretKind {
     Voice,
     /// The web search provider's key.
     Search,
+    /// The Google OAuth client secret.
+    Google,
 }
 
 impl SecretKind {
@@ -650,7 +682,8 @@ impl SecretKind {
             "model" => Ok(Self::Model),
             "voice" => Ok(Self::Voice),
             "search" => Ok(Self::Search),
-            _ => Err("name the key: model, voice or search".to_owned()),
+            "google" => Ok(Self::Google),
+            _ => Err("name the key: model, voice, search or google".to_owned()),
         }
     }
 
@@ -659,6 +692,7 @@ impl SecretKind {
             Self::Model => "executor_api_key_ref",
             Self::Voice => "speech_api_key_ref",
             Self::Search => "search_api_key_ref",
+            Self::Google => "google_client_secret_ref",
         }
     }
 
@@ -667,6 +701,7 @@ impl SecretKind {
             Self::Model => "model.key",
             Self::Voice => "speech.key",
             Self::Search => "search.key",
+            Self::Google => "google.key",
         }
     }
 
@@ -677,6 +712,7 @@ impl SecretKind {
             Self::Model => "JARVIS_MODEL_API_KEY",
             Self::Voice => "ELEVENLABS_API_KEY",
             Self::Search => "OLLAMA_API_KEY",
+            Self::Google => "GOOGLE_CLIENT_SECRET",
         }
     }
 }
@@ -763,6 +799,7 @@ pub fn remove_secret(paths: &AppPaths, kind: SecretKind) -> Result<(), String> {
         let daemon = table_mut(table, "daemon")?;
         let dependent: &[&str] = match kind {
             SecretKind::Search => &["search_api_key_ref"],
+            SecretKind::Google => &["google_client_secret_ref"],
             _ => &["speech_api_key_ref", "speech_voice_id", "speech_model"],
         };
         for field in dependent {

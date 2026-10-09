@@ -41,7 +41,7 @@ Every external integration requires a dated record based on current official sou
 | LangGraph | https://docs.langchain.com/oss/python/langgraph/llms.txt | create before adapter implementation | upstream patterns only |
 | Temporal | https://docs.temporal.io/llms.txt | create only when evaluating adapter | deferred |
 | Tauri | https://v2.tauri.app/llms.txt | create before desktop scaffold | upstream patterns only |
-| Ollama web search (`jarvis.web.search`) | https://docs.ollama.com/llms.txt | [ollama-web-search.md](ollama-web-search.md) | implemented and contract-tested; success path unverified live (needs a key) |
+| Ollama web search (`jarvis.web.search`) | https://docs.ollama.com/llms.txt | [ollama-web-search.md](ollama-web-search.md) | implemented; live positive path verified 2026-10-09 |
 
 ## Planned Connector Records
 

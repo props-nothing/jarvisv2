@@ -37,7 +37,7 @@ pub async fn run_schedule(client: &ApiClient, arguments: &[String]) -> ExitStatu
 
 /// The usage text for `jarvis schedule`.
 pub(crate) const fn schedule_usage() -> &'static str {
-    "usage: jarvis schedule <add|list|pause|resume|remove> [...]\n       jarvis schedule add <objective...> (--every 30m|6h|2d | --at 2026-10-04T09:00:00Z)\n       jarvis schedule list [--json]\n       jarvis schedule pause|resume|remove ID"
+    "usage: jarvis schedule <add|list|pause|resume|remove> [...]\n       jarvis schedule add <objective...> (--every 30m|6h|2d | --at 2026-10-04T09:00:00Z) [--project NAME]\n       jarvis schedule list [--json]\n       jarvis schedule pause|resume|remove ID"
 }
 
 /// Splits `add` arguments into the objective words and the cadence flags.
@@ -48,6 +48,7 @@ fn parse_add(arguments: &[String]) -> Result<CreateScheduleRequest, String> {
     let mut words: Vec<&str> = Vec::new();
     let mut every: Option<String> = None;
     let mut at: Option<UtcTimestamp> = None;
+    let mut project: Option<String> = None;
     let mut index = 2;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -69,6 +70,15 @@ fn parse_add(arguments: &[String]) -> Result<CreateScheduleRequest, String> {
                 })?);
                 index += 2;
             }
+            "--project" => {
+                project = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("--project needs a project name")?
+                        .clone(),
+                );
+                index += 2;
+            }
             "--root" => index += 2,
             "--json" => index += 1,
             word => {
@@ -84,6 +94,7 @@ fn parse_add(arguments: &[String]) -> Result<CreateScheduleRequest, String> {
         objective: words.join(" "),
         every,
         at,
+        project_id: project,
     })
 }
 
@@ -145,6 +156,10 @@ fn describe(schedule: &ScheduleReply) -> String {
     let cadence = match (schedule.cadence.as_str(), schedule.interval_seconds) {
         ("every", Some(seconds)) => format!("every {}", humanize(seconds)),
         _ => "once".to_owned(),
+    };
+    let cadence = match &schedule.project {
+        Some(project) => format!("{cadence}, project {project}"),
+        None => cadence,
     };
     match schedule.next_run_at {
         Some(next) => format!("{cadence}, next at {next}"),
@@ -294,7 +309,7 @@ fn one_line(text: &str, limit: usize) -> String {
     format!("{cut}…")
 }
 
-fn print_json<T: serde::Serialize>(value: &T) -> ExitStatus {
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> ExitStatus {
     match serde_json::to_string_pretty(value) {
         Ok(rendered) => {
             println!("{rendered}");
@@ -307,7 +322,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> ExitStatus {
     }
 }
 
-fn report(error: &ApiError) -> ExitStatus {
+pub(crate) fn report(error: &ApiError) -> ExitStatus {
     match error {
         ApiError::Refused(wire) => {
             eprintln!("jarvis: daemon error: {wire}");

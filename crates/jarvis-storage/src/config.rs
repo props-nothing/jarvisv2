@@ -218,6 +218,15 @@ pub struct DaemonConfig {
     /// File holding the web search provider's key (an absolute path). Without it there is no web search tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     search_api_key_ref: Option<PathBuf>,
+    /// The Google OAuth client id (a Desktop-app client the owner created), which turns on Google sign-in. Not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_client_id: Option<String>,
+    /// File holding that client's secret (an absolute path). Google issues one to Desktop-app clients and the token exchange needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_client_secret_ref: Option<PathBuf>,
+    /// Whether the Google sign-in also asks to send mail and create calendar events (each action still asks the owner). Unset means no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_actions: Option<bool>,
 }
 
 /// The words a reasoning effort may be (the same ones providers use).
@@ -327,6 +336,24 @@ impl DaemonConfig {
         self.speech_model.as_deref()
     }
 
+    /// The Google OAuth client id, if Google sign-in is configured.
+    #[must_use]
+    pub fn google_client_id(&self) -> Option<&str> {
+        self.google_client_id.as_deref()
+    }
+
+    /// Whether sending mail and creating events is switched on (off unless the owner turned it on).
+    #[must_use]
+    pub fn google_actions_enabled(&self) -> bool {
+        self.google_actions.unwrap_or(false)
+    }
+
+    /// The file holding the Google client secret, if one is configured.
+    #[must_use]
+    pub fn google_client_secret_ref(&self) -> Option<&Path> {
+        self.google_client_secret_ref.as_deref()
+    }
+
     /// The file holding the web search key, if search is configured.
     #[must_use]
     pub fn search_api_key_ref(&self) -> Option<&Path> {
@@ -370,6 +397,9 @@ impl Default for DaemonConfig {
             speech_model: None,
             notifications: None,
             search_api_key_ref: None,
+            google_client_id: None,
+            google_client_secret_ref: None,
+            google_actions: None,
         }
     }
 }
@@ -676,10 +706,31 @@ impl Config {
         {
             return Err(ConfigError::InvalidSearchKey);
         }
+        self.validate_google()?;
         self.validate_code_sandbox()?;
         self.validate_speech()?;
         self.validate_policy()?;
         Ok(())
+    }
+
+    /// Validates the Google sign-in settings.
+    fn validate_google(&self) -> Result<(), ConfigError> {
+        let daemon = &self.daemon;
+        match (&daemon.google_client_id, &daemon.google_client_secret_ref) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(ConfigError::InvalidGoogle),
+            (Some(id), secret) => {
+                let plain = !id.is_empty()
+                    && id.len() <= 256
+                    && id.bytes().all(|byte| byte.is_ascii_graphic());
+                let absolute = secret.as_ref().is_none_or(|path| path.is_absolute());
+                if plain && absolute {
+                    Ok(())
+                } else {
+                    Err(ConfigError::InvalidGoogle)
+                }
+            }
+        }
     }
 
     /// Validates the speech settings: the key file is an absolute path, and a voice or model without a key (a setting
@@ -1015,6 +1066,12 @@ pub enum ConfigError {
         "daemon.executor_reasoning_effort must be none, low, medium or high, and needs daemon.executor_model = openai-compatible"
     )]
     InvalidReasoningEffort,
+    /// The Google sign-in settings were unusable: a client id that is blank or has whitespace or control characters, a secret path that is
+    /// not absolute, or a secret with no client id.
+    #[error(
+        "daemon.google_client_id must be a plain client id, daemon.google_client_secret_ref an absolute path, and the secret needs the client id"
+    )]
+    InvalidGoogle,
     /// The web search key path was not absolute.
     #[error("daemon.search_api_key_ref must be an absolute path")]
     InvalidSearchKey,
@@ -1202,6 +1259,9 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "speech_model",
                 "notifications",
                 "search_api_key_ref",
+                "google_client_id",
+                "google_client_secret_ref",
+                "google_actions",
             ],
             &mut unknown,
         );

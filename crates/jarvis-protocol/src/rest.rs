@@ -64,6 +64,12 @@ pub struct StartRunRequest {
     /// exists here so the contract is not added later in a breaking way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// The project this run belongs to, by identifier or name (ADR-0151).
+    ///
+    /// Binds the run's **conversation** to the project, so every later run in it carries the project's brief. A project changes what a
+    /// run is told, never what it may do. A conversation that already belongs to another project is refused rather than moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// Response body for `POST /api/v1/runs` and `GET /api/v1/runs/{id}`.
@@ -205,6 +211,7 @@ mod tests {
             objective: "summarise".to_owned(),
             session_id: None,
             idempotency_key: None,
+            project_id: None,
         };
         let encoded = serde_json::to_string(&request).unwrap_or_default();
         assert_eq!(encoded, r#"{"objective":"summarise"}"#);

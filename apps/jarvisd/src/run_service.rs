@@ -34,9 +34,9 @@ use jarvis_protocol::{
     rest_error, safe,
 };
 use jarvis_storage::{
-    API_SESSION_CHANNEL, DatabaseError, SessionTarget, SqliteDatabase, StartRunInput,
-    find_approval, find_run, load_local_identity, record_decision, request_run_cancellation,
-    settle_parked_run_cancelled, start_run,
+    API_SESSION_CHANNEL, DatabaseError, LinkKind, SessionTarget, SqliteDatabase, StartRunInput,
+    find_approval, find_project, find_run, link_project, load_local_identity, project_for,
+    record_decision, request_run_cancellation, settle_parked_run_cancelled, start_run,
 };
 
 /// A run use-case failure that maps onto a status and the shared error envelope.
@@ -97,6 +97,7 @@ impl RunService {
         // request. The returned future's lifetime is already tied to `&self`, and adding a borrow of
         // the request to it as well would make the two outlive each other incorrectly.
         let requested_session = request.session_id.clone();
+        let requested_project = request.project_id.clone();
         async move {
             if objective.is_empty() {
                 return Err(RunServiceError::new(
@@ -124,6 +125,26 @@ impl RunService {
                 .map_err(|error| map_identity_error(&error))?;
             let now = UtcTimestamp::now(&SystemClock);
             let correlation_id = CorrelationId::new();
+
+            // A named project is resolved, and a conversation that already belongs to another one refused, before anything is
+            // written, so a refusal never leaves a run behind.
+            let project = match requested_project {
+                Some(name) => {
+                    let project = find_project(&self.database, identity.workspace_id(), &name)
+                        .await
+                        .map_err(|error| map_database_error(&error))?;
+                    if let Some(session) = &requested_session {
+                        let current = project_for(&self.database, LinkKind::Session, session)
+                            .await
+                            .map_err(|error| map_database_error(&error))?;
+                        if current.is_some_and(|other| other.id != project.id) {
+                            return Err(map_database_error(&DatabaseError::ProjectConflict));
+                        }
+                    }
+                    Some(project)
+                }
+                None => None,
+            };
 
             // The requested conversation, or a new one. The target is built from the request rather
             // than decided later, so "continue this session" and "start a conversation" stay
@@ -153,6 +174,16 @@ impl RunService {
             let started = start_run(&self.database, &input)
                 .await
                 .map_err(|error| map_database_error(&error))?;
+            if let Some(project) = project {
+                link_project(
+                    &self.database,
+                    LinkKind::Session,
+                    started.session_id(),
+                    &project.id,
+                )
+                .await
+                .map_err(|error| map_database_error(&error))?;
+            }
             Ok(reply::from_started(&started))
         }
     }
@@ -339,6 +370,26 @@ fn map_database_error(error: &DatabaseError) -> RunServiceError {
             StatusCode::NOT_FOUND,
             ErrorCode::Validation,
             "no run exists for the requested identifier",
+        ),
+        DatabaseError::ProjectNotFound => RunServiceError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Validation,
+            "no project has that name or identifier",
+        ),
+        DatabaseError::ProjectConflict => RunServiceError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "that conversation already belongs to a different project",
+        ),
+        DatabaseError::ProjectNameTaken => RunServiceError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "a project with that name already exists",
+        ),
+        DatabaseError::InvalidProject { .. } => RunServiceError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Validation,
+            "the project was not valid",
         ),
         // A continuation that named a session this identity may not write into is reported exactly
         // as one that does not exist, because a caller must not learn that somebody else's session

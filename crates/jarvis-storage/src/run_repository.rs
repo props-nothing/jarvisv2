@@ -412,6 +412,29 @@ pub async fn find_run(database: &SqliteDatabase, id: &str) -> Result<StoredRun, 
     decode_run(&row)
 }
 
+/// How many runs this process is driving right now: every run that is not finished and not waiting on an approval.
+///
+/// Used to warn before a restart, which would interrupt exactly these.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the count cannot be read.
+pub async fn count_working_runs(database: &SqliteDatabase) -> Result<u32, DatabaseError> {
+    // A run waiting for an approval is not working: no process holds it and the decision can still be made after a restart. Every
+    // other non-terminal run is being driven by this process and would be lost to a restart.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs \
+         WHERE state NOT IN ('completed', 'cancelled', 'failed', 'awaiting_approval')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "count working runs",
+        source,
+    })?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// Reads a workspace's most recent runs, newest first.
 ///
 /// Ordered by the run's **identifier**, which is a `UUIDv7` and therefore time-ordered, rather than by the

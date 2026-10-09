@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use axum::{
     Json,
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -148,6 +148,7 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
                     "model": key_json(&context.paths, SecretKind::Model),
                     "voice": key_json(&context.paths, SecretKind::Voice),
             "search": key_json(&context.paths, SecretKind::Search),
+            "google": key_json(&context.paths, SecretKind::Google),
                 },
             });
             (StatusCode::OK, Json(body)).into_response()
@@ -325,11 +326,15 @@ pub async fn remove_key(
 
 /// `POST /api/v1/restart`: starts `jarvis restart` (the `jarvis` program beside this one) and returns at once; that command
 /// stops this daemon gracefully and starts a new one with the saved settings.
-pub async fn restart(State(state): State<GatewayState>) -> Response {
+pub async fn restart(State(state): State<GatewayState>, RawQuery(raw): RawQuery) -> Response {
     let context = match context(&state) {
         Ok(context) => context,
         Err(response) => return response,
     };
+    let force = crate::stop::wants_force(raw.as_deref());
+    if let Some(refusal) = crate::stop::refusal_if_working(&state, force).await {
+        return refusal;
+    }
     let Some(cli) = std::env::current_exe()
         .ok()
         .and_then(|exe| sibling_cli(&exe))
@@ -340,7 +345,7 @@ pub async fn restart(State(state): State<GatewayState>) -> Response {
             "the `jarvis` program was not found beside this one; run `jarvis restart` in a terminal",
         );
     };
-    match spawn_restart(&cli, context.root.as_deref()) {
+    match spawn_restart(&cli, context.root.as_deref(), force) {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "restarting": true }))).into_response(),
         Err(message) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -361,11 +366,14 @@ fn sibling_cli(daemon: &Path) -> Option<PathBuf> {
 }
 
 /// Starts `jarvis restart [--root DIR]` detached, sharing no handle with this process.
-fn spawn_restart(cli: &Path, root: Option<&Path>) -> Result<(), String> {
+fn spawn_restart(cli: &Path, root: Option<&Path>, force: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
         let mut arguments = vec![quote("restart")];
+        if force {
+            arguments.push(quote("--force"));
+        }
         if let Some(root) = root {
             arguments.push(quote("--root"));
             arguments.push(quote(&root.display().to_string()));
@@ -388,6 +396,9 @@ fn spawn_restart(cli: &Path, root: Option<&Path>) -> Result<(), String> {
     {
         let mut command = std::process::Command::new(cli);
         command.arg("restart");
+        if force {
+            command.arg("--force");
+        }
         if let Some(root) = root {
             command.arg("--root").arg(root);
         }

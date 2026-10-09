@@ -241,7 +241,15 @@ fn every_setting_has_a_tab_and_says_what_unset_means() {
     let views = list(&paths).unwrap_or_else(|error| panic!("{error}"));
     for view in &views {
         assert!(
-            ["brain", "voice", "files", "permissions", "advanced"].contains(&view.group),
+            [
+                "brain",
+                "voice",
+                "files",
+                "permissions",
+                "google",
+                "advanced"
+            ]
+            .contains(&view.group),
             "{} has an unknown tab {}",
             view.key,
             view.group

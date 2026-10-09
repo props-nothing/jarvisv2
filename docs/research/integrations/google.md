@@ -1590,3 +1590,30 @@ interpretation**, since honouring a delay is a retry decision; and the timeout/c
 | 2026-10-01 | **Whether the health state's staleness reaches the report that ranks it** — no page fetched, an audit of what the diagnostics report derives its severity from versus the predicate the rest of the platform gates on | `security.md`'s "missing or stale evidence fails closed" is enforced by `ConnectorHealth::permits_calls_at(now, bound)`, whose own module doc calls it *"the method a caller should use"* and says calling `permits_calls` on an unfresh state *"is the defect this exists to prevent"* — and `diagnostics_for` derived the health state's severity from **`permits_calls()`** alone, so a `Connected` observation from yesterday was reported as `connected` at `Info` (the severity that means *nothing to do here*) about a state that permits **no call**. Worse, the report carried `HealthObservedAt` and **neither** the bound **nor** *now*, so the contradiction was not merely unreported but **unseeable** from the report — the `HealthObservedAt` value had a producer and no reader that could act on it. Fixed by adding `DiagnosticField::HealthStale` (emitted only when true, the `MissingScopes` rule) and taking `now` + `freshness_seconds` as parameters, with the severity derived from `permits_calls_at`. Staleness and unusability are kept as **independent** findings — a fresh `NeedsReauth` is an error and *not* stale. **A mutant survived the first version** (`stale = !permits_calls_at(..)` passed the whole suite, because every fixture was `Connected`, where the two predicates agree), so a second test with a state that refuses **and** is fresh was added. Three guards falsified A-B-A. Implement these as `DiagnosticField::HealthStale` + `diagnostics_for`, `ADR-0118`. |
 
 **No Google API was called, no credentials were used, no Cloud project was created, and no live test was run.**
+
+## Sign-in as built (`ADR-0149`, 2026-10-09)
+
+Verified again against the live native-app page on 2026-10-09 (the structure and parameter list match the record above):
+
+- **The owner brings the OAuth client.** A Desktop-app client belongs to a Google Cloud project, and JARVIS cannot ship a shared one (it would be
+  a distributed secret, and the Gmail scopes are restricted, which needs Google's verification and a security assessment for a public app). So the
+  owner creates one in their own project; the client id is a setting and the client secret a key file.
+- **Testing mode ends the sign-in after 7 days.** Verified on https://developers.google.com/identity/protocols/oauth2: a project whose consent screen
+  is External with publishing status "Testing" is issued a refresh token that expires in 7 days (unless only name/email/profile scopes are requested).
+  The setup steps therefore say to **publish** the app; an unverified published app works for the owner, with a warning screen.
+- **Redirect:** `http://127.0.0.1:<daemon port>/oauth/google/callback`. This chooses a path other than the connector crate's registered `/`
+  (`GoogleConnector::registered_redirect`); the native-app page allows a loopback redirect with any port, and Desktop-app clients accept it
+  without registration. **Unresolved Question 7 stays open in one respect:** whether the console would reject a path for a Desktop client was not
+  established by a real sign-in here, only that Google accepted the authorization request's shape (below).
+- **Authorization request:** `response_type=code`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`,
+  `scope=<gmail.readonly calendar.readonly>`, and `prompt=consent` so a repeat sign-in returns a refresh token.
+- **Code exchange** (form POST to the token endpoint): `grant_type=authorization_code`, `code`, `client_id`, `client_secret`, `code_verifier`,
+  `redirect_uri`. The secret is sent because a Desktop client is issued one, even though the page lists it as optional.
+- **Refresh:** `grant_type=refresh_token`, `refresh_token`, `client_id`, `client_secret`; an `invalid_grant` answer means the grant is gone (revoked,
+  or expired in Testing mode), so the stored sign-in is deleted and the owner is told to sign in again.
+- **Profile:** `GET https://gmail.googleapis.com/gmail/v1/users/me/profile` gives the mailbox address shown in Settings.
+- **Reads:** `GET .../gmail/v1/users/me/messages?q&maxResults`, `.../messages/{id}?format=metadata|full`, and
+  `GET https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin&timeMax&singleEvents=true&orderBy=startTime&maxResults`.
+- **Live evidence:** a deliberately fake client id was sent to Google's real authorization endpoint with the exact URL JARVIS builds; Google answered
+  `Error 401: invalid_client, The OAuth client was not found` (so the request was parsed and only the client was refused). **Not verified:** a real
+  sign-in, the token exchange against Google, and the Gmail and Calendar reads, which need the owner's own client and account.

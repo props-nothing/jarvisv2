@@ -84,6 +84,8 @@ pub struct GatewayState {
     speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
     /// Where the profile's configuration is, for the Settings routes (`P9-015`). `None` in a bare transport test.
     settings: Option<crate::settings_service::SettingsContext>,
+    /// The Google sign-in, when settings are available (ADR-0149).
+    google: Option<Arc<crate::google_account::GoogleAccount>>,
 }
 
 impl GatewayState {
@@ -101,6 +103,7 @@ impl GatewayState {
             tools: None,
             speech: None,
             settings: None,
+            google: None,
         }
     }
 
@@ -130,6 +133,19 @@ impl GatewayState {
     pub fn with_settings(mut self, settings: crate::settings_service::SettingsContext) -> Self {
         self.settings = Some(settings);
         self
+    }
+
+    /// Attaches the Google account, which turns the Google routes on.
+    #[must_use]
+    pub fn with_google(mut self, google: Arc<crate::google_account::GoogleAccount>) -> Self {
+        self.google = Some(google);
+        self
+    }
+
+    /// Returns the Google account, when Google sign-in is available.
+    #[must_use]
+    pub fn google(&self) -> Option<&Arc<crate::google_account::GoogleAccount>> {
+        self.google.as_ref()
     }
 
     /// Returns the settings context, when the profile location is known.
@@ -342,7 +358,9 @@ pub fn router(state: GatewayState) -> Router {
         .route("/skills/{id}", get(read_skill).delete(forget_skill))
         .route("/skills/{id}/promote", post(promote_skill))
         .route("/skills/{id}/disable", post(disable_skill))
-        .route("/skills/{id}/enable", post(enable_skill));
+        .route("/skills/{id}/enable", post(enable_skill))
+        .merge(crate::google_service::routes())
+        .merge(crate::project_service::routes());
 
     Router::new()
         // The heads-up display's two static assets: no data, no secret, served without the credential
@@ -351,7 +369,12 @@ pub fn router(state: GatewayState) -> Router {
         .route(crate::hud::ALIAS_PATH, get(crate::hud::page))
         .route(crate::hud::SCRIPT_PATH, get(crate::hud::script))
         .route(crate::hud::HEAD_PATH, get(crate::hud::head))
+        .route(crate::hud::MISSION_PATH, get(crate::hud::mission))
         .route(crate::hud::STYLE_PATH, get(crate::hud::style))
+        .route(
+            crate::google_account::CALLBACK_PATH,
+            get(crate::google_service::callback),
+        )
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .nest("/api/v1", api)
@@ -364,6 +387,10 @@ pub fn router(state: GatewayState) -> Router {
 async fn authenticate(State(state): State<GatewayState>, request: Request, next: Next) -> Response {
     // The two static display assets carry nothing to protect; the data they show is fetched with the credential.
     if crate::hud::is_public_asset(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+    // The browser's return from Google carries no credential; it is inert unless it answers a sign-in started with one.
+    if crate::google_service::is_oauth_callback(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
     let Some(presented) = bearer_token(request.headers()) else {
@@ -2598,6 +2625,87 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// **Google's return address is public, inert without a matching sign-in, and nothing else became public with it.**
+    ///
+    /// The browser redirect from Google cannot carry the bearer credential, so that one `GET` path skips it; the rest of the Google
+    /// routes still need it, a `POST` to the same path and a sibling path are still refused, and an answer that does not belong to a
+    /// sign-in started here is refused with a page of fixed words and connects nobody.
+    #[tokio::test]
+    async fn the_google_callback_is_public_but_inert_and_the_rest_is_not() {
+        let (_router, _presented, profile, paths) = test_router_with_settings().await;
+        let database = Arc::new(
+            jarvis_storage::SqliteDatabase::open(&profile.database_path())
+                .await
+                .unwrap_or_else(|error| panic!("open fixture database: {error}")),
+        );
+        let credential = ClientCredential::generate().unwrap_or_else(|error| panic!("{error}"));
+        let presented = credential.expose().to_owned();
+        let google = crate::google_account::GoogleAccount::new(paths.clone())
+            .unwrap_or_else(|error| panic!("{error}"));
+        let state = GatewayState::new(database, credential)
+            .with_settings(crate::settings_service::SettingsContext::new(
+                paths.clone(),
+                None,
+            ))
+            .with_google(Arc::new(google));
+        let app = router(state);
+        let call = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                app.oneshot(request)
+                    .await
+                    .unwrap_or_else(|error| panic!("router call: {error}"))
+            }
+        };
+
+        // The data routes need the credential.
+        assert_eq!(
+            call(get_request("/api/v1/google", None)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let status = call(get_request("/api/v1/google", Some(&presented))).await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert!(body_text(status).await.contains("\"connected\":false"));
+        let connect = call(post_json("/api/v1/google/connect", &presented, "")).await;
+        assert_eq!(
+            connect.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no client id is configured, so no sign-in starts"
+        );
+
+        // The callback is reachable with no credential, and with no sign-in pending it refuses and says so in fixed words.
+        let answer = call(get_request(
+            "/oauth/google/callback?code=forged&state=forged",
+            None,
+        ))
+        .await;
+        assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+        let page = body_text(answer).await;
+        assert!(page.contains("Google was not connected"), "{page}");
+        assert!(
+            !page.contains("forged"),
+            "nothing from the request is echoed into the page: {page}"
+        );
+        assert!(
+            !paths.config().join("google.token").exists(),
+            "nothing was stored"
+        );
+
+        // Nothing else became public with it.
+        let post = Request::builder()
+            .uri("/oauth/google/callback")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(call(post).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(get_request("/oauth/google/other", None))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     /// **The display's two static assets are public, and nothing else became public with them.**
     ///
     /// Asserted from both sides: the page and script are served with no credential, carry a content-security
@@ -2606,7 +2714,14 @@ mod tests {
     #[tokio::test]
     async fn the_display_assets_are_public_and_nothing_else_is() {
         let (app, presented, _profile) = test_router().await;
-        for path in ["/", "/hud", "/hud.js", "/head.js", "/hud.css"] {
+        for path in [
+            "/",
+            "/hud",
+            "/hud.js",
+            "/head.js",
+            "/mission.js",
+            "/hud.css",
+        ] {
             let response = app
                 .clone()
                 .oneshot(get_request(path, None))

@@ -62,6 +62,9 @@ pub const WRITE_TOOL: &str = "jarvis.files.write";
 /// The tool that replaces one exact piece of text in an existing file.
 pub const EDIT_TOOL: &str = "jarvis.files.edit";
 
+/// The tool that searches the text of the files under a folder.
+pub const SEARCH_TOOL: &str = "jarvis.files.search";
+
 /// The most characters one write or one replacement may carry.
 ///
 /// A held call keeps its arguments so the owner can see them (`ADR-0130`), and a pending approval holds at most
@@ -187,6 +190,33 @@ const EDIT_INPUT_SCHEMA: &str = r#"{
   }
 }"#;
 
+/// The input schema of `jarvis.files.search`.
+const SEARCH_INPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pattern"],
+  "properties": {
+    "pattern": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The text to look for, matched literally and ignoring case, within one line." },
+    "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "The folder to search, relative to a granted workspace root. Default: the root itself." },
+    "glob": { "type": "string", "minLength": 1, "maxLength": 100, "description": "Only search files whose NAME matches, for example *.ts or test_*.py (* and ? only)." },
+    "max_results": { "type": "integer", "minimum": 1, "maximum": 100, "description": "How many matching lines to return at most. Default 40." }
+  }
+}"#;
+
+/// The output schema of `jarvis.files.search`.
+const SEARCH_OUTPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["matches", "files_searched", "truncated"],
+  "properties": {
+    "matches": { "type": "array", "items": { "type": "object" } },
+    "files_searched": { "type": "integer" },
+    "truncated": { "type": "boolean", "description": "True when the search stopped at a bound before it finished." }
+  }
+}"#;
+
 /// The output schema of the two write tools.
 const WRITE_OUTPUT_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -236,6 +266,7 @@ impl FilesystemTool {
             Self::definition(LIST_TOOL)?,
             Self::definition(WRITE_TOOL)?,
             Self::definition(EDIT_TOOL)?,
+            Self::definition(SEARCH_TOOL)?,
         ])
     }
 
@@ -257,6 +288,8 @@ impl FilesystemTool {
     ///   the owner granted.
     /// - `edit`: `write`, risk 2, so it **asks by default**: it changes content that already exists. An owner who
     ///   trusts it (`ADR-0133`) is not asked.
+    // One table of constants, one entry per tool: splitting it would only scatter what is meant to be read together.
+    #[allow(clippy::too_many_lines)]
     pub fn definition(tool: &str) -> Result<ToolDefinition, FilesystemToolError> {
         struct Spec {
             id: &'static str,
@@ -318,6 +351,20 @@ impl FilesystemTool {
                 risk: 2,
                 scope: "files.write",
                 reads: false,
+            },
+            SEARCH_TOOL => Spec {
+                id: SEARCH_TOOL,
+                title: "Search the files",
+                description: "Finds lines containing some text in the files under a folder inside a granted workspace root, and \
+                              returns the file, line number and line. Literal and case-insensitive. Use it to find where \
+                              something is defined or used before reading or editing, instead of opening files one by one. \
+                              Skips binary files, large files and folders like .git, node_modules and target.",
+                input: SEARCH_INPUT_SCHEMA,
+                output: SEARCH_OUTPUT_SCHEMA,
+                effect: ToolEffect::ReadOnly,
+                risk: 0,
+                scope: "files.read",
+                reads: true,
             },
             other => {
                 return Err(FilesystemToolError::UnknownTool {
@@ -420,6 +467,7 @@ impl ToolExecutor for FilesystemTool {
             LIST_TOOL => Operation::List,
             WRITE_TOOL => Operation::Write,
             EDIT_TOOL => Operation::Edit,
+            SEARCH_TOOL => Operation::Search,
             other => {
                 return Err(AdapterError::NotImplemented {
                     tool: other.to_owned(),
@@ -436,6 +484,12 @@ impl ToolExecutor for FilesystemTool {
             });
         }
 
+        if matches!(operation, Operation::Search) {
+            return match self.search_bounded(request) {
+                Ok(result) => result,
+                Err(error) => refuse(&describe_io_error(&error)),
+            };
+        }
         let path = path_argument(request)?;
         // Both calls are synchronous and blocking, run on the calling thread. `tokio`'s `fs` feature
         // is not enabled for this crate, and a read of a granted local file is not the long operation
@@ -446,6 +500,9 @@ impl ToolExecutor for FilesystemTool {
             Operation::Read => self.read_bounded(&path),
             Operation::Write => self.write_bounded(request, &path),
             Operation::Edit => self.edit_bounded(request, &path),
+            Operation::Search => {
+                unreachable!("a search is handled before the path argument is read")
+            }
         };
         match outcome {
             Ok(result) => result,
@@ -461,6 +518,7 @@ enum Operation {
     List,
     Write,
     Edit,
+    Search,
 }
 
 impl FilesystemTool {
@@ -608,6 +666,197 @@ impl FilesystemTool {
     }
 }
 
+/// Folders a search never enters: version control, dependencies and build output are large, generated and never what is meant.
+const SEARCH_SKIPPED_DIRECTORIES: [&str; 10] = [
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    ".next",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+];
+/// Files visited, bytes read, per-file size and wall time are bounded so one search cannot run away on a large tree.
+const SEARCH_MAX_FILES: usize = 5000;
+const SEARCH_MAX_FILE_BYTES: u64 = 256 * 1024;
+const SEARCH_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const SEARCH_MAX_SECONDS: u64 = 10;
+const SEARCH_DEFAULT_RESULTS: u64 = 40;
+const SEARCH_MAX_RESULTS: u64 = 100;
+const SEARCH_LINE_CHARS: usize = 200;
+/// Stays under the 32 KiB output bound with room for the envelope.
+const SEARCH_MAX_OUTPUT_BYTES: usize = 28 * 1024;
+
+/// Whether a file name matches a glob of `*` (any run) and `?` (one character), ignoring case.
+fn glob_matches(glob: &str, name: &str) -> bool {
+    let glob: Vec<char> = glob.to_lowercase().chars().collect();
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut g, mut n) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while n < name.len() {
+        if g < glob.len() && (glob[g] == '?' || glob[g] == name[n]) {
+            g += 1;
+            n += 1;
+        } else if g < glob.len() && glob[g] == '*' {
+            star = Some(g);
+            mark = n;
+            g += 1;
+        } else if let Some(position) = star {
+            g = position + 1;
+            mark += 1;
+            n = mark;
+        } else {
+            return false;
+        }
+    }
+    glob[g..].iter().all(|character| *character == '*')
+}
+
+/// One line, cut to a readable length.
+fn clip_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= SEARCH_LINE_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut cut: String = trimmed.chars().take(SEARCH_LINE_CHARS - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+/// The pattern (lowercased), folder, optional glob and result limit of a search call, or why it is refused before touching a file.
+fn search_arguments(
+    request: &ToolExecutionRequest,
+) -> Result<(String, PathBuf, Option<String>, usize), AdapterError> {
+    let pattern = text_argument(request, "pattern", 200, false)?.to_lowercase();
+    let start = match request.arguments().get("path") {
+        None => PathBuf::from("."),
+        Some(_) => path_argument(request)?,
+    };
+    let glob = match request.arguments().get("glob") {
+        None => None,
+        Some(_) => Some(text_argument(request, "glob", 100, false)?),
+    };
+    let limit = usize::try_from(
+        request
+            .arguments()
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(SEARCH_DEFAULT_RESULTS)
+            .clamp(1, SEARCH_MAX_RESULTS),
+    )
+    .unwrap_or(40);
+    Ok((pattern, start, glob, limit))
+}
+impl FilesystemTool {
+    /// Finds lines containing a literal, case-insensitively, in the text files under a folder.
+    ///
+    /// Every directory listing and file read goes through the roots' handles, so a link out of the granted folder is an error and
+    /// never followed. The walk is depth-first in sorted order, so the same tree gives the same answer, and it stops at a bound
+    /// (files, bytes, time, matches, output size) with `truncated` set, because an answer that is silently partial would read as
+    /// "nothing else matches".
+    fn search_bounded(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<Result<ToolCallResult, AdapterError>, std::io::Error> {
+        let (pattern, start, glob, limit) = match search_arguments(request) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(Err(error)),
+        };
+        let began = std::time::Instant::now();
+        let mut stack = vec![start.clone()];
+        let (mut files, mut bytes, mut output_bytes) = (0_usize, 0_u64, 0_usize);
+        let mut matches: Vec<Value> = Vec::new();
+        let mut truncated = false;
+        let mut resolved_root: Option<PathBuf> = None;
+        'walk: while let Some(directory) = stack.pop() {
+            let (names, root) = self.roots.read_directory(&directory)?;
+            resolved_root.get_or_insert_with(|| root.to_path_buf());
+            // Pushed in reverse so the sorted first entry is visited first.
+            let mut subdirectories = Vec::new();
+            for name in names {
+                let child = if directory == Path::new(".") {
+                    PathBuf::from(&name)
+                } else {
+                    directory.join(&name)
+                };
+                let Ok((is_directory, length)) = self.roots.entry_kind(&child) else {
+                    continue;
+                };
+                if is_directory {
+                    if !SEARCH_SKIPPED_DIRECTORIES.contains(&name.as_str()) {
+                        subdirectories.push(child);
+                    }
+                    continue;
+                }
+                if glob
+                    .as_deref()
+                    .is_some_and(|glob| !glob_matches(glob, &name))
+                    || length > SEARCH_MAX_FILE_BYTES
+                {
+                    continue;
+                }
+                if files >= SEARCH_MAX_FILES
+                    || bytes >= SEARCH_MAX_TOTAL_BYTES
+                    || began.elapsed().as_secs() >= SEARCH_MAX_SECONDS
+                {
+                    truncated = true;
+                    break 'walk;
+                }
+                let Ok((file, _)) = self.roots.open_file(&child) else {
+                    continue;
+                };
+                let mut buffer = Vec::new();
+                if file
+                    .take(SEARCH_MAX_FILE_BYTES)
+                    .read_to_end(&mut buffer)
+                    .is_err()
+                {
+                    continue;
+                }
+                files += 1;
+                bytes += buffer.len() as u64;
+                // A NUL early on is the mark of a binary file; a file that is not UTF-8 text is not searched.
+                if buffer.iter().take(1024).any(|byte| *byte == 0) {
+                    continue;
+                }
+                let Ok(text) = String::from_utf8(buffer) else {
+                    continue;
+                };
+                for (index, line) in text.lines().enumerate() {
+                    if !line.to_lowercase().contains(&pattern) {
+                        continue;
+                    }
+                    let entry = json!({
+                        "path": child.to_string_lossy().replace('\\', "/"),
+                        "line": index + 1,
+                        "text": clip_line(line),
+                    });
+                    output_bytes += entry.to_string().len() + 1;
+                    if matches.len() >= limit || output_bytes > SEARCH_MAX_OUTPUT_BYTES {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    matches.push(entry);
+                }
+            }
+            stack.extend(subdirectories.into_iter().rev());
+        }
+        let text = serde_json::to_string(&json!({
+            "matches": matches,
+            "files_searched": files,
+            "truncated": truncated,
+        }))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        let root = resolved_root.unwrap_or_default();
+        Ok(confirm(
+            &locator("search", &start, &root),
+            BoundedOutput::from_bounded(text, truncated),
+        ))
+    }
+}
 /// Replaces `find` by `replace` when it occurs exactly once, and says why when it does not.
 ///
 /// A file with Windows line endings is matched by a `find` written with plain newlines (and the replacement is
@@ -1041,6 +1290,142 @@ mod tests {
         );
     }
 
+    fn search(executor: &FilesystemTool, arguments: Value) -> Value {
+        let result = run(executor, SEARCH_TOOL, arguments)
+            .unwrap_or_else(|error| panic!("search must complete: {error}"));
+        assert_eq!(result.outcome(), ToolOutcome::Confirmed);
+        let output = result
+            .output()
+            .unwrap_or_else(|| panic!("a search must return output"));
+        serde_json::from_str(output.content())
+            .unwrap_or_else(|error| panic!("the search must be JSON: {error}"))
+    }
+
+    /// **A search finds lines in nested files, ignoring case, with paths and line numbers, in a stable order.**
+    #[test]
+    fn a_search_finds_matching_lines_across_the_tree() {
+        let directory = TestDirectory::new();
+        let root = directory.make_dir("root");
+        directory.write("root/src/main.rs", "fn main() {\n    run_server();\n}\n");
+        directory.write(
+            "root/src/lib.rs",
+            "pub fn run_server() {}\n// RUN_SERVER again\n",
+        );
+        directory.write("root/notes.md", "nothing here\n");
+        let executor = adapter(&root);
+
+        let found = search(&executor, json!({ "pattern": "Run_Server" }));
+        let lines: Vec<(String, u64)> = found["matches"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{found}"))
+            .iter()
+            .map(|entry| {
+                (
+                    entry["path"].as_str().unwrap_or_default().to_owned(),
+                    entry["line"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("src/lib.rs".to_owned(), 1),
+                ("src/lib.rs".to_owned(), 2),
+                ("src/main.rs".to_owned(), 2)
+            ]
+        );
+        assert_eq!(found["files_searched"], 3);
+        assert_eq!(found["truncated"], false);
+
+        let only_markdown = search(&executor, json!({ "pattern": "here", "glob": "*.MD" }));
+        assert_eq!(only_markdown["matches"].as_array().map(Vec::len), Some(1));
+        let in_folder = search(&executor, json!({ "pattern": "fn", "path": "src" }));
+        assert_eq!(in_folder["matches"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// **Generated folders, binary files and big files are not searched, and the match limit says it cut the answer.**
+    #[test]
+    fn a_search_skips_what_is_never_meant_and_says_when_it_stopped() {
+        let directory = TestDirectory::new();
+        let root = directory.make_dir("root");
+        directory.write("root/node_modules/dep/index.js", "needle\n");
+        directory.write("root/.git/config", "needle\n");
+        directory.write("root/target/out.txt", "needle\n");
+        directory.write(
+            "root/big.txt",
+            &format!("needle\n{}", "x".repeat(300 * 1024)),
+        );
+        let binary = root.join("data.bin");
+        fs::write(&binary, b"\0\0needle\0").unwrap_or_else(|error| panic!("{error}"));
+        for index in 0..60 {
+            directory.write(&format!("root/src/f{index:02}.txt"), "needle here\n");
+        }
+        let executor = adapter(&root);
+
+        let found = search(&executor, json!({ "pattern": "needle", "max_results": 10 }));
+        let paths: Vec<&str> = found["matches"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{found}"))
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect();
+        assert_eq!(paths.len(), 10);
+        assert!(
+            paths.iter().all(|path| path.starts_with("src/")),
+            "{paths:?}"
+        );
+        assert_eq!(
+            found["truncated"], true,
+            "stopping at the limit is stated, not silent"
+        );
+    }
+
+    /// **The falsification: a search never follows a link out of the granted folder.**
+    ///
+    /// A directory link inside the root points at a folder outside it that holds the word searched for. The walk goes through the
+    /// roots' handles, so the link is an error and is skipped; if it were followed the outside file would appear in the answer.
+    #[test]
+    fn a_search_does_not_follow_a_link_out_of_the_root() {
+        let directory = TestDirectory::new();
+        let root = directory.make_dir("root");
+        let outside = directory.make_dir("outside");
+        directory.write("outside/secret.txt", "needle outside the root\n");
+        directory.write("root/inside.txt", "needle inside the root\n");
+        link_directory(&outside, &root.join("escape"));
+        let executor = adapter(&root);
+
+        let found = search(&executor, json!({ "pattern": "needle" }));
+        let text = found.to_string();
+        assert!(text.contains("inside.txt"), "{text}");
+        assert!(
+            !text.contains("outside the root") && !text.contains("secret.txt"),
+            "a link out of the root was followed: {text}"
+        );
+    }
+
+    #[test]
+    fn a_search_refuses_bad_arguments_and_matches_globs_like_a_shell() {
+        let directory = TestDirectory::new();
+        let root = directory.make_dir("root");
+        let executor = adapter(&root);
+        for arguments in [
+            json!({}),
+            json!({ "pattern": "" }),
+            json!({ "pattern": "x", "path": "../outside" }),
+        ] {
+            let result = run(&executor, SEARCH_TOOL, arguments.clone());
+            let refused = result.as_ref().is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|result| result.outcome() != ToolOutcome::Confirmed);
+            assert!(refused, "{arguments}: {result:?}");
+        }
+        assert!(glob_matches("*.rs", "Main.RS"));
+        assert!(glob_matches("test_?.py", "test_1.py"));
+        assert!(glob_matches("*", "anything"));
+        assert!(!glob_matches("*.rs", "main.rsx"));
+        assert!(!glob_matches("a*b", "acd"));
+    }
     /// A listing returns sorted entry names as JSON and confirms.
     #[test]
     fn a_listing_returns_sorted_entries() {
@@ -1542,11 +1927,11 @@ mod tests {
     fn both_definitions_are_accepted_and_declare_a_read() {
         let definitions = FilesystemTool::definitions()
             .unwrap_or_else(|error| panic!("both definitions must be accepted: {error}"));
-        assert_eq!(definitions.len(), 4);
+        assert_eq!(definitions.len(), 5);
 
         for definition in definitions
             .iter()
-            .filter(|d| [READ_TOOL, LIST_TOOL].contains(&d.id().to_string().as_str()))
+            .filter(|d| [READ_TOOL, LIST_TOOL, SEARCH_TOOL].contains(&d.id().to_string().as_str()))
         {
             assert_eq!(
                 definition.effects(),

@@ -197,6 +197,26 @@ impl WorkspaceRoots {
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no workspace root")))
     }
 
+    /// Whether a path beneath the first root that can resolve it is a directory, and its size in bytes.
+    ///
+    /// Resolved through the root's handle like every other call, so a link out of the root is an error here and never a
+    /// directory or a file that is silently followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] when no root could resolve the path.
+    pub fn entry_kind(&self, relative: &Path) -> Result<(bool, u64), io::Error> {
+        let mut last_error: Option<io::Error> = None;
+        for root in &self.roots {
+            match root.handle.metadata(relative) {
+                Ok(metadata) => return Ok((metadata.is_dir(), metadata.len())),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no workspace root")))
+    }
+
     /// Reads a directory's entries beneath the first root that can resolve it.
     ///
     /// Returns the entries sorted by name and the label of the resolving root. The entries are

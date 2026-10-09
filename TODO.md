@@ -7120,17 +7120,21 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   resumed with no memory of its steps, approved `npm run build` about fourteen times and ended empty; and an identical approved call was refused as
   a repeat. Migration 0015 makes the repeat guard apply only to pending/denied approvals; migration 0016 stores the run's own turns while it
   waits and puts them back on resume, with "not run" results for calls after the held one. Tests: a three-call turn resumes with a result for
-  every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.- [x] `P9-033` One executable (ADR-0144). `jarvis daemon` runs the daemon (`jarvisd` is now a library plus a thin wrapper binary); `jarvis start`
+  every call, trimming keeps whole turns, a storage round trip. **Live:** with an injected type error the run built, fixed and rebuilt, and answered.
+- [x] `P9-033` One executable (ADR-0144). `jarvis daemon` runs the daemon (`jarvisd` is now a library plus a thin wrapper binary); `jarvis start`
   and the login service launch the `jarvis` file itself, and release archives, `jarvis path install` and the smoke test carry just `jarvis`.
-  Tests: every service definition launches `<exe> daemon`; the PATH links are one file unless an old `jarvisd` is beside it. Live: see below.- [x] `P9-034` The daemon is ready only when it listens. CI on macOS failed intermittently (phase 3 in run 132, phase 2 in run 133) with "error sending
+  Tests: every service definition launches `<exe> daemon`; the PATH links are one file unless an old `jarvisd` is beside it. Live: see below.
+- [x] `P9-034` The daemon is ready only when it listens. CI on macOS failed intermittently (phase 3 in run 132, phase 2 in run 133) with "error sending
   request" to a freshly started daemon: the gates wait for the lifecycle row `ready`, and the daemon wrote it (and set the health state, and
   logged "daemon ready") **before** it bound the HTTP port, so a client that trusted it could connect to nothing. `declare_ready` now runs after every
   listener is bound. This is a real fault, not a test one: `jarvis status` and a service manager read the same state. All 56 test binaries pass on
-  Windows; macOS is confirmed only by the next CI run.- [x] `P9-035` JARVIS knows the date and time. A model has no clock, so "what day is it" or "remind me tomorrow at nine" was a guess. Every run's
+  Windows; macOS is confirmed only by the next CI run.
+- [x] `P9-035` JARVIS knows the date and time. A model has no clock, so "what day is it" or "remind me tomorrow at nine" was a guess. Every run's
   system message now ends with the current weekday, date and local time with its UTC offset, plus the UTC instant (`clock.rs`). The offset is read
   once at startup, before the async runtime has threads (the `time` crate only does it soundly then), so a daemon that stays up across a daylight-saving
   change keeps the old offset until restarted; the UTC time is always right. Tests: the date follows the offset across midnight, negative and unknown
-  offsets are stated honestly, a first turn carries the clock. **Live:** "what day and time is it" answered correctly (Friday 9 October 2026, 18:04, UTC+02:00).- [x] `P9-036` A tool's permission changes at once, and the approval card says "Always allow" (ADR-0145). Saving a tool's posture used to need a restart,
+  offsets are stated honestly, a first turn carries the clock. **Live:** "what day and time is it" answered correctly (Friday 9 October 2026, 18:04, UTC+02:00).
+- [x] `P9-036` A tool's permission changes at once, and the approval card says "Always allow" (ADR-0145). Saving a tool's posture used to need a restart,
   so "stop asking me for `npm run build`" meant leaving the conversation. The pipeline now holds the policy as a replaceable snapshot, the settings
   handler rebuilds it from the saved file with the daemon's own function and swaps it (`applied: true`); a file it cannot compose leaves the running
   policy untouched. Test: on one running pipeline a call asks, then (trusted) runs, then (off) is refused, each on the very next call. **Live** through
@@ -7138,24 +7142,69 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
 - [x] `P9-037` Scheduling from conversation (ADR-0145): `jarvis.schedule.add|list|remove` over the existing scheduler and its validation. Adding and removing
   ask (a schedule persists beyond the chat); listing is free; objectives read back are fenced. Tests on a real database: add/list/remove, and six bad inputs
   (both cadences, neither, past time, unparseable time, too-short interval, blank objective) each refused and creating nothing. **Live:** "remind me in
-  2 hours" asked, was approved, scheduled for the right UTC time (from the clock, `P9-035`), and was listed back.- [x] `P9-038` Scheduled work reports back in the console. A reminder or recurring check was only readable afterwards in `jarvis runs`. The console now watches
+  2 hours" asked, was approved, scheduled for the right UTC time (from the clock, `P9-035`), and was listed back.
+- [x] `P9-038` Scheduled work reports back in the console. A reminder or recurring check was only readable afterwards in `jarvis runs`. The console now watches
   the schedules it already polls: when one fires and that run finishes, the answer is put in the conversation ("Scheduled: ..." then the answer) and, with
   spoken answers on, said aloud; anything already fired when the page opened is not announced again. **Live** (browser): a one-off task scheduled 75 seconds
   ahead appeared in the open console when it ran. (The first attempt polled a wrong URL and showed nothing; the page's own error log showed the 405, which is
-  why this was verified in a real browser.) Not done: a notification when no console is open (needs the desktop shell, `P9-019`).- [x] `P9-039` A coding task now runs end to end, and its narration reads as paragraphs. Dogfood: "build a dependency-free Node todo CLI with `node:test` tests, run
+  why this was verified in a real browser.) Not done: a notification when no console is open (needs the desktop shell, `P9-019`).
+- [x] `P9-039` A coding task now runs end to end, and its narration reads as paragraphs. Dogfood: "build a dependency-free Node todo CLI with `node:test` tests, run
   them and fix failures" completed in about two minutes with 10 passing tests and no help (the command tool was trusted, `P9-031`, `P9-036`). It showed one
   defect: the narrated stages ran together ("...run the test suite.App and tests are written") because each model call's text was streamed with nothing between
   them. A call after one that already spoke now starts its streamed text with a paragraph break (the settled answer is unchanged, and a resumed run counts as
-  having spoken). Test: the stream of a tool turn plus an answer is `first.\n\nsecond`. **Live:** the same kind of task now prints each stage on its own line.- [x] `P9-040` A default reasoning effort (ADR-0146): `daemon.executor_reasoning_effort` none/low/medium/high, applied in the model adapter when a request does not choose
+  having spoken). Test: the stream of a tool turn plus an answer is `first.\n\nsecond`. **Live:** the same kind of task now prints each stage on its own line.
+- [x] `P9-040` A default reasoning effort (ADR-0146): `daemon.executor_reasoning_effort` none/low/medium/high, applied in the model adapter when a request does not choose
   its own (the loop's drop to `low` after an overrun still wins); refused without a live model or with an unknown word. Tests: the four words and both refusals;
   the adapter sends the default, and a request's own choice wins. **Live:** `jarvis config set` accepted `low`, refused `maximum`; a question answered in 1.5 s with it set.
 - [x] `P9-041` Desktop notifications for scheduled results (ADR-0146): on unless `notifications = off`; shown only when no console polled in the last 15 s; text passed
   apart from the script on every platform (tested with hostile text), Windows script single-quote-only. **Live:** a scheduled task with no console open logged and
   showed a notification; the exact toast script was run by hand and shown. macOS/Linux: command construction only.
-- [x] `P9-042` Web search (ADR-0146), contract-tested, success path **not verified live**: `jarvis.web.search` over Ollama's documented endpoint, opt-in by `jarvis keys set search`;
+- [x] `P9-042` Web search (ADR-0146), **verified live with the owner's key (2026-10-09)**: `jarvis.web.search` over Ollama's documented endpoint, opt-in by `jarvis keys set search`;
   research recorded in `docs/research/integrations/ollama-web-search.md` (the local Ollama server does not serve the endpoint, 404). Tests: documented request and fenced results,
   401/429/500/unreachable, malformed reply, long results, bad arguments, key never in `Debug`, composition skips a missing or malformed key. **Live:** with an invalid key the real
-  service refused it and the assistant said so and fell back to a page fetch. **Needs from the owner:** an Ollama API key to run the positive path (`jarvis keys test search`).- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
+  service refused it and the assistant said so and fell back to a page fetch. **Positive path (owner's key):** `jarvis keys test search` accepted; a run for the current Node.js LTS used the tool and answered; the real reply is `results[{title,url,content}]`, with very long `content` (40 KB seen) that the adapter clips.
+- [x] `P9-043` `jarvis install` / `jarvis uninstall` (ADR-0147): one command puts the single executable in a per-user folder, on the PATH, optionally starting at login; atomic replace;
+  relative `--dir` refused; the profile is never touched. Tests: the folder choice, replace-and-no-leftovers (and executable bit on Unix), a missing source, a relative dir. **Live:**
+  install into a scratch folder, replace, "already installed", uninstall. `--service` and macOS/Linux are not run here.
+- [x] `P9-044` `jarvis.memory.search` (ADR-0147): the model looks up what is remembered, by words that must all appear; same eligibility gate and fencing as a context; reports how much
+  it looked at. Tests on a real database (match rules, ranking, fencing and introduction, the count when nothing matches, argument limits). **Live:** after a fact was stored, "look up my cat" found it.
+- [x] `P9-045` The search key can be set and removed in the console (Settings, Brain), not only with `jarvis keys`. **Live** in a browser: the row shows, with its help text.
+- [x] `P9-046` `jarvis.files.search` (ADR-0148): find lines containing some text across a granted folder (literal, case-insensitive, optional file-name glob), through the same confinement as read and list,
+  bounded in files/bytes/time/output with `truncated` set when it stops. Tests: nested results in stable order, glob and sub-folder, skipped folders/binary/large files and the match limit,
+  **a link out of the root is not followed** (junction on Windows), bad arguments, glob rules. **Live:** found the right files and lines in a project with a decoy in `node_modules`.
+- [x] `P9-047` Search then fetch works end to end with the owner's key (live): a research question used `jarvis.web.search` then `jarvis.web.fetch` and summarised the real latest Rust release with its source.- [x] `P9-048` Sign in with Google from Settings (ADR-0149): `GoogleAccount` (PKCE via the connector crate, code exchange, refresh, revoke, private token file), routes `/api/v1/google*` and the one public
+  callback, and a Settings, Google tab (client id, client secret, Sign in, Disconnect, status). Tests: the authorization request (S256, state, redirect, exactly the two read scopes), the whole sign-in
+  against a local Google stand-in (the verifier proves the challenge, the secret is sent, only the refresh token is stored), **forged, repeated, cancelled, wrong-path and expired answers store nothing**, a partial
+  grant is refused and revoked, a revoked sign-in is removed, refresh, disconnect; at the gateway the callback is public but inert while the rest is not. **Live:** the tab renders; Google parsed the real authorization URL and
+  refused only the fake client id. **Not verified:** a real sign-in (needs your own OAuth client).
+- [x] `P9-049` `jarvis.gmail.search`, `jarvis.gmail.read`, `jarvis.calendar.events` (ADR-0149): read-only, held for the owner by default, fenced as untrusted, fixed-word failures (401/403/429/5xx, not signed in). Tests with a Google stand-in:
+  fenced search results with an injection-shaped snippet, base64url plain-text decoding from a multipart message, calendar ordering and bad windows, failures never echo the provider. `docs/user/google.md` is the setup guide.
+- [x] `P9-050` Sending mail and creating events (ADR-0150), opt-in: `daemon.google_actions` adds `gmail.send` + `calendar.events` to the sign-in; `jarvis.gmail.send` (external communication, risk 3, always asks, one validated recipient,
+  no header injection) and `jarvis.calendar.create` (asks, no invitees). Tests with a Google stand-in: the exact MIME message, eight injection/recipient shapes refused with nothing sent, no send without the granted scope, event times to UTC
+  and no attendees, the four-scope request and refusal of a partial grant, base64 both alphabets. **Not verified live:** a real send (turn actions on, sign in again; test to your own address only).
+- [x] `P9-051` A stop or restart no longer silently interrupts working tasks (ADR-0150). Found when a restart killed five of the owner's sub-agent runs: `/shutdown` and `/restart` answer 409 with the count unless `?force=true`;
+  `jarvis stop|restart` refuses and leaves the daemon running, `--wait` waits for the tasks, `--force` interrupts; the console offers "Restart anyway". Tests: counted, refused, forced, parked runs not counted, `force=true` parsing.
+  Not run against the live daemon (it had work in flight).
+- [x] `P9-052` Projects (ADR-0151): the owner writes a goal, standing guidance, a working folder and a status once, and every run of the project is told it, with a journal the model keeps. Storage
+  (`0017_projects.sql`, `project_repository`: case-insensitive unique names, relative-folder validation, notes, session/schedule links, cascade delete), routes (`/api/v1/projects`, `project_id` on a
+  run start and a schedule), the scheduler (a paused or done project's task is skipped and counted), `ProjectContext` in the executor (brief as a policy system message, journal fenced as data,
+  sub-agents get the brief only). Tests: storage CRUD/validation/links, routes (auth, bad input, a refused start leaves no run behind, no authority fields), scheduler pause, an injection-shaped note staying out
+  of the policy message.
+- [x] `P9-053` `jarvis.project.note` (ADR-0151): the model's journal tool. No project argument: the project comes from the call, its run and the run's conversation, so a model cannot write elsewhere; cannot claim the
+  `owner` kind; no approval (one line in the owner's own journal). A task scheduled from inside a project, and a sub-agent started from inside one, inherit it. Tests: written to the calling conversation's
+  project, refused outside a project and for an unknown call, owner kind/empty/over-long refused, schedule inheritance.
+- [x] `P9-054` Projects in the CLI and console: `jarvis project add|list|show|set|pause|resume|done|note|remove`, `ask|chat --project`, `schedule add --project`; Ops-page Projects panel, project window with
+  journal, and a project selector beside the conversation title. `docs/user/projects.md`. Verified live on a scratch profile (debug build, local Ollama `glm-5.3:cloud`): the console panel, project window (edit, status, journal entry) and selector, then a console message in the project.
+- [ ] `P9-055` Use projects on the owner's real prospecting work. Done on a scratch profile with a live model: the brief reached the model (it answered in Dutch, named the goal and folder), the model wrote
+  a journal entry through `jarvis.project.note` without an approval, a second conversation continued from that entry, and a paused project's schedule was shown as paused. Still to do: restart the owner's daemon on this
+  build when no run is in flight (their database migrates 16 to 17 with a backup), create the project from their existing sales brief, and attach the six-hourly schedule.
+- [x] `P9-056` Live view of what JARVIS is doing (ADR-0152): tool requests name their target (page, query, task; no URL query or credentials), a finished call reports `ok` and the links it touched (safe `http(s)` only, at most
+  eight), `jarvis_web::links_from_results`; `mission.js` (feed, sources, satellites/beams/effects per kind of work, the face docking right); the console follows scheduled and sub-agent runs too; finished answers list their sources;
+  links in answers are clickable under the same rule. Tests: target/secret stripping, hostile links refused, result classification, executor emits both events, parser, page security tests. Verified live (scratch profile, real model:
+  multi-search research, a sub-agent run started from the CLI and watched from the console).
+- [x] `P9-057` Console UX pass: Ops cards show the live action, scheduled tasks can be paused/resumed/removed and show their project, recent answers expand, tools grouped by family (Ops and Permissions), plain setting labels,
+  scrolling sheets with a fixed footer, dark scrollbars and focus outlines, a tidier chat header, starting points in an empty chat. Fixed a real failure found on the way: search replies over 512 KiB (ordinary) were refused; bound now 8 MiB.
+- [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in
   context), a clock/date tool, scheduling a task from conversation (the scheduler exists, `jarvis schedule`, but only as a command),

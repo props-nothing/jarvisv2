@@ -126,6 +126,17 @@ pre code { background: none; border: none; padding: 0; }
 .sheet { width: min(760px, 100%); background: rgba(4, 14, 26, 0.96); }
 .sheet h3 { margin: 16px 0 6px; font: 600 11px var(--mono); letter-spacing: 0.25em; text-transform: uppercase; color: var(--dim); }
 .sheet p.dim { margin: 0 0 8px; font-size: 12px; }
+#project-note { min-height: 18px; font: 12px var(--mono); letter-spacing: 0.04em; margin-bottom: 4px; }
+#project-note.ok { color: var(--green); } #project-note.bad { color: var(--amber); }
+.set-row textarea { min-width: 0; padding: 6px 9px; color: var(--text); background: rgba(2, 10, 20, 0.75); border: 1px solid var(--line); font: 12px var(--mono); resize: vertical; }
+.set-row textarea:focus, .set-row select:focus { border-color: var(--cyan); outline: 0; }
+#project-body .set-row > input, #project-body .set-row > textarea, #project-body .set-row > select { grid-column: 2 / 4; }
+.set-row select, #project-pick { padding: 5px 8px; color: var(--text); background: rgba(2, 10, 20, 0.85); border: 1px solid var(--line); font: 12px var(--mono); }
+#project-pick { max-width: 11em; padding: 3px 6px; } #project-pick[hidden] { display: none; }
+#project-body .acts button { white-space: nowrap; }
+.jline { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+.jline .jtext { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.jwrite { display: flex; gap: 6px; margin-top: 8px; } .jwrite input { flex: 1; min-width: 0; padding: 6px 9px; color: var(--text); background: rgba(2, 10, 20, 0.75); border: 1px solid var(--line); font: 12px var(--mono); }
 #settings-note { min-height: 18px; font: 12px var(--mono); letter-spacing: 0.04em; margin-bottom: 4px; }
 #settings-note.ok { color: var(--green); } #settings-note.bad { color: var(--amber); }
 .set-row { display: grid; grid-template-columns: 190px 1fr auto; gap: 4px 10px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); }
@@ -158,7 +169,7 @@ pre code { background: none; border: none; padding: 0; }
 #caption.live { color: var(--cyan); } #caption.wait { color: var(--amber); text-shadow: 0 0 12px rgba(255, 180, 84, 0.6); }
 
 /* what needs you stays on the face page, as a tray at the bottom left, so nothing waits out of sight */
-#tray { position: absolute; left: 20px; bottom: 44px; width: min(360px, calc(100% - 40px)); max-height: 60%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+#tray { position: absolute; left: 20px; bottom: 44px; width: min(360px, calc(100% - 40px)); max-height: 42%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
 #tray > div:empty { display: none; }
 #tray .item { padding: 12px 14px 10px; border: 1px solid rgba(255, 180, 84, 0.55); background: rgba(14, 12, 6, 0.82); backdrop-filter: blur(6px); box-shadow: 0 0 22px rgba(255, 180, 84, 0.18); animation: rise 0.25s ease; }
 #tray .item:first-child { border-top: 1px solid rgba(255, 180, 84, 0.55); padding-top: 12px; }
@@ -197,3 +208,83 @@ kbd { font: 11px var(--mono); border: 1px solid var(--line); padding: 0 5px; col
   #main { grid-template-columns: 1fr; } #stage { height: 62vh; } #side { height: 70vh; border-left: 0; border-top: 1px solid var(--line); }
   .opsgrid { grid-template-columns: 1fr; }
 }
+
+/* ---- the live mission view (mission.js): what JARVIS is doing, and where it looked ------------------------------------------ */
+#mission { position: absolute; left: 16px; top: 44px; width: min(330px, 38%); max-height: 54%; display: flex; flex-direction: column; gap: 8px; opacity: 0; transform: translateX(-14px); transition: opacity 0.4s, transform 0.4s; pointer-events: none; z-index: 2; }
+#mission.on { opacity: 1; transform: none; }
+#mission .mhead { display: flex; align-items: center; gap: 8px; font: 600 10px var(--mono); letter-spacing: 0.3em; color: var(--dim); }
+#mission .mhead i { width: 7px; height: 7px; background: var(--dim); transform: rotate(45deg); }
+#mission.busy .mhead { color: var(--cyan); }
+#mission.busy .mhead i { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: blink 1s infinite; }
+#mission .mhead b { margin-left: auto; font-weight: 500; letter-spacing: 0.1em; color: var(--dim); }
+#mfeed { display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+.mrow { --k: 94, 227, 255; display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px 8px 12px; border: 1px solid rgba(var(--k), 0.28); border-left: 3px solid rgb(var(--k)); background: linear-gradient(90deg, rgba(var(--k), 0.12), rgba(3, 12, 22, 0.8) 62%); backdrop-filter: blur(5px); pointer-events: auto; transition: opacity 0.4s, transform 0.4s; box-shadow: 0 0 18px rgba(var(--k), 0.08); }
+.mrow.enter { opacity: 0; transform: translateX(-18px); }
+.mrow.ok, .mrow.bad { opacity: 0.8; }
+.mrow.run { box-shadow: 0 0 22px rgba(var(--k), 0.2); }
+.mico { color: rgb(var(--k)); flex: none; margin-top: 1px; filter: drop-shadow(0 0 4px rgba(var(--k), 0.8)); }
+.mmain { flex: 1; min-width: 0; }
+.mline { display: flex; align-items: center; gap: 8px; font: 600 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: #fff; }
+.mverb { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mtime { font-weight: 400; color: var(--dim); letter-spacing: 0.04em; text-transform: none; }
+.mrow.wait .mtime { color: var(--amber); }
+.mtag { font: 9px var(--mono); padding: 0 5px; border: 1px solid var(--line); color: var(--violet); letter-spacing: 0.1em; }
+.mtarget { margin-top: 2px; font: 12px var(--mono); color: rgba(217, 241, 255, 0.86); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.mtarget[hidden] { display: none; }
+.mrow.bad .mtarget { color: var(--amber); }
+.mstate { width: 14px; height: 14px; flex: none; margin-top: 2px; border-radius: 50%; border: 2px solid rgba(var(--k), 0.25); border-top-color: rgb(var(--k)); animation: spin 0.8s linear infinite; }
+.mrow.ok .mstate { animation: none; border-color: var(--green); background: radial-gradient(circle, var(--green) 0 3px, transparent 4px); }
+.mrow.bad .mstate { animation: none; border-color: var(--red); background: radial-gradient(circle, var(--red) 0 3px, transparent 4px); }
+.mrow.wait .mstate { animation: blink 0.7s infinite; border-color: var(--amber); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.mlinks { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.mlinks:empty { display: none; }
+.mchip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 1px 9px 1px 7px; font: 11px var(--mono); color: var(--text); text-decoration: none; border: 1px solid var(--line-hot); background: rgba(94, 227, 255, 0.08); transition: background 0.15s, border-color 0.15s; }
+.mchip:hover { background: rgba(94, 227, 255, 0.24); color: #fff; border-color: var(--cyan); }
+.mchip i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.mchip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mmore { font: 11px var(--mono); color: var(--dim); align-self: center; }
+#msources { pointer-events: auto; padding: 8px 10px; border: 1px solid var(--line); background: rgba(3, 12, 22, 0.82); backdrop-filter: blur(5px); overflow-y: auto; }
+#msources[hidden] { display: none; }
+.mshead { display: flex; justify-content: space-between; font: 600 10px var(--mono); letter-spacing: 0.3em; color: var(--cyan); margin-bottom: 6px; }
+.mshead b { color: var(--dim); font-weight: 500; }
+#mchips { display: flex; flex-direction: column; gap: 4px; }
+.mchip.big { width: 100%; }
+.asources { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; align-items: center; }
+.alink { color: var(--cyan); text-decoration: underline; text-decoration-color: rgba(94, 227, 255, 0.4); text-underline-offset: 2px; overflow-wrap: anywhere; }
+.alink:hover { color: #fff; }
+@media (max-width: 960px) { #mission { width: calc(100% - 32px); max-height: 40%; } }
+
+/* ---- polish: scrollbars, focus, the chat header, and the long sheets ---------------------------------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: var(--line-hot) transparent; }
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-thumb { background: var(--line-hot); }
+::-webkit-scrollbar-track { background: transparent; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offset: 0; }
+button { white-space: nowrap; }
+#chathead .title { letter-spacing: 0.24em; }
+#chathead #project-pick { flex: 0 1 9.5em; min-width: 0; text-overflow: ellipsis; }
+.overlay { padding: 4vh 16px; }
+.opsboard { display: flex; flex-direction: column; max-height: 92vh; }
+.opsgrid { flex: 1; min-height: 0; overflow-y: auto; padding-right: 4px; }
+#abilities { max-height: none; overflow: visible; }
+.sheet { display: flex; flex-direction: column; max-height: 92vh; }
+#settings-body, #project-body { flex: 1; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.item { transition: background 0.15s; }
+.item.open { background: rgba(94, 227, 255, 0.05); }
+.item[data-open] { cursor: pointer; }
+.item .full { margin-top: 6px; padding: 8px 10px; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.25); font-size: 13px; }
+.item .full p { margin: 0 0 6px; }
+.item .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.glabel { margin: 10px 0 2px; font: 600 10px var(--mono); letter-spacing: 0.24em; text-transform: uppercase; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+.glabel::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.glabel:first-child { margin-top: 0; }
+.gdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.suggest { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 14px; }
+.suggest button { font-size: 12px; padding: 4px 12px; color: var(--cyan); border-color: var(--line-hot); }
+.sched-act { display: flex; gap: 6px; margin-top: 6px; }
+.sched-act button { padding: 1px 10px; font-size: 12px; }
+.live { color: var(--cyan); font: 11px var(--mono); }
+.nowline { margin-top: 5px; font: 12px var(--mono); color: var(--cyan); overflow-wrap: anywhere; }
+.nowline::before { content: "\25B8 "; }

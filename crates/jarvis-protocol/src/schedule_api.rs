@@ -22,6 +22,9 @@ pub struct CreateScheduleRequest {
     /// A single future instant (RFC 3339). Exactly one of `every` and `at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<UtcTimestamp>,
+    /// The project every run of this task belongs to, by identifier or name (ADR-0151).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// One scheduled task.
@@ -38,6 +41,9 @@ pub struct ScheduleReply {
     pub interval_seconds: Option<u64>,
     /// Whether it is active. A paused task, and a one-off that has fired, are not.
     pub enabled: bool,
+    /// The name of the project it belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// When it next fires, present only while it is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<UtcTimestamp>,

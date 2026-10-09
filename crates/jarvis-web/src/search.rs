@@ -39,7 +39,9 @@ const MAX_SNIPPET_CHARS: usize = 500;
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_URL_CHARS: usize = 300;
 /// The reply is read only this far; the documented answer is a handful of snippets.
-const MAX_REPLY_BYTES: usize = 512 * 1024;
+/// The service returns each hit's whole page text, so a reply of several megabytes is ordinary; only a few hundred characters of
+/// each hit reach the model (`MAX_RESULTS_TEXT_CHARS`). The bound only stops a runaway reply.
+const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_SECONDS: u32 = 25;
@@ -295,6 +297,33 @@ fn render(hits: &[Hit]) -> (String, bool) {
         text.push_str(&entry);
     }
     (text, truncated)
+}
+
+/// The (title, url) pairs in a search result's rendered text, for a client that wants to show where the assistant looked.
+///
+/// Reads the format [`render`] writes, which is why it lives beside it: an entry is a title line ("N. title"), the URL on the next
+/// line, then one flattened snippet line. Titles and snippets are flattened to one line, so nothing a page says can start a line of
+/// its own and forge an entry. The URLs are the search service's and are **not** vetted here; a caller that renders them as links
+/// must check the scheme.
+#[must_use]
+pub fn links_from_results(results: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = results.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some((number, title)) = line.split_once(". ") else {
+            continue;
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Some(next) = lines.get(index + 1).map(|text| text.trim()) else {
+            continue;
+        };
+        if next.starts_with("http://") || next.starts_with("https://") {
+            found.push((title.trim().to_owned(), next.to_owned()));
+        }
+    }
+    found
 }
 
 #[async_trait]

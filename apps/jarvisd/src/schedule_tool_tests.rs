@@ -56,6 +56,7 @@ async fn a_task_can_be_scheduled_listed_and_removed() {
 
     let added = tool
         .add(
+            "no-call",
             &json!({ "objective": "Tell me to stretch", "at": in_one_hour(now) }),
             now,
         )
@@ -69,6 +70,7 @@ async fn a_task_can_be_scheduled_listed_and_removed() {
 
     let repeated = tool
         .add(
+            "no-call",
             &json!({ "objective": "Check the build", "every": "6h" }),
             now,
         )
@@ -120,7 +122,7 @@ async fn bad_input_is_refused_and_creates_nothing() {
         json!({ "objective": "x", "every": "10s" }),
         json!({ "objective": "   ", "every": "1h" }),
     ] {
-        let result = tool.add(&arguments, now).await;
+        let result = tool.add("no-call", &arguments, now).await;
         assert!(
             matches!(result, Err(AdapterError::RefusedBeforeReaching { .. })),
             "{arguments}: {result:?}"

@@ -13,6 +13,7 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 | Setting | Default | What unset means |
 | --- | --- | --- |
 | `executor_reasoning_effort` | unset | The model decides how hard to think. `none`, `low`, `medium` or `high` makes a reasoning model faster and cheaper (`low`) or more thorough (`high`). A run that thinks past its budget is still dropped to `low` for the rest of that run. Needs the live model. |
+| `google_client_id` + client secret | none | **Off by design.** Needs an OAuth client you create in your own Google Cloud project (`docs/user/google.md`); without it there is no Google sign-in and no mail or calendar tools. Nothing is shared with Google until you press Sign in (Settings, Google). |
 | `search_api_key_ref` + search key | none | **Off by design.** Without an Ollama API key (`jarvis keys set search`, from a free ollama.com account) there is no web search tool; JARVIS can still fetch a page you name. `jarvis keys test search` checks the key against the real service (`ADR-0146`). |
 | `executor_model_name`, `executor_base_url`, model key | set by `jarvis init` | No model, so no answers. Setup always sets these. |
 

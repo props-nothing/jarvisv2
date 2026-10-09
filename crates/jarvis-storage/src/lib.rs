@@ -17,6 +17,7 @@ mod session_repository;
 mod summary_repository;
 
 mod approval_repository;
+mod project_repository;
 mod schedule_repository;
 pub mod settings;
 mod skill_repository;
@@ -69,14 +70,20 @@ pub use pgvector::{
     DistanceMetric, MAX_INDEXED_DIMENSIONS, PgVectorError, decode as decode_embedding,
     encode as encode_embedding, is_indexable,
 };
+pub use project_repository::{
+    LinkKind, MAX_NOTE_CHARS, NewProject, NoteKind, ProjectChanges, ProjectStatus, StoredProject,
+    StoredProjectNote, add_project_note, create_project, delete_project, find_project,
+    link_project, list_projects, project_for, recent_project_notes, update_project,
+};
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,
     read_run_events,
 };
 pub use run_repository::{
-    INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition, create_run,
-    find_run, read_recent_runs, recover_interrupted_runs, request_run_cancellation,
-    settle_parked_run_cancelled, settle_run, transition_run, withdraw_cancelled_run_approvals,
+    INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition,
+    count_working_runs, create_run, find_run, read_recent_runs, recover_interrupted_runs,
+    request_run_cancellation, settle_parked_run_cancelled, settle_run, transition_run,
+    withdraw_cancelled_run_approvals,
 };
 pub use run_transcript_repository::{
     MAX_RUN_TRANSCRIPT_BYTES, delete_run_transcript, load_run_transcript, save_run_transcript,

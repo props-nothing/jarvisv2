@@ -12,6 +12,11 @@ The target experience, and what is still missing from it, is in [product/onboard
   a workflow artifact, or a draft release for a tagged build; there is no public download until a licence is chosen), or build it with a Rust toolchain:
   `cargo build --release -p jarvis-cli`, then take it from `target/release/`.
 
+## Installing it
+
+`jarvis install` copies the program to your own folder (`%LOCALAPPDATA%\Programs\JARVIS` on Windows, `~/.local/share/jarvis` elsewhere), puts it on your PATH so `jarvis` works in any new terminal,
+and with `--service` starts it at login. It needs no administrator rights and never touches your settings or memory; `jarvis uninstall` takes it out again.
+
 ## First run
 
 ```text
@@ -30,7 +35,7 @@ jarvis init --base-url https://api.example.com/v1 --model NAME --api-key-file C:
 jarvis start
 ```
 
-`--workspace` may be repeated. The assistant can read, list and create files in those folders, and run commands there (such as a build or the tests) after you approve each one; changing an existing file is
+`--workspace` may be repeated. The assistant can read, list and create files in those folders, search their text, and run commands there (such as a build or the tests) after you approve each one; changing an existing file is
 asked about first. Nothing outside them is reachable.
 
 ## Keys
@@ -85,6 +90,10 @@ default.
   "Jarvis, stop" cancels everything. Voice recognition is your browser's (Chrome or Edge).
 - **The terminal:** `jarvis chat`, `jarvis ask "..."`, `jarvis watch`, `jarvis approvals`, `jarvis cancel --all`, `jarvis runs`,
   `jarvis schedule` (or just ask: "remind me tomorrow at nine" schedules it after you approve), `jarvis memory`, `jarvis tools list`. Every command has `--json` where it prints data.
+- **Watching it work:** while JARVIS works, the left of the face shows each action as it happens (searching, reading a page, running a command, a sub-agent) with the pages it found as links you can open, and the face shows
+  it too. Scheduled tasks and sub-agents appear there as well. Finished answers list their sources. Nothing is sent anywhere for this; it is what the run already reports.
+- **Long-running work:** give it a project (`jarvis project add`, or Ops → Projects): a goal, your standing guidance and a journal that every run of it is told, so a recurring task
+  continues instead of restarting. See `docs/user/projects.md`.
 - **Long tasks.** While it works you see a live line (the step it is on, what it is doing, how long, and "thinking (~11k tokens)" during a
   silent think), and the model is asked to tell you what it is about to do and to say when each stage is done. If a task stops, it says why
   and offers **Continue**. A task may take hundreds of steps; **Stop everything** is always there.

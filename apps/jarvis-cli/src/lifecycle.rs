@@ -17,11 +17,13 @@ fn listening(address: &SocketAddr) -> bool {
 
 /// What happened when a stop was asked for.
 #[derive(Debug, Eq, PartialEq)]
-pub enum Stopped {
+pub enum StopOutcome {
     /// Nothing was listening, so there was nothing to stop.
     NotRunning,
     /// The daemon stopped and its port is free.
     Stopped,
+    /// The daemon is still working on tasks that a stop would interrupt, so it was left running. Carries its explanation.
+    Busy(String),
 }
 
 /// Asks the daemon on `port` to stop and waits for its port to free.
@@ -29,10 +31,10 @@ pub enum Stopped {
 /// # Errors
 ///
 /// Returns the exit status to report: the daemon refused the credential, could not be asked, or did not stop in time.
-pub async fn stop(port: u16, credential: &str) -> Result<Stopped, ExitStatus> {
+pub async fn stop(port: u16, credential: &str, force: bool) -> Result<StopOutcome, ExitStatus> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     if !listening(&address) {
-        return Ok(Stopped::NotRunning);
+        return Ok(StopOutcome::NotRunning);
     }
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -40,7 +42,10 @@ pub async fn stop(port: u16, credential: &str) -> Result<Stopped, ExitStatus> {
         .build()
         .map_err(|_| ExitStatus::Internal)?;
     let response = client
-        .post(format!("http://127.0.0.1:{port}/api/v1/shutdown"))
+        .post(format!(
+            "http://127.0.0.1:{port}/api/v1/shutdown{}",
+            if force { "?force=true" } else { "" }
+        ))
         .bearer_auth(credential)
         .send()
         .await
@@ -48,6 +53,20 @@ pub async fn stop(port: u16, credential: &str) -> Result<Stopped, ExitStatus> {
             eprintln!("jarvis: the daemon could not be asked to stop");
             ExitStatus::Unavailable
         })?;
+    if response.status().as_u16() == 409 {
+        // Work is in flight and a stop would lose it: the daemon says how much, and is left running.
+        let message = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| {
+                body.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "tasks are still working".to_owned());
+        return Ok(StopOutcome::Busy(message));
+    }
     if !response.status().is_success() {
         eprintln!(
             "jarvis: the daemon refused the stop request (status {}); is this the profile it is running?",
@@ -58,7 +77,7 @@ pub async fn stop(port: u16, credential: &str) -> Result<Stopped, ExitStatus> {
     let deadline = Instant::now() + STOP_WAIT;
     while Instant::now() < deadline {
         if !listening(&address) {
-            return Ok(Stopped::Stopped);
+            return Ok(StopOutcome::Stopped);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -77,6 +96,6 @@ mod tests {
     #[tokio::test]
     async fn stopping_what_is_not_running_is_not_an_error() {
         // Port 1 is never a JARVIS daemon and is refused immediately.
-        assert_eq!(stop(1, "unused").await, Ok(Stopped::NotRunning));
+        assert_eq!(stop(1, "unused", false).await, Ok(StopOutcome::NotRunning));
     }
 }
