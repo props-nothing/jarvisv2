@@ -258,3 +258,18 @@ async fn deleting_a_project_removes_its_notes_and_links() {
         Err(DatabaseError::ProjectNotFound)
     ));
 }
+
+#[tokio::test]
+async fn a_schedule_can_be_refiled_into_another_project_or_out_of_all() {
+    let (_directory, database) = database().await;
+    let one = must(create_project(&database, LOCAL_WORKSPACE_ID, &new("One"), at(0)).await);
+    let two = must(create_project(&database, LOCAL_WORKSPACE_ID, &new("Two"), at(0)).await);
+    must(set_project_link(&database, LinkKind::Schedule, SCHEDULE, Some(&one.id)).await);
+    must(set_project_link(&database, LinkKind::Schedule, SCHEDULE, Some(&two.id)).await);
+    let now_in = must(project_for(&database, LinkKind::Schedule, SCHEDULE).await);
+    assert_eq!(now_in.map(|p| p.name), Some("Two".to_owned()));
+    must(set_project_link(&database, LinkKind::Schedule, SCHEDULE, None).await);
+    assert!(must(project_for(&database, LinkKind::Schedule, SCHEDULE).await).is_none());
+    // Taking out of a project it was never in is fine.
+    must(set_project_link(&database, LinkKind::Schedule, SCHEDULE, None).await);
+}

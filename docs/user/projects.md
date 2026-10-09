@@ -39,5 +39,5 @@ journal; its conversations and schedules stay.
 
 ## Moving existing work into a project
 
-If you already run something by hand (a long objective on a schedule, a worklog file the model keeps), create the project, move the standing instructions out of the objective into the guidance,
-and recreate the schedule with `--project`. Keep the objective to what is different each time ("check for replies and follow up").
+If you already run something by hand (a long objective on a schedule, a worklog file the model keeps), create the project, move the standing instructions out of the objective into the guidance, and file the
+existing schedule under it: `jarvis schedule project ID NAME` (or the project selector on the schedule's card on the Ops page; `--none` takes it out again). Then shorten the schedule's objective to what is different each time ("check for replies and follow up").

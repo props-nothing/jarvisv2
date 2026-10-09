@@ -342,3 +342,57 @@ async fn a_schedule_of_a_project_fires_into_it_and_waits_while_the_project_is_no
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn an_existing_schedule_can_be_filed_under_a_project_and_taken_out_again() {
+    let fixture = fixture().await;
+    let project = make(&fixture, "Prospecting").await;
+    let (_, text) = send(
+        &fixture,
+        "POST",
+        "/api/v1/schedules",
+        Some(r#"{"objective":"check","every":"1h"}"#),
+    )
+    .await;
+    let schedule: jarvis_protocol::ScheduleReply = parse(&text);
+    assert!(schedule.project.is_none());
+    let path = format!("/api/v1/schedules/{}/project", schedule.schedule_id);
+
+    let (status, text) = send(
+        &fixture,
+        "POST",
+        &path,
+        Some(&format!(r#"{{"project_id":"{}"}}"#, project.project_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        parse::<jarvis_protocol::ScheduleReply>(&text)
+            .project
+            .as_deref(),
+        Some("Prospecting")
+    );
+    let linked = must(
+        jarvis_storage::project_for(&fixture.database, LinkKind::Schedule, &schedule.schedule_id)
+            .await,
+    );
+    assert!(linked.is_some());
+
+    let (status, _) = send(&fixture, "POST", &path, Some(r#"{"project_id":"Nope"}"#)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, text) = send(&fixture, "POST", &path, Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        parse::<jarvis_protocol::ScheduleReply>(&text)
+            .project
+            .is_none()
+    );
+    let (status, _) = send(
+        &fixture,
+        "POST",
+        "/api/v1/schedules/00000000-0000-0000-0000-000000000000/project",
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

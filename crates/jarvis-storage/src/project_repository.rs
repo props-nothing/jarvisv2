@@ -562,6 +562,41 @@ pub async fn link_project(
     Ok(())
 }
 
+/// Puts a session or schedule in a project, replaces its project, or (with `None`) takes it out of any. Unlike [`link_project`] it
+/// moves: it is for the owner re-filing a schedule, never for a conversation that already belongs somewhere.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the write fails; nothing changes then.
+pub async fn set_project_link(
+    database: &SqliteDatabase,
+    kind: LinkKind,
+    ref_id: &str,
+    project_id: Option<&str>,
+) -> Result<(), DatabaseError> {
+    let fail = |source| DatabaseError::Sqlite {
+        operation: "move a project link",
+        source,
+    };
+    let mut transaction = database.pool().begin().await.map_err(fail)?;
+    sqlx::query("DELETE FROM project_links WHERE kind = ?1 AND ref_id = ?2")
+        .bind(kind.as_str())
+        .bind(ref_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(fail)?;
+    if let Some(project_id) = project_id {
+        sqlx::query("INSERT INTO project_links (kind, ref_id, project_id) VALUES (?1, ?2, ?3)")
+            .bind(kind.as_str())
+            .bind(ref_id)
+            .bind(project_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(fail)?;
+    }
+    transaction.commit().await.map_err(fail)
+}
+
 /// The project a session or schedule belongs to, if any.
 ///
 /// # Errors

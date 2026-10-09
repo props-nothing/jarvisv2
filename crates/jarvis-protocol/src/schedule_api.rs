@@ -27,6 +27,15 @@ pub struct CreateScheduleRequest {
     pub project_id: Option<String>,
 }
 
+/// Request body for `POST /api/v1/schedules/{id}/project`: file a task under a project, or (with no project) out of all of them.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetScheduleProjectRequest {
+    /// The project, by identifier or name; absent or `null` takes the task out of its project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
 /// One scheduled task.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduleReply {

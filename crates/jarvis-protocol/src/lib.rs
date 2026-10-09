@@ -45,6 +45,7 @@ pub use run_api::{
 };
 pub use schedule_api::{
     CreateScheduleRequest, RunListReply, RunSummaryReply, ScheduleListReply, ScheduleReply,
+    SetScheduleProjectRequest,
 };
 pub use session::{
     AdmittedClient, ClientContext, ClientSession, HANDSHAKE_TIMEOUT, MAX_REQUESTS_PER_CONNECTION,

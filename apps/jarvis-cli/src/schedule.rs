@@ -27,6 +27,7 @@ pub async fn run_schedule(client: &ApiClient, arguments: &[String]) -> ExitStatu
         Some("pause") => toggle(client, arguments, false).await,
         Some("resume") => toggle(client, arguments, true).await,
         Some("remove") => remove(client, arguments).await,
+        Some("project") => refile(client, arguments).await,
         Some(other) => {
             eprintln!("jarvis: unknown schedule command {other:?}");
             eprintln!("{}", schedule_usage());
@@ -37,7 +38,7 @@ pub async fn run_schedule(client: &ApiClient, arguments: &[String]) -> ExitStatu
 
 /// The usage text for `jarvis schedule`.
 pub(crate) const fn schedule_usage() -> &'static str {
-    "usage: jarvis schedule <add|list|pause|resume|remove> [...]\n       jarvis schedule add <objective...> (--every 30m|6h|2d | --at 2026-10-04T09:00:00Z) [--project NAME]\n       jarvis schedule list [--json]\n       jarvis schedule pause|resume|remove ID"
+    "usage: jarvis schedule <add|list|pause|resume|remove|project> [...]\n       jarvis schedule project ID (NAME | --none)     # file an existing task under a project, or take it out\n       jarvis schedule add <objective...> (--every 30m|6h|2d | --at 2026-10-04T09:00:00Z) [--project NAME]\n       jarvis schedule list [--json]\n       jarvis schedule pause|resume|remove ID"
 }
 
 /// Splits `add` arguments into the objective words and the cadence flags.
@@ -205,6 +206,35 @@ async fn resolve(client: &ApiClient, typed: &str) -> Result<String, ExitStatus> 
 
 fn identifier(arguments: &[String]) -> Option<&String> {
     arguments.get(2).filter(|value| !value.starts_with("--"))
+}
+
+/// `jarvis schedule project ID NAME` files a task under a project; `--none` takes it out of its project.
+async fn refile(client: &ApiClient, arguments: &[String]) -> ExitStatus {
+    let Some(typed) = identifier(arguments) else {
+        eprintln!("{}", schedule_usage());
+        return ExitStatus::Usage;
+    };
+    let none = arguments.iter().any(|argument| argument == "--none");
+    let name = arguments
+        .get(3)
+        .filter(|value| !value.starts_with("--"))
+        .map(String::as_str);
+    if name.is_none() && !none {
+        eprintln!("jarvis: name the project, or pass --none to take the task out of its project");
+        eprintln!("{}", schedule_usage());
+        return ExitStatus::Usage;
+    }
+    let id = match resolve(client, typed).await {
+        Ok(id) => id,
+        Err(status) => return status,
+    };
+    match client.set_schedule_project(&id, name).await {
+        Ok(schedule) => {
+            println!("{}  {}", schedule.schedule_id, describe(&schedule));
+            ExitStatus::Ok
+        }
+        Err(error) => report(&error),
+    }
 }
 
 async fn toggle(client: &ApiClient, arguments: &[String], enabled: bool) -> ExitStatus {

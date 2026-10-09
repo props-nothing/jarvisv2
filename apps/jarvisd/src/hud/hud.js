@@ -1298,6 +1298,26 @@
     if (schedule.last_fired_at) meta.appendChild(ageSpan(schedule.last_fired_at, " ago"));
     item.appendChild(meta);
     var acts = el("div", "sched-act");
+    var filed = projects.filter(function (project) { return project.status !== "done" || project.name === schedule.project; });
+    if (filed.length) {
+      var pick = el("select", "sched-project");
+      pick.title = "The project this task belongs to: its runs are told the project's goal and guidance";
+      var none = el("option", "", "No project");
+      none.value = "";
+      pick.appendChild(none);
+      filed.forEach(function (project) {
+        var option = el("option", "", project.name);
+        option.value = project.name;
+        pick.appendChild(option);
+      });
+      pick.value = schedule.project || "";
+      pick.addEventListener("change", function () {
+        pick.disabled = true;
+        putJson("/schedules/" + encodeURIComponent(schedule.schedule_id) + "/project", "POST", pick.value ? { project_id: pick.value } : {}).then(function () { lastSignature = ""; refresh(); },
+          function () { pick.disabled = false; pick.value = schedule.project || ""; notice("Could not move that task to the project."); });
+      });
+      acts.appendChild(pick);
+    }
     if (schedule.enabled || schedule.cadence !== "once") {
       var toggle = el("button", "", schedule.enabled ? "Pause" : "Resume");
       toggle.addEventListener("click", function () {
@@ -1316,7 +1336,7 @@
     item.appendChild(acts);
     return item;
   }
-  var openRuns = {};
+  var openRuns = {}, showFinished = false;
   function recentCard(run) {
     var item = el("div", "item");
     var row = el("div", "row");
@@ -1396,7 +1416,16 @@
       return item;
     }), "nothing running");
 
-    fill("scheduled", schedules.map(scheduleCard), "nothing scheduled: ask JARVIS to \u201Cdo this every morning\u201D");
+    // Tasks that will run come first; one-offs that already ran are put away behind a toggle so they do not push the rest down.
+    var recurring = schedules.filter(function (schedule) { return schedule.enabled || schedule.cadence !== "once"; })
+      .sort(function (a, b) { return (b.enabled ? 1 : 0) - (a.enabled ? 1 : 0); });
+    var finishedOnce = schedules.filter(function (schedule) { return !schedule.enabled && schedule.cadence === "once"; });
+    fill("scheduled", recurring.concat(showFinished ? finishedOnce : []).map(scheduleCard), "nothing scheduled: ask JARVIS to \u201Cdo this every morning\u201D");
+    if (finishedOnce.length) {
+      var more = el("button", "", showFinished ? "Hide finished one-off tasks" : "Show " + finishedOnce.length + " finished one-off task" + (finishedOnce.length === 1 ? "" : "s"));
+      more.addEventListener("click", function () { showFinished = !showFinished; lastSignature = ""; refresh(); });
+      $("scheduled").appendChild(more);
+    }
 
     fill("recent", finished.map(recentCard), "nothing yet");
   }
@@ -1412,6 +1441,7 @@
     projectsAt = Date.now();
     return api("/projects").then(function (reply) {
       projects = reply.projects || [];
+      lastSignature = "";
       paintProjects();
       paintProjectPick();
     }, function () {});

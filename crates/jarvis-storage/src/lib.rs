@@ -73,7 +73,8 @@ pub use pgvector::{
 pub use project_repository::{
     LinkKind, MAX_NOTE_CHARS, NewProject, NoteKind, ProjectChanges, ProjectStatus, StoredProject,
     StoredProjectNote, add_project_note, create_project, delete_project, find_project,
-    link_project, list_projects, project_for, recent_project_notes, update_project,
+    link_project, list_projects, project_for, recent_project_notes, set_project_link,
+    update_project,
 };
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,

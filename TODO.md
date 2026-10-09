@@ -7204,6 +7204,8 @@ This is the execution ledger. Work top to bottom unless an ADR records why order
   multi-search research, a sub-agent run started from the CLI and watched from the console).
 - [x] `P9-057` Console UX pass: Ops cards show the live action, scheduled tasks can be paused/resumed/removed and show their project, recent answers expand, tools grouped by family (Ops and Permissions), plain setting labels,
   scrolling sheets with a fixed footer, dark scrollbars and focus outlines, a tidier chat header, starting points in an empty chat. Fixed a real failure found on the way: search replies over 512 KiB (ordinary) were refused; bound now 8 MiB.
+- [x] `P9-058` An existing schedule can be filed under a project (or taken out): `POST /api/v1/schedules/{id}/project`, `jarvis schedule project ID NAME|--none`, a selector on the Ops card; `set_project_link`. The Ops page
+  puts finished one-off tasks behind a toggle. The finished event is also emitted when a call that waited for an approval completes (the resume path). Tests: re-filing in storage and through the route.
 - [ ] `P9-024` Give the model more to do. The command tool now exists (`P9-031`); today Docker-isolated snippets run code too. A fresh install offers four tools (web fetch, delegate, delegate result, propose memory);
   files need a granted folder (`P9-015b`), `run_code` needs Docker, and nothing else is model-facing yet. Next, in value order: a
   model-facing memory search (so "what do you remember about me" is answered from the store, not from what happened to be in

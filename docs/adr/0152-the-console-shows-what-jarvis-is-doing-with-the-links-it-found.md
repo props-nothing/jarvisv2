@@ -35,5 +35,5 @@ The new payload fields are additive and bounded (well inside the 64 KiB event li
 executor emitting both events, the parser, and the page tests (no markup insertion, nothing loaded from elsewhere, `rel="noopener noreferrer"`). Exercised live on a scratch profile with a real model: a multi-search research run with
 page reads, a CLI-started run with a sub-agent watched from the console, and the Ops and Settings pages.
 
-Not built: a replay of finished runs from history, clickable satellites, per-link preview, and the resume-after-approval path does not emit the finished event (the run's end closes the row instead).
+Not built: a replay of finished runs from history, clickable satellites, per-link preview, and the console does not yet follow a run that is waiting for an answer (its row closes when the call completes after approval).
 A related fix found while doing this: a search reply is often several megabytes (each hit carries its page text), so the 512 KiB bound made real searches fail; it is now 8 MiB (the model still receives only a few hundred characters per hit).

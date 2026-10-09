@@ -371,6 +371,17 @@ async fn workspace(state: &GatewayState) -> Result<String, Response> {
         })
 }
 
+/// The authenticated schedule routes, mounted under /api/v1.
+pub fn routes() -> axum::Router<GatewayState> {
+    use axum::routing::{delete, post};
+    axum::Router::new()
+        .route("/schedules", post(create).get(list))
+        .route("/schedules/{id}", delete(remove))
+        .route("/schedules/{id}/pause", post(pause))
+        .route("/schedules/{id}/resume", post(resume))
+        .route("/schedules/{id}/project", post(set_project))
+}
+
 /// `POST /api/v1/schedules`
 pub async fn create(
     State(state): State<GatewayState>,
@@ -484,6 +495,45 @@ async fn set_enabled(state: &GatewayState, id: &str, enabled: bool) -> Response 
         }
         Err(error) => storage_response(&error),
     }
+}
+
+/// `POST /api/v1/schedules/{id}/project`
+///
+/// Re-files a task: its next runs carry the new project's brief (and pause with it), or none. The owner's act; nothing a run does can reach it.
+pub async fn set_project(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(request): Json<jarvis_protocol::SetScheduleProjectRequest>,
+) -> Response {
+    let workspace_id = match workspace(&state).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let schedule = match jarvis_storage::find_schedule(state.database(), &workspace_id, &id).await {
+        Ok(schedule) => schedule,
+        Err(error) => return storage_response(&error),
+    };
+    let project = match &request.project_id {
+        Some(name) => {
+            match jarvis_storage::find_project(state.database(), &workspace_id, name).await {
+                Ok(project) => Some(project),
+                Err(error) => return storage_response(&error),
+            }
+        }
+        None => None,
+    };
+    let linked = jarvis_storage::set_project_link(
+        state.database(),
+        jarvis_storage::LinkKind::Schedule,
+        schedule.id(),
+        project.as_ref().map(|project| project.id.as_str()),
+    )
+    .await;
+    if let Err(error) = linked {
+        return storage_response(&error);
+    }
+    let reply = schedule_reply(&schedule, project.map(|project| project.name));
+    (StatusCode::OK, Json(reply)).into_response()
 }
 
 /// `POST /api/v1/schedules/{id}/pause`

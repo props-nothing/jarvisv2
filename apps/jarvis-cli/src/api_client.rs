@@ -50,10 +50,10 @@ use jarvis_protocol::{
     MemorySearchRequest, MergeEntityRequest, ProjectDetailReply, ProjectListReply,
     ProjectNoteReply, ProjectReply, PromoteSkillRequest, RememberRequest, RunListReply,
     RunPathError, RunReply, RunStreamDecoder, RunStreamFrame, SSE_ACCEPT, ScheduleListReply,
-    ScheduleReply, SkillDeletionReceipt, SkillDetailReply, SkillExportReply, SkillListReply,
-    SkillReply, SkillTransitionRequest, StartRunRequest, ToolListReply, ToolPreviewReply,
-    ToolPreviewRequest, UpdateProjectRequest, WireError, dotted_path_segment, path_segment,
-    run_path, run_stream_path, runs_path,
+    ScheduleReply, SetScheduleProjectRequest, SkillDeletionReceipt, SkillDetailReply,
+    SkillExportReply, SkillListReply, SkillReply, SkillTransitionRequest, StartRunRequest,
+    ToolListReply, ToolPreviewReply, ToolPreviewRequest, UpdateProjectRequest, WireError,
+    dotted_path_segment, path_segment, run_path, run_stream_path, runs_path,
 };
 
 /// The base path of the memory surface.
@@ -447,6 +447,23 @@ impl ApiClient {
         let path = format!("{SCHEDULES_PATH}/{}/{verb}", path_segment(schedule_id)?);
         self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
             .await
+    }
+
+    /// Files a scheduled task under a project, or (with `None`) out of all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when the task or the project is unknown.
+    pub async fn set_schedule_project(
+        &self,
+        schedule_id: &str,
+        project: Option<&str>,
+    ) -> Result<ScheduleReply, ApiError> {
+        let path = format!("{SCHEDULES_PATH}/{}/project", path_segment(schedule_id)?);
+        let body = SetScheduleProjectRequest {
+            project_id: project.map(ToOwned::to_owned),
+        };
+        self.send_json(reqwest::Method::POST, &path, &body).await
     }
 
     /// Removes a scheduled task.

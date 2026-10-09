@@ -283,22 +283,6 @@ pub fn router(state: GatewayState) -> Router {
             "/runs",
             post(start_run).get(crate::schedule_service::list_runs),
         )
-        .route(
-            "/schedules",
-            post(crate::schedule_service::create).get(crate::schedule_service::list),
-        )
-        .route(
-            "/schedules/{id}",
-            axum::routing::delete(crate::schedule_service::remove),
-        )
-        .route(
-            "/schedules/{id}/pause",
-            post(crate::schedule_service::pause),
-        )
-        .route(
-            "/schedules/{id}/resume",
-            post(crate::schedule_service::resume),
-        )
         .route("/runs/{id}", get(read_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(read_events))
@@ -360,7 +344,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/skills/{id}/disable", post(disable_skill))
         .route("/skills/{id}/enable", post(enable_skill))
         .merge(crate::google_service::routes())
-        .merge(crate::project_service::routes());
+        .merge(crate::project_service::routes())
+        .merge(crate::schedule_service::routes());
 
     Router::new()
         // The heads-up display's two static assets: no data, no secret, served without the credential

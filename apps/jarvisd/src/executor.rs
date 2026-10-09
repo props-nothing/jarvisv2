@@ -2416,6 +2416,13 @@ async fn resume_held_call(
         }
     };
 
+    // The console's live view closes the row of the call that waited for the owner (`ADR-0152`).
+    if let Ok(call) = find_tool_call(database, &pending.call_id).await
+        && call.outcome().is_terminal()
+    {
+        record_tool_result(database, run, call.tool(), &text, correlation_id).await;
+    }
+
     // The observation is fenced, because tool output originates outside JARVIS (`ADR-0049`). A payload
     // that is empty or is only the fence token cannot be isolated; that is reported honestly rather than
     // dropped, so the model is never left with a silent gap where an effect happened.
