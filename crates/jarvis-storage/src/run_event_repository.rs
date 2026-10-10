@@ -339,6 +339,32 @@ pub async fn read_run_events(
     Ok(events)
 }
 
+/// The payload of the latest event of one kind in a run's stream, however long the stream is.
+///
+/// A paged read starts at the front, so a caller that wants the *end* of a long stream (the final answer of a run that streamed
+/// thousands of fragments) must not look for it inside the first page: it would find nothing and report a finished answer as missing.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Sqlite`] when the read fails.
+pub async fn latest_run_event_payload(
+    database: &SqliteDatabase,
+    run_id: &str,
+    kind: jarvis_core::RunEventKind,
+) -> Result<Option<String>, DatabaseError> {
+    sqlx::query_scalar(
+        "SELECT payload FROM run_events WHERE run_id = ?1 AND kind = ?2 ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .bind(kind.as_str())
+    .fetch_optional(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read the latest run event of a kind",
+        source,
+    })
+}
+
 /// Returns the highest stored sequence for a run, or `None` when it has no events.
 ///
 /// A stream handler uses this to detect a client that supplied a last-event position

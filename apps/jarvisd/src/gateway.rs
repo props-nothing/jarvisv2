@@ -1143,6 +1143,7 @@ fn tool_reply(entry: &crate::tool_pipeline::PolicyInventoryEntry) -> jarvis_prot
         callable: entry.callable,
         unavailable_reason: entry.unavailable_reason.clone(),
         asks_first: entry.asks_first,
+        offer_tokens: u32::try_from(entry.offer_chars / 4).unwrap_or(u32::MAX),
     }
 }
 
@@ -5492,6 +5493,10 @@ mod tests {
         );
         assert!(!entry.denied, "no denial was configured");
         assert!(entry.callable, "a read over a granted root is callable");
+        assert!(
+            entry.offer_tokens > 0,
+            "the cost of offering the tool to a model on every call must be reported"
+        );
         // The workspace settings are reported beside the per-tool entries, so a single tool's posture is
         // readable against the ceiling it sits under.
         assert_eq!(reply.max_risk, jarvis_tools::Risk::High);

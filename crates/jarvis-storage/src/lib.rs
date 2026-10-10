@@ -86,7 +86,7 @@ pub use project_repository::{
 };
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,
-    read_run_events,
+    latest_run_event_payload, read_run_events,
 };
 pub use run_repository::{
     INTERRUPTED_ERROR_CODE, InterruptedRun, MAX_OBJECTIVE_CHARS, NewRun, StoredRun,

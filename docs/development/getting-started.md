@@ -29,9 +29,13 @@ model (see [ROADMAP.md](../../ROADMAP.md), "Current Direction"):
 - file writes and edits in granted folders (`ADR-0137`), a guarded web fetch, code in a disposable container, memory proposals, and sub-agents (`ADR-0129`, `ADR-0131`, `ADR-0134`)
 - scheduled tasks (`ADR-0132`), `jarvis cancel`, `jarvis watch`, and the browser console with browser-native voice
   (`ADR-0135`)
+- Google sign-in from Settings with Gmail and Calendar tools (`ADR-0149`, `ADR-0150`, `ADR-0157`, `ADR-0161`), projects with a journal and daily run and
+  token caps (`ADR-0151`, `ADR-0155`, `ADR-0165`), reading PDF, Word, spreadsheet and slide files and pictures (`ADR-0158`, `ADR-0162`), a provider and model
+  picker with a fallback model at a second provider (`ADR-0163`, `ADR-0164`), and a record of the tokens every model call used
 
-Not implemented yet: service installation, log rotation, durable workflows, connectors callable by the model, telephony,
-the desktop client and installers, and external agent runtimes. See [TODO.md](../../TODO.md) for exactly which slices
+Not implemented yet: service installation (`jarvis service` prints a plan), log rotation, durable workflows, Microsoft and GitHub connectors (Google's
+push and watch framework exists in `jarvis-connectors` but nothing calls it, `P5-005b`), telephony, the desktop client and installers, and external
+agent runtimes. See [TODO.md](../../TODO.md) for exactly which slices
 are done.
 
 The next implementation task is the first unchecked item in [TODO.md](../../TODO.md).

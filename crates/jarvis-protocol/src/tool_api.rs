@@ -90,6 +90,10 @@ pub struct ToolReply {
     /// Whether a call is held for the owner's yes or no before it runs, under the policy now in force.
     #[serde(default)]
     pub asks_first: bool,
+    /// A rough count of the tokens this tool costs on **every** model call (its name, description and argument schema, in characters
+    /// divided by four). A run is sent every tool it may call, so the sum over the tools is what each call pays before it says a word.
+    #[serde(default)]
+    pub offer_tokens: u32,
 }
 
 /// Response body for `GET /api/v1/tools`.

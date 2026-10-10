@@ -2,33 +2,39 @@
 
 This roadmap is ordered by risk. Each phase must leave a runnable vertical slice. A later phase may start only when the previous phase's exit gate passes or an ADR explains the exception.
 
-## Current Direction (reviewed 2026-10-06)
+## Current Direction (reviewed 2026-10-10)
 
 The phases below remain the dependency order of the *platform*; the order of *product slices* was changed on purpose,
 because a platform that cannot yet be talked to, watched or trusted with a task is not the product. Delivered ahead of
 their phases, each with an ADR and a live run against a real model: web fetch (`ADR-0129`), approval from the CLI that
 survives a restart (`ADR-0130`), code in a disposable container (`ADR-0131`), scheduled tasks (`ADR-0132`), first-run
-`init`/`start`, a kill switch, standing trust for low-risk tools (`ADR-0133`), sub-agents (`ADR-0134`), and the browser
-console with its holographic head and browser-native voice, served as the daemon's main page (`ADR-0135`). `example/` is
-still not retired (`P9-009`).
+`init`/`start`, a kill switch, standing trust for low-risk tools (`ADR-0133`), sub-agents (`ADR-0134`), the browser
+console with its holographic head and browser-native voice (`ADR-0135`), light approvals (`ADR-0136`), file write, edit
+and move, a natural voice, onboarding and settings (`ADR-0137` to `ADR-0139`), a web search (`ADR-0146`), **Google sign-in from Settings
+with Gmail and Calendar tools, including send, attachments, replies and drafts** (`ADR-0149`, `ADR-0150`, `ADR-0157`,
+`ADR-0161`), **projects** with a journal, daily run and token caps, a digest and push (`ADR-0151`, `ADR-0155`, `ADR-0165`),
+a live mission view (`ADR-0152`), a contacts list, **documents and OCR** (`ADR-0158`, `ADR-0162`), a **fallback model at
+a second provider** and a provider and model picker (`ADR-0159`, `ADR-0163`, `ADR-0164`), and token usage recorded for
+every model call. `example/` is still not retired (`P9-009`).
 
 Measured against the four hallmarks of a real J.A.R.V.I.S.:
 
 | Hallmark | State | Next slice |
 | --- | --- | --- |
-| Oversight | Strongest. Approvals, `jarvis cancel`, one-level sub-agents, `jarvis watch`, the console. | Coding agents as supervised runtimes (`P7`, via ACP); a push notification when something needs you (`P6-007`). |
-| Visual presence | The console at `/` (`jarvis hud`): a holographic human head (real face mesh) that speaks, listens and reacts, streaming conversation, waiting/working/scheduled/recent and "can do" panels with Stop, Approve and Deny; `jarvis start` opens it. | A push stream instead of polling; the Tauri desktop client (`P9-001`). |
-| Voice | Browser-native push-to-talk, wake word, spoken answers, interruption (the microphone path is untested here; the browser's recognizer may use a vendor cloud). | Local (non-cloud) recognition and synthesis, then telephony and ElevenLabs (`P8`). |
-| Hands-free | Spoken "Jarvis, stop" cancels everything, and a spoken "yes"/"no" answers a waiting approval (`ADR-0136`). | Always-on local wake word and recognition so it works without the browser tab in front. |
+| Oversight | Strong. Approvals, `jarvis cancel`, one-level sub-agents, `jarvis watch`, the console, an audit trail, per-project caps, a count of tokens per run. | Coding agents as supervised runtimes (`P7`, via ACP); stop a run midway at a spend limit. |
+| Visual presence | The console at `/`: a face that speaks, listens and reacts, a live mission view of what it reads and calls, panels with Stop, Approve and Deny. | A push stream instead of polling; the Tauri desktop client (`P9-019`). |
+| Voice | Browser-native push-to-talk, wake word, spoken answers, interruption; a neural voice with an ElevenLabs key. | Local (non-cloud) recognition and synthesis, then telephony (`P8`). |
+| Hands-free | A spoken "Jarvis, stop" and a spoken "yes"/"no" for approvals (`ADR-0136`). | Always-on local wake word so it works without the browser tab in front. |
 
-Order of work from here: (0) **onboarding and settings** (`docs/product/onboarding.md`, `P9-012` to `P9-019`): stop/restart,
-guided setup with key entry and a test call, `jarvis config` / `jarvis keys`, a Settings screen in the console, a real `doctor`,
-and a one-folder release, because a capable assistant that is hard to start and impossible to reconfigure is not yet a product;
-(1) one real connector callable by the model (Gmail/Calendar read), because `jarvis-connectors`
-is 38k lines and nothing in `jarvisd` calls it, so `P5` is time-boxed to that single slice; (2) ~~a file write/edit tool for
-granted folders~~ (done, `ADR-0137`) and ~~a natural voice~~ (done through ElevenLabs, `ADR-0138`); (3) local voice; (4) coding-agent runtimes; (5) model routing so sub-agents and background work can use a
-cheaper model; (6) the answer-quality harness (`P9-011`) moved forward, because every change needs a measure of whether
-the assistant got better; (7) archive the finished parts of `TODO.md`, which has outgrown being readable as a ledger.
+**Order of work from here** (the same list, with detail, is at the top of `TODO.md`):
+
+1. **Check what is only tested against stand-ins**, with the owner's own accounts: Gmail drafts, a real OCR run, the fallback at a second provider, the push, a reply sent from another sender. Nothing new is built; several shipped features have no live evidence yet.
+2. **An answer-quality harness** (`P9-011`): every change needs a measure of whether the assistant got better, and the owner's work (prospecting, mail, research) is the test set.
+3. **A browser tool for pages that need JavaScript**, the largest gap in research quality (`P9-069`).
+4. **Model routing**: a cheaper model for sub-agents and background work, now that usage is recorded and a second provider can be configured.
+5. **Coding-agent runtimes** (`P7`, ACP), and delegation as durable workflow steps (`P6-010`, `P7-010`).
+6. **Decide the Google push and watch framework** (`P5-005b`): compose it if event-driven mail is wanted, otherwise retire it. Polling from a schedule is what works.
+7. Local voice and telephony (`P8`); then distribution (`P9-003` to `P9-007`, blocked on a licence choice) and the server profile (`P10`).
 ## Phase 0: Architecture Baseline
 
 **Outcome:** future contributors share one product definition, trust model, repository map, research method, and testable backlog.

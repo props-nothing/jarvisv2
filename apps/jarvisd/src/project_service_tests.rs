@@ -773,3 +773,57 @@ async fn the_owner_manages_contacts_over_the_api_including_lifting_a_do_not_cont
         StatusCode::UNAUTHORIZED
     );
 }
+
+/// **A long run keeps its answer.**
+///
+/// The answer used to be looked for inside the first page of a run''s events (a thousand), so a run that streamed more fragments than that
+/// before its final answer lost the answer: the parent that delegated it, the owner''s notification and the transcript all saw nothing.
+#[tokio::test]
+async fn an_answer_is_found_even_when_the_run_streamed_more_events_than_one_page() {
+    let fixture = fixture().await;
+    let (status, text) = start(&fixture, r#"{"objective":"long research"}"#).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let run: RunReply = parse(&text);
+    let append = |kind, payload: &'static str| {
+        let event = must(jarvis_storage::NewRunEvent::new(
+            jarvis_core::RunId::new().to_string(),
+            &run.run_id,
+            kind,
+            None,
+            must(jarvis_core::RunEventPayload::new(payload)),
+            jarvis_core::CorrelationId::new(),
+            now(),
+        ));
+        let database = fixture.database.clone();
+        async move { must(jarvis_storage::append_run_event(&database, &event).await) }
+    };
+    for _ in 0..1_300 {
+        append(
+            jarvis_core::RunEventKind::OutputDelta,
+            r#"{"text":"fragment "}"#,
+        )
+        .await;
+    }
+    let stored = must(jarvis_storage::find_run(&fixture.database, &run.run_id).await);
+    assert_eq!(
+        must(crate::executor::last_answer(&fixture.state.database_handle(), &stored).await),
+        None,
+        "no answer yet"
+    );
+    append(
+        jarvis_core::RunEventKind::OutputCompleted,
+        r#"{"text":"first answer"}"#,
+    )
+    .await;
+    append(
+        jarvis_core::RunEventKind::OutputCompleted,
+        r#"{"text":"the final answer"}"#,
+    )
+    .await;
+    assert_eq!(
+        must(crate::executor::last_answer(&fixture.state.database_handle(), &stored).await)
+            .as_deref(),
+        Some("the final answer"),
+        "the latest answer, past the first thousand events"
+    );
+}

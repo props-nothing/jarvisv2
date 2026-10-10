@@ -182,12 +182,6 @@ now (call a tool or give the user a short status), and keep any further thinking
 /// How often a silent model call reports that it is still working.
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Events read back when locating a run's completed answer.
-///
-/// Well above any answer this slice produces, and bounded rather than unbounded so the read cannot
-/// grow with a runaway run. A run that exceeded it would be one this executor did not produce.
-const MAX_EVENTS_READ: u32 = 1_000;
-
 /// The system prompt for a native run.
 ///
 /// Authoritative text, and the only instruction-bearing content in the request. It states the tool
@@ -2789,31 +2783,27 @@ async fn complete(
 /// Read back rather than threaded through the loop, so the stored transcript and the stored events
 /// cannot disagree: the message is built from the event that a client already receives, not from a
 /// second copy of the text held in memory.
+///
+/// The latest answer event is asked for directly. The first version read the first page of the stream and looked backwards through it,
+/// which found nothing for a run with more events than one page: a long research run streams hundreds of fragments, so exactly the runs
+/// with the most to say lost their answer, to the parent that delegated them, to the owner's notification and to the transcript.
 pub(crate) async fn last_answer(
     database: &Arc<SqliteDatabase>,
     run: &StoredRun,
 ) -> Result<Option<String>, DatabaseError> {
-    let events = jarvis_storage::read_run_events(
-        database,
-        run.id(),
-        jarvis_core::ReplayRequest::new(jarvis_core::RunEventSequence::first(), MAX_EVENTS_READ)
-            .map_err(|_| DatabaseError::InvalidRunEventRequest { field: "replay" })?,
-    )
-    .await?;
-
-    for event in events.iter().rev() {
-        if event.kind() != RunEventKind::OutputCompleted {
-            continue;
-        }
-        let payload: serde_json::Value = serde_json::from_str(event.payload())
-            .map_err(|_| DatabaseError::StoredRunEventInvalid { field: "payload" })?;
-        if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
-            return Ok(Some(text.to_owned()));
-        }
-    }
-    Ok(None)
+    let Some(payload) =
+        jarvis_storage::latest_run_event_payload(database, run.id(), RunEventKind::OutputCompleted)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let payload: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|_| DatabaseError::StoredRunEventInvalid { field: "payload" })?;
+    Ok(payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
-
 /// Settles a run as failed with a bounded reason.
 async fn fail(
     database: &Arc<SqliteDatabase>,

@@ -172,6 +172,8 @@ pub struct PolicyInventoryEntry {
     pub unavailable_reason: Option<String>,
     /// Whether a call is held for the owner's yes or no before it runs.
     pub asks_first: bool,
+    /// Characters of the name, description and argument schema the model is sent about this tool on every call.
+    pub offer_chars: usize,
 }
 
 /// What one pipeline call produced.
@@ -1136,6 +1138,9 @@ impl ToolPipeline {
                 callable: entry.callable,
                 unavailable_reason: entry.unavailable_reason,
                 asks_first: policy.asks_first(&definition),
+                offer_chars: definition.id().to_string().len()
+                    + definition.description().len()
+                    + definition.input_schema().document().to_string().len(),
             });
         }
         Ok(entries)

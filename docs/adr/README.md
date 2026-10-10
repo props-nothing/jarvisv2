@@ -140,6 +140,11 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0121](0121-a-providers-credential-is-a-file-path-not-a-value.md) | A provider's credential is a file path, and a partial provider is refused rather than guessed | Accepted |
 | [0122](0122-an-approval-override-can-only-tighten.md) | An operator's approval override can only tighten, and the risk vocabulary moved to core | Accepted |
 | [0123](0123-the-control-plane-reads-the-policy-in-force.md) | The control plane reads the policy in force, and a preview is a decision not a prediction | Accepted |
+| [0124](0124-memory-admission-is-a-column-pair.md) | A memory's admission is a column pair, and its cross-column rule lives in the decode | Accepted |
+| [0125](0125-a-summary-is-a-memory-plus-a-span.md) | A session summary is a memory plus a span table, and its retention is an explicit verb | Accepted |
+| [0126](0126-an-entity-is-its-own-surface.md) | An entity is its own surface, and identity is not trust | Accepted |
+| [0127](0127-the-naming-strategy-is-the-documents.md) | The naming strategy is the document's, not the caller's | Accepted |
+| [0128](0128-a-container-backend-confines-without-ffi.md) | A container backend confines without FFI, and claims three of five guarantees | Accepted |
 | [0129](0129-a-fetch-is-checked-on-the-address-it-connects-to.md) | A fetch is checked on the address it connects to, and a model-chosen URL was held for a person by default (amended by 0133) | Accepted |
 | [0130](0130-a-pending-approval-holds-what-it-is-waiting-on.md) | A pending approval holds what it is waiting on, so a person can decide it (amends 0013) | Accepted |
 | [0131](0131-model-authored-code-runs-in-a-disposable-container.md) | Model-authored code runs in a disposable container, and is held for a person unless the owner trusts it (amended by 0133) | Accepted |
@@ -148,3 +153,32 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0134](0134-a-sub-agent-is-an-ordinary-run-one-level-deep.md) | A sub-agent is an ordinary run, one level deep | Accepted |
 | [0135](0135-the-console-is-a-static-page-the-daemon-serves.md) | The console is a static page the daemon serves, and it is where you talk, watch, answer and stop | Accepted |
 | [0136](0136-an-approval-is-a-yes-or-no-from-the-owner.md) | An approval is a yes or no from the owner | Accepted |
+| [0137](0137-file-writes-create-or-append-an-edit-replaces-one-exact-text.md) | File writes create or append; an edit replaces one exact text | Accepted |
+| [0138](0138-the-voice-is-synthesized-by-the-daemon.md) | The voice is synthesized by the daemon | Accepted |
+| [0139](0139-settings-are-changed-by-the-owner-through-one-validated-path.md) | Settings are changed by the owner, through one validated path | Accepted |
+| [0140](0140-remembering-is-conversational-and-defaults-to-the-owner.md) | Remembering is conversational, and a claim with no subject is about the owner | Accepted |
+| [0141](0141-the-console-is-a-face-with-a-conversation.md) | The console is a face with a conversation; operations are their own page | Accepted |
+| [0142](0142-a-run-is-bounded-by-progress-and-by-you.md) | A run is bounded by progress and by you, not by small counts | Accepted |
+| [0143](0143-a-command-tool-and-a-run-that-remembers-its-turn.md) | JARVIS can run a command in your folder, and a run that waits for you remembers what it was doing | Accepted |
+| [0144](0144-one-executable-the-daemon-is-jarvis-daemon.md) | One executable: the daemon is `jarvis daemon` | Accepted |
+| [0145](0145-a-tool-permission-changes-at-once-and-jarvis-can-schedule.md) | A tool's permission changes at once, and JARVIS can schedule work from a conversation | Accepted |
+| [0146](0146-reasoning-effort-notifications-and-web-search.md) | A default reasoning effort, desktop notifications for scheduled results, and web search | Accepted |
+| [0147](0147-install-itself-and-search-memory.md) | JARVIS installs itself, and the model can search its memory | Accepted |
+| [0148](0148-the-model-can-search-files.md) | The model can search the text of the files in a granted folder | Accepted |
+| [0149](0149-sign-in-with-google-and-read-mail-and-calendar.md) | Sign in with Google from Settings, and read mail and calendar | Accepted |
+| [0150](0150-google-actions-opt-in-and-a-stop-that-does-not-throw-work-away.md) | Sending mail and creating events is opt-in and always asked, and a stop does not silently throw work away | Accepted |
+| [0151](0151-a-project-tells-a-run-what-it-is-for-and-never-what-it-may-do.md) | A project tells a run what it is for, and never what it may do | Accepted |
+| [0152](0152-the-console-shows-what-jarvis-is-doing-with-the-links-it-found.md) | The console shows what JARVIS is doing as it happens, with the links it found | Accepted |
+| [0153](0153-jarvis-can-create-projects-and-keep-its-memory-straight.md) | JARVIS can create and change projects itself, and keep its memory straight, with the owner's yes | Accepted |
+| [0154](0154-the-face-stands-alone-and-the-work-stays-on-screen.md) | The face stands alone, and what JARVIS did stays on screen as a constellation | Accepted |
+| [0155](0155-restarts-keep-work-the-owner-hears-and-leads-live-in-rows.md) | A restart no longer drops work, the owner hears when it matters, and prospect data lives in rows | Accepted |
+| [0156](0156-rate-limits-are-waited-out-and-do-not-contact-is-enforced.md) | A run waits out a provider rate limit, and the Gmail send tool honours do_not_contact | Accepted |
+| [0157](0157-email-can-carry-files-answer-in-thread-and-save-attachments.md) | Email can carry files, answer in its thread, and save what arrives | Accepted |
+| [0158](0158-jarvis-reads-pdf-word-spreadsheet-and-slide-files.md) | JARVIS reads PDF, Word, spreadsheet and slide files | Accepted |
+| [0159](0159-files-can-be-moved-and-a-limited-model-can-be-swapped.md) | Files can be moved, and a limited model can be swapped for another | Accepted |
+| [0160](0160-web-pages-are-read-in-parts-and-pdfs-and-word-notes-are-read.md) | Web pages are read in parts, PDFs on the web are read, and Word notes are read | Accepted |
+| [0161](0161-an-email-can-be-saved-as-a-draft-for-the-owner-to-review.md) | An email can be saved as a draft for the owner to review | Accepted |
+| [0162](0162-pictures-and-scanned-pdfs-are-read-by-the-owners-tesseract.md) | Pictures and scanned PDFs are read by the owner's tesseract | Accepted |
+| [0163](0163-the-fallback-model-may-be-at-a-different-provider.md) | The fallback model may be at a different provider | Accepted |
+| [0164](0164-the-brain-settings-choose-a-provider-and-a-model-from-a-list.md) | The Brain settings choose a provider and a model from a list | Accepted |
+| [0165](0165-a-project-can-cap-the-tokens-its-scheduled-work-uses-in-a-day.md) | A project can cap the tokens its scheduled work uses in a day | Accepted |

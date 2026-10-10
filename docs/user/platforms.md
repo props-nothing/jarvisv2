@@ -85,6 +85,6 @@ uninstall` removes it. `jarvis start` launches the daemon so that scripts which 
   run (`Run workflow`) is also its test.
 - The Linux sandbox backend without a container runtime has no wait-for-exit support recorded in the sandbox research; use the
   Docker-backed code tool.
-- Telephony, messaging apps and the connectors are not built, so a server has no way to reach you except the console, the CLI and the
-  schedule runner (`ROADMAP.md`).
+- Telephony and messaging apps are not built, so a server has no way to reach you except the console, the CLI, the schedule runner, an optional
+  ntfy push (`docs/user/settings.md`) and the Gmail and Calendar tools once you have signed in to Google (`docs/user/google.md`). Other connectors (Microsoft, GitHub) are not built (`ROADMAP.md`).
 - Several optional integrations (a coding-agent runtime, local speech) have not been designed for a headless host yet.

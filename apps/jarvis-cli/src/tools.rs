@@ -101,6 +101,16 @@ fn render_list(reply: &ToolListReply) {
         "{} tool(s); workspace ceiling {}, approval from {}",
         reply.total, reply.max_risk, reply.approval_threshold
     );
+    // What a run is sent about its tools on every model call: the price of having them, paid before it says a word.
+    let offered: u32 = reply
+        .tools
+        .iter()
+        .filter(|tool| tool.callable && !tool.denied)
+        .map(|tool| tool.offer_tokens)
+        .sum();
+    println!(
+        "  each model call is sent about {offered} tokens of tool definitions (rough: characters / 4); the last column is each tool's share"
+    );
     if reply.tools.is_empty() {
         println!("  (none registered)");
         return;
@@ -128,11 +138,12 @@ fn render_list(reply: &ToolListReply) {
             }
         };
         println!(
-            "  {id:<40} risk {risk:<9} approval {approval:<32} {state}",
+            "  {id:<40} risk {risk:<9} approval {approval:<32} {state:<12} ~{tokens} tok",
             id = tool.id,
             risk = tool.risk.as_str(),
             approval = approval,
-            state = state
+            state = state,
+            tokens = tool.offer_tokens
         );
     }
 }
