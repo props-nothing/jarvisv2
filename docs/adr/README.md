@@ -182,3 +182,4 @@ Each ADR includes status/date, context, decision, consequences, alternatives, an
 | [0163](0163-the-fallback-model-may-be-at-a-different-provider.md) | The fallback model may be at a different provider | Accepted |
 | [0164](0164-the-brain-settings-choose-a-provider-and-a-model-from-a-list.md) | The Brain settings choose a provider and a model from a list | Accepted |
 | [0165](0165-a-project-can-cap-the-tokens-its-scheduled-work-uses-in-a-day.md) | A project can cap the tokens its scheduled work uses in a day | Accepted |
+| [0166](0166-an-evaluation-harness-measures-whether-the-assistant-is-getting-better.md) | An evaluation harness measures whether the assistant is getting better | Accepted |

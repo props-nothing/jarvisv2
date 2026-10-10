@@ -366,6 +366,36 @@ impl ApiClient {
         Err(self.refusal(response).await)
     }
 
+    /// Reads one page of a run's events, from `from` (one-based, inclusive), at most `limit` of them.
+    ///
+    /// The plain read rather than the stream: a client that wants what a finished run did (its answer, its tools, its token use)
+    /// pages through this and needs no connection held open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the run is unknown, the page is refused, or the transport fails.
+    pub async fn read_run_events(
+        &self,
+        run_id: &str,
+        from: u32,
+        limit: u32,
+    ) -> Result<jarvis_protocol::RunEventPageReply, ApiError> {
+        let path = format!("{}/events?from={from}&limit={limit}", run_path(run_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::GET, &path)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<jarvis_protocol::RunEventPageReply>()
+                .await
+                .map_err(|_| ApiError::Decode);
+        }
+        Err(self.refusal(response).await)
+    }
+
     /// Lists the workspace's remembered claims.
     ///
     /// # Errors

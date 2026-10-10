@@ -28,8 +28,8 @@ Measured against the four hallmarks of a real J.A.R.V.I.S.:
 
 **Order of work from here** (the same list, with detail, is at the top of `TODO.md`):
 
-1. **Check what is only tested against stand-ins**, with the owner's own accounts: Gmail drafts, a real OCR run, the fallback at a second provider, the push, a reply sent from another sender. Nothing new is built; several shipped features have no live evidence yet.
-2. **An answer-quality harness** (`P9-011`): every change needs a measure of whether the assistant got better, and the owner's work (prospecting, mail, research) is the test set.
+1. **Check what is only tested against stand-ins**, with the owner's own accounts: a real OCR run, the fallback at a second provider, the push, a reply sent from another sender (Gmail drafts and the send gate were checked live on 2026-10-10). Nothing new is built; several shipped features have no live evidence yet.
+2. ~~An answer-quality harness (`P9-011`)~~ **built** (`jarvis eval`, `ADR-0166`). Next: the owner's own suites for their real work (prospecting, mail, research), then use it to compare models.
 3. **A browser tool for pages that need JavaScript**, the largest gap in research quality (`P9-069`).
 4. **Model routing**: a cheaper model for sub-agents and background work, now that usage is recorded and a second provider can be configured.
 5. **Coding-agent runtimes** (`P7`, ACP), and delegation as durable workflow steps (`P6-010`, `P7-010`).

@@ -111,6 +111,8 @@ default.
 - **Approvals are a yes or no.** Anything it asks about appears with Approve and Deny; you can also say "yes" or "no", or use
   `jarvis approvals approve|deny`.
 
+To check that a change made JARVIS better and not worse, run a suite of prompts against it and compare with the last run: `jarvis eval run evals/basics.toml` ([evals.md](evals.md)).
+
 ## `jarvis` is not found?
 
 A built or unpacked JARVIS is a folder, and nothing puts that folder on your PATH, so a terminal says `jarvis: command not found`

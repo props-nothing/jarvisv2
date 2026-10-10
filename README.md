@@ -9,7 +9,7 @@ This repository is in the **working-assistant stage**: `jarvisd` and `jarvis` ru
 - **Gmail and Google Calendar** after you sign in once from Settings: search and read mail, send mail with attachments and replies, save drafts, save attachments, read and create events (anything that reaches another person asks you first).
 - **Projects:** a goal, standing guidance and a journal per project, with daily caps on scheduled runs and on tokens; a contacts list that stops it writing to someone you marked do-not-contact; a daily digest and an optional push to your phone.
 - **Work that continues without you:** scheduled tasks, sub-agents, resume after a restart, code and shell commands (the shell tool is held for you by default), memory it proposes and you confirm.
-- **Oversight:** approvals, `jarvis cancel` as a kill switch, an audit trail, and a token count for every model call.
+- **Oversight:** approvals, `jarvis cancel` as a kill switch, an audit trail, and a token count for every model call; `jarvis eval` runs a suite of prompts against it and compares with the last run, so a change to a prompt, a tool or a model can be measured.
 
 Telephony, messaging apps, Microsoft and GitHub connectors, the desktop client, installers and external agent runtimes are not built. Google's push and watch framework in `jarvis-connectors` is tested but not wired into the daemon (`TODO.md`, `P5-005b`). [ROADMAP.md](ROADMAP.md) has the current direction and the next slices; [TODO.md](TODO.md) is the ledger. A `--root <dir>` portable mode keeps every managed file inside one explicit directory. The existing [Python example](example/readme.md) is a behavior reference and prototype, not the production core.
 ## Quick start
