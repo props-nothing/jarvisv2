@@ -90,6 +90,25 @@ fn clear() {
     }
 }
 
+/// What an approval would do, not the generic preview: the arguments are what a person decides on. A cut line is never the whole
+/// of what is approved, so it says where the rest is.
+fn approval_text(approval: &jarvis_protocol::PendingApprovalReply) -> String {
+    approval.arguments.as_ref().map_or_else(
+        || clip(&approval.preview, LINE_CHARS),
+        |arguments| {
+            let text = arguments.to_string();
+            if text.chars().count() > LINE_CHARS {
+                format!(
+                    "{}  (cut: `jarvis approvals approve` shows it all)",
+                    clip(&text, LINE_CHARS)
+                )
+            } else {
+                text
+            }
+        },
+    )
+}
+
 /// Builds the screen. Pure over its inputs and the clock reading, so it is tested without a daemon.
 #[must_use]
 pub fn render(
@@ -137,11 +156,7 @@ pub fn render(
                 "  [!] {}  risk {}  {}",
                 approval.tool,
                 approval.risk_level,
-                // What it would do, not the generic preview: the arguments are what a person decides on.
-                approval.arguments.as_ref().map_or_else(
-                    || clip(&approval.preview, LINE_CHARS),
-                    |arguments| clip(&arguments.to_string(), LINE_CHARS)
-                )
+                approval_text(approval)
             );
             let _ = writeln!(
                 screen,

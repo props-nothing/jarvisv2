@@ -129,6 +129,8 @@ fn skill_path(revision_id: &str) -> Result<String, RunPathError> {
 const SCHEDULES_PATH: &str = "/api/v1/schedules";
 /// The project collection's path.
 const PROJECTS_PATH: &str = "/api/v1/projects";
+/// The digest's path; a window in hours follows it.
+const DIGEST_PATH: &str = "/api/v1/digest";
 
 /// The approval collection's path.
 const APPROVALS_PATH: &str = "/api/v1/approvals";
@@ -497,6 +499,31 @@ impl ApiClient {
             .await
     }
 
+    /// Asks the daemon to send one push test message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `409` when push is not set up and a `502` when the push server refuses.
+    pub async fn push_test(&self) -> Result<(), ApiError> {
+        let _: serde_json::Value = self
+            .send_json(
+                reqwest::Method::POST,
+                "/api/v1/push/test",
+                &serde_json::json!({}),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads what happened over the last `hours` hours.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` for a window outside 1 hour to 31 days.
+    pub async fn digest(&self, hours: u32) -> Result<jarvis_protocol::DigestReply, ApiError> {
+        self.get_json(&format!("{DIGEST_PATH}/{hours}")).await
+    }
+
     /// Lists the workspace's projects, active first.
     ///
     /// # Errors
@@ -537,6 +564,55 @@ impl ApiClient {
     /// Returns [`ApiError::Refused`] with a `404` when there is no such project.
     pub async fn remove_project(&self, project_id: &str) -> Result<(), ApiError> {
         let path = format!("{PROJECTS_PATH}/{}", path_segment(project_id)?);
+        let response = self
+            .bounded_request(reqwest::Method::DELETE, &path)
+            .send()
+            .await
+            .map_err(|error| ApiError::Transport(classify(&error)))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(self.refusal(response).await)
+    }
+
+    /// Lists a page of contacts, with the count at every status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` for an unknown status or a limit outside 1 to 1000.
+    pub async fn list_contacts(
+        &self,
+        status: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<jarvis_protocol::ContactListReply, ApiError> {
+        let mut path = format!("/api/v1/contacts?limit={limit}&offset={offset}");
+        if let Some(status) = status {
+            path = format!("{path}&status={}", path_segment(status)?);
+        }
+        self.get_json(&path).await
+    }
+
+    /// Saves a contact as the owner: creates it, or updates the one the address (or company and person) names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `422` for a bad field or a new contact with no company.
+    pub async fn save_contact(
+        &self,
+        request: &jarvis_protocol::SaveContactRequest,
+    ) -> Result<jarvis_protocol::ContactReply, ApiError> {
+        self.send_json(reqwest::Method::POST, "/api/v1/contacts", request)
+            .await
+    }
+
+    /// Deletes a contact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Refused`] with a `404` when there is no such contact.
+    pub async fn remove_contact(&self, contact_id: &str) -> Result<(), ApiError> {
+        let path = format!("/api/v1/contacts/{}", path_segment(contact_id)?);
         let response = self
             .bounded_request(reqwest::Method::DELETE, &path)
             .send()

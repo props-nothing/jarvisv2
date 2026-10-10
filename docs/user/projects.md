@@ -42,6 +42,27 @@ project window. Journal entries are shown to the model as data to read, never as
 `jarvis project pause|resume|done NAME`. While a project is paused or done its scheduled tasks stop firing (you can still chat in it). (JARVIS can pause a project too, with your yes.) `jarvis project remove NAME` deletes the project and its
 journal; its conversations and schedules stay.
 
+## Cap how much it runs by itself
+
+`jarvis project set NAME --daily-limit 12` (or **Daily runs** in the project window) stops the project's *scheduled* tasks from starting more than that many runs in any 24 hours; the rest wait, and are counted as skipped in
+`jarvis schedule list`. Zero means no cap. Your own messages in the project are never refused, and JARVIS cannot change the cap itself.
+
+## What it decided long ago
+
+Every run is shown the newest journal entries and, before them, older **decision, result, blocker and owner** entries, so a long project keeps what it settled even after the progress notes have scrolled away. Write down what you
+want remembered as a decision.
+
+## What it did while you were away
+
+`jarvis digest` (or **Ops → Last 24 hours**): runs, outcomes, how many wait for you, tokens, and each project's runs with its newest decisions, results and blockers. `jarvis digest 72` looks further back.
+
+## Leads and contacts
+
+For prospecting, JARVIS keeps a contact list instead of a spreadsheet it has to rewrite: `jarvis.contacts.save|search|stats`. Saving the same lead twice updates it, a status tracks where it stands
+(`new`, `contacted`, `replied`, `meeting`, `won`, `lost`, `do_not_contact`), and a lead found inside a project is filed under it. JARVIS cannot move a contact out of `do_not_contact`; only you can.
+`jarvis contacts list [--status S] [--find TEXT]`, `jarvis contacts stats`, `jarvis contacts add COMPANY --email ... --status ...`, `jarvis contacts remove ID`, and `jarvis contacts export > contacts.csv`.
+The list is local: nothing in it is sent anywhere, and writing to a contact does not email them.
+
 ## Moving existing work into a project
 
 If you already run something by hand (a long objective on a schedule, a worklog file the model keeps), create the project, move the standing instructions out of the objective into the guidance, and file the

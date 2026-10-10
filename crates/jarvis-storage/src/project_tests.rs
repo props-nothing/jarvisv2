@@ -59,6 +59,7 @@ fn new(name: &str) -> NewProject {
         goal: "Win customers".to_owned(),
         guidance: "Be brief.".to_owned(),
         folder: "sales".to_owned(),
+        daily_run_limit: 0,
     }
 }
 
@@ -272,4 +273,42 @@ async fn a_schedule_can_be_refiled_into_another_project_or_out_of_all() {
     assert!(must(project_for(&database, LinkKind::Schedule, SCHEDULE).await).is_none());
     // Taking out of a project it was never in is fine.
     must(set_project_link(&database, LinkKind::Schedule, SCHEDULE, None).await);
+}
+
+#[tokio::test]
+async fn earlier_important_notes_skip_routine_progress_and_stop_at_the_window() {
+    let (_directory, database) = database().await;
+    let project = must(create_project(&database, LOCAL_WORKSPACE_ID, &new("P"), at(0)).await);
+    let mut ids = Vec::new();
+    for (index, (kind, body)) in [
+        (NoteKind::Progress, "routine one"),
+        (NoteKind::Decision, "chose Dutch list"),
+        (NoteKind::Progress, "routine two"),
+        (NoteKind::Blocker, "needs a login"),
+        (NoteKind::Progress, "recent"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let made = must(
+            add_project_note(
+                &database,
+                &project.id,
+                kind,
+                body,
+                None,
+                at(i64::try_from(index).unwrap_or(0).into()),
+            )
+            .await,
+        );
+        ids.push(made.id);
+    }
+    let earlier = must(earlier_important_notes(&database, &project.id, &ids[4], 10).await);
+    let bodies: Vec<&str> = earlier.iter().map(|note| note.body.as_str()).collect();
+    assert_eq!(bodies, ["chose Dutch list", "needs a login"]);
+    let none = must(earlier_important_notes(&database, &project.id, &ids[1], 10).await);
+    assert!(
+        none.is_empty(),
+        "nothing important precedes the first decision"
+    );
 }

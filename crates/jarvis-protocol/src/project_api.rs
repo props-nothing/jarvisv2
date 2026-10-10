@@ -22,6 +22,9 @@ pub struct CreateProjectRequest {
     /// The working folder, relative to a granted root.
     #[serde(default)]
     pub folder: String,
+    /// The most runs the scheduler may start for it in 24 hours; zero (or absent) means no cap.
+    #[serde(default)]
+    pub daily_run_limit: u32,
 }
 
 /// Request body for `PATCH /api/v1/projects/{id}`; an absent field is left as it is.
@@ -43,6 +46,9 @@ pub struct UpdateProjectRequest {
     /// `active`, `paused` or `done`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// A new cap on scheduled runs per 24 hours; zero removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_run_limit: Option<u32>,
 }
 
 /// Request body for `POST /api/v1/projects/{id}/notes`.
@@ -71,6 +77,10 @@ pub struct ProjectReply {
     pub folder: String,
     /// `active`, `paused` or `done`.
     pub status: String,
+    /// The most runs the scheduler may start for it in 24 hours; zero means no cap.
+    pub daily_run_limit: u32,
+    /// How many runs it has started in the last 24 hours.
+    pub runs_today: u32,
     /// When it was made.
     pub created_at: String,
     /// When it last changed, including a new journal entry.

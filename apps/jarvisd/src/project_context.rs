@@ -24,6 +24,12 @@ const JOURNAL_NOTES: u32 = 40;
 /// The longest journal block, in characters: inside what one fenced payload may hold.
 const JOURNAL_CHARS: usize = 3800;
 
+/// How much of it is kept for older decisions, results and blockers, so a long project still knows what it decided.
+const EARLIER_CHARS: usize = 1300;
+
+/// How many older important entries are read.
+const EARLIER_NOTES: u32 = 30;
+
 /// The longest single entry shown, so one long note cannot push out the rest.
 const NOTE_CHARS: usize = 700;
 
@@ -102,12 +108,27 @@ impl ProjectContext {
             };
         };
         // A sub-agent gets the brief but not the journal: its parent keeps that.
-        let notes = if delegated {
-            Vec::new()
+        let (earlier, notes) = if delegated {
+            (Vec::new(), Vec::new())
         } else {
-            recent_project_notes(database, &project.id, JOURNAL_NOTES).await?
+            let recent = recent_project_notes(database, &project.id, JOURNAL_NOTES).await?;
+            let start = recent_start(&recent, JOURNAL_CHARS - EARLIER_CHARS);
+            let shown = recent[start..].to_vec();
+            let earlier = match shown.first() {
+                Some(oldest) => {
+                    jarvis_storage::earlier_important_notes(
+                        database,
+                        &project.id,
+                        &oldest.id,
+                        EARLIER_NOTES,
+                    )
+                    .await?
+                }
+                None => Vec::new(),
+            };
+            (earlier, shown)
         };
-        Ok(Self::build(&project, &notes, delegated))
+        Ok(Self::build(&project, &earlier, &notes, delegated))
     }
 
     async fn load_index(
@@ -141,6 +162,7 @@ impl ProjectContext {
 
     fn build(
         project: &StoredProject,
+        earlier: &[StoredProjectNote],
         notes: &[StoredProjectNote],
         delegated: bool,
     ) -> Option<Self> {
@@ -152,7 +174,7 @@ impl ProjectContext {
             &brief,
             InclusionReason::ReservedPolicy,
         )?;
-        let journal = journal_text(&project.name, notes).and_then(|text| {
+        let journal = journal_text(&project.name, earlier, notes).and_then(|text| {
             let isolated = IsolatedText::new(&text).ok()?;
             let item = item(
                 ContextSourceKind::ActiveRunState,
@@ -302,32 +324,68 @@ background work unless they say so.",
     text
 }
 
-/// The newest entries that fit, oldest first; `None` when there is nothing to say.
-fn journal_text(name: &str, notes: &[StoredProjectNote]) -> Option<String> {
-    let mut lines: Vec<String> = Vec::new();
+fn note_line(note: &StoredProjectNote) -> String {
+    let body: String = note.body.chars().take(NOTE_CHARS).collect();
+    let day = note.created_at.get(..10).unwrap_or("");
+    format!(
+        "- {day} [{}] {}",
+        note.kind.as_str(),
+        body.replace('\n', " ")
+    )
+}
+
+/// Where in `notes` (oldest first) the entries that fit `budget` characters begin: the newest are kept.
+fn recent_start(notes: &[StoredProjectNote], budget: usize) -> usize {
     let mut used = 0;
-    for note in notes.iter().rev() {
-        let body: String = note.body.chars().take(NOTE_CHARS).collect();
-        let day = note.created_at.get(..10).unwrap_or("");
-        let line = format!(
-            "- {day} [{}] {}",
-            note.kind.as_str(),
-            body.replace('\n', " ")
-        );
-        let cost = line.chars().count() + 1;
-        if used + cost > JOURNAL_CHARS {
+    let mut start = notes.len();
+    for (index, note) in notes.iter().enumerate().rev() {
+        let cost = note_line(note).chars().count() + 1;
+        if used + cost > budget {
             break;
         }
         used += cost;
-        lines.push(line);
+        start = index;
     }
-    if lines.is_empty() {
-        return None;
-    }
-    lines.reverse();
-    Some(format!("Journal of {name}:\n{}", lines.join("\n")))
+    start
 }
 
+/// The journal as the model reads it: older decisions, results and blockers (so a long project keeps what it decided), then the
+/// recent entries, oldest first; `None` when there is nothing to say. One line per entry, so a note cannot imitate another.
+fn journal_text(
+    name: &str,
+    earlier: &[StoredProjectNote],
+    notes: &[StoredProjectNote],
+) -> Option<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0;
+    for note in earlier.iter().rev() {
+        let line = note_line(note);
+        let cost = line.chars().count() + 1;
+        if used + cost > EARLIER_CHARS {
+            break;
+        }
+        used += cost;
+        kept.push(line);
+    }
+    kept.reverse();
+    let recent: Vec<String> = notes[recent_start(notes, JOURNAL_CHARS - EARLIER_CHARS)..]
+        .iter()
+        .map(note_line)
+        .collect();
+    if kept.is_empty() && recent.is_empty() {
+        return None;
+    }
+    let mut text = format!("Journal of {name}:");
+    if !kept.is_empty() {
+        text.push_str("\nEarlier decisions, results and blockers:\n");
+        text.push_str(&kept.join("\n"));
+    }
+    if !recent.is_empty() {
+        text.push_str(if kept.is_empty() { "\n" } else { "\nRecent:\n" });
+        text.push_str(&recent.join("\n"));
+    }
+    Some(text)
+}
 #[cfg(test)]
 #[path = "project_context_tests.rs"]
 mod tests;

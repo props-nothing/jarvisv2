@@ -387,6 +387,84 @@ pub async fn recover_interrupted_runs(
     Ok(settled)
 }
 
+/// A run a restart cut off, with what a continuation needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedRun {
+    /// The interrupted run.
+    pub run_id: String,
+    /// Its conversation, which a continuation joins so it sees everything already said and done.
+    pub session_id: String,
+    /// What it was asked, as stored.
+    pub objective: String,
+}
+
+/// Which of the runs just settled by [`recover_interrupted_runs`] are worth continuing (`ADR-0155`).
+///
+/// A run qualifies when it failed with the restart code, started at or after `since`, and is the newest run of its
+/// conversation: a person who already answered after the interruption has moved on. A run whose objective starts with
+/// one of `skip_prefixes` (an earlier continuation, or a sub-agent whose parent is gone) is never offered, so a daemon
+/// that keeps dying cannot loop. At most `limit` are returned, in the order given.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when a read fails.
+pub async fn continuable_interrupted_runs(
+    database: &SqliteDatabase,
+    settled: &[String],
+    since: UtcTimestamp,
+    skip_prefixes: &[&str],
+    limit: u32,
+) -> Result<Vec<InterruptedRun>, DatabaseError> {
+    let mut found = Vec::new();
+    for id in settled {
+        if found.len() >= limit as usize {
+            break;
+        }
+        let row = sqlx::query(
+            "SELECT id, session_id, objective FROM agent_runs AS run \
+             WHERE id = ?1 AND state = 'failed' AND error_code = ?2 AND started_at >= ?3 \
+               AND NOT EXISTS (SELECT 1 FROM agent_runs AS later \
+                               WHERE later.session_id = run.session_id AND later.id > run.id)",
+        )
+        .bind(id)
+        .bind(INTERRUPTED_ERROR_CODE)
+        .bind(since.to_string())
+        .fetch_optional(database.pool())
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "find a continuable interrupted run",
+            source,
+        })?;
+        let Some(row) = row else { continue };
+        let objective: String =
+            row.try_get("objective")
+                .map_err(|source| DatabaseError::Sqlite {
+                    operation: "decode an interrupted run objective",
+                    source,
+                })?;
+        if skip_prefixes
+            .iter()
+            .any(|prefix| objective.starts_with(prefix))
+        {
+            continue;
+        }
+        found.push(InterruptedRun {
+            run_id: id.clone(),
+            session_id: row
+                .try_get("session_id")
+                .map_err(|source| DatabaseError::Sqlite {
+                    operation: "decode an interrupted run session",
+                    source,
+                })?,
+            objective,
+        });
+        if found.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(found)
+}
+
 /// Reads one run by identifier.
 ///
 /// # Errors
@@ -2031,6 +2109,57 @@ mod tests {
             .is_err(),
             "a non-terminal target must not be accepted by the settlement path"
         );
+    }
+
+    /// Only a recent, newest-in-its-conversation, not-already-a-continuation run is offered for a continuation.
+    #[tokio::test]
+    async fn only_a_recent_unanswered_original_run_is_offered_for_continuation() {
+        let (_directory, database) = seeded_database().await;
+        let run = at_responding(&database).await;
+        let settled = must(recover_interrupted_runs(&database, at(3)).await);
+
+        let offered = must(
+            continuable_interrupted_runs(&database, &settled, at(-10), &["[resumed] "], 3).await,
+        );
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].run_id, run.id());
+        assert_eq!(offered[0].session_id, SESSION);
+        assert_eq!(offered[0].objective, "Summarise today's calendar");
+
+        let stale = must(
+            continuable_interrupted_runs(&database, &settled, at(10), &["[resumed] "], 3).await,
+        );
+        assert!(
+            stale.is_empty(),
+            "a run from before the window is not continued"
+        );
+        let continuation = must(
+            continuable_interrupted_runs(&database, &settled, at(-10), &["Summarise"], 3).await,
+        );
+        assert!(
+            continuation.is_empty(),
+            "a continuation is never continued again"
+        );
+        let none = must(
+            continuable_interrupted_runs(&database, &settled, at(-10), &["[resumed] "], 0).await,
+        );
+        assert!(none.is_empty());
+
+        // A person who asked something else in the same conversation afterwards has moved on.
+        let later = must(NewRun::new(
+            RUN_B,
+            SESSION,
+            WORKSPACE,
+            USER,
+            "And tomorrow?",
+            CorrelationId::new(),
+            at(5),
+        ));
+        must(create_run(&database, &later).await);
+        let moved_on = must(
+            continuable_interrupted_runs(&database, &settled, at(-10), &["[resumed] "], 3).await,
+        );
+        assert!(moved_on.is_empty());
     }
 
     /// A run left in flight by a dead process is settled truthfully, not left looking active.

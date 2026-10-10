@@ -17,6 +17,8 @@ mod session_repository;
 mod summary_repository;
 
 mod approval_repository;
+mod contact_repository;
+mod digest_repository;
 mod project_repository;
 mod schedule_repository;
 pub mod settings;
@@ -35,11 +37,16 @@ pub use config::{
     LIVE_PROVIDER_MODEL_NAME, LoadedConfig, LoggingConfig, ProfileConfig,
     unrecognized_environment_keys,
 };
+pub use contact_repository::{
+    ContactInput, ContactStatus, MAX_CONTACTS, MAX_SEARCH_RESULTS, StoredContact, contact_stats,
+    delete_contact, list_contacts, save_contact, search_contacts,
+};
 pub use credential::{CREDENTIAL_FILE_NAME, CredentialStore, CredentialStoreError};
 pub use database::{
     CURRENT_SCHEMA_VERSION, DEFAULT_DATABASE_FILENAME, DaemonInstanceStart, DaemonStopReason,
     DatabaseError, SqliteDatabase,
 };
+pub use digest_repository::{FailedRun, ProjectActivity, RunTotals, StoredDigest, digest_since};
 pub use embedding_repository::{
     DEFAULT_INDEXED_DIMENSIONS, EmbeddingError, MAX_SIMILARITY_RESULTS, NewMemoryEmbedding,
     SimilarMemory, SimilarityQuery, index_ddl, record_memory_embedding, search_similar,
@@ -71,20 +78,20 @@ pub use pgvector::{
     encode as encode_embedding, is_indexable,
 };
 pub use project_repository::{
-    LinkKind, MAX_NOTE_CHARS, NewProject, NoteKind, ProjectChanges, ProjectStatus, StoredProject,
-    StoredProjectNote, add_project_note, create_project, delete_project, find_project,
-    link_project, list_projects, project_for, recent_project_notes, set_project_link,
-    update_project,
+    LinkKind, MAX_DAILY_RUN_LIMIT, MAX_NOTE_CHARS, NewProject, NoteKind, ProjectChanges,
+    ProjectStatus, StoredProject, StoredProjectNote, add_project_note, count_project_runs_since,
+    create_project, delete_project, earlier_important_notes, find_project, link_project,
+    list_projects, project_for, recent_project_notes, set_project_link, update_project,
 };
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,
     read_run_events,
 };
 pub use run_repository::{
-    INTERRUPTED_ERROR_CODE, MAX_OBJECTIVE_CHARS, NewRun, StoredRun, TerminalTransition,
-    count_working_runs, create_run, find_run, read_recent_runs, recover_interrupted_runs,
-    request_run_cancellation, settle_parked_run_cancelled, settle_run, transition_run,
-    withdraw_cancelled_run_approvals,
+    INTERRUPTED_ERROR_CODE, InterruptedRun, MAX_OBJECTIVE_CHARS, NewRun, StoredRun,
+    TerminalTransition, continuable_interrupted_runs, count_working_runs, create_run, find_run,
+    read_recent_runs, recover_interrupted_runs, request_run_cancellation,
+    settle_parked_run_cancelled, settle_run, transition_run, withdraw_cancelled_run_approvals,
 };
 pub use run_transcript_repository::{
     MAX_RUN_TRANSCRIPT_BYTES, delete_run_transcript, load_run_transcript, save_run_transcript,

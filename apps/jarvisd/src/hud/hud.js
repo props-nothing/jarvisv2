@@ -265,7 +265,7 @@
     "jarvis.files.write": "writing", "jarvis.files.edit": "editing", "jarvis.files.read": "reading", "jarvis.files.list": "listing", "jarvis.files.search": "searching files",
     "jarvis.web.fetch": "fetching a page", "jarvis.agent.delegate": "handing off a task", "jarvis.agent.result": "collecting a result",
     "jarvis.memory.propose": "noting a memory", "jarvis.code.run": "running code", "jarvis.command.run": "running",
-    "jarvis.web.search": "searching the web", "jarvis.memory.search": "checking memory", "jarvis.gmail.search": "searching your mail", "jarvis.gmail.read": "reading an email", "jarvis.calendar.events": "checking your calendar", "jarvis.gmail.send": "sending an email", "jarvis.calendar.create": "adding a calendar event", "jarvis.project.note": "writing a project note", "jarvis.project.list": "checking the projects", "jarvis.memory.correct": "correcting a memory", "jarvis.memory.forget": "forgetting a memory", "jarvis.project.use": "joining a project", "jarvis.project.create": "creating a project", "jarvis.project.update": "updating a project", "jarvis.project.assign_schedule": "filing a schedule under a project", "jarvis.schedule.pause": "pausing a scheduled task", "jarvis.schedule.resume": "resuming a scheduled task", "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task"
+    "jarvis.web.search": "searching the web", "jarvis.memory.search": "checking memory", "jarvis.gmail.search": "searching your mail", "jarvis.gmail.read": "reading an email", "jarvis.calendar.events": "checking your calendar", "jarvis.gmail.send": "sending an email", "jarvis.calendar.create": "adding a calendar event", "jarvis.project.note": "writing a project note", "jarvis.project.list": "checking the projects", "jarvis.memory.correct": "correcting a memory", "jarvis.memory.forget": "forgetting a memory", "jarvis.project.use": "joining a project", "jarvis.project.create": "creating a project", "jarvis.project.update": "updating a project", "jarvis.project.assign_schedule": "filing a schedule under a project", "jarvis.schedule.pause": "pausing a scheduled task", "jarvis.schedule.resume": "resuming a scheduled task", "jarvis.schedule.add": "scheduling a task", "jarvis.schedule.list": "checking the schedule", "jarvis.schedule.remove": "removing a scheduled task", "jarvis.contacts.save": "saving a contact", "jarvis.contacts.search": "checking the contacts", "jarvis.contacts.stats": "counting the contacts"
   };
   function describeCall(tool, target) {
     var verb = VERBS[tool] || String(tool || "working").replace(/^jarvis\./, "");
@@ -1013,6 +1013,13 @@
   }
 
   function answerPending(approve) {
+    // A spoken yes cannot approve what becomes a standing instruction or changes memory: its text is not heard, only read. A no is always fine.
+    if (S.pending.length === 1 && approve && NEVER_TRUSTED[S.pending[0].tool]) {
+      var screenOnly = "That one changes what I am told to do or remember, so please read it and press Approve on the screen.";
+      say(screenOnly);
+      if (S.speak) speak(screenOnly);
+      return;
+    }
     if (S.pending.length === 1) { decide(S.pending[0].approval_id, approve, "voice"); return; }
     if (S.pending.length === 0) { say("nothing is waiting for an answer"); return; }
     var message = S.pending.length + " things are waiting, so use the buttons to say which.";
@@ -1201,6 +1208,8 @@
     });
     return button;
   }
+  // Tools that write standing instructions or change memory: the daemon never lets them run without a yes, so the card does not offer it.
+  var NEVER_TRUSTED = { "jarvis.project.create": 1, "jarvis.project.update": 1, "jarvis.project.assign_schedule": 1, "jarvis.memory.correct": 1, "jarvis.memory.forget": 1 };
   function answerButtons(approvalId, tool) {
     var row = el("div", "row cmd");
     var yes = el("button", "yes", "Approve");
@@ -1213,7 +1222,7 @@
     }
     // "Always": the owner's own click trusts this tool from now on (the same setting as Settings, Permissions), then approves.
     // It applies at once; anything that talks to other people still asks, whatever is chosen.
-    var always = tool ? el("button", "", "Always allow") : null;
+    var always = tool && !NEVER_TRUSTED[tool] ? el("button", "", "Always allow") : null;
     if (always) {
       always.title = "Approve, and stop asking for " + tool + ". Change it any time in Settings, Permissions.";
       always.addEventListener("click", function () {
@@ -1260,7 +1269,7 @@
     });
   }
   // ---- the cards on the Ops page ------------------------------------------------------------------------------------
-  function plainObjective(text) { return String(text || "").replace(/^\[(scheduled|sub-agent)\]\s*/, ""); }
+  function plainObjective(text) { return String(text || "").replace(/^(\[(scheduled|sub-agent|resumed)\]\s*)+/, ""); }
   function span(from, to) {
     var seconds = Math.max(0, Math.round((Date.parse(to) - Date.parse(from)) / 1000));
     return duration(seconds);
@@ -1387,7 +1396,21 @@
       row.appendChild(el("span", "tag wait", "risk " + approval.risk_level));
       row.appendChild(el("strong", "", approval.tool));
       item.appendChild(row);
-      item.appendChild(el("div", "obj", clip(approval.arguments ? JSON.stringify(approval.arguments) : approval.preview, 400)));
+      if (NEVER_TRUSTED[approval.tool] && approval.arguments) {
+        // What is approved here becomes a standing instruction or changes memory, so every field is shown whole, one under its name:
+        // a long harmless-looking field must not push the one that matters out of sight.
+        var whole = el("div", "fields");
+        Object.keys(approval.arguments).forEach(function (key) {
+          var value = approval.arguments[key];
+          var field = el("div", "field");
+          field.appendChild(el("span", "dim", key));
+          field.appendChild(el("div", "fieldtext", typeof value === "string" ? value : JSON.stringify(value)));
+          whole.appendChild(field);
+        });
+        item.appendChild(whole);
+      } else {
+        item.appendChild(el("div", "obj", clip(approval.arguments ? JSON.stringify(approval.arguments) : approval.preview, 400)));
+      }
       item.appendChild(answerButtons(approval.approval_id, approval.tool));
       return item;
     }
@@ -1428,6 +1451,42 @@
     }
 
     fill("recent", finished.map(recentCard), "nothing yet");
+  }
+
+  // ---- what happened lately (ADR-0155) ----------------------------------------------------------------------------------
+  var digestAt = 0;
+  function loadDigest() {
+    digestAt = Date.now();
+    api("/digest").then(paintDigest, function () { digestAt = 0; });
+  }
+  function tokenText(count) {
+    var n = Number(count) || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+    return String(n);
+  }
+  function paintDigest(digest) {
+    var host = $("digest");
+    host.replaceChildren();
+    function line(label, value, hot) {
+      var row = el("div", "stat" + (hot ? " hot" : ""));
+      row.appendChild(el("span", "", label));
+      row.appendChild(el("b", "", String(value)));
+      host.appendChild(row);
+    }
+    line("Runs", digest.runs, false);
+    line("Finished", digest.succeeded, false);
+    line("Failed", digest.failed, digest.failed > 0);
+    line("Waiting for you", digest.waiting, digest.waiting > 0);
+    // Not every provider reports usage, so zero means unknown rather than free.
+    line("Tokens", digest.input_tokens + digest.output_tokens === 0 ? "not reported" : tokenText(digest.input_tokens) + " in / " + tokenText(digest.output_tokens) + " out", false);
+    (digest.projects || []).forEach(function (project) {
+      line(project.name, project.runs + " run" + (project.runs === 1 ? "" : "s"), false);
+      (project.highlights || []).forEach(function (note) { host.appendChild(el("div", "dim", note.kind + ": " + clip(note.text, 140))); });
+    });
+    (digest.problems || []).forEach(function (problem) {
+      host.appendChild(el("div", "dim", "failed: " + clip(plainObjective(problem.objective), 70) + " (" + problem.error_code + ")"));
+    });
   }
 
   // ---- projects (ADR-0151) ----------------------------------------------------------------------------------------------
@@ -1549,6 +1608,9 @@
     body.appendChild(formRow("Name", name));
     body.appendChild(formRow("Goal", goal));
     body.appendChild(formRow("Folder", folder, "Where its files live, relative to a folder you granted in Settings, Files. Empty means that folder itself."));
+    var cap = textField(project && project.daily_run_limit ? String(project.daily_run_limit) : "", "0 = no cap");
+    var used = project && project.daily_run_limit ? " Used in the last 24 hours: " + project.runs_today + "." : "";
+    body.appendChild(formRow("Daily runs", cap, "The most runs its scheduled tasks may start in 24 hours; past it they wait. Your own messages are never refused." + used));
     body.appendChild(formRow("Guidance", guidance, "Your standing instructions. The project cannot widen what JARVIS may do: approvals and permissions stay as they are."));
     var status = null;
     if (project) {
@@ -1564,7 +1626,9 @@
     var acts = el("div", "acts");
     var save = el("button", "yes", project ? "Save" : "Create");
     save.addEventListener("click", function () {
-      var fields = { name: name.value, goal: goal.value, folder: folder.value, guidance: guidance.value };
+      var limit = cap.value.trim() === "" ? 0 : Number(cap.value);
+      if (!Number.isInteger(limit) || limit < 0) { projectNote("Daily runs must be a whole number, or empty for no cap.", true); return; }
+      var fields = { name: name.value, goal: goal.value, folder: folder.value, guidance: guidance.value, daily_run_limit: limit };
       if (status) fields.status = status.value;
       save.disabled = true;
       putJson(project ? "/projects/" + encodeURIComponent(project.project_id) : "/projects", project ? "PATCH" : "POST", fields).then(function (saved) {
@@ -1696,7 +1760,7 @@
     ["Web", /^jarvis\.web\./, "94,227,255"], ["Files", /^jarvis\.files\./, "107,226,160"], ["Memory", /^jarvis\.memory\./, "176,150,255"],
     ["Sub-agents", /^jarvis\.agent\./, "255,120,214"], ["Commands & code", /^jarvis\.(command|code)\./, "255,138,92"],
     ["Mail & calendar", /^jarvis\.(gmail|calendar)\./, "255,180,84"], ["Schedule", /^jarvis\.schedule\./, "120,240,214"],
-    ["Projects", /^jarvis\.project\./, "150,200,255"]
+    ["Projects", /^jarvis\.project\./, "150,200,255"], ["Contacts", /^jarvis\.contacts\./, "255,214,120"]
   ];
   function families(tools) {
     var groups = FAMILIES.map(function (family) { return { name: family[0], rgb: family[2], tools: [] }; });
@@ -2248,7 +2312,10 @@
   function observeRuns(runs) {
     if (!window.JarvisMission) return;
     var wanted = {};
-    runs.filter(function (run) { return !run.outcome && run.state !== "awaiting_approval" && run.run_id !== S.runId; })
+    // Working runs first, then parked ones (they show as a held step), three in all: a browser allows six connections per host.
+    var live = runs.filter(function (run) { return !run.outcome && run.run_id !== S.runId; });
+    live.filter(function (run) { return run.state !== "awaiting_approval"; })
+      .concat(live.filter(function (run) { return run.state === "awaiting_approval"; }))
       .slice(0, 3).forEach(function (run) { wanted[run.run_id] = run; });
     Object.keys(observers).forEach(function (id) { if (!wanted[id]) { observers[id].abort(); delete observers[id]; } });
     Object.keys(wanted).forEach(function (id) { if (!observers[id]) observe(wanted[id]); });
@@ -2280,6 +2347,7 @@
       watchSchedules(results[2].schedules);
       refreshAbilities();
       refreshProposals();
+      if (Date.now() - digestAt > 60000) loadDigest();
       if (Date.now() - projectsAt > 15000) loadProjects();
       tickAges();
       paintHeader();

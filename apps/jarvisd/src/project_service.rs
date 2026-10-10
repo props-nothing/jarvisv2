@@ -33,7 +33,20 @@ pub fn routes() -> axum::Router<GatewayState> {
 /// How many journal entries the detail view carries.
 const DETAIL_NOTES: u32 = 50;
 
-pub(crate) fn project_reply(project: &StoredProject) -> ProjectReply {
+/// The start of the window a daily cap counts: the last 24 hours, so it needs no time zone.
+pub(crate) fn day_window_start() -> UtcTimestamp {
+    let now = UtcTimestamp::now(&SystemClock).unix_nanos();
+    UtcTimestamp::from_unix_nanos(now - 86_400_000_000_000)
+        .unwrap_or_else(|_| UtcTimestamp::now(&SystemClock))
+}
+
+async fn runs_today(state: &GatewayState, project: &StoredProject) -> u32 {
+    jarvis_storage::count_project_runs_since(state.database(), &project.id, day_window_start())
+        .await
+        .unwrap_or(0)
+}
+
+pub(crate) fn project_reply(project: &StoredProject, runs_today: u32) -> ProjectReply {
     ProjectReply {
         project_id: project.id.clone(),
         name: project.name.clone(),
@@ -41,6 +54,8 @@ pub(crate) fn project_reply(project: &StoredProject) -> ProjectReply {
         guidance: project.guidance.clone(),
         folder: project.folder.clone(),
         status: project.status.as_str().to_owned(),
+        daily_run_limit: project.daily_run_limit,
+        runs_today,
         created_at: project.created_at.clone(),
         updated_at: project.updated_at.clone(),
     }
@@ -113,6 +128,7 @@ pub async fn create(
         goal: request.goal,
         guidance: request.guidance,
         folder: request.folder,
+        daily_run_limit: request.daily_run_limit,
     };
     match jarvis_storage::create_project(
         state.database(),
@@ -122,7 +138,7 @@ pub async fn create(
     )
     .await
     {
-        Ok(project) => (StatusCode::CREATED, Json(project_reply(&project))).into_response(),
+        Ok(project) => (StatusCode::CREATED, Json(project_reply(&project, 0))).into_response(),
         Err(error) => storage_response(&error),
     }
 }
@@ -135,9 +151,13 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
     };
     match jarvis_storage::list_projects(state.database(), &workspace_id).await {
         Ok(projects) => {
+            let mut replies = Vec::with_capacity(projects.len());
+            for project in &projects {
+                replies.push(project_reply(project, runs_today(&state, project).await));
+            }
             let reply = ProjectListReply {
-                total: projects.len(),
-                projects: projects.iter().map(project_reply).collect(),
+                total: replies.len(),
+                projects: replies,
             };
             (StatusCode::OK, Json(reply)).into_response()
         }
@@ -158,7 +178,7 @@ pub async fn read(State(state): State<GatewayState>, Path(id): Path<String>) -> 
     match jarvis_storage::recent_project_notes(state.database(), &project.id, DETAIL_NOTES).await {
         Ok(notes) => {
             let reply = ProjectDetailReply {
-                project: project_reply(&project),
+                project: project_reply(&project, runs_today(&state, &project).await),
                 notes: notes.iter().map(note_reply).collect(),
             };
             (StatusCode::OK, Json(reply)).into_response()
@@ -194,6 +214,7 @@ pub async fn update(
         guidance: request.guidance,
         folder: request.folder,
         status,
+        daily_run_limit: request.daily_run_limit,
     };
     match jarvis_storage::update_project(
         state.database(),
@@ -204,7 +225,10 @@ pub async fn update(
     )
     .await
     {
-        Ok(project) => (StatusCode::OK, Json(project_reply(&project))).into_response(),
+        Ok(project) => {
+            let used = runs_today(&state, &project).await;
+            (StatusCode::OK, Json(project_reply(&project, used))).into_response()
+        }
         Err(error) => storage_response(&error),
     }
 }

@@ -114,6 +114,8 @@ fn unix_seconds() -> i64 {
 struct ResultWatcher {
     seen: Option<std::collections::HashMap<String, String>>,
     pending: Vec<(String, String)>,
+    /// Approvals already announced, so each is announced once; the ones present at startup are included.
+    approvals: std::collections::HashSet<String>,
 }
 
 impl ResultWatcher {
@@ -149,13 +151,53 @@ impl ResultWatcher {
             }
         }
         self.pending = still_running;
+        self.announce_approvals(state, first_pass).await;
+    }
+
+    /// An approval that appears while no console is open is announced once: a parked run waits for the owner and nobody else.
+    async fn announce_approvals(&mut self, state: &GatewayState, first_pass: bool) {
+        let Ok(identity) = jarvis_storage::load_local_identity(state.database()).await else {
+            return;
+        };
+        let Ok(pending) = jarvis_storage::read_workspace_pending_approvals(
+            state.database(),
+            identity.workspace_id(),
+            UtcTimestamp::now(&SystemClock),
+        )
+        .await
+        else {
+            return;
+        };
+        let ids: std::collections::HashSet<String> = pending
+            .iter()
+            .map(|approval| approval.id().to_string())
+            .collect();
+        self.approvals.retain(|id| ids.contains(id));
+        for approval in &pending {
+            if self.approvals.insert(approval.id().to_string()) && !first_pass {
+                let body = format!(
+                    "JARVIS is waiting for your approval to use {}.",
+                    approval.tool()
+                );
+                tell_owner(state, &body, &body, 4).await;
+            }
+        }
     }
 }
 
-async fn announce(state: &GatewayState, run: &jarvis_storage::StoredRun, task: &str) {
-    let console_open = unix_seconds()
-        - LAST_CONSOLE_POLL.load(std::sync::atomic::Ordering::Relaxed)
-        < CONSOLE_OPEN_WITHIN_SECONDS;
+/// Whether a console polled recently enough to be open, and so to show things itself.
+fn console_is_open() -> bool {
+    unix_seconds() - LAST_CONSOLE_POLL.load(std::sync::atomic::Ordering::Relaxed)
+        < CONSOLE_OPEN_WITHIN_SECONDS
+}
+
+/// Tells the owner something while no console is open: a desktop notification carrying `shown` (unless turned off) and, when a
+/// push topic is set, a push carrying `pushed`. They differ on purpose: the desktop text may hold an answer, which stays on this
+/// machine, while the push never does. A console that is open shows things itself, so nothing is sent then.
+async fn tell_owner(state: &GatewayState, shown: &str, pushed: &str, priority: u8) {
+    if console_is_open() {
+        return;
+    }
     let enabled = state.settings().is_none_or(|context| {
         jarvis_storage::ConfigStore::from_paths(context.paths())
             .load()
@@ -163,9 +205,13 @@ async fn announce(state: &GatewayState, run: &jarvis_storage::StoredRun, task: &
                 loaded.config().daemon().notifications_enabled()
             })
     });
-    if console_open || !enabled {
-        return;
+    if enabled {
+        crate::notify::show("JARVIS", shown);
     }
+    crate::push::alert(state, "JARVIS", pushed, priority).await;
+}
+
+async fn announce(state: &GatewayState, run: &jarvis_storage::StoredRun, task: &str) {
     let answer = if run.terminal_outcome() == Some(jarvis_core::RunOutcome::Succeeded) {
         crate::executor::last_answer(&state.database_handle(), run)
             .await
@@ -174,13 +220,14 @@ async fn announce(state: &GatewayState, run: &jarvis_storage::StoredRun, task: &
     } else {
         None
     };
-    let body = answer.unwrap_or_else(|| format!("This scheduled task did not finish: {task}"));
-    tracing::info!(
-        "a scheduled task finished with no console open, so it was shown as a desktop notification"
-    );
-    crate::notify::show("JARVIS", &body);
+    let pushed = if answer.is_some() {
+        "A scheduled task finished."
+    } else {
+        "A scheduled task did not finish."
+    };
+    let shown = answer.unwrap_or_else(|| format!("This scheduled task did not finish: {task}"));
+    tell_owner(state, &shown, pushed, 3).await;
 }
-
 /// Runs one scheduler pass at `now`.
 ///
 /// # Errors
@@ -212,9 +259,23 @@ pub async fn tick(state: &GatewayState, now: UtcTimestamp) -> Result<TickReport,
         .await
         .ok()
         .flatten();
-        if project
-            .as_ref()
-            .is_some_and(|project| project.status != jarvis_storage::ProjectStatus::Active)
+        // A project that has used its daily cap stops getting scheduled runs until the 24 hours roll over: counted as skipped.
+        let over_cap = match project.as_ref() {
+            Some(project) if project.daily_run_limit > 0 => {
+                jarvis_storage::count_project_runs_since(
+                    state.database(),
+                    &project.id,
+                    crate::project_service::day_window_start(),
+                )
+                .await
+                .is_ok_and(|used| used >= project.daily_run_limit)
+            }
+            _ => false,
+        };
+        if over_cap
+            || project
+                .as_ref()
+                .is_some_and(|project| project.status != jarvis_storage::ProjectStatus::Active)
         {
             if let Err(error) =
                 jarvis_storage::record_schedule_skip(state.database(), schedule.id()).await
@@ -269,7 +330,10 @@ async fn previous_run_is_active(state: &GatewayState, schedule: &StoredSchedule)
 
 /// The objective as a person would recognise it: a scheduled or delegated run's framing line is for the model, not
 /// for a list.
-fn shown_objective(objective: &str) -> String {
+pub(crate) fn shown_objective(objective: &str) -> String {
+    if let Some(original) = objective.strip_prefix(crate::resume::RESUME_NOTICE) {
+        return format!("[resumed] {}", shown_objective(original));
+    }
     if let Some(task) = objective.strip_prefix(UNATTENDED_NOTICE) {
         return format!("[scheduled] {task}");
     }

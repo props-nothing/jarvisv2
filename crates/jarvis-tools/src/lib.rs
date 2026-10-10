@@ -64,8 +64,9 @@ pub use definition::{
 pub use documents::{DocumentError, DocumentSet, MAX_SUPPLIED_DOCUMENTS};
 pub use effect::{EffectSet, ToolEffect};
 pub use evaluation::{
-    ActorAuthority, ActorStatus, Decision, DenyReason, EscalationSignal, PolicyDecision,
-    PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, effective_risk, evaluate,
+    ActorAuthority, ActorStatus, Decision, DenyReason, EscalationSignal, NEVER_TRUSTED_TOOLS,
+    PolicyDecision, PolicyError, PolicyRequest, TargetAssessment, WorkspacePolicy, effective_risk,
+    evaluate,
 };
 pub use execution::{
     ApprovalCitation, AuthorizationReceipt, AuthorizationReceiptParts, BoundedOutput,

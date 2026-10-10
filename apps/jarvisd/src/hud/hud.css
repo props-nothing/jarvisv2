@@ -301,6 +301,10 @@ button { white-space: nowrap; }
 .suggest button { font-size: 12px; padding: 4px 12px; color: var(--cyan); border-color: var(--line-hot); white-space: normal; max-width: 100%; text-align: center; }
 #chat { overflow-x: hidden; }
 .sched-act { display: flex; gap: 6px; margin-top: 6px; }
+.fields { margin-top: 6px; max-height: 260px; overflow-y: auto; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.25); padding: 4px 8px; }
+.field { padding: 4px 0; border-top: 1px dashed var(--line); }
+.field:first-child { border-top: 0; }
+.fieldtext { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); }
 .sched-act select { padding: 2px 6px; color: var(--text); background: rgba(2, 10, 20, 0.85); border: 1px solid var(--line); font: 12px var(--mono); max-width: 11em; }
 .sched-act { flex-wrap: wrap; align-items: center; }
 .sched-act button { padding: 1px 10px; font-size: 12px; }

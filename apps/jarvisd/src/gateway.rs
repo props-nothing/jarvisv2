@@ -344,6 +344,9 @@ pub fn router(state: GatewayState) -> Router {
         .route("/skills/{id}/disable", post(disable_skill))
         .route("/skills/{id}/enable", post(enable_skill))
         .merge(crate::google_service::routes())
+        .merge(crate::contacts_service::routes())
+        .merge(crate::digest_service::routes())
+        .merge(crate::push::routes())
         .merge(crate::project_service::routes())
         .merge(crate::schedule_service::routes());
 
@@ -2451,6 +2454,18 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("router call: {error}"));
         assert_eq!(off.status(), StatusCode::OK);
+        // A tool that writes standing instructions cannot be set to run without asking, and nothing is saved.
+        let never = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/settings/tools/jarvis.project.create",
+                &presented,
+                r#"{"posture":"trusted"}"#,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("router call: {error}"));
+        assert_eq!(never.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!read().contains("jarvis.project.create"));
         let listed = body_text(
             app.clone()
                 .oneshot(get_request("/api/v1/settings", Some(&presented)))

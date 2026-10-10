@@ -109,6 +109,15 @@ impl ActorAuthority {
     }
 }
 
+/// Tools whose every call needs the owner's own yes, whatever the trust list says (`ADR-0155`).
+pub const NEVER_TRUSTED_TOOLS: &[&str] = &[
+    "jarvis.project.create",
+    "jarvis.project.update",
+    "jarvis.project.assign_schedule",
+    "jarvis.memory.correct",
+    "jarvis.memory.forget",
+];
+
 /// The workspace's own policy, which a request cannot widen.
 ///
 /// Every field can only make the outcome **more** restrictive than the tool's own declaration. That
@@ -214,8 +223,15 @@ impl WorkspacePolicy {
     ///   tool changes nothing;
     /// - a later denial or approval override for the same tool **wins**: tightening outranks trust, whichever
     ///   order the two were declared in.
+    ///
+    /// - it is **never** applied to the tools in [`NEVER_TRUSTED_TOOLS`]: they write text that later runs receive as standing
+    ///   policy (a project's guidance) or change what the owner remembers, so a yes to each one is the control, and a blanket
+    ///   "always" would let a prompt-injected model plant it silently.
     #[must_use]
     pub fn trusting(mut self, id: ToolId) -> Self {
+        if NEVER_TRUSTED_TOOLS.contains(&id.to_string().as_str()) {
+            return self;
+        }
         if !self.denied_tools.contains(&id) && !self.approval_tools.contains_key(&id) {
             self.trusted_tools.insert(id);
         }
@@ -1050,6 +1066,20 @@ mod tests {
         assert!(
             evaluate(&request(&sending, &trusted_sender, sender_actor)).is_held(),
             "trust must not release a tool that communicates externally"
+        );
+    }
+
+    /// **The tools that write standing policy or change the owner's memory are never trusted**, whatever the trust list says.
+    #[test]
+    fn a_trust_list_cannot_waive_the_approval_of_policy_writing_tools() {
+        for tool in NEVER_TRUSTED_TOOLS {
+            let workspace = WorkspacePolicy::default().trusting(id(tool));
+            assert!(!workspace.trusts(&id(tool)), "{tool} must stay asked");
+        }
+        let workspace = WorkspacePolicy::default().trusting(id("jarvis.code.run"));
+        assert!(
+            workspace.trusts(&id("jarvis.code.run")),
+            "other tools can still be trusted"
         );
     }
 

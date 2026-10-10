@@ -3508,6 +3508,7 @@ mod tests {
                 goal: "Book five demos".to_owned(),
                 guidance: "Write in Dutch. Never email anyone without asking.".to_owned(),
                 folder: "sales".to_owned(),
+                daily_run_limit: 0,
             },
             now,
         )

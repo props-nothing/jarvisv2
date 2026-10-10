@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current application-owned SQLite schema version.
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 /// Default filename for the canonical local database.
 pub const DEFAULT_DATABASE_FILENAME: &str = "jarvis.sqlite3";
 
@@ -419,6 +419,15 @@ pub enum DatabaseError {
         /// Stable field name without the offending value.
         field: &'static str,
     },
+    /// A contact field was refused (a company is required; lengths and characters are bounded).
+    #[error("the contact's {field} is not acceptable")]
+    InvalidContact {
+        /// Stable field name without the offending value.
+        field: &'static str,
+    },
+    /// The workspace already holds the most contacts it may.
+    #[error("this workspace already holds the maximum number of contacts")]
+    ContactLimit,
     /// The session or schedule already belongs to a different project.
     #[error("that conversation or schedule already belongs to a different project")]
     ProjectConflict,

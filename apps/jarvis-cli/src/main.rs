@@ -15,6 +15,8 @@ mod cancel;
 mod chat;
 mod checks;
 mod connector;
+mod contacts;
+mod digest;
 mod entity;
 mod hud;
 mod init;
@@ -23,6 +25,7 @@ mod lifecycle;
 mod memory;
 mod output;
 mod project;
+mod push;
 mod schedule;
 mod service_install;
 mod settings;
@@ -124,6 +127,9 @@ async fn client_main(arguments: Vec<String>) -> ExitCode {
         Some("runs") => schedule_command(&arguments, true).await,
         // Projects: the goal, guidance, folder and journal of long-running work (`ADR-0151`).
         Some("project") => project_command(&arguments).await,
+        Some("digest") => digest_command(&arguments).await,
+        Some("contacts") => contacts_command(&arguments).await,
+        Some("push") => push_command(&arguments).await,
         // `skills` is the `P4-013` inspection and control surface: the `FR-MEM-005` lifecycle applied to a
         // stored procedure, which before this verb group was reachable only from a test.
         Some("skills") => skills_command(&arguments).await,
@@ -194,9 +200,12 @@ async fn launch_command(arguments: &[String]) -> ExitStatus {
 }
 
 const fn usage() -> &'static str {
-    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|project|skills|connector|doctor|path|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
+    "usage: jarvis [launch] | jarvis <init|start|stop|restart|config|keys|service|status|health|ask|chat|logs|memory|tools|approvals|cancel|watch|hud|schedule|runs|project|digest|contacts|push|skills|connector|doctor|path|version> [--json] [--lines N] [--repair] [--root DIR]\n       jarvis ask <objective...> [--root DIR]\n       jarvis chat [--root DIR]\n       jarvis start [--no-open] [--root DIR]\n       jarvis memory <list|show|search|remember|correct|confirm|forget|export> [...]\n       jarvis tools <list|preview> [...]\n       jarvis approvals <list|approve|deny|resume> [...]
        jarvis schedule <add|list|pause|resume|remove> [...]
        jarvis project <add|list|show|set|pause|resume|done|note|remove> [...]   # long-running work with its own goal, guidance and journal; `jarvis ask --project NAME ...`
+       jarvis digest [HOURS] [--json]   # what JARVIS did while you were away: runs, outcomes, project decisions, failures, tokens
+       jarvis contacts <list|stats|add|remove|export> [...]   # the people and companies JARVIS is working with; `export` writes a CSV
+       jarvis push test                 # send one test message to your ntfy topic (daemon.push_topic)
        jarvis runs [list] [--limit N] [--full]\n       jarvis skills <list|show|create|promote|disable|enable|forget|export> [...]\n       jarvis connector <new|check|items> [...]\n       jarvis path <install|uninstall|status>      # make `jarvis` work from any terminal\n       jarvis stop|restart [--wait] [--force]      # a stop that would interrupt working tasks is refused unless --force (or waits with --wait)\n       jarvis install [--service] [--dir DIR]      # install this one program for the current user (and start it at login)\n       jarvis uninstall                            # remove it again (your settings and memory stay)"
 }
 
@@ -268,6 +277,48 @@ async fn project_command(arguments: &[String]) -> ExitStatus {
         Err(status) => return status,
     };
     project::run_project(&client, arguments).await
+}
+
+/// Runs `jarvis digest` over the daemon's HTTP API.
+async fn digest_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    digest::run_digest(&client, arguments).await
+}
+
+/// Runs one `jarvis contacts` verb over the daemon API.
+async fn contacts_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    contacts::run_contacts(&client, arguments).await
+}
+
+/// Runs `jarvis push test` over the daemon API.
+async fn push_command(arguments: &[String]) -> ExitStatus {
+    let root = match requested_root(arguments) {
+        Ok(Some(root)) => vec!["--root".to_owned(), root.display().to_string()],
+        Ok(None) => Vec::new(),
+        Err(status) => return status,
+    };
+    let client = match run_client(&root) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    push::run_push(&client, arguments).await
 }
 
 /// Takes `--project NAME` out of the arguments, so `ask` and `chat` can start runs inside a project.

@@ -6,8 +6,11 @@ mod build_info;
 mod clock;
 mod code_run;
 mod command_run;
+mod contacts_service;
+mod contacts_tool;
 mod control;
 mod delegate;
+mod digest_service;
 mod dispatch;
 mod entity_service;
 mod executor;
@@ -27,6 +30,8 @@ mod notify;
 mod project_context;
 mod project_service;
 mod project_tool;
+mod push;
+mod resume;
 mod run_service;
 mod schedule_service;
 mod schedule_tool;
@@ -190,6 +195,13 @@ enum DaemonError {
         /// Which part was rejected, named by the variant.
         #[source]
         source: crate::project_tool::ProjectToolError,
+    },
+    /// The contact tools could not state their own contract.
+    #[error("the contact tools could not be defined")]
+    ContactsTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::contacts_tool::ContactsToolError,
     },
     /// The schedule tools could not state their own contract.
     #[error("the schedule tools could not be defined")]
@@ -360,6 +372,14 @@ async fn daemon_main(arguments: Vec<String>) -> ExitCode {
     }
 }
 
+/// What the gateway drives runs with, and the runs recovery just settled as interrupted.
+struct Services {
+    executor: Option<Arc<executor::Executor>>,
+    tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
+    speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
+    interrupted: Vec<String>,
+}
+
 /// Everything the daemon must hold for its lifetime, constructed in startup order.
 struct Running {
     health: Arc<HealthState>,
@@ -377,6 +397,8 @@ struct Running {
     tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
     /// The speech provider, resolved at start so a missing key file fails the daemon rather than the first sentence.
     speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
+    /// The runs recovery just settled as interrupted, which may get one continuation once runs can be driven.
+    interrupted: Vec<String>,
     /// The connected MCP host, held so its connections stay open and can be closed on shutdown.
     ///
     /// Held **beside** the pipeline rather than inside it because the two have different lifetimes: the
@@ -425,7 +447,7 @@ struct Running {
 async fn settle_interrupted_runs(
     database: &SqliteDatabase,
     daemon_id: DaemonRunId,
-) -> Result<(), DaemonError> {
+) -> Result<Vec<String>, DaemonError> {
     match jarvis_storage::recover_interrupted_runs(database, UtcTimestamp::now(&SystemClock)).await
     {
         Ok(recovered) if !recovered.is_empty() => {
@@ -436,9 +458,9 @@ async fn settle_interrupted_runs(
                 runs = ?recovered,
                 "settled runs interrupted by a previous process"
             );
-            Ok(())
+            Ok(recovered)
         }
-        Ok(_) => Ok(()),
+        Ok(recovered) => Ok(recovered),
         Err(error) => {
             let _ = database
                 .mark_daemon_stopped(
@@ -512,10 +534,13 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
 
     // Recovery runs BEFORE the listener binds, so no client can observe a run in a non-terminal
     // state that no process will ever advance.
-    if let Err(error) = settle_interrupted_runs(&database, daemon_id).await {
-        database.close().await;
-        return Err(error);
-    }
+    let interrupted = match settle_interrupted_runs(&database, daemon_id).await {
+        Ok(settled) => settled,
+        Err(error) => {
+            database.close().await;
+            return Err(error);
+        }
+    };
 
     let endpoint = LocalEndpoint::scoped(paths.runtime(), loaded_config.config().profile().name())?;
     let listener = LocalListener::bind(&endpoint)?;
@@ -583,6 +608,7 @@ async fn start(build: BuildInfo, root: Option<&Path>) -> Result<Running, DaemonE
         executor,
         tools,
         speech,
+        interrupted,
         daemon_id,
         accept_loop: Box::pin(accept_clients(listener, context)),
     })
@@ -911,6 +937,13 @@ fn push_project_tool(
             .map_err(|source| DaemonError::ProjectTool { source })?,
         Arc::new(crate::project_tool::ProjectTool::new(Arc::clone(database)))
             as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    additional.push((
+        crate::contacts_tool::ContactsTool::definitions()
+            .map_err(|source| DaemonError::ContactsTool { source })?,
+        Arc::new(crate::contacts_tool::ContactsTool::new(Arc::clone(
+            database,
+        ))) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
     // Correcting and forgetting a memory ask the owner, and are composed beside the projects because both are the model keeping the
     // owner's long-lived state straight.
@@ -1303,11 +1336,15 @@ impl HttpTransport {
         port: u16,
         database: Arc<SqliteDatabase>,
         credential: jarvis_core::ClientCredential,
-        executor: Option<Arc<executor::Executor>>,
-        tools: Option<Arc<crate::tool_pipeline::ToolPipeline>>,
-        speech: Option<Arc<jarvis_voice::ElevenLabsSpeech>>,
+        services: Services,
         settings: settings_service::SettingsContext,
     ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), DaemonError> {
+        let Services {
+            executor,
+            tools,
+            speech,
+            interrupted,
+        } = services;
         // Loopback only. Reaching any other interface is remote mode, which `P10-004` owns as an
         // explicit TLS-terminated configuration rather than something that happens by default.
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -1336,6 +1373,12 @@ impl HttpTransport {
         let scheduler = state
             .drives_runs()
             .then(|| schedule_service::spawn(state.clone()));
+        if state.drives_runs() && !interrupted.is_empty() {
+            let resumed = state.clone();
+            tokio::spawn(async move {
+                resume::continue_interrupted(&resumed, &interrupted).await;
+            });
+        }
         let app = gateway::router(state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (stopped_tx, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -1539,6 +1582,7 @@ where
         executor,
         tools,
         speech,
+        interrupted,
         mcp,
         serving_mcp,
         mcp_stop,
@@ -1555,9 +1599,12 @@ where
                 port,
                 Arc::clone(&database),
                 credential.clone(),
-                executor,
-                tools,
-                speech,
+                Services {
+                    executor,
+                    tools,
+                    speech,
+                    interrupted,
+                },
                 settings_service::SettingsContext::new(paths.clone(), root.clone()),
             )
             .await?;

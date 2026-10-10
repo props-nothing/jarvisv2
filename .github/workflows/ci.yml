@@ -37,6 +37,12 @@ jobs:
           cargo --version
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check the console scripts parse
+        # The console is plain JavaScript embedded in the daemon, so a syntax slip would otherwise show only as a blank page.
+        shell: bash
+        run: |
+          set -e
+          for script in hud mission head; do node --check "apps/jarvisd/src/hud/$script.js"; done
       - name: Lint all targets
         # `--locked` keeps the lint run on the committed lockfile, like every other
         # step. Without it a dependency could resolve differently here than in the

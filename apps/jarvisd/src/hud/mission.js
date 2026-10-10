@@ -61,7 +61,10 @@
     "jarvis.project.use": ["project", "Joining a project", "out", "pull"],
     "jarvis.project.create": ["project", "Creating a project", "out", "spark"],
     "jarvis.project.update": ["project", "Updating a project", "out", "pull"],
-    "jarvis.project.assign_schedule": ["project", "Filing a schedule", "out", "pull"]
+    "jarvis.project.assign_schedule": ["project", "Filing a schedule", "out", "pull"],
+    "jarvis.contacts.save": ["project", "Saving a contact", "out", "pull"],
+    "jarvis.contacts.search": ["project", "Checking contacts", "in", "pull"],
+    "jarvis.contacts.stats": ["project", "Counting contacts", "in", "pull"]
   };
   function describe(tool) {
     var known = TOOLS[tool];

@@ -213,6 +213,10 @@ typed_id!(
     ProjectNoteId
 );
 typed_id!(
+    /// Identifies one contact: a person or company JARVIS is working with.
+    ContactId
+);
+typed_id!(
     /// Identifies one durable memory record.
     ///
     /// Distinct from every other identifier: a memory outlives the run that produced it and the

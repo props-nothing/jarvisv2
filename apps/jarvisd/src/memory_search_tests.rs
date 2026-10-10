@@ -150,3 +150,42 @@ async fn nothing_a_run_would_withhold_is_returned_and_bad_arguments_are_refused(
         Some(10)
     );
 }
+
+/// **A rephrased question still finds the nearest claim, and the reply says it is only a partial match.**
+#[tokio::test]
+async fn when_no_claim_has_every_word_the_closest_is_offered_and_labelled() {
+    let (_scratch, database, tool) = fixture().await;
+    remember(&database, "The user prefers dark roast coffee", 5).await;
+    remember(&database, "Their dentist appointment is on Tuesday", 5).await;
+    let now = UtcTimestamp::now(&SystemClock);
+
+    let partial = tool
+        .search("coffee machine", 5, now)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(partial["count"], 1);
+    assert!(
+        partial["match"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("partial"),
+        "{partial}"
+    );
+    assert!(
+        partial["memories"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dark roast")
+    );
+
+    let exact = tool
+        .search("dentist tuesday", 5, now)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(exact["match"], "all words");
+    let none = tool
+        .search("holiday", 5, now)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(none["count"], 0, "no word in common is still nothing");
+}

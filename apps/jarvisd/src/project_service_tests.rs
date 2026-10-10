@@ -396,3 +396,289 @@ async fn an_existing_schedule_can_be_filed_under_a_project_and_taken_out_again()
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_project_that_used_its_daily_cap_gets_no_more_scheduled_runs() {
+    let fixture = fixture().await;
+    let body = r#"{"name":"Capped","goal":"g","daily_run_limit":1}"#;
+    let (status, text) = send(&fixture, "POST", "/api/v1/projects", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let project: ProjectReply = parse(&text);
+    assert_eq!((project.daily_run_limit, project.runs_today), (1, 0));
+
+    // The owner's own message counts towards the day, and is never refused by the cap.
+    let (status, _) = start(&fixture, r#"{"objective":"look","project_id":"Capped"}"#).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, text) = send(&fixture, "GET", "/api/v1/projects/Capped", None).await;
+    let detail: ProjectDetailReply = parse(&text);
+    assert_eq!(detail.project.runs_today, 1);
+
+    let task = r#"{"objective":"check","every":"1h","project_id":"Capped"}"#;
+    send(&fixture, "POST", "/api/v1/schedules", Some(task)).await;
+    let later = must(UtcTimestamp::from_unix_nanos(
+        now().unix_nanos() + 3_700_000_000_000,
+    ));
+    let report = must(crate::schedule_service::tick(&fixture.state, later).await);
+    assert_eq!(
+        (report.started, report.skipped),
+        (0, 1),
+        "the cap holds the fire"
+    );
+
+    // Raising the cap lets the next fire through.
+    let (status, _) = send(
+        &fixture,
+        "PATCH",
+        "/api/v1/projects/Capped",
+        Some(r#"{"daily_run_limit":5}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let much_later = must(UtcTimestamp::from_unix_nanos(
+        later.unix_nanos() + 3_700_000_000_000,
+    ));
+    assert_eq!(
+        must(crate::schedule_service::tick(&fixture.state, much_later).await).started,
+        1
+    );
+
+    let (status, _) = send(
+        &fixture,
+        "POST",
+        "/api/v1/projects",
+        Some(r#"{"name":"Huge","daily_run_limit":5000}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a cap beyond the maximum is refused"
+    );
+}
+
+#[tokio::test]
+async fn a_run_a_restart_cut_off_is_continued_once_in_its_conversation_and_never_again() {
+    let fixture = fixture().await;
+    make(&fixture, "Prospecting").await;
+    let (status, text) = start(
+        &fixture,
+        r#"{"objective":"find five leads","project_id":"Prospecting"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let first: RunReply = parse(&text);
+
+    // A restart: the run was never driven to the end, so recovery settles it as interrupted.
+    let settled = must(jarvis_storage::recover_interrupted_runs(&fixture.database, now()).await);
+    assert_eq!(settled, vec![first.run_id.clone()]);
+    assert_eq!(
+        crate::resume::continue_interrupted(&fixture.state, &settled).await,
+        1
+    );
+
+    let runs =
+        must(jarvis_storage::read_recent_runs(&fixture.database, LOCAL_WORKSPACE_ID, 10).await);
+    let continued = runs
+        .iter()
+        .find(|run| run.id() != first.run_id)
+        .map(|run| (run.session_id().to_owned(), run.objective().to_owned()));
+    let (session, objective) = continued.unwrap_or_else(|| panic!("a continuation was started"));
+    assert_eq!(
+        session, first.session_id,
+        "it joins the conversation, and with it the project"
+    );
+    assert!(
+        objective.starts_with(crate::resume::RESUME_NOTICE)
+            && objective.ends_with("find five leads")
+    );
+
+    // It dies in turn: it is not continued again, and the original is no longer the newest run of its conversation.
+    let again = must(jarvis_storage::recover_interrupted_runs(&fixture.database, now()).await);
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        crate::resume::continue_interrupted(&fixture.state, &again).await,
+        0
+    );
+    assert_eq!(
+        crate::resume::continue_interrupted(&fixture.state, &settled).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_digest_counts_runs_by_project_and_lists_what_was_decided_and_what_failed() {
+    let fixture = fixture().await;
+    make(&fixture, "Prospecting").await;
+    let (status, _) = send(&fixture, "GET", "/api/v1/digest", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, text) = start(
+        &fixture,
+        r#"{"objective":"find leads","project_id":"Prospecting"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    start(&fixture, r#"{"objective":"just a chat"}"#).await;
+    let note = r#"{"text":"Target dentists first.","kind":"decision"}"#;
+    send(
+        &fixture,
+        "POST",
+        "/api/v1/projects/Prospecting/notes",
+        Some(note),
+    )
+    .await;
+    send(
+        &fixture,
+        "POST",
+        "/api/v1/projects/Prospecting/notes",
+        Some(r#"{"text":"fiddling","kind":"progress"}"#),
+    )
+    .await;
+    // Each model call records its own usage event; the digest adds them up.
+    let run: RunReply = parse(&text);
+    for (input, output) in [(1000, 40), (500, 10)] {
+        let payload = format!(
+            r#"{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0}}"#
+        );
+        let event = must(jarvis_storage::NewRunEvent::new(
+            jarvis_core::RunId::new().to_string(),
+            &run.run_id,
+            jarvis_core::RunEventKind::UsageUpdated,
+            None,
+            must(jarvis_core::RunEventPayload::new(&payload)),
+            jarvis_core::CorrelationId::new(),
+            now(),
+        ));
+        must(jarvis_storage::append_run_event(&fixture.database, &event).await);
+    }
+    must(jarvis_storage::recover_interrupted_runs(&fixture.database, now()).await);
+
+    let (status, text) = send(&fixture, "GET", "/api/v1/digest/48", None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let digest: jarvis_protocol::DigestReply = parse(&text);
+    assert_eq!(
+        (digest.hours, digest.runs, digest.failed, digest.succeeded),
+        (48, 2, 2, 0)
+    );
+    assert_eq!((digest.input_tokens, digest.output_tokens), (1500, 50));
+    assert_eq!(
+        digest.projects.len(),
+        1,
+        "a plain chat belongs to no project"
+    );
+    assert_eq!(
+        (digest.projects[0].name.as_str(), digest.projects[0].runs),
+        ("Prospecting", 1)
+    );
+    let kinds: Vec<&str> = digest.projects[0]
+        .highlights
+        .iter()
+        .map(|note| note.kind.as_str())
+        .collect();
+    assert_eq!(kinds, ["decision"], "progress chatter is not a highlight");
+    assert_eq!(digest.problems.len(), 2);
+    assert_eq!(digest.problems[0].error_code, "interrupted_by_restart");
+
+    for bad in ["0", "99999"] {
+        let (status, _) = send(&fixture, "GET", &format!("/api/v1/digest/{bad}"), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+    let (status, _) = call(&fixture, "GET", "/api/v1/digest", false, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_push_test_without_a_topic_is_refused_and_needs_the_credential() {
+    let fixture = fixture().await;
+    let (status, text) = send(&fixture, "POST", "/api/v1/push/test", Some("{}")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("daemon.push_topic"));
+    let (status, _) = call(&fixture, "POST", "/api/v1/push/test", false, Some("{}")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_owner_manages_contacts_over_the_api_including_lifting_a_do_not_contact() {
+    let fixture = fixture().await;
+    let add =
+        r#"{"company":"Acme BV","person":"Eva","email":"eva@acme.nl","status":"do_not_contact"}"#;
+    let (status, text) = send(&fixture, "POST", "/api/v1/contacts", Some(add)).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let made: jarvis_protocol::ContactReply = parse(&text);
+
+    let (status, text) = send(
+        &fixture,
+        "POST",
+        "/api/v1/contacts",
+        Some(r#"{"email":"eva@acme.nl","status":"contacted"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        parse::<jarvis_protocol::ContactReply>(&text).status,
+        "contacted",
+        "the owner may lift it"
+    );
+
+    let (_, text) = send(
+        &fixture,
+        "GET",
+        "/api/v1/contacts?status=contacted&limit=10",
+        None,
+    )
+    .await;
+    let listed: jarvis_protocol::ContactListReply = parse(&text);
+    assert_eq!(listed.contacts.len(), 1);
+    assert_eq!(
+        listed
+            .counts
+            .iter()
+            .find(|count| count.status == "contacted")
+            .map(|count| count.count),
+        Some(1)
+    );
+    let (_, text) = send(&fixture, "GET", "/api/v1/contacts?status=won", None).await;
+    assert!(
+        parse::<jarvis_protocol::ContactListReply>(&text)
+            .contacts
+            .is_empty()
+    );
+
+    for bad in [
+        "?status=maybe",
+        "?limit=0",
+        "?limit=5000",
+        "?colour=red",
+        "?limit=x",
+    ] {
+        let (status, _) = send(&fixture, "GET", &format!("/api/v1/contacts{bad}"), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+    let (status, _) = send(
+        &fixture,
+        "POST",
+        "/api/v1/contacts",
+        Some(r#"{"person":"nobody"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a new contact needs a company"
+    );
+
+    let path = format!("/api/v1/contacts/{}", made.contact_id);
+    assert_eq!(
+        send(&fixture, "DELETE", &path, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&fixture, "DELETE", &path, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&fixture, "GET", "/api/v1/contacts", false, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}

@@ -82,6 +82,9 @@ impl LoggingConfig {
 /// name, and loopback-only so enabling it does not expose the daemon to the network.
 pub const DEFAULT_HTTP_PORT: u16 = 8765;
 
+/// The public ntfy server, used when `daemon.push_server` is unset.
+pub const DEFAULT_PUSH_SERVER: &str = "https://ntfy.sh";
+
 /// Daemon lifecycle configuration.
 ///
 /// Not `Copy`, because `executor_model` holds a name and a `String` cannot be copied. `Clone`
@@ -215,6 +218,15 @@ pub struct DaemonConfig {
     /// Whether a scheduled task's result is shown as a desktop notification when no console is open. Unset means yes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notifications: Option<bool>,
+    /// Whether a run that a restart cut off is continued once, in its own conversation (`ADR-0155`). Unset means yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_interrupted: Option<bool>,
+    /// The ntfy topic that approvals and scheduled results are pushed to when no console is open (`ADR-0155`). The topic is the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_topic: Option<String>,
+    /// The ntfy server, `https://ntfy.sh` when unset. A plain `http://` server is accepted only on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_server: Option<String>,
     /// File holding the web search provider's key (an absolute path). Without it there is no web search tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     search_api_key_ref: Option<PathBuf>,
@@ -366,6 +378,24 @@ impl DaemonConfig {
         self.notifications.unwrap_or(true)
     }
 
+    /// The ntfy topic to push to, if push is set up.
+    #[must_use]
+    pub fn push_topic(&self) -> Option<&str> {
+        self.push_topic.as_deref()
+    }
+
+    /// The ntfy server to push through (the public one when unset).
+    #[must_use]
+    pub fn push_server(&self) -> &str {
+        self.push_server.as_deref().unwrap_or(DEFAULT_PUSH_SERVER)
+    }
+
+    /// Whether a run cut off by a restart is continued once, as a new run that is told to check what was already done (on unless turned off).
+    #[must_use]
+    pub fn resume_interrupted_enabled(&self) -> bool {
+        self.resume_interrupted.unwrap_or(true)
+    }
+
     /// Returns the configured default reasoning effort (`none`, `low`, `medium` or `high`), if any.
     #[must_use]
     pub fn executor_reasoning_effort(&self) -> Option<&str> {
@@ -396,6 +426,9 @@ impl Default for DaemonConfig {
             speech_voice_id: None,
             speech_model: None,
             notifications: None,
+            resume_interrupted: None,
+            push_topic: None,
+            push_server: None,
             search_api_key_ref: None,
             google_client_id: None,
             google_client_secret_ref: None,
@@ -707,10 +740,35 @@ impl Config {
             return Err(ConfigError::InvalidSearchKey);
         }
         self.validate_google()?;
+        self.validate_push()?;
         self.validate_code_sandbox()?;
         self.validate_speech()?;
         self.validate_policy()?;
         Ok(())
+    }
+
+    /// Validates the push settings: a topic ntfy would accept, and a server that is `https://`, or `http://` on this machine only.
+    fn validate_push(&self) -> Result<(), ConfigError> {
+        let topic_ok = self.daemon.push_topic.as_deref().is_none_or(|topic| {
+            (1..=64).contains(&topic.len())
+                && topic
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        });
+        let server_ok = self.daemon.push_server.as_deref().is_none_or(|server| {
+            let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+                .iter()
+                .any(|prefix| server.starts_with(prefix));
+            (server.starts_with("https://") || local)
+                && server.len() <= 200
+                && server.bytes().all(|byte| byte.is_ascii_graphic())
+                && !server.contains('@')
+        });
+        if topic_ok && server_ok {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidPush)
+        }
     }
 
     /// Validates the Google sign-in settings.
@@ -1072,6 +1130,11 @@ pub enum ConfigError {
         "daemon.google_client_id must be a plain client id, daemon.google_client_secret_ref an absolute path, and the secret needs the client id"
     )]
     InvalidGoogle,
+    /// The push settings were unusable: a topic that is not 1 to 64 letters, digits, dashes or underscores, or a server that is not `https://`.
+    #[error(
+        "daemon.push_topic must be 1 to 64 letters, digits, dashes or underscores, and daemon.push_server an https:// address with no login in it"
+    )]
+    InvalidPush,
     /// The web search key path was not absolute.
     #[error("daemon.search_api_key_ref must be an absolute path")]
     InvalidSearchKey,
@@ -1258,6 +1321,9 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "speech_voice_id",
                 "speech_model",
                 "notifications",
+                "resume_interrupted",
+                "push_topic",
+                "push_server",
                 "search_api_key_ref",
                 "google_client_id",
                 "google_client_secret_ref",
@@ -2413,6 +2479,40 @@ shutdown_timeout_seconds = 20
                 .speech_api_key_ref()
                 .is_none()
         );
+    }
+
+    /// Push needs a topic ntfy accepts and a server that is https, or http on this machine; anything else fails closed.
+    #[test]
+    fn push_settings_are_refused_unless_the_topic_and_server_are_safe() {
+        let parse = |extra: &str| {
+            Config::parse_with_environment(
+                &V1_CONFIG.replace("[daemon]", &format!("[daemon]\n{extra}")),
+                Vec::<(String, String)>::new(),
+            )
+        };
+        let loaded = parse("push_topic = \"jarvis_7f3a-9c2e\"")
+            .unwrap_or_else(|error| panic!("a plain topic: {error}"));
+        assert_eq!(
+            loaded.config().daemon().push_topic(),
+            Some("jarvis_7f3a-9c2e")
+        );
+        assert_eq!(loaded.config().daemon().push_server(), DEFAULT_PUSH_SERVER);
+        assert!(parse("push_topic = \"t\"\npush_server = \"https://ntfy.example.com\"").is_ok());
+        assert!(parse("push_topic = \"t\"\npush_server = \"http://127.0.0.1:2586\"").is_ok());
+
+        let too_long = format!("push_topic = \"{}\"", "a".repeat(65));
+        for bad in [
+            "push_topic = \"\"",
+            "push_topic = \"has space\"",
+            "push_topic = \"a/b\"",
+            too_long.as_str(),
+            "push_server = \"http://ntfy.example.com\"",
+            "push_server = \"https://user:pass@ntfy.example.com\"",
+            "push_server = \"ftp://ntfy.example.com\"",
+        ] {
+            assert_eq!(parse(bad).err(), Some(ConfigError::InvalidPush), "{bad}");
+        }
+        assert!(parse("").is_ok_and(|loaded| loaded.config().daemon().push_topic().is_none()));
     }
 
     /// The code sandbox is an image **and** an interpreter, from the document or the environment.

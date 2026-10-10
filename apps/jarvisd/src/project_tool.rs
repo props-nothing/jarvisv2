@@ -394,6 +394,7 @@ impl ProjectTool {
             goal: owned("goal"),
             guidance: owned("guidance"),
             folder: owned("folder"),
+            daily_run_limit: 0,
         };
         let workspace = self.workspace().await?;
         let site = self.site(call_id).await?;
@@ -446,6 +447,8 @@ impl ProjectTool {
             guidance: owned("guidance"),
             folder: owned("folder"),
             status,
+            // The cap is the owner's dial, not the model's.
+            daily_run_limit: None,
         };
         let stored =
             jarvis_storage::update_project(&self.database, &workspace, &project.id, &changes, now)
@@ -512,6 +515,7 @@ fn describe(project: &StoredProject) -> Value {
         "name": project.name,
         "status": project.status.as_str(),
         "folder": project.folder,
+        "daily_run_limit": project.daily_run_limit,
         "goal": fenced(&project.goal),
         "guidance": fenced(&project.guidance),
     })

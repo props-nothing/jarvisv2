@@ -123,6 +123,8 @@ pub struct StoredProject {
     pub folder: String,
     /// How far along it is.
     pub status: ProjectStatus,
+    /// The most runs the scheduler starts for it in a day; zero means no cap.
+    pub daily_run_limit: u32,
     /// When it was made.
     pub created_at: String,
     /// When it was last changed.
@@ -157,6 +159,8 @@ pub struct NewProject {
     pub guidance: String,
     /// The working folder, relative to a granted root.
     pub folder: String,
+    /// The most runs the scheduler starts for it in a day; zero means no cap.
+    pub daily_run_limit: u32,
 }
 
 /// The fields of a project that may change; `None` leaves a field as it is.
@@ -172,6 +176,8 @@ pub struct ProjectChanges {
     pub folder: Option<String>,
     /// A new status.
     pub status: Option<ProjectStatus>,
+    /// A new daily cap on scheduled runs; zero removes it.
+    pub daily_run_limit: Option<u32>,
 }
 
 const MAX_NAME_CHARS: usize = 80;
@@ -194,6 +200,16 @@ fn check_name(name: &str) -> Result<String, DatabaseError> {
         return Err(invalid("name"));
     }
     Ok(name.to_owned())
+}
+
+/// The largest daily cap that can be set.
+pub const MAX_DAILY_RUN_LIMIT: u32 = 1000;
+
+fn check_limit(limit: u32) -> Result<u32, DatabaseError> {
+    if limit > MAX_DAILY_RUN_LIMIT {
+        return Err(invalid("daily_run_limit"));
+    }
+    Ok(limit)
 }
 
 fn check_text(text: &str, limit: usize, field: &'static str) -> Result<String, DatabaseError> {
@@ -238,6 +254,13 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<StoredProject, DatabaseError>
                 field: "project status",
             },
         )?,
+        daily_run_limit: row
+            .try_get::<i64, _>("daily_run_limit")
+            .ok()
+            .and_then(|limit| u32::try_from(limit).ok())
+            .ok_or(DatabaseError::StoredScheduleInvalid {
+                field: "project run limit",
+            })?,
         created_at: text("created_at")?,
         updated_at: text("updated_at")?,
     })
@@ -245,7 +268,7 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<StoredProject, DatabaseError>
 
 macro_rules! columns {
     () => {
-        "id, workspace_id, name, goal, guidance, folder, status, created_at, updated_at"
+        "id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, created_at, updated_at"
     };
 }
 
@@ -265,10 +288,11 @@ pub async fn create_project(
     let goal = check_text(&new.goal, MAX_GOAL_CHARS, "goal")?;
     let guidance = check_text(&new.guidance, MAX_GUIDANCE_CHARS, "guidance")?;
     let folder = check_folder(&new.folder)?;
+    let limit = check_limit(new.daily_run_limit)?;
     let id = ProjectId::new().to_string();
     let result = sqlx::query(
-        "INSERT INTO projects (id, workspace_id, name, goal, guidance, folder, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)",
+        "INSERT INTO projects (id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?8, ?7, ?7)",
     )
     .bind(&id)
     .bind(workspace_id)
@@ -277,6 +301,7 @@ pub async fn create_project(
     .bind(&guidance)
     .bind(&folder)
     .bind(now.to_string())
+    .bind(i64::from(limit))
     .execute(database.pool())
     .await;
     match result {
@@ -374,8 +399,9 @@ pub async fn update_project(
         .as_deref()
         .map_or_else(|| Ok(current.folder.clone()), check_folder)?;
     let status = changes.status.unwrap_or(current.status);
+    let limit = check_limit(changes.daily_run_limit.unwrap_or(current.daily_run_limit))?;
     let result = sqlx::query(
-        "UPDATE projects SET name = ?1, goal = ?2, guidance = ?3, folder = ?4, status = ?5, updated_at = ?6 \
+        "UPDATE projects SET name = ?1, goal = ?2, guidance = ?3, folder = ?4, status = ?5, updated_at = ?6, daily_run_limit = ?9 \
          WHERE id = ?7 AND workspace_id = ?8",
     )
     .bind(&name)
@@ -386,6 +412,7 @@ pub async fn update_project(
     .bind(now.to_string())
     .bind(&current.id)
     .bind(workspace_id)
+    .bind(i64::from(limit))
     .execute(database.pool())
     .await;
     match result {
@@ -495,8 +522,47 @@ pub async fn recent_project_notes(
         operation: "read project notes",
         source,
     })?;
+    let mut notes = decode_notes(&rows)?;
+    notes.reverse();
+    Ok(notes)
+}
+
+/// Older entries of the kinds worth remembering for a long time (decisions, results, blockers, and what the owner wrote), the latest
+/// `limit` that come before `before_id`, oldest first. A long project's recent window forgets what it decided last month; these do not.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the read fails.
+pub async fn earlier_important_notes(
+    database: &SqliteDatabase,
+    project_id: &str,
+    before_id: &str,
+    limit: u32,
+) -> Result<Vec<StoredProjectNote>, DatabaseError> {
+    let rows = sqlx::query(
+        "SELECT id, project_id, kind, body, run_id, created_at FROM project_notes \
+         WHERE project_id = ?1 AND id < ?2 AND kind IN ('decision', 'result', 'blocker', 'owner') \
+         ORDER BY id DESC LIMIT ?3",
+    )
+    .bind(project_id)
+    .bind(before_id)
+    .bind(i64::from(limit))
+    .fetch_all(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "read earlier project notes",
+        source,
+    })?;
+    let mut notes = decode_notes(&rows)?;
+    notes.reverse();
+    Ok(notes)
+}
+
+pub(crate) fn decode_notes(
+    rows: &[sqlx::sqlite::SqliteRow],
+) -> Result<Vec<StoredProjectNote>, DatabaseError> {
     let mut notes = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for row in rows {
         let text = |name: &'static str| -> Result<String, DatabaseError> {
             row.try_get::<String, _>(name)
                 .map_err(|source| DatabaseError::Sqlite {
@@ -519,7 +585,6 @@ pub async fn recent_project_notes(
             created_at: text("created_at")?,
         });
     }
-    notes.reverse();
     Ok(notes)
 }
 
@@ -595,6 +660,32 @@ pub async fn set_project_link(
             .map_err(fail)?;
     }
     transaction.commit().await.map_err(fail)
+}
+
+/// How many runs started since `since` in conversations that belong to the project: what a daily cap counts.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the read fails.
+pub async fn count_project_runs_since(
+    database: &SqliteDatabase,
+    project_id: &str,
+    since: UtcTimestamp,
+) -> Result<u32, DatabaseError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs \
+         WHERE started_at >= ?2 \
+           AND session_id IN (SELECT ref_id FROM project_links WHERE kind = 'session' AND project_id = ?1)",
+    )
+    .bind(project_id)
+    .bind(since.to_string())
+    .fetch_one(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "count a project's runs",
+        source,
+    })?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// The project a session or schedule belongs to, if any.

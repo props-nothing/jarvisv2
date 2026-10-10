@@ -239,6 +239,15 @@ pub async fn set_posture(
         Ok(posture) => posture,
         Err(message) => return refused(&message),
     };
+    // These tools write standing instructions or change memory: each call is the owner's own yes, so "run without asking" is refused
+    // rather than accepted and ignored.
+    if posture == settings::Posture::Trusted
+        && jarvis_tools::NEVER_TRUSTED_TOOLS.contains(&tool.as_str())
+    {
+        return refused(
+            "this tool changes what JARVIS is told to do or remember, so every call asks you; it cannot run without asking",
+        );
+    }
     // Only a tool this daemon actually has: a typo in a trust list would otherwise be a silent no-op.
     if let Some(tools) = state.tools()
         && !tools

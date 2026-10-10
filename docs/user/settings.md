@@ -42,7 +42,10 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 
 | Setting | Default | What unset means |
 | --- | --- | --- |
-| `notifications` | on | When a scheduled task finishes and no console is open, its result is shown as a desktop notification (Windows toast, macOS notification, `notify-send` on Linux). While the console is open it shows the result itself, so nothing pops up. `jarvis config set notifications off` turns it off; it applies at once. |
+| `notifications` | on | When a scheduled task finishes, or a new approval is waiting, and no console is open, it is shown as a desktop notification (Windows toast, macOS notification, `notify-send` on Linux). While the console is open it shows the result itself, so nothing pops up. `jarvis config set notifications off` turns it off; it applies at once. |
+| `resume_interrupted` | on | After a restart or crash, a run that was working in the last two hours gets **one** continuation in its conversation, told to check what was already done before repeating it (`ADR-0155`). A continuation is never continued, and nothing is resumed that you cancelled. `off` leaves interrupted runs as failed. |
+| `push_topic` | none | Set a long, unguessable [ntfy](https://ntfy.sh) topic and JARVIS also pushes to your phone when no console is open: that an approval is waiting (and for which tool), or that a scheduled task finished. **It never sends an answer, a question or an argument.** The topic name is the only secret, so make it random. Try it with `jarvis push test`. |
+| `push_server` | `https://ntfy.sh` | The ntfy server. Use your own (`https://` only) to keep even the metadata off a third party. |
 | `http_port` | 8765 | The default port. |
 | `mcp_serve_port` | none | **Off by design.** JARVIS opens no inbound MCP port unless you ask it to (`ADR-0039`). |
 

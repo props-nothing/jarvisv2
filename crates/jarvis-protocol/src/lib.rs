@@ -1,6 +1,8 @@
 //! Versioned wire contracts and conversions for JARVIS clients and runtimes.
 
 mod approval;
+mod contact_api;
+mod digest_api;
 mod entity_api;
 mod frame;
 mod memory_api;
@@ -17,6 +19,8 @@ pub use approval::{
     ApprovalDecisionBody, ApprovalDecisionRequest, ApprovalListReply, ApprovalReply,
     PendingApprovalReply,
 };
+pub use contact_api::{ContactCount, ContactListReply, ContactReply, SaveContactRequest};
+pub use digest_api::{DigestHighlight, DigestProblem, DigestProject, DigestReply};
 pub use entity_api::{
     AddAliasRequest, AliasVerificationName, CreateEntityRequest, EntityAliasReply,
     EntityDetailReply, EntityKindName, EntityListReply, EntityLookupReply, EntityMatchReply,

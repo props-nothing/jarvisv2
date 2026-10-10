@@ -142,19 +142,30 @@ impl MemorySearchTool {
                 .map_err(|_| refused("memory could not be read"))?;
         let considered = stored.len();
         let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        let mut matches: Vec<(u8, RetrievedMemory)> = stored
+        // How many of the query's words each claim holds. A claim with every word is a match; when none has, the ones with the most
+        // words are offered instead (and the reply says so), so a rephrased question finds something rather than nothing.
+        let mut ranked: Vec<(usize, u8, RetrievedMemory)> = stored
             .iter()
-            .filter(|memory| {
-                let content = memory.record().content().to_lowercase();
-                words.iter().all(|word| content.contains(word.as_str()))
-            })
             .filter_map(|memory| {
+                let content = memory.record().content().to_lowercase();
+                let held = words
+                    .iter()
+                    .filter(|word| content.contains(word.as_str()))
+                    .count();
+                if held == 0 {
+                    return None;
+                }
                 RetrievedMemory::new(memory.record(), &crate::executor::MODEL_MEMORY_TYPES, now)
                     .ok()
-                    .map(|item| (memory.record().importance(), item))
+                    .map(|item| (held, memory.record().importance(), item))
             })
             .collect();
-        // Most important first; the sort is stable, so equal importance keeps the store's own order.
+        let best = ranked.iter().map(|entry| entry.0).max().unwrap_or(0);
+        let complete = best == words.len();
+        // Only the claims with the most words, then most important first; the sort is stable, so ties keep the store's own order.
+        ranked.retain(|entry| entry.0 == best);
+        let mut matches: Vec<(u8, RetrievedMemory)> =
+            ranked.into_iter().map(|entry| (entry.1, entry.2)).collect();
         matches.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         let mut rendered = String::new();
         let mut shown = Vec::new();
@@ -180,6 +191,7 @@ impl MemorySearchTool {
             "outcome": "searched",
             "query": query,
             "considered": considered,
+            "match": if complete { "all words" } else { "partial: no remembered claim has every word, so these hold the most of them" },
             "count": shown.len(),
             "memories": memories,
         }))
