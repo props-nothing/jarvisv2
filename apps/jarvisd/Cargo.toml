@@ -39,6 +39,7 @@ jarvis-storage.workspace = true
 # the call lifecycle, and the filesystem adapter are joined in the composition root. That is also what
 # keeps `AGENTS.md`'s rule structural — an adapter is only reachable from a binary that chose to
 # construct one, never from the application layer.
+jarvis-documents.workspace = true
 jarvis-tools.workspace = true
 # The web fetch tool is composed here for the same reason the filesystem and memory tools are: an adapter is only
 # reachable from a binary that chose to construct one.
@@ -59,6 +60,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 tracing.workspace = true
 
 [dev-dependencies]
+# Builds a .docx in the document tool's tests.
+zip.workspace = true
 # `ServiceExt::oneshot` drives a `Router` without binding a socket, so the gateway's
 # authentication and routing are tested as a real `tower` service rather than by calling the
 # handlers directly, which would bypass the layers the tests exist to falsify.

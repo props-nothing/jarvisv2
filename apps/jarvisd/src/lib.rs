@@ -12,14 +12,17 @@ mod control;
 mod delegate;
 mod digest_service;
 mod dispatch;
+mod document_tool;
 mod entity_service;
 mod executor;
 mod gateway;
 mod google_account;
+mod google_files;
 mod google_service;
 mod google_tools;
 mod health;
 mod hud;
+mod mail_mime;
 mod mcp_host;
 mod mcp_serve;
 mod memory_manage;
@@ -195,6 +198,13 @@ enum DaemonError {
         /// Which part was rejected, named by the variant.
         #[source]
         source: crate::project_tool::ProjectToolError,
+    },
+    /// The document reading tool could not state its own contract.
+    #[error("the document tool could not be defined")]
+    DocumentTool {
+        /// Which part was rejected, named by the variant.
+        #[source]
+        source: crate::document_tool::DocumentToolError,
     },
     /// The contact tools could not state their own contract.
     #[error("the contact tools could not be defined")]
@@ -844,6 +854,7 @@ async fn compose_tools(
     ));
     push_search_tool(config, &mut additional)?;
     push_google_tools(config, paths, &database, &mut additional)?;
+    push_document_tool(config, &mut additional)?;
     push_code_tool(config, &mut additional)?;
     push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
@@ -878,6 +889,50 @@ async fn compose_tools(
     Ok((mcp, tools))
 }
 
+/// Opens the granted folders a second time for a tool that reads or writes files beside the file tools (`ADR-0157`, `ADR-0158`), or `None`
+/// when none is granted or they cannot be opened. Each tool holds its own handles, read from the same configuration, so the boundary stays
+/// the list the owner wrote.
+fn open_granted_folders(
+    config: &jarvis_storage::Config,
+    purpose: &str,
+) -> Option<Arc<jarvis_tools::WorkspaceRoots>> {
+    match config.daemon().tool_workspace_roots() {
+        [] => None,
+        roots => match jarvis_tools::WorkspaceRoots::new(roots.iter()) {
+            Ok(roots) => Some(Arc::new(roots)),
+            Err(error) => {
+                tracing::warn!(%error, purpose, "the granted folders could not be opened for this tool");
+                None
+            }
+        },
+    }
+}
+
+/// Adds the document reading tool, when a folder is granted: without one there is nothing it could read (`ADR-0158`).
+///
+/// # Errors
+///
+/// Returns [`DaemonError::DocumentTool`] when the tool's own contract is rejected.
+fn push_document_tool(
+    config: &jarvis_storage::Config,
+    additional: &mut Vec<(
+        Vec<jarvis_tools::ToolDefinition>,
+        Arc<dyn jarvis_tools::ToolExecutor>,
+    )>,
+) -> Result<(), DaemonError> {
+    let Some(roots) = open_granted_folders(config, "document reading") else {
+        return Ok(());
+    };
+    additional.push((
+        vec![
+            document_tool::DocumentTool::definition()
+                .map_err(|source| DaemonError::DocumentTool { source })?,
+        ],
+        Arc::new(document_tool::DocumentTool::new(roots)) as Arc<dyn jarvis_tools::ToolExecutor>,
+    ));
+    Ok(())
+}
+
 /// Adds the Gmail and Calendar read tools, when a Google client id is configured.
 ///
 /// Opt-in, and offered whether or not anyone is signed in yet: the owner signs in from Settings while the daemon runs, and the tools
@@ -906,6 +961,15 @@ fn push_google_tools(
     };
     let mut definitions = google_tools::GoogleTool::definitions()
         .map_err(|source| DaemonError::GoogleTool { source })?;
+    // Attachments are read from and saved into the folders the owner granted, through their own handles (`ADR-0157`). Without a
+    // grant there are no file operations, and a send with an attachment says so.
+    let workspace = open_granted_folders(config, "mail attachments");
+    if workspace.is_some() {
+        definitions.extend(
+            google_tools::GoogleTool::file_definitions()
+                .map_err(|source| DaemonError::GoogleTool { source })?,
+        );
+    }
     // Sending mail and creating events exist only when the owner switched Google actions on (and signed in again to grant them).
     if config.daemon().google_actions_enabled() {
         definitions.extend(
@@ -915,8 +979,13 @@ fn push_google_tools(
     }
     additional.push((
         definitions,
-        Arc::new(google_tools::GoogleTool::new(account).with_contacts(Arc::clone(database)))
-            as Arc<dyn jarvis_tools::ToolExecutor>,
+        Arc::new({
+            let tool = google_tools::GoogleTool::new(account).with_contacts(Arc::clone(database));
+            match workspace {
+                Some(roots) => tool.with_workspace(roots),
+                None => tool,
+            }
+        }) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
     tracing::info!("the Gmail and Calendar tools are available");
     Ok(())

@@ -1,0 +1,16 @@
+[package]
+name = "jarvis-documents"
+description = "Plain text out of PDF, Word and spreadsheet files, bounded and panic-safe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lopdf.workspace = true
+roxmltree.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

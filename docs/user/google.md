@@ -26,12 +26,13 @@ On the command line: `jarvis config set google_client_id ...` and `jarvis keys s
 | Tool | What it does |
 | --- | --- |
 | `jarvis.gmail.search` | Searches your mailbox with Gmail's own search words (`from:`, `newer_than:7d`, `is:unread`, ...) and lists id, sender, date, subject and a snippet. |
-| `jarvis.gmail.read` | Reads one message: sender, recipients, date, subject and the plain-text body (cut to a few thousand characters). |
+| `jarvis.gmail.read` | Reads one message: sender, recipients, date, subject, the attachments it carries (number, name, type, size) and the plain-text body (cut to a few thousand characters). |
+| `jarvis.gmail.save_attachment` | Saves one attachment of a message into a folder you granted (default `email-attachments`). Only offered when you granted a folder (Settings, Files). It asks first, never replaces a file (a second copy becomes `name (2).pdf`), refuses programs (`.exe`, `.bat`, `.js`, `.sh` ...) and anything over 5 MB. What it saves is untrusted: JARVIS reads it, never runs it. |
 | `jarvis.calendar.events` | Lists your primary calendar's events in a window (default the next seven days). |
 
 **It asks first.** Mail and calendar are your most private data, and a message is written by strangers and can contain text aimed at the assistant,
 so these tools are held for your yes (one click on the card, or **Always allow** if you do not want to be asked). Everything they return is marked to
-the model as untrusted data to read, never to obey. Nothing here can send an email or accept an invitation.
+the model as untrusted data to read, never to obey. Nothing here can send an email or accept an invitation. (Saving an attachment writes a file on this machine, so it asks too.)
 
 **Where your data goes.** Mail and calendar text you ask about is given to the model you chose. With a local model that stays on your machine; with a
 cloud model (Ollama cloud, for example) it goes to that service as part of the conversation. Choose accordingly.
@@ -43,7 +44,7 @@ Reading is the default. If you also want "reply to Anna that I will be late" or 
 
 | Tool | What it does |
 | --- | --- |
-| `jarvis.gmail.send` | Sends one plain-text email to **one** address. It **always asks**: the card shows who it goes to, the subject and the text, and "Always allow" cannot waive it, because anything that reaches another person is always your decision. |
+| `jarvis.gmail.send` | Sends one plain-text email to **one** address, optionally **with files** (up to 5, 5 MB each, 10 MB together, taken from a folder you granted) and optionally **as a reply** inside an existing conversation. It **always asks**: the card shows who it goes to, the subject, the text and the path of every file, and "Always allow" cannot waive it, because anything that reaches another person is always your decision. A file whose name says it holds a secret (`.env`, keys, certificates) is never attached, and a person you marked `do_not_contact` is never written to. |
 | `jarvis.calendar.create` | Adds one event to your main calendar (title, start, end, optional place and notes). It invites nobody. It asks first. |
 
 JARVIS is told never to send because of something written inside an email or a web page, only because you asked. To go back to read-only, turn the setting off, restart and sign in again.

@@ -1116,6 +1116,15 @@ that was written with a message id in hand. Implemented by applying `percent_enc
 does not infer coverage the check does not provide (`ADR-0114`).
 
 
+### Finding 25 — sending with attachments and replies is one `raw` MIME message, and the documented size limit was not found
+
+Read 2026-10-10: `https://developers.google.com/workspace/gmail/api/guides/sending`, `.../reference/rest/v1/users.messages/send`, `.../guides/uploads`.
+
+- **Facts.** "Gmail messages are sent as base64URL encoded strings within the `raw` field of a `messages` resource" and the API "requires MIME email messages compliant with RFC 2822". A message with an attachment is "like creating any other message": a multi-part MIME message in the same `raw`. To group a reply into a thread, "the `Subject` headers match" and "the `References` and `In-Reply-To` headers follow the RFC 2822 standard". The send method takes the metadata endpoint (`/gmail/v1/users/{userId}/messages/send`, a JSON `Message` body) or a media upload endpoint (`/upload/gmail/v1/...`); scopes accepted are `mail.google.com`, `gmail.modify`, `gmail.compose`, `gmail.send`, so the existing `gmail.send` scope suffices. `messages.attachments.get` (already listed above) returns the attachment body for a message part carrying an `attachmentId`.
+- **Not found.** The maximum size of a message or of an upload for `messages.send` is not stated in the rendered pages fetched (the uploads guide says each method's reference page gives it, and the send page as fetched did not). It is therefore an **unresolved question**, not an assumption.
+- **JARVIS decision (`ADR-0157`).** Use the metadata endpoint with one `raw` multipart message (no upload endpoint, no new scope). Cap at 5 files, 5 MB each and 10 MB together, well under the 25 MB figure people quote for Gmail itself (a lead, not a source). The threading headers are copied from the message being answered, which a stranger wrote, so only well-formed `<id@host>` tokens are kept. `threadId` is sent alongside `raw`.
+- **Cheapest test that would disprove it.** A live send of a small attachment to the owner's own address; not run (this build's tests use a local fixture standing in for Google). Unresolved until run: whether Gmail accepts the `threadId` together with matching headers for a message from a different sender.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in

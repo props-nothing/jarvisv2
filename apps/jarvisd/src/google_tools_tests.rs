@@ -458,3 +458,254 @@ async fn a_do_not_contact_address_is_never_sent_to() {
     );
     jarvis_core::remove_scratch_dir(&directory);
 }
+
+// ---- attachments, replies and saving what arrives (ADR-0157) ------------------------------------------------------------------
+
+/// A granted folder holding a few files, and the tool given it.
+fn with_folder(tool: GoogleTool) -> (GoogleTool, std::path::PathBuf) {
+    let folder = std::env::temp_dir().join(format!("jgf-{}", jarvis_core::scratch_tag()));
+    std::fs::create_dir_all(folder.join("reports")).unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(
+        folder.join("reports").join("offer.pdf"),
+        b"%PDF-1.4 not really",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(folder.join("notes.txt"), "hello\nworld")
+        .unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(folder.join(".env"), "TOKEN=1").unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(folder.join("big.bin"), vec![7_u8; 5 * 1024 * 1024 + 1])
+        .unwrap_or_else(|error| panic!("{error}"));
+    let roots =
+        jarvis_tools::WorkspaceRoots::new([&folder]).unwrap_or_else(|error| panic!("{error}"));
+    (tool.with_workspace(Arc::new(roots)), folder)
+}
+
+fn sent_message(fixture: &Fixture) -> (String, Value) {
+    let request = fixture.bodies("/gmail/users/me/messages/send").remove(0);
+    let payload = serde_json::from_str::<Value>(&request).unwrap_or_default();
+    let raw = payload["raw"].as_str().unwrap_or_default();
+    (
+        String::from_utf8(decode_base64url(raw).unwrap_or_default()).unwrap_or_default(),
+        payload,
+    )
+}
+
+/// **A file from a granted folder is attached, byte for byte, and the owner's sentence says which.**
+#[tokio::test]
+async fn an_email_carries_files_from_a_granted_folder() {
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    let (tool, folder) = with_folder(tool);
+    fixture.answer("/gmail/users/me/messages/send", 200, r#"{"id":"sent-9"}"#);
+    let said = tool
+        .send_mail(
+            &json!({ "to": "me@example.com", "subject": "Offer", "body": "See attached",
+            "attachments": ["reports/offer.pdf", "notes.txt"] }),
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert!(
+        said.contains("2 attachment(s)") && said.contains("offer.pdf (19 bytes)"),
+        "{said}"
+    );
+
+    let (message, _) = sent_message(&fixture);
+    assert!(
+        message.contains("Content-Type: multipart/mixed; boundary=\"jarvis-"),
+        "{message}"
+    );
+    assert!(message.contains("Content-Type: application/pdf; name=\"offer.pdf\""));
+    assert!(message.contains("Content-Type: text/plain; name=\"notes.txt\""));
+    // The encoded bytes of the first file are in the message.
+    assert!(message.contains(&encode_base64(b"%PDF-1.4 not really", false, true)));
+    assert!(message.contains(&encode_base64(b"hello\nworld", false, true)));
+    jarvis_core::remove_scratch_dir(&folder);
+}
+
+/// **Nothing outside the granted folders, nothing that looks like a secret, nothing too big: each is refused and nothing is sent.**
+#[tokio::test]
+async fn attachments_are_confined_and_bounded_and_a_refusal_sends_nothing() {
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    let (tool, folder) = with_folder(tool);
+    fixture.answer("/gmail/users/me/messages/send", 200, r#"{"id":"x"}"#);
+    let outside = std::env::temp_dir().join("jgf-outside.txt");
+    std::fs::write(&outside, "outside").unwrap_or_else(|error| panic!("{error}"));
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (vec!["../jgf-outside.txt".to_owned()], "no .."),
+        (vec![outside.display().to_string()], "absolute path"),
+        (vec!["C:\\Windows\\win.ini".to_owned()], "a drive"),
+        (vec!["missing.pdf".to_owned()], "not found"),
+        (vec!["reports".to_owned()], "a folder"),
+        (vec![".env".to_owned()], "a secret"),
+        (vec!["big.bin".to_owned()], "larger than 5 MB"),
+        (
+            (0..6).map(|_| "notes.txt".to_owned()).collect(),
+            "at most 5",
+        ),
+    ];
+    for (attachments, why) in cases {
+        let refused = tool
+            .send_mail(&json!({ "to": "me@example.com", "subject": "s", "body": "b", "attachments": attachments }))
+            .await;
+        assert!(refused.is_err(), "{why} must be refused");
+    }
+    assert!(
+        fixture.bodies("/gmail/users/me/messages/send").is_empty(),
+        "nothing was sent"
+    );
+    jarvis_core::remove_scratch_dir(&folder);
+    let _ = std::fs::remove_file(outside);
+}
+
+/// **Without a granted folder an attachment is refused in words that say how to fix it.**
+#[tokio::test]
+async fn an_attachment_needs_a_granted_folder() {
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    fixture.answer("/gmail/users/me/messages/send", 200, r#"{"id":"x"}"#);
+    let refused = tool
+        .send_mail(&json!({ "to": "me@example.com", "subject": "s", "body": "b", "attachments": ["a.pdf"] }))
+        .await;
+    assert!(refused.is_err_and(|failure| failure.detail.contains("granted")));
+    assert!(fixture.bodies("/gmail/users/me/messages/send").is_empty());
+}
+
+/// **A reply joins its thread: the thread id travels, the headers are the original's, and the subject is kept.**
+#[tokio::test]
+async fn a_reply_joins_the_thread_of_the_message_it_answers() {
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    fixture.answer(
+        "/gmail/users/me/messages/orig1",
+        200,
+        r#"{"id":"orig1","threadId":"thr-7","payload":{"headers":[
+            {"name":"Message-ID","value":"<abc@mail.example.com>"},
+            {"name":"References","value":"<first@mail.example.com>"},
+            {"name":"Subject","value":"Quote for the website"}]}}"#,
+    );
+    fixture.answer("/gmail/users/me/messages/send", 200, r#"{"id":"reply-1"}"#);
+    tool.send_mail(
+        &json!({ "to": "me@example.com", "body": "Thanks, yes.", "reply_to_message_id": "orig1" }),
+    )
+    .await
+    .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    let (message, payload) = sent_message(&fixture);
+    assert_eq!(payload["threadId"], "thr-7");
+    assert!(
+        message.contains("Subject: Re: Quote for the website\r\n"),
+        "{message}"
+    );
+    assert!(message.contains("In-Reply-To: <abc@mail.example.com>\r\nReferences: <first@mail.example.com> <abc@mail.example.com>\r\n"), "{message}");
+
+    // Without a reply, a subject is still required.
+    let refused = tool
+        .send_mail(&json!({ "to": "me@example.com", "body": "b" }))
+        .await;
+    assert!(refused.is_err());
+}
+
+/// **A message lists its attachments, and one is saved into a granted folder, never over a file, and never a program.**
+#[tokio::test]
+async fn an_attachment_is_listed_and_saved_without_replacing_anything() {
+    let (_scratch, fixture, tool) = signed_in().await;
+    let (tool, folder) = with_folder(tool);
+    let data = encode_base64(b"quote contents", true, false);
+    fixture.answer(
+        "/gmail/users/me/messages/m42",
+        200,
+        &json!({ "id": "m42", "snippet": "s", "payload": { "mimeType": "multipart/mixed", "headers": [{"name":"Subject","value":"Quote"}],
+            "parts": [
+              { "mimeType": "text/plain", "filename": "", "body": { "size": 2, "data": encode_base64(b"hi", true, false) } },
+              { "mimeType": "application/pdf", "filename": "quote.pdf", "body": { "size": 14, "attachmentId": "ATT-1" } },
+              { "mimeType": "application/x-msdownload", "filename": "setup.exe", "body": { "size": 3, "attachmentId": "ATT-2" } },
+              { "mimeType": "text/plain", "filename": "..\\..\\evil\"name.txt", "body": { "size": 14, "attachmentId": "ATT-3" } }
+            ] } })
+        .to_string(),
+    );
+    for attachment in ["ATT-1", "ATT-2", "ATT-3"] {
+        fixture.answer(
+            &format!("/gmail/users/me/messages/m42/attachments/{attachment}"),
+            200,
+            &json!({ "size": 14, "data": data }).to_string(),
+        );
+    }
+
+    let read = tool
+        .mail_read("m42")
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert!(
+        read.contains("attachment 1: quote.pdf (application/pdf, 14 bytes)"),
+        "{read}"
+    );
+    assert!(
+        read.contains("attachment 3: evil_name.txt"),
+        "a hostile name is reduced to a plain one: {read}"
+    );
+
+    let saved = tool
+        .save_attachment(&json!({ "message_id": "m42", "attachment": "quote.pdf" }))
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert!(saved.contains("email-attachments"), "{saved}");
+    assert_eq!(
+        std::fs::read(folder.join("email-attachments").join("quote.pdf")).unwrap_or_default(),
+        b"quote contents"
+    );
+
+    // The same attachment again goes beside it, never over it.
+    tool.save_attachment(&json!({ "message_id": "m42", "attachment": 1 }))
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert_eq!(
+        std::fs::read(folder.join("email-attachments").join("quote (2).pdf")).unwrap_or_default(),
+        b"quote contents"
+    );
+    assert_eq!(
+        std::fs::read(folder.join("email-attachments").join("quote.pdf")).unwrap_or_default(),
+        b"quote contents"
+    );
+
+    // Another folder inside the grant, a name from the sender reduced, a program refused, a path out of the grant refused.
+    tool.save_attachment(
+        &json!({ "message_id": "m42", "attachment": "3", "folder": "inbox/acme" }),
+    )
+    .await
+    .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert!(
+        folder
+            .join("inbox")
+            .join("acme")
+            .join("evil_name.txt")
+            .is_file()
+    );
+    let program = tool
+        .save_attachment(&json!({ "message_id": "m42", "attachment": "setup.exe" }))
+        .await;
+    assert!(program.is_err_and(|failure| failure.detail.contains("program")));
+    for folder_argument in ["../outside", "/etc", "C:\\x"] {
+        let refused = tool
+            .save_attachment(
+                &json!({ "message_id": "m42", "attachment": 1, "folder": folder_argument }),
+            )
+            .await;
+        assert!(refused.is_err(), "{folder_argument}");
+    }
+    let unknown = tool
+        .save_attachment(&json!({ "message_id": "m42", "attachment": "nope.pdf" }))
+        .await;
+    assert!(unknown.is_err());
+    jarvis_core::remove_scratch_dir(&folder);
+}
+
+#[test]
+fn the_save_tool_is_a_write_that_asks_and_the_send_schema_offers_files_and_replies() {
+    let save = GoogleTool::file_definitions().unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(save.len(), 1);
+    assert!(save[0].effects().contains(ToolEffect::Write));
+    assert_eq!(save[0].approval(), ApprovalPolicy::Policy);
+    assert!(save[0].risk().level() >= 2, "held for the owner by default");
+    assert!(SEND_INPUT.contains("attachments") && SEND_INPUT.contains("reply_to_message_id"));
+    assert!(SEND_INPUT.contains(r#""additionalProperties": false"#));
+}

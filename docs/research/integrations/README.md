@@ -11,6 +11,7 @@ Every external integration requires a dated record based on current official sou
 | ElevenLabs | https://elevenlabs.io/docs/llms.txt | [elevenlabs.md](elevenlabs.md) | architecture researched; both custom-brain transports and turn-taking config recorded; not implemented |
 | Twilio | no usable single index; official TwiML/Media Streams/pricing pages | [twilio.md](twilio.md) | architecture researched; not implemented |
 | Deepgram (Flux) | https://developers.deepgram.com/llms.txt | [deepgram.md](deepgram.md) | architecture researched; not implemented |
+| Document reading (`lopdf`, `zip`, `roxmltree`) | none of the crates publishes `llms.txt`; crates.io metadata | [document-reading-crates.md](document-reading-crates.md) | `ADR-0158` implemented; tested on documents built in memory, not on files from Office or LibreOffice |
 | ntfy (push notifications) | `https://docs.ntfy.sh/llms.txt` returned 404; docs at https://docs.ntfy.sh/publish/ | [ntfy.md](ntfy.md) | `ADR-0155` implemented minimally: plain POST, content-free, off by default; access tokens not built |
 | Google Gemini Live | https://ai.google.dev/llms.txt | [google-gemini-live.md](google-gemini-live.md) | researched; speech-to-speech **not selected** as default |
 | LiveKit | https://docs.livekit.io/llms.txt | [livekit.md](livekit.md) | architecture researched; realtime transport, data/RPC, E2EE and Rust SDKs recorded; boundary vs runtime unresolved; session scope undecided; not implemented |

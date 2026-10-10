@@ -6,6 +6,7 @@ members = [
     "crates/jarvis-connectors",
     "crates/jarvis-core",
     "crates/jarvis-diagnostics",
+    "crates/jarvis-documents",
     "crates/jarvis-mcp",
     "crates/jarvis-mcp-transport",
     "crates/jarvis-models",
@@ -49,6 +50,12 @@ bytes = "1.12.0"
 # a path at all. See docs/research/integrations/cap-std-filesystem-confinement.md.
 cap-std = "4.0.3"
 etcetera = "0.11.0"
+# Text out of documents people send (PDF, Word, spreadsheets), for `jarvis.files.read_document` (`ADR-0158`). Pure parsers, in their own crate so the
+# dependencies stay out of the domain crates. `lopdf` with its default `rayon`/`chrono` features off; `zip` with only the deflate backend that
+# `flate2` already provides.
+lopdf = { version = "0.45.0", default-features = false }
+roxmltree = "0.21.1"
+zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
@@ -63,6 +70,7 @@ jarvis-application = { path = "crates/jarvis-application", version = "0.1.0" }
 jarvis-connectors = { path = "crates/jarvis-connectors", version = "0.1.0" }
 jarvis-core = { path = "crates/jarvis-core", version = "0.1.0" }
 jarvis-diagnostics = { path = "crates/jarvis-diagnostics", version = "0.1.0" }
+jarvis-documents = { path = "crates/jarvis-documents", version = "0.1.0" }
 jarvis-mcp = { path = "crates/jarvis-mcp", version = "0.1.0" }
 jarvis-mcp-transport = { path = "crates/jarvis-mcp-transport", version = "0.1.0" }
 jarvis-models = { path = "crates/jarvis-models", version = "0.1.0" }
