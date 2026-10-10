@@ -5,7 +5,10 @@
 //! (after the adapter's own quick retries), the same request is made once more for the configured fallback model. Nothing was said, so
 //! nothing can be said twice; the answer comes from the fallback for that call only, and the next call tries the main model again.
 //!
-//! Only those two refusals fall back. A refused credential, a model that does not exist, a context that is too large or a content refusal are
+//! The fallback may also be a **different provider** (`ADR-0163`): then the limit, an outage that outlasted the adapter's own retries, or
+//! spent credit at the main provider does not stop the run, and the request goes to the other provider with the fallback model name.
+//!
+//! Only those two refusals fall back (and, for a different provider, an outage or spent credit). A refused credential, a model that does not exist, a context that is too large or a content refusal are
 //! not a reason to ask someone else, and are reported as they are.
 
 use async_trait::async_trait;
@@ -18,20 +21,55 @@ use jarvis_models::{
 pub(crate) struct FallbackGateway {
     inner: Box<dyn ModelGateway>,
     fallback: ModelId,
+    /// A different provider that serves the fallback model; the main provider serves it when this is `None`.
+    elsewhere: Option<Box<dyn ModelGateway>>,
 }
 
 impl FallbackGateway {
     /// Wraps `inner`, asking `fallback` when a call for any other model is limited.
     pub(crate) fn new(inner: Box<dyn ModelGateway>, fallback: ModelId) -> Self {
-        Self { inner, fallback }
+        Self {
+            inner,
+            fallback,
+            elsewhere: None,
+        }
     }
 
-    /// Whether this refusal is one a different model might not share.
+    /// Wraps `inner`, asking `fallback` at the `other` provider when `inner` is limited or down.
+    pub(crate) fn at_another_provider(
+        inner: Box<dyn ModelGateway>,
+        other: Box<dyn ModelGateway>,
+        fallback: ModelId,
+    ) -> Self {
+        Self {
+            inner,
+            fallback,
+            elsewhere: Some(other),
+        }
+    }
+
+    /// Whether this refusal is one a different model, or a different provider, might not share.
     fn worth_falling_back(&self, error: &ModelError, request: &ChatRequest) -> bool {
-        matches!(
-            error.kind(),
-            ModelErrorKind::RateLimited | ModelErrorKind::Overloaded
-        ) && request.model() != &self.fallback
+        match &self.elsewhere {
+            Some(_) => matches!(
+                error.kind(),
+                ModelErrorKind::RateLimited
+                    | ModelErrorKind::Overloaded
+                    | ModelErrorKind::Transient
+                    | ModelErrorKind::QuotaExhausted
+            ),
+            None => {
+                matches!(
+                    error.kind(),
+                    ModelErrorKind::RateLimited | ModelErrorKind::Overloaded
+                ) && request.model() != &self.fallback
+            }
+        }
+    }
+
+    /// Who is asked for the fallback model.
+    fn fallback_gateway(&self) -> &dyn ModelGateway {
+        self.elsewhere.as_deref().unwrap_or(self.inner.as_ref())
     }
 }
 
@@ -53,7 +91,7 @@ impl ModelGateway for FallbackGateway {
                     fallback = self.fallback.as_str(),
                     "the model is limited, so the fallback model is asked instead"
                 );
-                self.inner
+                self.fallback_gateway()
                     .complete(request.with_model(self.fallback.clone()))
                     .await
             }
@@ -69,7 +107,7 @@ impl ModelGateway for FallbackGateway {
                     fallback = self.fallback.as_str(),
                     "the model is limited, so the fallback model is asked instead"
                 );
-                self.inner
+                self.fallback_gateway()
                     .stream(request.with_model(self.fallback.clone()))
                     .await
             }

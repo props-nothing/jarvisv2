@@ -30,6 +30,7 @@ const PAGE: &str = include_str!("hud/index.html");
 const SCRIPT: &str = include_str!("hud/hud.js");
 const HEAD: &str = include_str!("hud/head.js");
 const MISSION: &str = include_str!("hud/mission.js");
+const SETTINGS: &str = include_str!("hud/settings.js");
 const STYLE: &str = include_str!("hud/hud.css");
 
 /// The path of the page.
@@ -47,6 +48,9 @@ pub const HEAD_PATH: &str = "/head.js";
 
 /// The path of the live mission view: the feed of what JARVIS is doing, its sources, and the animation around the face.
 pub const MISSION_PATH: &str = "/mission.js";
+
+/// The path of the settings dialog's script.
+pub const SETTINGS_PATH: &str = "/settings.js";
 
 /// The path of the page's stylesheet.
 pub const STYLE_PATH: &str = "/hud.css";
@@ -71,6 +75,7 @@ pub fn is_public_asset(method: &Method, path: &str) -> bool {
             || path == SCRIPT_PATH
             || path == HEAD_PATH
             || path == MISSION_PATH
+            || path == SETTINGS_PATH
             || path == STYLE_PATH)
 }
 
@@ -118,6 +123,11 @@ pub async fn mission() -> Response {
     asset(MISSION, "text/javascript; charset=utf-8")
 }
 
+/// `GET /settings.js`
+pub async fn settings() -> Response {
+    asset(SETTINGS, "text/javascript; charset=utf-8")
+}
+
 /// `GET /hud.css`
 pub async fn style() -> Response {
     asset(STYLE, "text/css; charset=utf-8")
@@ -134,6 +144,7 @@ mod tests {
         assert!(is_public_asset(&Method::GET, "/hud.js"));
         assert!(is_public_asset(&Method::GET, "/head.js"));
         assert!(is_public_asset(&Method::GET, "/mission.js"));
+        assert!(is_public_asset(&Method::GET, "/settings.js"));
         assert!(is_public_asset(&Method::GET, "/hud.css"));
         for path in [
             "/hud/",
@@ -152,6 +163,7 @@ mod tests {
         assert!(!is_public_asset(&Method::DELETE, "/hud.js"));
         assert!(!is_public_asset(&Method::POST, "/head.js"));
         assert!(!is_public_asset(&Method::POST, "/mission.js"));
+        assert!(!is_public_asset(&Method::POST, "/settings.js"));
     }
 
     #[test]
@@ -167,7 +179,8 @@ mod tests {
             assert!(
                 !SCRIPT.contains(forbidden)
                     && !HEAD.contains(forbidden)
-                    && !MISSION.contains(forbidden),
+                    && !MISSION.contains(forbidden)
+                    && !SETTINGS.contains(forbidden),
                 "the scripts must not use {forbidden}"
             );
         }
@@ -185,6 +198,11 @@ mod tests {
         assert!(MISSION.contains("\"http:\" && url.protocol !== \"https:\""));
         assert!(MISSION.contains("url.username || url.password"));
         assert!(PAGE.contains("/mission.js"));
+        assert!(PAGE.contains("/settings.js"));
+        // hud.js calls JarvisSettings while it loads, so the settings script must come first.
+        let at = |name: &str| PAGE.find(name).unwrap_or(usize::MAX);
+        assert!(at("/settings.js") < at("/hud.js"));
+        assert!(SCRIPT.contains("JarvisSettings(") && SETTINGS.contains("window.JarvisSettings"));
     }
 
     #[test]
@@ -200,6 +218,7 @@ mod tests {
                 !SCRIPT.contains(external)
                     && !HEAD.contains(external)
                     && !MISSION.contains(external)
+                    && !SETTINGS.contains(external)
                     && !PAGE.contains(external),
                 "the page must load and send nothing outside this origin: {external}"
             );

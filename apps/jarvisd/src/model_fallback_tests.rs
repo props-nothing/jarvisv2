@@ -138,3 +138,83 @@ async fn a_call_that_works_is_asked_once() {
     assert!(gateway.stream(request("primary")).await.is_ok());
     assert_eq!(asked(&log), ["primary"]);
 }
+
+/// What a recording model was asked for.
+type Log = Arc<Mutex<Vec<String>>>;
+
+fn recording(name: &str, turns: Vec<Turn>) -> (Recording, Arc<Mutex<Vec<String>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let model = Recording {
+        inner: scripted("scripted", name, turns).unwrap_or_else(|error| panic!("{error}")),
+        asked: Arc::clone(&asked),
+    };
+    (model, asked)
+}
+
+fn across_providers(main: Vec<Turn>, other: Vec<Turn>) -> (FallbackGateway, Log, Log) {
+    let (main, main_log) = recording("primary", main);
+    let (other, other_log) = recording("backup", other);
+    (
+        FallbackGateway::at_another_provider(Box::new(main), Box::new(other), id("backup")),
+        main_log,
+        other_log,
+    )
+}
+
+#[tokio::test]
+async fn a_limit_an_outage_or_spent_credit_at_the_main_provider_goes_to_the_other_provider() {
+    for kind in [
+        ModelErrorKind::RateLimited,
+        ModelErrorKind::Overloaded,
+        ModelErrorKind::Transient,
+        ModelErrorKind::QuotaExhausted,
+    ] {
+        let (gateway, main_log, other_log) =
+            across_providers(vec![Turn::Fail(kind)], vec![Turn::answer("from elsewhere")]);
+        assert!(gateway.stream(request("primary")).await.is_ok(), "{kind:?}");
+        assert_eq!(asked(&main_log), ["primary"], "{kind:?}");
+        assert_eq!(asked(&other_log), ["backup"], "{kind:?}");
+    }
+    let (gateway, main_log, other_log) = across_providers(
+        vec![Turn::Fail(ModelErrorKind::RateLimited)],
+        vec![Turn::answer("from elsewhere")],
+    );
+    assert!(gateway.complete(request("primary")).await.is_ok());
+    assert_eq!(asked(&main_log), ["primary"]);
+    assert_eq!(asked(&other_log), ["backup"]);
+}
+
+#[tokio::test]
+async fn a_refusal_that_is_the_owners_to_fix_never_leaves_for_another_provider() {
+    // Falsifies the guard: a bad credential, a missing model, an oversized context or a content refusal must not send the run's text
+    // to a provider the owner did not choose for that case.
+    for kind in [
+        ModelErrorKind::Authentication,
+        ModelErrorKind::Authorization,
+        ModelErrorKind::ModelNotFound,
+        ModelErrorKind::ContextOverflow,
+        ModelErrorKind::ContentRefusal,
+        ModelErrorKind::InvalidRequest,
+    ] {
+        let (gateway, main_log, other_log) =
+            across_providers(vec![Turn::Fail(kind)], vec![Turn::answer("no")]);
+        let refused = gateway.stream(request("primary")).await.err();
+        assert_eq!(refused.map(|error| error.kind()), Some(kind));
+        assert_eq!(asked(&main_log), ["primary"]);
+        assert!(asked(&other_log).is_empty(), "{kind:?} stays at home");
+    }
+}
+
+#[tokio::test]
+async fn when_both_providers_fail_the_other_providers_refusal_is_reported_once() {
+    let (gateway, main_log, other_log) = across_providers(
+        vec![Turn::Fail(ModelErrorKind::Transient)],
+        vec![Turn::Fail(ModelErrorKind::RateLimited)],
+    );
+    let refused = gateway.stream(request("primary")).await.err();
+    assert_eq!(
+        refused.map(|error| error.kind()),
+        Some(ModelErrorKind::RateLimited)
+    );
+    assert_eq!(asked(&main_log).len() + asked(&other_log).len(), 2);
+}

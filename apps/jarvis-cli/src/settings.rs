@@ -125,7 +125,7 @@ fn show(paths: &AppPaths, json: bool) -> Result<(), String> {
 
 fn kind_of(word: Option<&String>) -> Result<SecretKind, String> {
     word.map_or_else(
-        || Err("name the key: model, voice, search or google".to_owned()),
+        || Err("name the key: model, voice, search, google or fallback".to_owned()),
         |word| SecretKind::parse(word),
     )
 }
@@ -186,6 +186,7 @@ pub async fn keys(
             Ok(SecretKind::Model) => test_model(paths).await,
             Ok(SecretKind::Voice) => test_voice(paths, credential).await,
             Ok(SecretKind::Search) => test_search(paths).await,
+            Ok(SecretKind::Fallback) => test_fallback(paths).await,
             Ok(SecretKind::Google) => Err(
                 "the Google secret is checked by signing in: open the console, Settings, Google"
                     .to_owned(),
@@ -203,10 +204,11 @@ fn status(paths: &AppPaths, json: bool) -> Result<(), String> {
     let voice = settings::key_state(paths, SecretKind::Voice)?;
     let search = settings::key_state(paths, SecretKind::Search)?;
     let google = settings::key_state(paths, SecretKind::Google)?;
+    let fallback = settings::key_state(paths, SecretKind::Fallback)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "model": model.state, "voice": voice.state, "search": search.state, "google": google.state })
+            serde_json::json!({ "model": model.state, "voice": voice.state, "search": search.state, "google": google.state, "fallback": fallback.state })
         );
         return Ok(());
     }
@@ -215,9 +217,10 @@ fn status(paths: &AppPaths, json: bool) -> Result<(), String> {
         ("voice", voice),
         ("search", search),
         ("google", google),
+        ("fallback", fallback),
     ] {
         println!(
-            "{name:<6} {:<13} {}",
+            "{name:<8} {:<13} {}",
             state.state,
             state.path.unwrap_or_default()
         );
@@ -256,12 +259,32 @@ async fn test_search(paths: &AppPaths) -> Result<(), String> {
 }
 
 async fn test_model(paths: &AppPaths) -> Result<(), String> {
-    let base = settings::get(paths, "executor_base_url")
-        .map_err(|_| "no model is configured".to_owned())?;
-    let file = settings::get(paths, "executor_api_key_ref")
-        .map_err(|_| "no model is configured".to_owned())?;
+    test_models_endpoint(paths, "executor_base_url", "executor_api_key_ref", "model").await
+}
+
+/// The same check for the different provider the fallback model is asked at.
+async fn test_fallback(paths: &AppPaths) -> Result<(), String> {
+    test_models_endpoint(
+        paths,
+        "executor_fallback_base_url",
+        "executor_fallback_api_key_ref",
+        "fallback",
+    )
+    .await
+}
+
+async fn test_models_endpoint(
+    paths: &AppPaths,
+    url_field: &str,
+    key_field: &str,
+    label: &str,
+) -> Result<(), String> {
+    let base = settings::get(paths, url_field)
+        .map_err(|_| format!("no {label} provider is configured"))?;
+    let file = settings::get(paths, key_field)
+        .map_err(|_| format!("no {label} key is set; use `jarvis keys set {label}`"))?;
     let key = std::fs::read_to_string(&file)
-        .map_err(|_| "the model key file could not be read".to_owned())?;
+        .map_err(|_| format!("the {label} key file could not be read"))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -274,11 +297,11 @@ async fn test_model(paths: &AppPaths) -> Result<(), String> {
         .map_err(|_| format!("could not reach {base}"))?;
     match response.status().as_u16() {
         200..=299 => {
-            println!("model server answered and accepted the key");
+            println!("{label} server answered and accepted the key");
             Ok(())
         }
-        401 | 403 => Err("the model server rejected the key".to_owned()),
-        other => Err(format!("the model server answered with status {other}")),
+        401 | 403 => Err(format!("the {label} server rejected the key")),
+        other => Err(format!("the {label} server answered with status {other}")),
     }
 }
 

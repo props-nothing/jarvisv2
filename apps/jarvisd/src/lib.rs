@@ -678,10 +678,30 @@ fn compose_model_provider(
             "high" => Some(jarvis_models::ReasoningEffort::High),
             _ => None,
         });
+    // The fallback is optional, so a key that cannot be read costs the fallback and not the daemon: it is said once and the main
+    // provider runs on its own.
+    let fallback_provider = match (
+        daemon.executor_fallback_base_url(),
+        daemon.executor_fallback_api_key_ref(),
+    ) {
+        (Some(url), Some(file)) => match fs::read_to_string(file) {
+            Ok(other) if !other.trim().is_empty() => {
+                Some((url.to_owned(), other.trim().to_owned()))
+            }
+            _ => {
+                tracing::warn!(
+                    "the fallback provider key could not be read or is empty, so the fallback provider is not used"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
     Ok(Some(
         executor::ModelProviderConfig::new(base_url, model, key)
             .with_reasoning_effort(effort)
-            .with_fallback_model(daemon.executor_fallback_model_name().map(str::to_owned)),
+            .with_fallback_model(daemon.executor_fallback_model_name().map(str::to_owned))
+            .with_fallback_provider(fallback_provider),
     ))
 }
 

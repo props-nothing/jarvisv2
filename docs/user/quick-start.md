@@ -43,6 +43,7 @@ asked about first. Nothing outside them is reachable.
 | Key | What it is for | How to give it today |
 | --- | --- | --- |
 | Model key | A hosted model provider (not needed for local Ollama) | `jarvis keys set model --from-env NAME` (or `--file PATH`, or pipe it in), or `--api-key-file PATH` at `init`. |
+| Fallback key | A second provider for when the main model is limited or down | `jarvis keys set fallback --from-env NAME`, after `executor_fallback_model_name` and `executor_fallback_base_url` are set (see settings.md). |
 | Voice key | A natural voice (ElevenLabs) | `jarvis keys set voice --from-env ELEVENLABS_API_KEY`, then `jarvis restart`. Without it the console speaks with your browser's own voice. |
 
 ```text

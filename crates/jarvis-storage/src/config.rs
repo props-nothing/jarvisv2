@@ -134,6 +134,13 @@ pub struct DaemonConfig {
     /// A second model name, asked at the same provider, when the first is rate limited or overloaded (`ADR-0159`). Needs a live provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executor_fallback_model_name: Option<String>,
+    /// Where the fallback model is asked, when it is at a different provider than the main one (`ADR-0163`). Set together with
+    /// [`Self::executor_fallback_api_key_ref`]; without both, the fallback model is asked at the main provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_fallback_base_url: Option<String>,
+    /// The key file for the different fallback provider, absolute, like [`Self::executor_api_key_ref`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_fallback_api_key_ref: Option<PathBuf>,
     /// The base URL a **live** provider is called at, including its version path (`https://host/v1`).
     ///
     /// # Why no credential may appear here
@@ -410,6 +417,18 @@ impl DaemonConfig {
     pub fn executor_fallback_model_name(&self) -> Option<&str> {
         self.executor_fallback_model_name.as_deref()
     }
+
+    /// The base URL of a different provider for the fallback model, when one is configured.
+    #[must_use]
+    pub fn executor_fallback_base_url(&self) -> Option<&str> {
+        self.executor_fallback_base_url.as_deref()
+    }
+
+    /// The key file of a different provider for the fallback model, when one is configured.
+    #[must_use]
+    pub fn executor_fallback_api_key_ref(&self) -> Option<&Path> {
+        self.executor_fallback_api_key_ref.as_deref()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -424,6 +443,8 @@ impl Default for DaemonConfig {
             executor_model_name: None,
             executor_reasoning_effort: None,
             executor_fallback_model_name: None,
+            executor_fallback_base_url: None,
+            executor_fallback_api_key_ref: None,
             executor_base_url: None,
             executor_api_key_ref: None,
             // Empty: no filesystem tool is registered until an operator grants roots.
@@ -754,6 +775,7 @@ impl Config {
         {
             return Err(ConfigError::InvalidFallbackModel);
         }
+        self.validate_fallback_provider()?;
         if let Some(path) = &self.daemon.search_api_key_ref
             && !path.is_absolute()
         {
@@ -767,6 +789,32 @@ impl Config {
         Ok(())
     }
 
+    /// A different provider for the fallback model: an address (http or https, no login in it) with a fallback model to ask there, and
+    /// then its key file, absolute. The address may be saved before the key, as the settings screen saves one field at a time; the
+    /// daemon uses the other provider only when it has both, and a key without an address is refused.
+    fn validate_fallback_provider(&self) -> Result<(), ConfigError> {
+        let daemon = &self.daemon;
+        let Some(url) = &daemon.executor_fallback_base_url else {
+            return if daemon.executor_fallback_api_key_ref.is_none() {
+                Ok(())
+            } else {
+                Err(ConfigError::InvalidFallbackProvider)
+            };
+        };
+        let plain = (url.starts_with("http://") || url.starts_with("https://"))
+            && url.len() <= 512
+            && url.bytes().all(|byte| byte.is_ascii_graphic())
+            && !url.contains('@');
+        let key_ok = daemon
+            .executor_fallback_api_key_ref
+            .as_ref()
+            .is_none_or(|path| path.is_absolute());
+        if plain && key_ok && daemon.executor_fallback_model_name.is_some() {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidFallbackProvider)
+        }
+    }
     /// Validates the push settings: a topic ntfy would accept, and a server that is `https://`, or `http://` on this machine only.
     fn validate_push(&self) -> Result<(), ConfigError> {
         let topic_ok = self.daemon.push_topic.as_deref().is_none_or(|topic| {
@@ -1149,6 +1197,11 @@ pub enum ConfigError {
         "daemon.executor_fallback_model_name must be a model identifier with no spaces, and needs daemon.executor_model = openai-compatible"
     )]
     InvalidFallbackModel,
+    /// A different fallback provider needs its address (http or https, no credentials in it) and an absolute key file together, and a fallback model name.
+    #[error(
+        "daemon.executor_fallback_base_url needs daemon.executor_fallback_model_name and must be an http(s) address with no login in it; daemon.executor_fallback_api_key_ref must be an absolute path and needs the address"
+    )]
+    InvalidFallbackProvider,
     /// The Google sign-in settings were unusable: a client id that is blank or has whitespace or control characters, a secret path that is
     /// not absolute, or a secret with no client id.
     #[error(
@@ -1337,6 +1390,8 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "executor_model_name",
                 "executor_reasoning_effort",
                 "executor_fallback_model_name",
+                "executor_fallback_base_url",
+                "executor_fallback_api_key_ref",
                 "executor_base_url",
                 "executor_api_key_ref",
                 "tool_workspace_roots",
@@ -1995,6 +2050,64 @@ executor_api_key_ref = "/etc/jarvis/model.key"
             parse(scripted).err(),
             Some(ConfigError::InvalidFallbackModel)
         );
+    }
+
+    /// **A fallback at a different provider needs a model and an address, may add its key after, and refuses a key alone, and refuses a login inside the address.**
+    #[test]
+    fn a_fallback_at_another_provider_needs_address_key_and_model_together() {
+        let (main_key, other_key) = if cfg!(windows) {
+            ("C:/keys/model.key", "C:/keys/fallback.key")
+        } else {
+            ("/keys/model.key", "/keys/fallback.key")
+        };
+        let live = |extra: &str| {
+            format!(
+                "schema_version = 1\n[profile]\nname = \"home\"\n[logging]\nlevel = \"warn\"\n[daemon]\nshutdown_timeout_seconds = 30\n\
+                 executor_model = \"openai-compatible\"\nexecutor_model_name = \"m\"\n\
+                 executor_base_url = \"http://127.0.0.1:11434/v1\"\nexecutor_api_key_ref = \"{main_key}\"\n{extra}"
+            )
+        };
+        let parse = |document: &str| {
+            Config::parse_with_environment(document, Vec::<(String, String)>::new())
+        };
+        let good = live(&format!(
+            "executor_fallback_model_name = \"gpt-4.1-mini\"\nexecutor_fallback_base_url = \"https://api.openai.com/v1\"\nexecutor_fallback_api_key_ref = \"{other_key}\"\n"
+        ));
+        let loaded = parse(&good).unwrap_or_else(|error| panic!("{error}"));
+        let daemon = loaded.config().daemon();
+        assert_eq!(
+            daemon.executor_fallback_base_url(),
+            Some("https://api.openai.com/v1")
+        );
+        assert!(daemon.executor_fallback_api_key_ref().is_some());
+        // The address may be saved before its key.
+        assert!(
+            parse(&live(
+                "executor_fallback_model_name = \"x\"\nexecutor_fallback_base_url = \"https://example.com/v1\"\n"
+            ))
+            .is_ok()
+        );
+
+        let name = "executor_fallback_model_name = \"x\"\n";
+        let url = "executor_fallback_base_url = \"https://example.com/v1\"\n";
+        assert!(parse(&live(&format!("{name}{url}"))).is_ok());
+        let key = format!("executor_fallback_api_key_ref = \"{other_key}\"\n");
+        let cases = [
+            format!("{name}{key}"),
+            format!("{url}{key}"),
+            format!(
+                "{name}executor_fallback_base_url = \"https://user:secret@example.com/v1\"\n{key}"
+            ),
+            format!("{name}executor_fallback_base_url = \"ftp://example.com\"\n{key}"),
+            format!("{name}{url}executor_fallback_api_key_ref = \"relative.key\"\n"),
+        ];
+        for bad in cases {
+            assert_eq!(
+                parse(&live(&bad)).err(),
+                Some(ConfigError::InvalidFallbackProvider),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

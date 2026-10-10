@@ -149,6 +149,7 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
                     "voice": key_json(&context.paths, SecretKind::Voice),
             "search": key_json(&context.paths, SecretKind::Search),
             "google": key_json(&context.paths, SecretKind::Google),
+            "fallback": key_json(&context.paths, SecretKind::Fallback),
                 },
             });
             (StatusCode::OK, Json(body)).into_response()

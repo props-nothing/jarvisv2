@@ -246,6 +246,8 @@ pub struct ModelProviderConfig {
     api_key: String,
     /// A second model identifier at the same provider, asked when the first is rate limited or overloaded.
     fallback_model: Option<String>,
+    /// A different provider that serves the fallback model: its base URL and API key.
+    fallback_provider: Option<(String, String)>,
 }
 
 impl ModelProviderConfig {
@@ -262,7 +264,15 @@ impl ModelProviderConfig {
             reasoning_effort: None,
             api_key: api_key.into(),
             fallback_model: None,
+            fallback_provider: None,
         }
+    }
+
+    /// Sets a different provider (base URL and key) at which the fallback model is asked.
+    #[must_use]
+    pub fn with_fallback_provider(mut self, provider: Option<(String, String)>) -> Self {
+        self.fallback_provider = provider;
+        self
     }
 
     /// Sets the model asked instead when the main one is rate limited or overloaded.
@@ -375,26 +385,14 @@ impl Executor {
     /// when the first run is started. The transport is built with the adapter's hardened defaults (no
     /// proxy, no redirects, a read timeout), which is the same transport `P2-003` shipped and tested.
     fn build_openai_compatible(provider: &ModelProviderConfig) -> Result<Self, ExecutorBuildError> {
-        let base_url = jarvis_models::openai::BaseUrl::new(provider.base_url.clone())
-            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "base_url" })?;
-        let api_key = jarvis_models::openai::ApiKey::new(provider.api_key.clone())
-            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "api_key" })?;
         let model_id = ModelId::new(provider.model.clone())
             .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "model" })?;
-        let provider_id = jarvis_models::ProviderId::new("openai-compatible")
-            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "provider" })?;
-        let transport = Arc::new(
-            jarvis_models::openai::HttpTransport::new()
-                .map_err(|_| ExecutorBuildError::Transport)?,
-        );
-        let model = jarvis_models::openai::OpenAiCompatibleProvider::new(
-            provider_id,
-            base_url,
-            api_key,
-            transport,
-            jarvis_models::openai::RetryPolicy::default(),
-        )
-        .with_default_reasoning_effort(provider.reasoning_effort);
+        let model = Self::build_provider(
+            &provider.base_url,
+            &provider.api_key,
+            provider.reasoning_effort,
+            "base_url",
+        )?;
         let fallback = provider
             .fallback_model
             .clone()
@@ -402,17 +400,51 @@ impl Executor {
             .transpose()
             .map_err(|_| ExecutorBuildError::InvalidProviderField {
                 field: "fallback model",
-            })?
-            .filter(|fallback| *fallback != model_id);
-        Ok(Self {
-            model: match fallback {
-                Some(fallback) => Box::new(FallbackGateway::new(Box::new(model), fallback)),
-                None => Box::new(model),
-            },
-            model_id,
-        })
+            })?;
+        let model: Box<dyn ModelGateway> = match (fallback, &provider.fallback_provider) {
+            (Some(fallback), Some((url, key))) => {
+                let other =
+                    Self::build_provider(url, key, provider.reasoning_effort, "fallback base_url")?;
+                Box::new(FallbackGateway::at_another_provider(
+                    Box::new(model),
+                    Box::new(other),
+                    fallback,
+                ))
+            }
+            (Some(fallback), None) if fallback != model_id => {
+                Box::new(FallbackGateway::new(Box::new(model), fallback))
+            }
+            _ => Box::new(model),
+        };
+        Ok(Self { model, model_id })
     }
 
+    /// One OpenAI-compatible provider adapter from an address and a key.
+    fn build_provider(
+        base_url: &str,
+        api_key: &str,
+        reasoning_effort: Option<jarvis_models::ReasoningEffort>,
+        url_field: &'static str,
+    ) -> Result<jarvis_models::openai::OpenAiCompatibleProvider, ExecutorBuildError> {
+        let base_url = jarvis_models::openai::BaseUrl::new(base_url.to_owned())
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: url_field })?;
+        let api_key = jarvis_models::openai::ApiKey::new(api_key.to_owned())
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "api_key" })?;
+        let provider_id = jarvis_models::ProviderId::new("openai-compatible")
+            .map_err(|_| ExecutorBuildError::InvalidProviderField { field: "provider" })?;
+        let transport = Arc::new(
+            jarvis_models::openai::HttpTransport::new()
+                .map_err(|_| ExecutorBuildError::Transport)?,
+        );
+        Ok(jarvis_models::openai::OpenAiCompatibleProvider::new(
+            provider_id,
+            base_url,
+            api_key,
+            transport,
+            jarvis_models::openai::RetryPolicy::default(),
+        )
+        .with_default_reasoning_effort(reasoning_effort))
+    }
     /// Returns the model gateway the executor drives.
     #[must_use]
     pub fn model(&self) -> &dyn ModelGateway {
@@ -3067,6 +3099,39 @@ mod tests {
             "gpt-oss:20b",
             "the run must name the model the operator configured, not a built-in literal"
         );
+    }
+
+    /// **A fallback provider the adapter rejects is refused, naming the field and not echoing the value; a good one builds.**
+    #[test]
+    fn a_fallback_provider_is_checked_like_the_main_one() {
+        let base = || {
+            ModelProviderConfig::new(
+                "http://127.0.0.1:11434/v1",
+                "gpt-oss:20b",
+                "main-key-not-real",
+            )
+            .with_fallback_model(Some("backup-model".to_owned()))
+        };
+        let live = jarvis_storage::LIVE_PROVIDER_MODEL_NAME;
+        let good = base().with_fallback_provider(Some((
+            "https://api.example.invalid/v1".to_owned(),
+            "other-key-not-real".to_owned(),
+        )));
+        assert!(Executor::build(live, Some(&good)).is_ok());
+        let bad = base().with_fallback_provider(Some((
+            "ftp://other.example.invalid/v1".to_owned(),
+            "other-key-not-real".to_owned(),
+        )));
+        let error = Executor::build(live, Some(&bad))
+            .err()
+            .unwrap_or_else(|| panic!("a bad fallback address must be refused"));
+        assert_eq!(
+            error,
+            ExecutorBuildError::InvalidProviderField {
+                field: "fallback base_url"
+            }
+        );
+        assert!(!error.to_string().contains("other.example"));
     }
 
     /// **The live provider without coordinates is refused rather than silently falling back.**

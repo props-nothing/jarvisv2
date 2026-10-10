@@ -358,6 +358,7 @@ pub fn router(state: GatewayState) -> Router {
         .route(crate::hud::SCRIPT_PATH, get(crate::hud::script))
         .route(crate::hud::HEAD_PATH, get(crate::hud::head))
         .route(crate::hud::MISSION_PATH, get(crate::hud::mission))
+        .route(crate::hud::SETTINGS_PATH, get(crate::hud::settings))
         .route(crate::hud::STYLE_PATH, get(crate::hud::style))
         .route(
             crate::google_account::CALLBACK_PATH,
@@ -2720,6 +2721,7 @@ mod tests {
             "/hud.js",
             "/head.js",
             "/mission.js",
+            "/settings.js",
             "/hud.css",
         ] {
             let response = app

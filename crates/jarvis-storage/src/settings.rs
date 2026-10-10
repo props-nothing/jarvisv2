@@ -90,8 +90,28 @@ const SETTINGS: &[Setting] = &[
         help: "a second model to ask when the main one is rate limited or overloaded",
         group: "brain",
         default: None,
-        unset_means: "No fallback: a run waits out a rate limit (up to about five minutes) and then fails. With one, the same provider is asked for this model at once, for that call only; the next call tries the main model again.",
+        unset_means: "No fallback: a run waits out a rate limit (up to about five minutes) and then fails. With one, the same provider is asked for this model at once (or the provider below, when one is set), for that call only; the next call tries the main model again.",
         example: "glm-5.3:cloud",
+    },
+    Setting {
+        table: "daemon",
+        field: "executor_fallback_base_url",
+        kind: Kind::Text,
+        help: "a different provider for the fallback model: its address, with its /v1 (then set its key below)",
+        group: "brain",
+        default: None,
+        unset_means: "The fallback model is asked at the main provider. With an address and a key, it is asked there instead, so a limit or an outage at the main provider does not stop a run. What the run is saying is then sent to that provider.",
+        example: "https://api.openai.com/v1",
+    },
+    Setting {
+        table: "daemon",
+        field: "executor_fallback_api_key_ref",
+        kind: Kind::File,
+        help: "file holding the fallback provider key (set the key itself with `jarvis keys set fallback`)",
+        group: "brain",
+        default: None,
+        unset_means: "No key for a different fallback provider.",
+        example: "",
     },
     Setting {
         table: "daemon",
@@ -709,6 +729,8 @@ pub enum SecretKind {
     Search,
     /// The Google OAuth client secret.
     Google,
+    /// The key of the different provider the fallback model is asked at.
+    Fallback,
 }
 
 impl SecretKind {
@@ -723,7 +745,8 @@ impl SecretKind {
             "voice" => Ok(Self::Voice),
             "search" => Ok(Self::Search),
             "google" => Ok(Self::Google),
-            _ => Err("name the key: model, voice, search or google".to_owned()),
+            "fallback" => Ok(Self::Fallback),
+            _ => Err("name the key: model, voice, search, google or fallback".to_owned()),
         }
     }
 
@@ -733,6 +756,7 @@ impl SecretKind {
             Self::Voice => "speech_api_key_ref",
             Self::Search => "search_api_key_ref",
             Self::Google => "google_client_secret_ref",
+            Self::Fallback => "executor_fallback_api_key_ref",
         }
     }
 
@@ -742,6 +766,7 @@ impl SecretKind {
             Self::Voice => "speech.key",
             Self::Search => "search.key",
             Self::Google => "google.key",
+            Self::Fallback => "fallback.key",
         }
     }
 
@@ -753,6 +778,7 @@ impl SecretKind {
             Self::Voice => "ELEVENLABS_API_KEY",
             Self::Search => "OLLAMA_API_KEY",
             Self::Google => "GOOGLE_CLIENT_SECRET",
+            Self::Fallback => "JARVIS_FALLBACK_API_KEY",
         }
     }
 }
@@ -840,6 +866,7 @@ pub fn remove_secret(paths: &AppPaths, kind: SecretKind) -> Result<(), String> {
         let dependent: &[&str] = match kind {
             SecretKind::Search => &["search_api_key_ref"],
             SecretKind::Google => &["google_client_secret_ref"],
+            SecretKind::Fallback => &["executor_fallback_api_key_ref"],
             _ => &["speech_api_key_ref", "speech_voice_id", "speech_model"],
         };
         for field in dependent {
