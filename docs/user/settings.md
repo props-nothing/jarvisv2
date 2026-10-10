@@ -10,6 +10,8 @@ refused, leaving the file untouched, if it would not start. Keys are stored in a
 
 ## Brain
 
+In the console, **Settings, Brain** has one card for the **main model** and one for the **fallback**. Pick a provider (Ollama on this computer, Ollama Cloud, OpenAI, Google Gemini, Anthropic, or any other OpenAI-compatible server), paste its key, press **Load models** to choose from what that provider actually offers (you can still type a name), press **Test** to see that the model answers, then **Save** and restart. JARVIS asks the provider itself, so a key you saved is never sent to the page, and a saved key is only ever used with the address it was saved for: changing the address means pasting that provider's key. Test checks that the model answers, not that it uses tools well. Anthropic and Gemini are reached through their OpenAI-compatible endpoints; Anthropic describes its as a way to try Claude rather than a production route (no prompt caching, thinking not returned). The web-search key has its own **Web search** tab. The table below is the same settings by name, for `jarvis config`.
+
 | Setting | Default | What unset means |
 | --- | --- | --- |
 | `executor_reasoning_effort` | unset | The model decides how hard to think. `none`, `low`, `medium` or `high` makes a reasoning model faster and cheaper (`low`) or more thorough (`high`). A run that thinks past its budget is still dropped to `low` for the rest of that run. Needs the live model. |

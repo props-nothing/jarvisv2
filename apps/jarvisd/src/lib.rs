@@ -30,6 +30,7 @@ mod memory_propose;
 mod memory_search;
 mod memory_service;
 mod model_fallback;
+mod model_probe;
 mod notify;
 mod ocr;
 mod project_context;

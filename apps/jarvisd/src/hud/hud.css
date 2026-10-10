@@ -143,6 +143,19 @@ pre code { background: none; border: none; padding: 0; }
 .set-row:first-child { border-top: 0; }
 .set-row .name { font: 12px var(--mono); color: var(--cyan); word-break: break-all; }
 .set-row .help { grid-column: 2 / 4; font-size: 11px; color: var(--dim); }
+.set-row .help.bad { color: var(--amber); }
+.set-row input:disabled, .set-row select:disabled { opacity: 0.5; }
+.combo { position: relative; min-width: 0; display: flex; }
+.combo input { flex: 1; min-width: 0; padding-right: 26px; }
+.combo-toggle { position: absolute; right: 0; top: 0; bottom: 0; width: 24px; padding: 0; border: 0; background: transparent; color: var(--cyan); cursor: pointer; font-size: 12px; }
+.combo-list { position: absolute; z-index: 20; left: 0; right: 0; top: 100%; margin: 2px 0 0; padding: 0; list-style: none; max-height: 240px; overflow-y: auto; background: #06121f; border: 1px solid var(--cyan); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6); }
+.combo-list[hidden] { display: none; }
+.combo-list li { padding: 5px 9px; font: 12px var(--mono); color: var(--text); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.combo-list li:hover, .combo-list li.active { background: rgba(60, 200, 255, 0.18); }
+.combo-list li.current { color: var(--cyan); }
+.combo-list li.dim { color: var(--dim); }
+.combo-list li.note { color: var(--dim); cursor: default; white-space: normal; }
+.combo-list li.note:hover { background: transparent; }
 .set-row input { min-width: 0; padding: 6px 9px; color: var(--text); background: rgba(2, 10, 20, 0.75); border: 1px solid var(--line); font: 12px var(--mono); }
 .set-row input:focus { border-color: var(--cyan); outline: 0; }
 .set-row .acts { display: flex; gap: 6px; }

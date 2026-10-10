@@ -302,6 +302,10 @@ pub fn router(state: GatewayState) -> Router {
             axum::routing::put(crate::settings_service::set).delete(crate::settings_service::unset),
         )
         .route(
+            "/settings/models",
+            post(crate::settings_service::probe_models),
+        )
+        .route(
             "/settings/keys/{which}",
             axum::routing::put(crate::settings_service::set_key)
                 .delete(crate::settings_service::remove_key),

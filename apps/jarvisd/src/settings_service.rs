@@ -141,8 +141,15 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
                 })
                 .collect();
             let postures = settings::tool_postures(&context.paths).unwrap_or_default();
+            let providers: Vec<_> = crate::model_probe::PRESETS
+                .iter()
+                .map(|preset| {
+                    json!({ "id": preset.id, "name": preset.name, "url": preset.url, "needs_key": preset.needs_key, "help": preset.help })
+                })
+                .collect();
             let body = json!({
                 "settings": items,
+                "providers": providers,
                 "postures": postures,
                 "keys": {
                     "model": key_json(&context.paths, SecretKind::Model),
@@ -283,6 +290,101 @@ pub async fn unset(State(state): State<GatewayState>, UrlPath(key): UrlPath<Stri
             Json(json!({ "saved": true, "restart_to_apply": true })),
         )
             .into_response(),
+        Err(message) => refused(&message),
+    }
+}
+
+/// The body of `POST /api/v1/settings/models`.
+///
+/// No `Debug`: it may carry a key being tried out.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeBody {
+    /// `main` or `fallback`: which provider slot this is for.
+    slot: String,
+    /// An address to look at instead of the configured one.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// A key typed on the screen, not yet saved. Without one, the stored key is used for the configured address only.
+    #[serde(default)]
+    key: Option<String>,
+    /// A model to ask for one short answer, as a test.
+    #[serde(default)]
+    test_model: Option<String>,
+}
+
+/// `POST /api/v1/settings/models`: the models a provider serves, and optionally a test of one.
+///
+/// The daemon makes the request, so a stored key is never sent to the browser, and it is only ever sent to the address it was stored for
+/// (`model_probe::resolve`). The answer holds model names and plain sentences, never a key.
+pub async fn probe_models(
+    State(state): State<GatewayState>,
+    Json(body): Json<ProbeBody>,
+) -> Response {
+    let context = match context(&state) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let paths = context.paths();
+    let (url_field, key_field) = match body.slot.as_str() {
+        "main" => ("executor_base_url", "executor_api_key_ref"),
+        "fallback" => (
+            "executor_fallback_base_url",
+            "executor_fallback_api_key_ref",
+        ),
+        _ => return refused("the slot must be main or fallback"),
+    };
+    // A fallback with no address of its own is asked at the main provider, with the main key.
+    let (configured_url, key_file) = match settings::get(paths, url_field) {
+        Ok(url) => (Some(url), settings::get(paths, key_field).ok()),
+        Err(_) if body.slot == "fallback" => (
+            settings::get(paths, "executor_base_url").ok(),
+            settings::get(paths, "executor_api_key_ref").ok(),
+        ),
+        Err(_) => (None, None),
+    };
+    let resolved = crate::model_probe::resolve(
+        configured_url.as_deref(),
+        body.base_url.as_deref(),
+        body.key.as_deref(),
+        || key_file.and_then(|file| std::fs::read_to_string(file).ok()),
+    );
+    let (base, key) = match resolved {
+        Ok(found) => found,
+        Err(message) => return refused(&message),
+    };
+    let Ok(transport) = jarvis_models::openai::HttpTransport::new() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "the network client could not be built",
+        );
+    };
+    let transport: std::sync::Arc<dyn jarvis_models::openai::Transport> =
+        std::sync::Arc::new(transport);
+    let test_model = body
+        .test_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    match crate::model_probe::run(transport, base, &key, test_model).await {
+        Ok(report) => {
+            let models: Vec<_> = report
+                .models
+                .iter()
+                .map(|model| json!({ "id": model.id, "likely_chat": model.likely_chat }))
+                .collect();
+            let test = report.test.map(
+                |test| json!({ "ok": test.ok, "message": test.message, "millis": test.millis }),
+            );
+            (
+                StatusCode::OK,
+                Json(
+                    json!({ "models": models, "list_problem": report.list_problem, "test": test }),
+                ),
+            )
+                .into_response()
+        }
         Err(message) => refused(&message),
     }
 }

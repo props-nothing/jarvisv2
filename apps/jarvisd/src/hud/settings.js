@@ -13,11 +13,12 @@ window.JarvisSettings = function (context) {
     // The same checks as `jarvis config` and `jarvis keys` (one code path in the daemon). A key is typed into a password field,
     // sent once, and the field is cleared; the daemon never sends it back, only whether it is set.
     var TABS = [
-      ["brain", "Brain", "Which model JARVIS thinks with, and the key for it."],
+      ["brain", "Brain", "Which model JARVIS thinks with, and a second one for when the first is limited or down."],
+      ["search", "Web search", "Lets JARVIS search the web for you. Uses an Ollama key (a free ollama.com account makes one)."],
       ["voice", "Voice", "How JARVIS sounds. Without a voice key it speaks with your browser's own voice."],
       ["files", "Folders & code", "What JARVIS may touch. Both are off until you turn them on, so nothing is reachable by accident."],
       ["permissions", "Permissions", "For each tool: let the rules decide, always ask, run without asking, or switch it off."],
-      ["google", "Google", "Sign in with your Google account so JARVIS can read your mail and calendar. Read-only: it can never send, change or delete anything."],
+      ["google", "Google", "Sign in with your Google account so JARVIS can read your mail and calendar. Reading is on by default. Sending mail and adding events need the option below and ask you every time; drafts are saved without asking."],
       ["advanced", "Advanced", "Ports. The defaults are right for almost everyone."]
     ];
     var sview = { reply: null, tools: [], tab: "brain" };
@@ -138,6 +139,220 @@ window.JarvisSettings = function (context) {
       return row;
     }
     // Two settings that only make sense together are saved together.
+    // ---- the model providers: pick one, load its models, test it, save ---------------------------------------------------------
+    // The presets come from the daemon (with the settings list) and only fill in an address. Every request to a provider is made by the
+    // daemon, so a stored key never reaches this page; the key typed here is sent once, with the request that needs it.
+    function normUrl(url) { return String(url || "").trim().replace(/\/+$/, "").toLowerCase(); }
+    function providerFor(url) {
+      var all = (sview.reply && sview.reply.providers) || [];
+      var found = all.filter(function (p) { return p.url && normUrl(p.url) === normUrl(url); })[0];
+      return found || all.filter(function (p) { return p.id === "custom"; })[0];
+    }
+    function providerRow(label, control, acts, help) {
+      var row = el("div", "set-row");
+      row.appendChild(el("span", "name", label));
+      row.appendChild(control);
+      row.appendChild(acts || el("span"));
+      if (help) row.appendChild(help);
+      return row;
+    }
+    // A filterable dropdown for the model box. The browser's own <datalist> only offers what matches the text already in the box (so a
+    // saved model name hides every other choice) and cannot be styled, so this draws its own: it opens on click or with the arrow,
+    // lists every model, narrows as you type, and takes the keyboard. Typing any name that is not listed is still allowed.
+    var openPicker = null;
+    function modelPicker(input) {
+      var wrap = el("div", "combo");
+      var toggle = el("button", "combo-toggle", "\u25BE");
+      toggle.type = "button";
+      toggle.title = "Show the models";
+      var menu = el("ul", "combo-list");
+      menu.hidden = true;
+      wrap.appendChild(input);
+      wrap.appendChild(toggle);
+      wrap.appendChild(menu);
+      var models = [], active = -1, typed = false;
+      function visible() {
+        var needle = typed ? input.value.trim().toLowerCase() : "";
+        return models.filter(function (m) { return !needle || m.id.toLowerCase().indexOf(needle) >= 0; }).slice(0, 300);
+      }
+      function draw() {
+        var shown = visible();
+        menu.replaceChildren();
+        if (!models.length) {
+          menu.appendChild(el("li", "note", "Press Load models to see what this provider offers, or type a model name."));
+        } else if (!shown.length) {
+          menu.appendChild(el("li", "note", "No model matches. Keep typing to use that name as it is."));
+        }
+        shown.forEach(function (m, index) {
+          var item = el("li", (m.likely_chat ? "" : "dim ") + (m.id === input.value ? "current " : "") + (index === active ? "active" : ""), m.id + (m.likely_chat ? "" : "   (probably not a chat model)"));
+          item.addEventListener("mousedown", function (event) { event.preventDefault(); choose(m.id); });
+          menu.appendChild(item);
+          if (index === active) item.scrollIntoView({ block: "nearest" });
+        });
+      }
+      function open() {
+        if (openPicker && openPicker !== api2) openPicker.close();
+        openPicker = api2;
+        menu.hidden = false;
+        draw();
+      }
+      function close() {
+        menu.hidden = true;
+        active = -1;
+        typed = false;
+        if (openPicker === api2) openPicker = null;
+      }
+      function choose(id) { input.value = id; close(); input.dispatchEvent(new Event("change")); }
+      toggle.addEventListener("mousedown", function (event) { event.preventDefault(); if (menu.hidden) { input.focus(); open(); } else close(); });
+      input.addEventListener("focus", function () { typed = false; active = -1; open(); });
+      input.addEventListener("click", function () { if (menu.hidden) open(); });
+      input.addEventListener("input", function () { typed = true; active = -1; if (menu.hidden) open(); else draw(); });
+      input.addEventListener("keydown", function (event) {
+        var shown = visible();
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          if (menu.hidden) open();
+          if (!shown.length) return;
+          active = (active + (event.key === "ArrowDown" ? 1 : -1) + shown.length) % shown.length;
+          draw();
+        } else if (event.key === "Enter" && !menu.hidden && active >= 0 && shown[active]) {
+          event.preventDefault();
+          choose(shown[active].id);
+        } else if (event.key === "Tab") {
+          close();
+        }
+      });
+      document.addEventListener("mousedown", function (event) { if (!menu.hidden && !wrap.contains(event.target)) close(); });
+      var api2 = {
+        element: wrap,
+        close: close,
+        // Sets the models on offer; `show` opens the list so the person sees it arrive.
+        setModels: function (list, show) {
+          models = list || [];
+          if (show && models.length) { input.focus(); open(); } else if (!menu.hidden) draw();
+        }
+      };
+      return api2;
+    }    function providerCard(slot) {
+      var fallback = slot === "fallback";
+      var urlKey = fallback ? "daemon.executor_fallback_base_url" : "daemon.executor_base_url";
+      var modelKey = fallback ? "daemon.executor_fallback_model_name" : "daemon.executor_model_name";
+      var which = fallback ? "fallback" : "model";
+      var urlSetting = byKey(urlKey), modelSetting = byKey(modelKey);
+      var keyState = sview.reply.keys && sview.reply.keys[which] ? sview.reply.keys[which].state : "unknown";
+      var savedUrl = urlSetting && urlSetting.value ? String(urlSetting.value) : "";
+      var presets = (sview.reply.providers || []).slice();
+      if (fallback) presets.unshift({ id: "same", name: "Same provider as the main model", url: "", needs_key: false,
+        help: "The fallback model is asked at the main provider: a different model there, for when this one is limited." });
+      var card = el("div", "card");
+      var title = el("h4", "", fallback ? "Fallback model" : "Main model");
+      var isSet = modelSetting && modelSetting.value;
+      title.appendChild(el("span", "badge " + (isSet ? "on" : "off"), isSet ? "set" : "off"));
+      card.appendChild(title);
+      card.appendChild(el("p", "lead", fallback
+        ? "Asked instead when the main model is rate limited, overloaded, down or out of credit. A different provider keeps JARVIS working through an outage; what a run is saying is then sent to that provider."
+        : "The model JARVIS thinks with. Pick a provider, paste its key, load the list of models, and test before saving."));
+
+      var select = el("select");
+      presets.forEach(function (p) { var option = el("option", "", p.name); option.value = p.id; select.appendChild(option); });
+      var address = el("input");
+      address.type = "text";
+      var keyBox = el("input");
+      keyBox.type = "password";
+      keyBox.autocomplete = "off";
+      var model = el("input");
+      model.type = "text";
+      model.value = modelSetting && modelSetting.value ? String(modelSetting.value) : "";
+      model.placeholder = "choose from the list, or type a model name";
+      var picker = modelPicker(model);
+      var providerHelp = el("span", "help");
+      var status = el("div", "help");
+
+      var current = savedUrl ? providerFor(savedUrl) : (fallback ? presets[0] : providerFor(""));
+      select.value = current.id;
+      address.value = savedUrl;
+      function chosen() { return presets.filter(function (p) { return p.id === select.value; })[0]; }
+      function isSame() { return select.value === "same"; }
+      function addressChanged() { return normUrl(address.value) !== normUrl(savedUrl); }
+      function refreshFields() {
+        var p = chosen();
+        address.disabled = isSame();
+        address.placeholder = p.id === "custom" ? "the provider's address, ending in /v1" : "";
+        keyBox.disabled = isSame() || !p.needs_key;
+        keyBox.placeholder = isSame() ? "uses the main key" : !p.needs_key ? "no key needed" :
+          (keyState === "set" && !addressChanged() ? "set; paste a new key to replace it" : "paste the key for this provider");
+        providerHelp.textContent = p.help || "";
+      }
+      function say(text, bad) { status.textContent = text; status.className = "help " + (bad ? "bad" : ""); }
+      select.addEventListener("change", function () {
+        var p = chosen();
+        if (p.id !== "custom") address.value = p.url;
+        if (p.id === "custom" && !addressChanged()) address.value = "";
+        picker.setModels([], false);
+        say("");
+        refreshFields();
+      });
+      address.addEventListener("input", function () {
+        var p = providerFor(address.value);
+        if (!isSame() && p) select.value = p.id;
+        refreshFields();
+      });
+      refreshFields();
+
+      function ask(test) {
+        var body = { slot: slot };
+        if (!isSame()) body.base_url = address.value.trim();
+        if (keyBox.value.trim()) body.key = keyBox.value.trim();
+        if (test) {
+          if (!model.value.trim()) { say("Choose or type a model to test.", true); return; }
+          body.test_model = model.value.trim();
+        }
+        say(test ? "Asking the model..." : "Asking the provider for its models...");
+        putJson("/settings/models", "POST", body).then(function (reply) {
+          picker.setModels(reply.models || [], true);
+          var parts = [];
+          if ((reply.models || []).length) parts.push((reply.models.length) + " models found: choose one from the list in the model box.");
+          else if (reply.list_problem) parts.push("No list: " + reply.list_problem + " You can still type a model name.");
+          if (reply.test) parts.push((reply.test.ok ? "Test passed in " + (reply.test.millis / 1000).toFixed(1) + " s. " : "Test failed: ") + reply.test.message);
+          say(parts.join(" "), (reply.test && !reply.test.ok) || (!reply.models.length && !!reply.list_problem && !reply.test));
+        }, function (error) { say(explain(error, "Could not ask the provider."), true); });
+      }
+      var load = el("button", "", "Load models");
+      load.addEventListener("click", function () { ask(false); });
+      var test = el("button", "", "Test");
+      test.addEventListener("click", function () { ask(true); });
+      var save = el("button", "", "Save");
+      save.addEventListener("click", function () {
+        var p = chosen(), typed = keyBox.value.trim(), name = model.value.trim();
+        if (!name) { say("Choose or type a model first.", true); return; }
+        var changes = [{ key: modelKey, values: [name] }];
+        if (isSame()) { if (savedUrl) changes.push({ key: urlKey, values: null }); }
+        else {
+          if (!address.value.trim()) { say("Give the provider's address first.", true); return; }
+          changes.push({ key: urlKey, values: [address.value.trim()] });
+          // The key on file belongs to the address it was saved for: never leave it standing for a different provider.
+          if (p.needs_key && !typed && (addressChanged() || keyState !== "set")) { say("Paste the key for " + p.name + " first.", true); return; }
+        }
+        var keyStep = function () {
+          if (typed && !isSame() && p.needs_key) return putJson("/settings/keys/" + which, "PUT", { key: typed });
+          if (!isSame() && !p.needs_key && (addressChanged() || keyState !== "set")) return putJson("/settings/keys/" + which, "PUT", { key: "ollama" });
+          if (isSame() && fallback && keyState === "set") return putJson("/settings/keys/fallback", "DELETE");
+          return Promise.resolve();
+        };
+        putJson("/settings", "PUT", { changes: changes }).then(keyStep).then(function () {
+          keyBox.value = "";
+          saved(fallback ? "Fallback model" : "Main model");
+        }, function (error) { say(explain(error, "That was refused."), true); });
+      });
+      var acts = el("div", "acts");
+      acts.appendChild(load); acts.appendChild(test); acts.appendChild(save);
+
+      card.appendChild(providerRow("Provider", select, null, providerHelp));
+      card.appendChild(providerRow("Address", address));
+      card.appendChild(providerRow("Key" + (keyState === "set" ? " (set)" : ""), keyBox));
+      card.appendChild(providerRow("Model", picker.element, acts, status));
+      return card;
+    }
     function codeCard() {
       var image = byKey("daemon.code_sandbox_image"), command = byKey("daemon.code_sandbox_interpreter");
       var card = el("div", "card");
@@ -310,10 +525,12 @@ window.JarvisSettings = function (context) {
       var settings = sview.reply.settings || [];
       var inGroup = function (name) { return settings.filter(function (s) { return s.group === name && !/(_api_key_ref|_secret_ref)$/.test(s.key); }); };
       if (sview.tab === "brain") {
-        body.appendChild(keyRow("model", "Model key"));
+        body.appendChild(providerCard("main"));
+        body.appendChild(providerCard("fallback"));
+        var effort = byKey("daemon.executor_reasoning_effort");
+        if (effort) body.appendChild(settingRow(effort, "Thinking effort"));
+      } else if (sview.tab === "search") {
         body.appendChild(keyRow("search", "Search key"));
-        body.appendChild(keyRow("fallback", "Fallback key"));
-        inGroup("brain").forEach(function (s) { body.appendChild(settingRow(s)); });
       } else if (sview.tab === "voice") {
         var voiceKey = sview.reply.keys && sview.reply.keys.voice ? sview.reply.keys.voice.state : "";
         body.appendChild(el("p", "lead", voiceKey === "set" ? "Using the ElevenLabs voice below (after a restart)." : "Using your browser's own voice. Add an ElevenLabs key for a natural one."));
@@ -345,7 +562,11 @@ window.JarvisSettings = function (context) {
     $("settings-close").addEventListener("click", closeSettings);
     $("settings").addEventListener("click", function (event) { if (event.target === $("settings")) closeSettings(); });
     document.addEventListener("keydown", function (event) {
-      if (event.key === "Escape" && !$("settings").hidden) { closeSettings(); event.stopPropagation(); }
+      if (event.key === "Escape" && !$("settings").hidden) {
+        // Escape closes an open model list first, and the dialog only when none is open.
+        if (openPicker) openPicker.close(); else closeSettings();
+        event.stopPropagation();
+      }
     }, true);
     // A restart that would interrupt working tasks is refused by the daemon, which says how many; the button then offers to do it anyway.
     var restartForce = false;

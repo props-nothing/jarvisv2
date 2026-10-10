@@ -793,3 +793,45 @@ fn a_quota_error_display_never_contains_provider_text() {
     assert!(!rendered.contains(CANARY));
     assert!(rendered.contains("quota"));
 }
+
+/// A model list is read once, sorted and de-duplicated, with unusable identifiers dropped and Google's `models/` prefix removed.
+#[tokio::test]
+async fn a_provider_lists_its_models_and_nothing_secret_is_in_the_request_or_the_error() {
+    let transport = ScriptedTransport::new(vec![Reply::Body(
+        r#"{"object":"list","data":[{"id":"zeta"},{"id":"models/gemini-x"},{"id":"alpha"},{"id":"alpha"},{"id":"has space"},{"id":7},{"nope":1}]}"#,
+    )]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::default());
+    let models = provider.list_models().await.unwrap();
+    assert_eq!(models, ["alpha", "gemini-x", "zeta"]);
+    assert_eq!(transport.request_count(), 1, "one attempt, no retry");
+
+    for (reply, kind) in [
+        (
+            Reply::Status {
+                status: 401,
+                body: r#"{"error":{"message":"bad key sk-canary-9f3b2a7e1d"}}"#,
+                retry_after: None,
+            },
+            ModelErrorKind::Authentication,
+        ),
+        (
+            Reply::Failure(TransportError::Connect),
+            ModelErrorKind::Transient,
+        ),
+        (
+            Reply::Body("<html>not json</html>"),
+            ModelErrorKind::MalformedResponse,
+        ),
+        (
+            Reply::Body(r#"{"data":"nope"}"#),
+            ModelErrorKind::MalformedResponse,
+        ),
+    ] {
+        let transport = ScriptedTransport::new(vec![reply]);
+        let provider = provider_with(Arc::clone(&transport), RetryPolicy::default());
+        let error = provider.list_models().await.unwrap_err();
+        assert_eq!(error.kind(), kind);
+        assert!(!format!("{error:?} {error}").contains(CANARY));
+        assert_eq!(transport.request_count(), 1, "{kind:?} is not retried");
+    }
+}

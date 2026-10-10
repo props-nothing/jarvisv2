@@ -97,6 +97,42 @@ impl OpenAiCompatibleProvider {
         self.retry
     }
 
+    /// Lists the model identifiers the provider serves (`GET {base}/models`), so a person can choose one instead of typing it.
+    ///
+    /// One attempt, no retry: it answers a person who is looking at the screen. The provider's own error text is never carried.
+    ///
+    /// # Errors
+    ///
+    /// A [`ModelError`] classified like any other call (a rejected key is `Authentication`), `Transient` when the provider cannot be
+    /// reached, and `MalformedResponse` when the answer is not a model list.
+    pub async fn list_models(&self) -> Result<Vec<String>, ModelError> {
+        let request = TransportRequest::get(
+            self.base_url.join(MODELS_PATH),
+            self.headers(jarvis_core::CorrelationId::new()),
+        );
+        let response = self.transport.send(&request, false).await.map_err(|_| {
+            ModelError::from_static(
+                ModelErrorKind::Transient,
+                "the provider could not be reached",
+            )
+        })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(Self::classify_response(&response));
+        }
+        let TransportResponse::Buffered { body, .. } = &response else {
+            return Err(ModelError::from_static(
+                ModelErrorKind::MalformedResponse,
+                "the provider returned a stream where a model list was expected",
+            ));
+        };
+        parse_model_ids(body).ok_or_else(|| {
+            ModelError::from_static(
+                ModelErrorKind::MalformedResponse,
+                "the provider response was not a model list",
+            )
+        })
+    }
+
     /// Builds the headers for one attempt.
     fn headers(&self, correlation_id: jarvis_core::CorrelationId) -> TransportHeaders {
         TransportHeaders::new()
@@ -269,6 +305,29 @@ impl OpenAiCompatibleProvider {
             .with_provider_request_id(provider_request_id(response))
             .with_provider_status(Some(status))
     }
+}
+
+/// The most model identifiers a listing keeps.
+const MAX_LISTED_MODELS: usize = 500;
+
+/// The identifiers in an OpenAI-style model list (`{"data": [{"id": "..."}]}`), sorted and without duplicates.
+///
+/// An identifier that is not a valid [`ModelId`] is dropped rather than shown, and a leading `models/` (how Google names them) is removed,
+/// because the bare name is what a chat request takes. `None` when the body is not a list at all.
+pub(super) fn parse_model_ids(body: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let items = value.get("data")?.as_array()?;
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.get("id")?.as_str())
+        .map(|id| id.strip_prefix("models/").unwrap_or(id))
+        .filter(|id| ModelId::new(*id).is_ok())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.truncate(MAX_LISTED_MODELS);
+    Some(ids)
 }
 
 /// Extracts a validated provider request identifier from a response.
