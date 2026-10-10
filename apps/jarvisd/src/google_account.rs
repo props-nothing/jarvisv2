@@ -62,6 +62,9 @@ pub const SCOPES: [&str; 2] = [SCOPE_GMAIL_READONLY, SCOPE_CALENDAR_READONLY];
 
 /// Sending mail (and nothing else of Gmail's write surface), asked for only when the owner turns actions on.
 pub const SCOPE_GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
+/// Managing drafts (Google says "Manage drafts and send emails" and classes it restricted), asked for only when the owner turns actions on,
+/// so a draft can be saved for the owner to review (`ADR-0161`). Sending still uses the narrower send scope.
+pub const SCOPE_GMAIL_COMPOSE: &str = "https://www.googleapis.com/auth/gmail.compose";
 /// Creating and changing calendar events, asked for only when the owner turns actions on.
 pub const SCOPE_CALENDAR_EVENTS: &str = "https://www.googleapis.com/auth/calendar.events";
 
@@ -271,6 +274,7 @@ impl GoogleAccount {
         let mut scopes: Vec<String> = SCOPES.iter().map(|scope| (*scope).to_owned()).collect();
         if actions {
             scopes.push(SCOPE_GMAIL_SEND.to_owned());
+            scopes.push(SCOPE_GMAIL_COMPOSE.to_owned());
             scopes.push(SCOPE_CALENDAR_EVENTS.to_owned());
         }
         scopes
@@ -338,7 +342,9 @@ impl GoogleAccount {
             email: stored.map(|stored| stored.email),
             pending,
             actions: wanted.len() > SCOPES.len(),
-            can_act: self.has_scope(SCOPE_GMAIL_SEND) && self.has_scope(SCOPE_CALENDAR_EVENTS),
+            can_act: self.has_scope(SCOPE_GMAIL_SEND)
+                && self.has_scope(SCOPE_GMAIL_COMPOSE)
+                && self.has_scope(SCOPE_CALENDAR_EVENTS),
         }
     }
 

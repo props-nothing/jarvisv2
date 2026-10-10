@@ -146,3 +146,117 @@ async fn what_should_not_be_read_is_refused_in_words() {
     assert!(message.contains("PDF"), "{message}");
     let _ = std::fs::remove_file(outside);
 }
+
+/// A one-page PDF whose only content is the given picture stream, written out by hand with a correct cross-reference table.
+fn scanned_pdf(picture: &[u8]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut object = |out: &mut Vec<u8>, number: usize, body: &[u8]| {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    object(&mut out, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    object(&mut out, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    object(
+        &mut out,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /XObject << /Im1 4 0 R >> >> >>",
+    );
+    let mut image = format!(
+        "<< /Type /XObject /Subtype /Image /Width 20 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+        picture.len()
+    )
+    .into_bytes();
+    image.extend_from_slice(picture);
+    image.extend_from_slice(b"\nendstream");
+    object(&mut out, 4, &image);
+    let content = b"q 612 0 0 792 0 0 cm /Im1 Do Q";
+    let mut stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+    stream.extend_from_slice(content);
+    stream.extend_from_slice(b"\nendstream");
+    object(&mut out, 5, &stream);
+    let table = out.len();
+    out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[tokio::test]
+async fn a_picture_and_a_scanned_pdf_are_read_by_the_text_reader_and_marked_as_such() {
+    let directory = crate::ocr::tests::scratch();
+    let engine = crate::ocr::tests::echoing_engine(&directory);
+    let (tool, folder) = tool_over_a_folder();
+    let tool = tool.with_engine(Some(engine));
+    let png = crate::ocr::tests::png(200, 100, b"\nline-from-the-picture\n");
+    std::fs::write(folder.0.join("inbox").join("sign.png"), &png)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let reply = must(
+        tool.read(&json!({ "path": "inbox/sign.png", "language": "nld" }))
+            .await,
+    );
+    assert_eq!(reply["kind"], "image");
+    assert_eq!(reply["read_by"], "ocr");
+    let content = reply["content"].as_str().unwrap_or_default();
+    assert!(content.contains(jarvis_core::FENCE_OPEN), "{content}");
+    assert!(content.contains("args:stdin stdout -l nld"), "{content}");
+    assert!(content.contains("line-from-the-picture"), "{content}");
+
+    // A PDF with no text, only a JPEG page, is read through the same reader, page by page.
+    let jpeg = crate::ocr::tests::jpeg(300, 400);
+    let pdf = scanned_pdf(&[jpeg.as_slice(), b"\nline-from-the-scan\n"].concat());
+    std::fs::write(folder.0.join("inbox").join("scan.pdf"), pdf)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let reply = must(tool.read(&json!({ "path": "inbox/scan.pdf" })).await);
+    assert_eq!(reply["kind"], "scanned_pdf");
+    assert_eq!(reply["read_by"], "ocr");
+    let content = reply["content"].as_str().unwrap_or_default();
+    assert!(content.contains("--- page 1 ---"), "{content}");
+    assert!(content.contains("line-from-the-scan"), "{content}");
+    jarvis_core::remove_scratch_dir(&directory);
+}
+
+#[tokio::test]
+async fn without_the_engine_the_answer_says_how_to_get_it_and_a_bad_picture_never_reaches_it() {
+    let (tool, folder) = tool_over_a_folder();
+    let missing = tool.with_engine(None);
+    std::fs::write(folder.0.join("a.png"), crate::ocr::tests::png(10, 10, b""))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let message = match missing.read(&json!({ "path": "a.png" })).await {
+        Err(AdapterError::RefusedBeforeReaching { reason }) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        message.contains("tesseract") && message.contains("install"),
+        "{message}"
+    );
+
+    // Even with an engine present, a picture that would unpack to gigabytes and a language that reads as an option are refused.
+    let directory = crate::ocr::tests::scratch();
+    let engine = crate::ocr::tests::echoing_engine(&directory);
+    let (tool, folder) = tool_over_a_folder();
+    let tool = tool.with_engine(Some(engine));
+    std::fs::write(
+        folder.0.join("bomb.png"),
+        crate::ocr::tests::png(50_000, 50_000, b""),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(
+        folder.0.join("ok.png"),
+        crate::ocr::tests::png(10, 10, b"x"),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(tool.read(&json!({ "path": "bomb.png" })).await.is_err());
+    assert!(
+        tool.read(&json!({ "path": "ok.png", "language": "--tessdata-dir" }))
+            .await
+            .is_err()
+    );
+    jarvis_core::remove_scratch_dir(&directory);
+}

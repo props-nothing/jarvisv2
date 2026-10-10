@@ -62,6 +62,85 @@ fn pdf_of(pages: &[&str]) -> Vec<u8> {
     bytes
 }
 
+/// A PDF whose pages are each one picture: `(stream bytes, filter)` per page, drawn with no text at all, as a scan is.
+fn scanned_pdf_of(pictures: &[(&[u8], &str)]) -> Vec<u8> {
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let mut kids = Vec::new();
+    for (data, filter) in pictures {
+        let image = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => *filter,
+            },
+            data.to_vec(),
+        ));
+        let resources =
+            document.add_object(dictionary! { "XObject" => dictionary! { "Im1" => image } });
+        let content = document.add_object(Stream::new(
+            dictionary! {},
+            b"q 612 0 0 792 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page = document.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content, "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        kids.push(Object::Reference(page));
+    }
+    let count = i64::try_from(kids.len()).unwrap_or(0);
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }),
+    );
+    let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    document.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    document
+        .save_to(&mut bytes)
+        .unwrap_or_else(|error| panic!("{error}"));
+    bytes
+}
+
+#[test]
+fn a_scanned_pdf_hands_on_the_jpeg_of_each_page_and_says_where_it_stopped() {
+    let first = [&[0xFF, 0xD8, 0xFF, 0xE0][..], b"first"].concat();
+    let second = [&[0xFF, 0xD8, 0xFF, 0xE0][..], b"second"].concat();
+    let scan = pdf_scan(&scanned_pdf_of(&[
+        (&first, "DCTDecode"),
+        (&second, "DCTDecode"),
+    ]))
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(scan.pages, vec![(1, first), (2, second)]);
+    assert!(!scan.cut);
+
+    let many: Vec<(Vec<u8>, &str)> = (0..MAX_SCAN_PAGES + 3)
+        .map(|_| (vec![0xFF, 0xD8, 0xFF, 0xE0, 1], "DCTDecode"))
+        .collect();
+    let borrowed: Vec<(&[u8], &str)> = many.iter().map(|(data, f)| (data.as_slice(), *f)).collect();
+    let cut = pdf_scan(&scanned_pdf_of(&borrowed)).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(cut.pages.len(), MAX_SCAN_PAGES);
+    assert!(cut.cut);
+}
+
+#[test]
+fn a_scan_in_another_encoding_a_lie_about_jpeg_or_a_text_pdf_is_not_handed_on() {
+    // Falsifies the guard: a stream that claims to be a JPEG but is not one must not reach the reader of pictures.
+    let liar = scanned_pdf_of(&[(b"not a jpeg at all", "DCTDecode")]);
+    assert_eq!(pdf_scan(&liar), Err(DocumentError::ScanUnsupported));
+    let other = scanned_pdf_of(&[(&[0xFF, 0xD8, 0xFF, 0xE0, 1], "CCITTFaxDecode")]);
+    assert_eq!(pdf_scan(&other), Err(DocumentError::ScanUnsupported));
+    assert_eq!(
+        pdf_scan(&pdf_of(&["only text"])),
+        Err(DocumentError::ScanUnsupported)
+    );
+    assert_eq!(pdf_scan(b"%PDF-1.5 garbage"), Err(DocumentError::Malformed));
+    assert_eq!(pdf_scan(b"PK not a pdf"), Err(DocumentError::Unsupported));
+    assert_eq!(
+        pdf_scan(&vec![b'%'; MAX_INPUT_BYTES + 1]),
+        Err(DocumentError::TooLarge)
+    );
+}
+
 #[test]
 fn a_word_document_reads_paragraphs_runs_tabs_and_table_cells() {
     let bytes = docx(
@@ -82,6 +161,59 @@ fn a_word_document_reads_paragraphs_runs_tabs_and_table_cells() {
         found.text
     );
     assert!(!found.truncated);
+}
+
+#[test]
+fn a_word_document_also_reads_its_headers_footers_and_notes() {
+    const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+    let body = format!(
+        r"<w:document {NS}><w:body><w:p><w:r><w:t>Body text</w:t></w:r></w:p></w:body></w:document>"
+    );
+    let header =
+        |text: &str| format!(r"<w:hdr {NS}><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:hdr>");
+    let (header1, header2) = (header("ACME CONFIDENTIAL"), header("ACME CONFIDENTIAL"));
+    let footer = format!(r"<w:ftr {NS}><w:p><w:r><w:t>Page footer</w:t></w:r></w:p></w:ftr>");
+    let footnotes = format!(
+        r#"<w:footnotes {NS}><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEPARATOR</w:t></w:r></w:p></w:footnote>
+           <w:footnote w:id="1"><w:p><w:r><w:t>Source: the 2026 price list</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+    );
+    let endnotes = format!(
+        r#"<w:endnotes {NS}><w:endnote w:id="1"><w:p><w:r><w:t>See appendix</w:t></w:r></w:p></w:endnote></w:endnotes>"#
+    );
+    let bytes = archive_of(&[
+        ("word/document.xml", &body),
+        ("word/header1.xml", &header1),
+        ("word/header2.xml", &header2),
+        ("word/footer1.xml", &footer),
+        ("word/footnotes.xml", &footnotes),
+        ("word/endnotes.xml", &endnotes),
+    ]);
+    let found = extract("memo.docx", &bytes).unwrap_or_else(|error| panic!("{error}"));
+    assert!(found.text.starts_with("Body text"), "{}", found.text);
+    assert_eq!(
+        found.text.matches("ACME CONFIDENTIAL").count(),
+        1,
+        "the same header on every page is said once: {}",
+        found.text
+    );
+    assert!(
+        found.text.contains("--- headers and footers ---") && found.text.contains("Page footer"),
+        "{}",
+        found.text
+    );
+    assert!(
+        found
+            .text
+            .contains("--- footnotes ---\n[1] Source: the 2026 price list"),
+        "{}",
+        found.text
+    );
+    assert!(
+        found.text.contains("--- endnotes ---\n[1] See appendix"),
+        "{}",
+        found.text
+    );
+    assert!(!found.text.contains("SEPARATOR"), "{}", found.text);
 }
 
 #[test]

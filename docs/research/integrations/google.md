@@ -1125,6 +1125,15 @@ Read 2026-10-10: `https://developers.google.com/workspace/gmail/api/guides/sendi
 - **JARVIS decision (`ADR-0157`).** Use the metadata endpoint with one `raw` multipart message (no upload endpoint, no new scope). Cap at 5 files, 5 MB each and 10 MB together, well under the 25 MB figure people quote for Gmail itself (a lead, not a source). The threading headers are copied from the message being answered, which a stranger wrote, so only well-formed `<id@host>` tokens are kept. `threadId` is sent alongside `raw`.
 - **Cheapest test that would disprove it.** A live send of a small attachment to the owner's own address; not run (this build's tests use a local fixture standing in for Google). Unresolved until run: whether Gmail accepts the `threadId` together with matching headers for a message from a different sender.
 
+### Finding 26 — a draft is created through `drafts.create`, which does not accept the send scope
+
+Read 2026-10-10: `.../reference/rest/v1/users.drafts/create`, `.../guides/drafts`, `.../auth/scopes`.
+
+- **Facts.** `POST https://gmail.googleapis.com/gmail/v1/users/{userId}/drafts` takes a `Draft` whose `message.raw` is "the RFC 2822 formatted MIME message, encoded as base64URL" (the same message a send carries; `threadId` goes inside `message`). It requires one of `mail.google.com`, `gmail.modify` or **`gmail.compose`**; `gmail.send` is not on the list. The draft is a container with a stable id; the message inside cannot be edited, only replaced; sending a draft deletes it and creates a `SENT` message.
+- **The scope.** `gmail.compose` is listed under **restricted scopes** ("Manage drafts and send emails"), as `gmail.readonly` (already asked for) is; `gmail.send` is sensitive. So drafts need a new consent, and the owner's Google Cloud consent screen must allow the scope (an app in testing mode with the owner as test user can request it). `gmail.compose` also covers sending, so adding it widens nothing beyond what `gmail.send` already allows, and adds reading and managing drafts.
+- **JARVIS decision (`ADR-0161`).** One new tool, `jarvis.gmail.draft`, with the same arguments as `jarvis.gmail.send` and the same message builder; it posts to `drafts.create` and needs `gmail.compose`, which is asked for only when Google actions are on. Not built: listing, editing or sending a draft through JARVIS (the owner sends from Gmail).
+- **Not verified.** A live draft, and the consent flow for the restricted scope on the owner's project. Unresolved until run.
+
 ## Rejected Alternatives
 
 - **The Gmail MCP server instead of a connector.** Rejected *for this slice's purpose* for the reasons in

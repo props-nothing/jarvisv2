@@ -508,7 +508,7 @@ async fn an_expired_access_token_is_refreshed() {
     assert_eq!(field(&refresh, "refresh_token"), "refresh-1");
 }
 
-/// **Turning actions on adds exactly the two write scopes to the request, and a sign-in that lacks one is refused.**
+/// **Turning actions on adds exactly the write scopes to the request (send, drafts, calendar events), and a sign-in that lacks one is refused.**
 #[tokio::test]
 async fn actions_add_the_write_scopes_and_hold_the_grant_to_them() {
     let fixture = fixture().await;
@@ -522,8 +522,12 @@ async fn actions_add_the_write_scopes_and_hold_the_grant_to_them() {
         .begin(PORT)
         .unwrap_or_else(|error| panic!("{error}"));
     let scopes = query(&url, "scope");
-    assert_eq!(scopes.split(' ').count(), 4, "{scopes}");
-    assert!(scopes.contains(SCOPE_GMAIL_SEND) && scopes.contains(SCOPE_CALENDAR_EVENTS));
+    assert_eq!(scopes.split(' ').count(), 5, "{scopes}");
+    assert!(
+        scopes.contains(SCOPE_GMAIL_SEND)
+            && scopes.contains(SCOPE_GMAIL_COMPOSE)
+            && scopes.contains(SCOPE_CALENDAR_EVENTS)
+    );
     assert!(
         !scopes.contains("gmail.modify") && !scopes.contains("mail.google.com"),
         "no broader mail scope is ever asked for"

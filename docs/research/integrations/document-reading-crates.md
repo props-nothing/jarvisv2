@@ -60,8 +60,8 @@ formats), OCR of scanned pages, images, formulas' results beyond the cached valu
 
 ## Unresolved Questions
 
-- Real files from Office and LibreOffice (blocks claiming "reads every .docx"). Known simplifications: sheets are found by position (`sheet1.xml` is the first listed), not through the workbook relationships; headers, footers, footnotes and comments of a Word file are not read; encrypted
-  PDFs are refused rather than opened with an empty password.
+- ~~Real files from Office and LibreOffice~~: the owner reported (2026-10-10) that the reader works on real Office, LibreOffice and PDF files. Known simplifications that remain: sheets are found by position (`sheet1.xml` is the first listed), not through the workbook relationships; comments in a Word file are not read; encrypted
+  PDFs are refused rather than opened with an empty password. Headers, footers, footnotes and endnotes are read since `ADR-0160`.
 - The duplicate crate versions this adds (`sha2`, `digest`, `block-buffer`, `crypto-common`, `cpufeatures`, `getrandom`, `hashbrown`, among others): `cargo deny` passes because `multiple-versions` is a warning in this repository, but the build is larger. Blocks nothing.
 
 ## Verification Log

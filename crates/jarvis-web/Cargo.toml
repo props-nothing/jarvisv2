@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 jarvis-core.workspace = true
+jarvis-documents.workspace = true
 jarvis-tools.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
@@ -17,6 +18,8 @@ tokio = { workspace = true, features = ["net", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]
+# Builds a PDF to serve in the fetch tests.
+lopdf.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]

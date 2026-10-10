@@ -31,6 +31,7 @@ mod memory_search;
 mod memory_service;
 mod model_fallback;
 mod notify;
+mod ocr;
 mod project_context;
 mod project_service;
 mod project_tool;
@@ -1494,7 +1495,29 @@ impl HttpTransport {
             scheduler.abort();
         }
         let _ = self.shutdown.send(());
-        let _ = self.handle.await;
+        if !drain(self.handle, SHUTDOWN_GRACE).await {
+            tracing::warn!(
+                seconds = SHUTDOWN_GRACE.as_secs(),
+                "connections were still open at shutdown (a console watching a run keeps one), so they were closed"
+            );
+        }
+    }
+}
+
+/// How long a stopping daemon lets open connections finish before closing them.
+///
+/// A graceful shutdown waits for every connection, and a live stream (the console watches runs this way) never finishes by itself, so
+/// without a limit a daemon asked to stop while a console was open stayed alive and unreachable until it was killed.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Waits for a serving task to finish its graceful shutdown, for at most `grace`, then aborts it. Returns whether it finished in time.
+async fn drain(handle: tokio::task::JoinHandle<()>, grace: std::time::Duration) -> bool {
+    let abort = handle.abort_handle();
+    if tokio::time::timeout(grace, handle).await.is_ok() {
+        true
+    } else {
+        abort.abort();
+        false
     }
 }
 
@@ -1794,6 +1817,81 @@ mod tests {
     async fn injected_shutdown_future_is_awaitable_without_os_signal() {
         let result = async { Ok::<(), io::Error>(()) }.await;
         assert!(result.is_ok());
+    }
+
+    /// **A stop does not wait for a connection that never ends.** A console watching a run holds a stream open; graceful shutdown waits for
+    /// every connection, so the daemon used to stay alive and unreachable until killed. Here a real server has a stream that never finishes:
+    /// the drain gives up after its grace period and closes it, and a server with nothing open finishes at once.
+    #[tokio::test]
+    async fn a_stop_closes_a_stream_that_never_ends_instead_of_waiting_for_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn forever() -> axum::body::Body {
+            let endless = futures_util::stream::unfold((), |()| async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: tick\n\n",
+                    )),
+                    (),
+                ))
+            });
+            axum::body::Body::from_stream(endless)
+        }
+
+        async fn serve_with(
+            routes: axum::Router,
+        ) -> (
+            u16,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let port = listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .port();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, routes)
+                    .with_graceful_shutdown(async move {
+                        let _ = stopped.await;
+                    })
+                    .await;
+            });
+            (port, stop, handle)
+        }
+
+        let grace = std::time::Duration::from_millis(300);
+
+        let (port, stop, handle) =
+            serve_with(axum::Router::new().route("/stream", axum::routing::get(forever))).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        client
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut first = [0_u8; 64];
+        let read = client.read(&mut first).await.unwrap_or(0);
+        assert!(read > 0, "the stream is open and flowing");
+        let _ = stop.send(());
+        let started = std::time::Instant::now();
+        assert!(!drain(handle, grace).await, "it gave up on the open stream");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "and did not wait for it"
+        );
+
+        let (_, stop, handle) = serve_with(axum::Router::new()).await;
+        let _ = stop.send(());
+        assert!(
+            drain(handle, std::time::Duration::from_secs(5)).await,
+            "nothing open: it finishes at once"
+        );
     }
 
     #[test]

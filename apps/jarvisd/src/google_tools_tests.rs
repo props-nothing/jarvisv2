@@ -385,6 +385,17 @@ fn the_action_tools_always_ask_and_sending_is_external_communication() {
         .find(|definition| definition.id().to_string() == EVENT_CREATE_TOOL)
         .unwrap_or_else(|| panic!("create"));
     assert_eq!(create.approval(), ApprovalPolicy::Ask);
+    // A draft sends nothing and stays in the owner's own mailbox: a low-risk write that runs, which is the point of it.
+    let draft = definitions
+        .iter()
+        .find(|definition| definition.id().to_string() == MAIL_DRAFT_TOOL)
+        .unwrap_or_else(|| panic!("draft"));
+    assert!(
+        draft.effects().contains(ToolEffect::Write)
+            && !draft.effects().contains(ToolEffect::ExternalCommunication)
+    );
+    assert_eq!(draft.approval(), ApprovalPolicy::Policy);
+    assert_eq!(draft.risk().level(), 1);
 }
 
 #[test]
@@ -708,4 +719,114 @@ fn the_save_tool_is_a_write_that_asks_and_the_send_schema_offers_files_and_repli
     assert!(save[0].risk().level() >= 2, "held for the owner by default");
     assert!(SEND_INPUT.contains("attachments") && SEND_INPUT.contains("reply_to_message_id"));
     assert!(SEND_INPUT.contains(r#""additionalProperties": false"#));
+}
+
+/// **A draft is saved in the owner's Drafts with the same message a send would carry, and nothing is sent.**
+#[tokio::test]
+async fn a_draft_is_saved_for_review_and_nothing_is_sent() {
+    let (_scratch, fixture, tool) = signed_in_with(&[
+        crate::google_account::SCOPE_GMAIL_SEND,
+        crate::google_account::SCOPE_GMAIL_COMPOSE,
+    ])
+    .await;
+    let (tool, folder) = with_folder(tool);
+    fixture.answer(
+        "/gmail/users/me/drafts",
+        200,
+        r#"{"id":"draft-5","message":{"id":"m1"}}"#,
+    );
+    fixture.answer(
+        "/gmail/users/me/messages/send",
+        200,
+        r#"{"id":"must-not-happen"}"#,
+    );
+    fixture.answer(
+        "/gmail/users/me/messages/orig1",
+        200,
+        r#"{"id":"orig1","threadId":"thr-7","payload":{"headers":[{"name":"Message-ID","value":"<abc@mail.example.com>"},{"name":"Subject","value":"Quote"}]}}"#,
+    );
+    let said = tool
+        .draft_mail(
+            &json!({ "to": "me@example.com", "body": "Draft body", "reply_to_message_id": "orig1",
+            "attachments": ["notes.txt"] }),
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
+    assert!(
+        said.contains("draft id draft-5")
+            && said.contains("nothing was sent")
+            && said.contains("notes.txt"),
+        "{said}"
+    );
+
+    assert!(
+        fixture.bodies("/gmail/users/me/messages/send").is_empty(),
+        "a draft sends nothing"
+    );
+    let request = fixture.bodies("/gmail/users/me/drafts").remove(0);
+    let payload = serde_json::from_str::<Value>(&request).unwrap_or_default();
+    assert_eq!(
+        payload["message"]["threadId"], "thr-7",
+        "a draft can be a reply too"
+    );
+    let raw = payload["message"]["raw"].as_str().unwrap_or_default();
+    let message = String::from_utf8(decode_base64url(raw).unwrap_or_default()).unwrap_or_default();
+    assert!(
+        message.contains("Subject: Re: Quote") && message.contains("name=\"notes.txt\""),
+        "{message}"
+    );
+    jarvis_core::remove_scratch_dir(&folder);
+}
+
+/// **A draft needs its own permission, and the do-not-contact list applies to it too.**
+#[tokio::test]
+async fn a_draft_needs_the_compose_permission_and_honours_do_not_contact() {
+    // Signed in with send but not compose: the owner is told to sign in again, and Google is not called.
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    fixture.answer("/gmail/users/me/drafts", 200, r#"{"id":"x"}"#);
+    let refused = tool
+        .draft_mail(&json!({ "to": "me@example.com", "subject": "s", "body": "b" }))
+        .await;
+    assert!(refused.is_err_and(|failure| failure.detail.contains("signs in to Google again")));
+    assert!(fixture.bodies("/gmail/users/me/drafts").is_empty());
+
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_COMPOSE]).await;
+    fixture.answer("/gmail/users/me/drafts", 200, r#"{"id":"x"}"#);
+    let directory = std::env::temp_dir().join(format!("jgd-{}", jarvis_core::scratch_tag()));
+    std::fs::create_dir_all(&directory).unwrap_or_else(|error| panic!("{error}"));
+    let database = Arc::new(
+        jarvis_storage::SqliteDatabase::open(&directory.join("jarvis.sqlite3"))
+            .await
+            .unwrap_or_else(|error| panic!("{error:?}")),
+    );
+    let tool = tool.with_contacts(Arc::clone(&database));
+    let barred = jarvis_storage::ContactInput {
+        company: Some("Acme".to_owned()),
+        email: Some("eva@acme.nl".to_owned()),
+        status: Some(jarvis_storage::ContactStatus::DoNotContact),
+        ..jarvis_storage::ContactInput::default()
+    };
+    jarvis_storage::save_contact(
+        &database,
+        jarvis_storage::LOCAL_WORKSPACE_ID,
+        None,
+        &barred,
+        true,
+        UtcTimestamp::now(&SystemClock),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    let refused = tool
+        .draft_mail(&json!({ "to": "eva@acme.nl", "subject": "s", "body": "b" }))
+        .await;
+    assert!(refused.is_err_and(|failure| failure.detail.contains("do_not_contact")));
+    assert!(fixture.bodies("/gmail/users/me/drafts").is_empty());
+    let allowed = tool
+        .draft_mail(&json!({ "to": "tom@beta.nl", "subject": "s", "body": "b" }))
+        .await;
+    assert!(allowed.is_ok());
+    database.close().await;
+    jarvis_core::remove_scratch_dir(&directory);
 }

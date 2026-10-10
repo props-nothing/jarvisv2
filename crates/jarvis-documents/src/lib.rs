@@ -19,6 +19,10 @@ pub const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_OUTPUT_CHARS: usize = 400_000;
 /// The most pages of a PDF read.
 const MAX_PDF_PAGES: usize = 300;
+/// The most pages of a scanned PDF whose pictures are handed on to be read as text.
+pub const MAX_SCAN_PAGES: usize = 10;
+/// The largest single embedded picture handed on, in bytes.
+const MAX_SCAN_IMAGE_BYTES: usize = 6 * 1024 * 1024;
 /// The most bytes any one XML part of an archive may unpack to.
 const MAX_XML_BYTES: u64 = 24 * 1024 * 1024;
 /// The most bytes read out of one archive in total.
@@ -90,6 +94,77 @@ pub enum DocumentError {
     /// The document is damaged, holds no text (a scan is pictures), or is not what its name says.
     #[error("the document could not be parsed, or holds no text to read")]
     Malformed,
+    /// The PDF is a scan, but none of its pictures is in a form that can be handed on (only JPEG-encoded pages are).
+    #[error(
+        "the PDF is made of pictures, but not in a form that can be read (only JPEG-encoded scans are supported)"
+    )]
+    ScanUnsupported,
+}
+
+/// The pictures of a scanned PDF: the JPEG of each page, with the page number, in page order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scan {
+    /// `(page number, JPEG bytes)`, at most [`MAX_SCAN_PAGES`] of them.
+    pub pages: Vec<(u32, Vec<u8>)>,
+    /// Whether the PDF has more pages than were taken.
+    pub cut: bool,
+}
+
+/// Takes the JPEG picture of each page out of a scanned PDF, so that it can be read as text by something that reads pictures.
+///
+/// Only a picture stored as a bare JPEG (`DCTDecode` and nothing else) is taken: that stream *is* a JPEG file. Pictures in any other
+/// encoding are not decoded here; a PDF holding only those is reported as [`DocumentError::ScanUnsupported`]. A page with several
+/// pictures contributes the largest. Never panics.
+///
+/// # Errors
+///
+/// [`DocumentError`] for an oversized, protected or damaged PDF, or one with no usable picture.
+pub fn pdf_scan(bytes: &[u8]) -> Result<Scan, DocumentError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(DocumentError::TooLarge);
+    }
+    catch_unwind(AssertUnwindSafe(|| scan_pages(bytes))).unwrap_or(Err(DocumentError::Malformed))
+}
+
+fn scan_pages(bytes: &[u8]) -> Result<Scan, DocumentError> {
+    if !bytes.starts_with(b"%PDF") {
+        return Err(DocumentError::Unsupported);
+    }
+    let document = lopdf::Document::load_mem(bytes).map_err(|_| DocumentError::Malformed)?;
+    if document.is_encrypted() {
+        return Err(DocumentError::Encrypted);
+    }
+    let pages = document.get_pages();
+    let mut taken = Vec::new();
+    for (number, id) in pages.iter().take(MAX_PDF_PAGES) {
+        let Ok(images) = document.get_page_images(*id) else {
+            continue;
+        };
+        let best = images
+            .iter()
+            .filter(|image| {
+                image.filters.as_deref() == Some(&["DCTDecode".to_owned()][..])
+                    && image.content.starts_with(&[0xFF, 0xD8, 0xFF])
+                    && image.content.len() <= MAX_SCAN_IMAGE_BYTES
+            })
+            .max_by_key(|image| image.content.len());
+        if let Some(image) = best {
+            if taken.len() == MAX_SCAN_PAGES {
+                return Ok(Scan {
+                    pages: taken,
+                    cut: true,
+                });
+            }
+            taken.push((*number, image.content.to_vec()));
+        }
+    }
+    if taken.is_empty() {
+        return Err(DocumentError::ScanUnsupported);
+    }
+    Ok(Scan {
+        pages: taken,
+        cut: pages.len() > MAX_PDF_PAGES,
+    })
 }
 
 /// Reads the text of a document, choosing the parser from its contents (and the name when the contents do not say).
@@ -262,6 +337,7 @@ fn word(bytes: &[u8]) -> Result<Extracted, DocumentError> {
     let document = parse(&xml)?;
     let mut text = String::new();
     flow(document.root_element(), 0, &mut text);
+    word_extras(&mut archive, &mut budget, &mut text)?;
     let stopped = text.chars().count() > FLOW_LIMIT;
     let (text, truncated) = bounded(tidy(&text));
     Ok(Extracted {
@@ -270,6 +346,74 @@ fn word(bytes: &[u8]) -> Result<Extracted, DocumentError> {
         parts: 1,
         truncated: truncated || stopped,
     })
+}
+
+/// Appends what a Word file keeps outside its body: running headers and footers (each distinct text once), footnotes and endnotes.
+fn word_extras(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    budget: &mut u64,
+    text: &mut String,
+) -> Result<(), DocumentError> {
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|name| name.starts_with("word/header") || name.starts_with("word/footer"))
+        .filter(|name| {
+            std::path::Path::new(name.as_ref())
+                .extension()
+                .is_some_and(|extension| extension == "xml")
+        })
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    names.sort();
+    let mut running: Vec<String> = Vec::new();
+    for name in names.iter().take(12) {
+        let Some(xml) = part(archive, name, budget)? else {
+            continue;
+        };
+        let mut found = String::new();
+        flow(parse(&xml)?.root_element(), 0, &mut found);
+        let found = tidy(&found);
+        if !found.is_empty() && !running.contains(&found) {
+            running.push(found);
+        }
+    }
+    if !running.is_empty() {
+        let _ = writeln!(
+            text,
+            "\n--- headers and footers ---\n{}",
+            running.join("\n")
+        );
+    }
+    for (file, heading, element) in [
+        ("word/footnotes.xml", "footnotes", "footnote"),
+        ("word/endnotes.xml", "endnotes", "endnote"),
+    ] {
+        let Some(xml) = part(archive, file, budget)? else {
+            continue;
+        };
+        let document = parse(&xml)?;
+        let mut notes = String::new();
+        for note in document
+            .root_element()
+            .children()
+            .filter(|node| node.is_element() && local(*node) == element)
+            // The separators Word writes between the body and its notes are not notes.
+            .filter(|node| node.attribute("type").is_none_or(|kind| kind == "normal"))
+        {
+            let mut body = String::new();
+            flow(note, 0, &mut body);
+            let body = tidy(&body);
+            if !body.is_empty() {
+                let id = note.attribute("id").unwrap_or("?");
+                let _ = writeln!(notes, "[{id}] {body}");
+            }
+        }
+        if !notes.is_empty() {
+            let _ = writeln!(text, "\n--- {heading} ---\n{notes}");
+        }
+    }
+    Ok(())
 }
 
 fn slides(bytes: &[u8]) -> Result<Extracted, DocumentError> {

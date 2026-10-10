@@ -52,6 +52,7 @@
     "jarvis.gmail.read": ["mail", "Reading an email", "in", "scan"],
     "jarvis.gmail.send": ["mail", "Sending an email", "out", "spark"],
     "jarvis.gmail.save_attachment": ["mail", "Saving an attachment", "in", "pull"],
+    "jarvis.gmail.draft": ["mail", "Drafting an email", "out", "pull"],
     "jarvis.calendar.events": ["mail", "Checking the calendar", "in", "scan"],
     "jarvis.calendar.create": ["mail", "Adding an event", "out", "spark"],
     "jarvis.schedule.add": ["time", "Scheduling", "out", "pull"],

@@ -12,6 +12,8 @@ pub enum Kind {
     Html,
     /// Other text, used as it is.
     Text,
+    /// A PDF, read for its text by `jarvis-documents` (`ADR-0160`).
+    Pdf,
     /// Not text. Reported by type and size, never decoded.
     Other,
 }
@@ -31,6 +33,7 @@ pub fn classify(content_type: Option<&str>) -> Kind {
         .to_ascii_lowercase();
     match media.as_str() {
         "text/html" | "application/xhtml+xml" => Kind::Html,
+        "application/pdf" => Kind::Pdf,
         "application/json" | "application/xml" => Kind::Text,
         other if other.starts_with("text/") => Kind::Text,
         other if other.ends_with("+json") || other.ends_with("+xml") => Kind::Text,
@@ -214,7 +217,8 @@ mod tests {
         assert_eq!(classify(Some("application/json")), Kind::Text);
         assert_eq!(classify(Some("application/ld+json")), Kind::Text);
         assert_eq!(classify(Some("application/atom+xml")), Kind::Text);
-        assert_eq!(classify(Some("application/pdf")), Kind::Other);
+        assert_eq!(classify(Some("application/pdf")), Kind::Pdf);
+        assert_eq!(classify(Some("application/zip")), Kind::Other);
         assert_eq!(classify(Some("image/png")), Kind::Other);
         assert_eq!(classify(None), Kind::Other);
     }
