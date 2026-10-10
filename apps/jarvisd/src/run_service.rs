@@ -434,12 +434,15 @@ fn map_database_error(error: &DatabaseError) -> RunServiceError {
             "the stored state is not internally consistent",
         ),
         // Every remaining variant is an infrastructure failure whose text can name a path or
-        // a database message, so the source is deliberately not echoed to the client.
-        _ => RunServiceError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Internal,
-            "the local database is not available",
-        ),
+        // a database message, so the source is deliberately not echoed to the client, only logged.
+        other => {
+            tracing::warn!(error = %other, "a run request could not be served by the database");
+            RunServiceError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Internal,
+                "the local database is not available",
+            )
+        }
     }
 }
 

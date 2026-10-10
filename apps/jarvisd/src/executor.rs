@@ -1570,7 +1570,17 @@ async fn destination_ceiling(model: &dyn ModelGateway, model_id: &ModelId) -> Se
 struct StreamFailure {
     code: RunErrorCode,
     message: String,
+    /// The call was refused before any stream opened, so nothing was said and asking again cannot repeat output.
+    nothing_sent: bool,
 }
+
+/// How long a run waits, in seconds, before each new try when the provider says it is rate limited and refused to open a
+/// stream (`ADR-0156`). The adapter has already tried three times within a couple of seconds; a provider limit usually
+/// lasts longer, and an unattended run that fails on the first one wastes the whole task. Cancelling ends the wait.
+#[cfg(not(test))]
+const RATE_LIMIT_WAITS: [u64; 4] = [20, 45, 90, 180];
+#[cfg(test)]
+const RATE_LIMIT_WAITS: [u64; 4] = [0, 0, 0, 0];
 
 /// Consumes a validated model stream, appending one event per text fragment.
 ///
@@ -1607,6 +1617,7 @@ async fn consume_stream(
                             }
                         })?,
                         message: "the model stream violated its sequence contract".to_owned(),
+                        nothing_sent: false,
                     }));
                 }
                 if let StreamEvent::Progress { kind, chars } = envelope.event()
@@ -1641,6 +1652,7 @@ async fn consume_stream(
                             }
                         })?,
                         message: "the model reasoned for too long without answering".to_owned(),
+                        nothing_sent: false,
                     }));
                 }
                 if let StreamEvent::TextDelta { text: fragment } = envelope.event() {
@@ -1666,6 +1678,7 @@ async fn consume_stream(
                 return Ok(Err(StreamFailure {
                     code: model_error_code(error.kind()),
                     message: format!("the model stream failed: {}", error.message()),
+                    nothing_sent: false,
                 }));
             }
         }
@@ -1682,6 +1695,7 @@ async fn consume_stream(
                 }
             })?,
             message: "the model stream ended without a terminal event".to_owned(),
+            nothing_sent: false,
         })),
     }
 }
@@ -1710,11 +1724,91 @@ async fn call_model(
             return Ok(Err(StreamFailure {
                 code: model_error_code(error.kind()),
                 message: format!("the model call failed: {}", error.message()),
+                nothing_sent: true,
             }));
         }
     };
     consume_stream(deps.database, run, stream, lead_in, correlation_id).await
 }
+/// One model call's result: the validated summary and answer, or the failure that settles the run.
+type Attempt = Result<(jarvis_models::StreamSummary, String), StreamFailure>;
+
+/// Waits out a provider rate limit that outlasts the adapter's quick retries, a few times and with growing pauses, rather than
+/// failing an unattended task outright. Only a call that never opened a stream is asked again: nothing was said, so nothing can be
+/// said twice. Returns `None` when a cancellation arrived during a wait.
+async fn wait_out_rate_limit(
+    deps: RunDeps<'_>,
+    run: &StoredRun,
+    specs: &[ToolSpec],
+    state: &RunLoopState,
+    mut attempt: Attempt,
+    correlation_id: CorrelationId,
+) -> Result<Option<Attempt>, DatabaseError> {
+    for seconds in RATE_LIMIT_WAITS {
+        let limited = attempt.as_ref().err().is_some_and(|failure| {
+            failure.nothing_sent && failure.code.as_str() == "model_rate_limited"
+        });
+        if !limited {
+            break;
+        }
+        note_rate_limit(deps.database, run, seconds, correlation_id).await?;
+        if wait_unless_cancelled(deps.database, run, seconds).await? {
+            return Ok(None);
+        }
+        attempt = call_model(
+            deps,
+            run,
+            specs,
+            state.messages.clone(),
+            state.reasoning_effort,
+            state.lead_in(),
+            correlation_id,
+        )
+        .await?;
+    }
+    Ok(Some(attempt))
+}
+/// Records that the provider is rate limiting and the run is waiting before it asks again, for a person watching the run.
+async fn note_rate_limit(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    seconds: u64,
+    correlation_id: CorrelationId,
+) -> Result<(), DatabaseError> {
+    append(
+        database,
+        run,
+        RunEventKind::ActivityUpdated,
+        Some("the model is rate limited; waiting to try again"),
+        &format!(r#"{{"phase":"rate_limited","wait_seconds":{seconds}}}"#),
+        correlation_id,
+    )
+    .await
+}
+
+/// Waits `seconds`, a second at a time, and returns `true` as soon as a cancellation is requested.
+async fn wait_unless_cancelled(
+    database: &Arc<SqliteDatabase>,
+    run: &StoredRun,
+    seconds: u64,
+) -> Result<bool, DatabaseError> {
+    let mut waited = 0;
+    loop {
+        if find_run(database, run.id())
+            .await?
+            .cancellation_requested_at()
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if waited >= seconds {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        waited += 1;
+    }
+}
+
 /// Records that a model call reasoned past its budget and is being asked again, for a person watching the run.
 async fn note_reasoning_limit(
     database: &Arc<SqliteDatabase>,
@@ -1802,6 +1896,11 @@ async fn generate(
         )
         .await?;
     }
+    let Some(attempt) =
+        wait_out_rate_limit(deps, run, &specs, state, attempt, correlation_id).await?
+    else {
+        return check_cancellation(database, run, correlation_id).await;
+    };
     let (summary, text) = match attempt {
         Ok(outcome) => outcome,
         Err(failure) => {
@@ -3227,6 +3326,52 @@ mod tests {
             3,
             "each fragment is its own durable event"
         );
+        database.close().await;
+    }
+
+    /// A rate limit that clears is waited out: the run asks again and completes, and says it was waiting.
+    #[tokio::test]
+    async fn a_rate_limited_model_call_is_waited_out_and_asked_again() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "anything").await;
+        let limited = || Turn::Fail(jarvis_models::ModelErrorKind::RateLimited);
+        let scripted = model(vec![limited(), limited(), Turn::answer("done")]);
+
+        let settled = execute_run(&database, &scripted, run.id())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a rate limit must not be a persistence error: {error:?}")
+            });
+        assert_eq!(settled.state(), RunState::Completed);
+        assert_eq!(scripted.calls(), 3);
+        let waits = events(&database, run.id())
+            .await
+            .into_iter()
+            .filter(|kind| *kind == RunEventKind::ActivityUpdated)
+            .count();
+        assert!(
+            waits >= 2,
+            "each wait is visible to a person watching: {waits}"
+        );
+        database.close().await;
+    }
+
+    /// A limit that never clears still ends the run as failed with the rate-limit code, after a bounded number of tries.
+    #[tokio::test]
+    async fn a_rate_limit_that_never_clears_fails_after_a_bounded_number_of_tries() {
+        let (_profile, database) = database().await;
+        let run = start(&database, "anything").await;
+        let turns = (0..10)
+            .map(|_| Turn::Fail(jarvis_models::ModelErrorKind::RateLimited))
+            .collect();
+        let scripted = model(turns);
+
+        let settled = execute_run(&database, &scripted, run.id())
+            .await
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(settled.state(), RunState::Failed);
+        assert_eq!(settled.error_code(), Some("model_rate_limited"));
+        assert_eq!(scripted.calls(), 1 + RATE_LIMIT_WAITS.len());
         database.close().await;
     }
 

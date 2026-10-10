@@ -843,7 +843,7 @@ async fn compose_tools(
         ))) as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
     push_search_tool(config, &mut additional)?;
-    push_google_tools(config, paths, &mut additional)?;
+    push_google_tools(config, paths, &database, &mut additional)?;
     push_code_tool(config, &mut additional)?;
     push_command_tool(config, &mut additional)?;
     // Delegation needs a model to drive a sub-agent with, so it is composed only when the daemon has an executor.
@@ -889,6 +889,7 @@ async fn compose_tools(
 fn push_google_tools(
     config: &jarvis_storage::Config,
     paths: &AppPaths,
+    database: &Arc<SqliteDatabase>,
     additional: &mut Vec<(
         Vec<jarvis_tools::ToolDefinition>,
         Arc<dyn jarvis_tools::ToolExecutor>,
@@ -914,7 +915,8 @@ fn push_google_tools(
     }
     additional.push((
         definitions,
-        Arc::new(google_tools::GoogleTool::new(account)) as Arc<dyn jarvis_tools::ToolExecutor>,
+        Arc::new(google_tools::GoogleTool::new(account).with_contacts(Arc::clone(database)))
+            as Arc<dyn jarvis_tools::ToolExecutor>,
     ));
     tracing::info!("the Gmail and Calendar tools are available");
     Ok(())

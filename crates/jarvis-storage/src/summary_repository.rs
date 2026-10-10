@@ -129,15 +129,14 @@ pub async fn record_summary(
             field: invalid_memory_field(&error),
         })?;
 
-    let mut transaction =
-        database
-            .pool()
-            .begin()
-            .await
-            .map_err(|source| DatabaseError::Sqlite {
-                operation: "begin a summary write",
-                source,
-            })?;
+    let mut transaction = database
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "begin a summary write",
+            source,
+        })?;
 
     // The overlap check, on this connection. `spans_overlap` is `jarvis-core`'s relation, applied here to the
     // rows this query brings back rather than transcribed into a `WHERE` clause: the rule is "same session and

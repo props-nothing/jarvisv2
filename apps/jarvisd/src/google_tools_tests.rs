@@ -398,3 +398,63 @@ fn base64_encodes_both_alphabets_with_and_without_padding() {
         Some("grüße 🙂".as_bytes())
     );
 }
+
+/// **An address the owner marked `do_not_contact` is never written to, and nothing reaches Google; others still go through.** The guard
+/// is in the tool, so it holds for a run that ignores its guidance. A list that cannot be read also refuses.
+#[tokio::test]
+async fn a_do_not_contact_address_is_never_sent_to() {
+    let (_scratch, fixture, tool) =
+        signed_in_with(&[crate::google_account::SCOPE_GMAIL_SEND]).await;
+    let directory = std::env::temp_dir().join(format!("jgt-{}", jarvis_core::scratch_tag()));
+    std::fs::create_dir_all(&directory).unwrap_or_else(|error| panic!("{error}"));
+    let database = Arc::new(
+        jarvis_storage::SqliteDatabase::open(&directory.join("jarvis.sqlite3"))
+            .await
+            .unwrap_or_else(|error| panic!("{error:?}")),
+    );
+    let tool = tool.with_contacts(Arc::clone(&database));
+    fixture.answer("/gmail/users/me/messages/send", 200, r#"{"id":"sent-1"}"#);
+
+    let barred = jarvis_storage::ContactInput {
+        company: Some("Acme".to_owned()),
+        email: Some("Eva@Acme.nl".to_owned()),
+        status: Some(jarvis_storage::ContactStatus::DoNotContact),
+        ..jarvis_storage::ContactInput::default()
+    };
+    jarvis_storage::save_contact(
+        &database,
+        jarvis_storage::LOCAL_WORKSPACE_ID,
+        None,
+        &barred,
+        true,
+        UtcTimestamp::now(&SystemClock),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error:?}"));
+
+    let refused = tool
+        .send_mail(&json!({ "to": "eva@acme.nl", "subject": "Hi", "body": "Hello" }))
+        .await;
+    assert!(
+        refused.is_err_and(|failure| failure.detail.contains("do_not_contact")),
+        "the address matches without regard to case"
+    );
+    assert!(
+        fixture.bodies("/gmail/users/me/messages/send").is_empty(),
+        "nothing was sent"
+    );
+    let allowed = tool
+        .send_mail(&json!({ "to": "tom@beta.nl", "subject": "Hi", "body": "Hello" }))
+        .await;
+    assert!(allowed.is_ok(), "an address that is not barred still sends");
+
+    database.close().await;
+    let unreadable = tool
+        .send_mail(&json!({ "to": "tom@beta.nl", "subject": "Hi", "body": "Hello" }))
+        .await;
+    assert!(
+        unreadable.is_err_and(|failure| failure.detail.contains("could not be checked")),
+        "a list that cannot be read fails closed"
+    );
+    jarvis_core::remove_scratch_dir(&directory);
+}

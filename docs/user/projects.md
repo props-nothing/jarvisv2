@@ -59,8 +59,8 @@ want remembered as a decision.
 ## Leads and contacts
 
 For prospecting, JARVIS keeps a contact list instead of a spreadsheet it has to rewrite: `jarvis.contacts.save|search|stats`. Saving the same lead twice updates it, a status tracks where it stands
-(`new`, `contacted`, `replied`, `meeting`, `won`, `lost`, `do_not_contact`), and a lead found inside a project is filed under it. JARVIS cannot move a contact out of `do_not_contact`; only you can.
-`jarvis contacts list [--status S] [--find TEXT]`, `jarvis contacts stats`, `jarvis contacts add COMPANY --email ... --status ...`, `jarvis contacts remove ID`, and `jarvis contacts export > contacts.csv`.
+(`new`, `contacted`, `replied`, `meeting`, `won`, `lost`, `do_not_contact`), and a lead found inside a project is filed under it. JARVIS cannot move a contact out of `do_not_contact`; only you can, and `jarvis.gmail.send` refuses to write to that address at all (you still approve every send).
+In the console, **Ops → Contacts** lists them with a status selector on each row (this is also where you lift a `do_not_contact`). `jarvis contacts list [--status S] [--find TEXT]`, `jarvis contacts stats`, `jarvis contacts add COMPANY --email ... --status ...`, `jarvis contacts remove ID`, and `jarvis contacts export > contacts.csv`.
 The list is local: nothing in it is sent anywhere, and writing to a contact does not email them.
 
 ## Moving existing work into a project

@@ -39,7 +39,7 @@ pub use config::{
 };
 pub use contact_repository::{
     ContactInput, ContactStatus, MAX_CONTACTS, MAX_SEARCH_RESULTS, StoredContact, contact_stats,
-    delete_contact, list_contacts, save_contact, search_contacts,
+    contact_status_for_email, delete_contact, list_contacts, save_contact, search_contacts,
 };
 pub use credential::{CREDENTIAL_FILE_NAME, CredentialStore, CredentialStoreError};
 pub use database::{

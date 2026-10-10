@@ -94,7 +94,7 @@ default.
   the face and stays there while the task goes on: point at one to see what it was, press it to jump to its step. After a minute and a half of quiet the list folds to one line. Scheduled tasks and sub-agents appear there as well. Finished answers list their sources. Nothing is sent anywhere for this; it is what the run already reports.
 - **Long-running work:** give it a project (`jarvis project add`, or Ops → Projects): a goal, your standing guidance and a journal that every run of it is told, so a recurring task
   continues instead of restarting. See `docs/user/projects.md`.
-- **While you are away:** `jarvis digest` says what it did (runs, outcomes, what waits for you, tokens, what each project decided). A task a restart cut off is continued once. Set a `push_topic` (Settings → Advanced, then `jarvis push test`)
+- **While you are away:** `jarvis digest` says what it did (runs, outcomes, what waits for you, tokens, what each project decided). A task a restart cut off is continued once, and a model call the provider rate limits is waited out (up to about five minutes) rather than failing the task. Set a `push_topic` (Settings → Advanced, then `jarvis push test`)
   to hear on your phone, with no content, when an approval is waiting or a scheduled task finished.
 - **Long tasks.** While it works you see a live line (the step it is on, what it is doing, how long, and "thinking (~11k tokens)" during a
   silent think), and the model is asked to tell you what it is about to do and to say when each stage is done. If a task stops, it says why

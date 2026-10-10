@@ -994,15 +994,14 @@ pub async fn purge_memory(
     // pool while this transaction held a read made the delete fail with a bare "failed to purge a memory".
     // The first version of this function did exactly that, and the failure was invisible until a purge ran
     // against a memory whose tombstone had to be written.
-    let mut transaction =
-        database
-            .pool()
-            .begin()
-            .await
-            .map_err(|source| DatabaseError::Sqlite {
-                operation: "begin a memory purge",
-                source,
-            })?;
+    let mut transaction = database
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "begin a memory purge",
+            source,
+        })?;
 
     let row = sqlx::query(
         "SELECT version, workspace_id, memory_type, search_key, created_by_actor_id, correlation_id \

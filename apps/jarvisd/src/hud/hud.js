@@ -1489,6 +1489,55 @@
     });
   }
 
+  // ---- contacts (ADR-0155) ---------------------------------------------------------------------------------------------
+  // The people and companies JARVIS is working with. You can change where one stands here, which is also how a do-not-contact is lifted:
+  // JARVIS itself cannot do that.
+  var contactsAt = 0;
+  var CONTACT_STATUSES = ["new", "contacted", "replied", "meeting", "won", "lost", "do_not_contact"];
+  function loadContacts() {
+    contactsAt = Date.now();
+    api("/contacts?limit=40").then(paintContacts, function () { contactsAt = 0; });
+  }
+  function contactRow(contact) {
+    var item = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("strong", "", contact.company));
+    if (contact.person) row.appendChild(el("span", "dim", contact.person));
+    row.appendChild(el("span", "spacer"));
+    var status = el("select");
+    CONTACT_STATUSES.forEach(function (name) {
+      var option = el("option", "", name.replace("_", " "));
+      option.value = name;
+      status.appendChild(option);
+    });
+    status.value = contact.status;
+    status.addEventListener("change", function () {
+      var change = { company: contact.company, person: contact.person, status: status.value };
+      if (contact.email) change.email = contact.email;
+      putJson("/contacts", "POST", change).then(function () { loadContacts(); }, function () { status.value = contact.status; });
+    });
+    row.appendChild(status);
+    item.appendChild(row);
+    var detail = [contact.email, contact.role].filter(Boolean).join(" \u00B7 ");
+    if (detail) item.appendChild(el("div", "dim", detail));
+    if (contact.notes) item.appendChild(el("div", "obj", clip(contact.notes, 140)));
+    return item;
+  }
+  function paintContacts(reply) {
+    var total = (reply.counts || []).reduce(function (sum, entry) { return sum + entry.count; }, 0);
+    var host = $("contacts");
+    if (!total) {
+      host.replaceChildren(el("div", "none", "no contacts yet: JARVIS saves the leads it finds, or add one with `jarvis contacts add`"));
+      return;
+    }
+    var counts = (reply.counts || []).filter(function (entry) { return entry.count > 0; })
+      .map(function (entry) { return entry.status.replace("_", " ") + " " + entry.count; }).join(" \u00B7 ");
+    var nodes = [el("div", "dim", total + " in all: " + counts)];
+    (reply.contacts || []).forEach(function (contact) { nodes.push(contactRow(contact)); });
+    if (total > (reply.contacts || []).length) nodes.push(el("div", "dim", "showing the first " + reply.contacts.length + "; `jarvis contacts export` has them all"));
+    host.replaceChildren.apply(host, nodes);
+  }
+
   // ---- projects (ADR-0151) ----------------------------------------------------------------------------------------------
   // A project is long-running work with a goal, the owner's standing guidance, a working folder and a journal. A conversation that
   // belongs to one is told all of that on every run, so it is written once here instead of pasted into each request. A project
@@ -2348,6 +2397,7 @@
       refreshAbilities();
       refreshProposals();
       if (Date.now() - digestAt > 60000) loadDigest();
+      if (Date.now() - contactsAt > 30000) loadContacts();
       if (Date.now() - projectsAt > 15000) loadProjects();
       tickAges();
       paintHeader();

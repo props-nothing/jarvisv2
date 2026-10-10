@@ -527,15 +527,16 @@ pub async fn start_run(
     database: &SqliteDatabase,
     input: &StartRunInput,
 ) -> Result<StartedRun, DatabaseError> {
-    let mut transaction =
-        database
-            .pool()
-            .begin()
-            .await
-            .map_err(|source| DatabaseError::Sqlite {
-                operation: "begin a run start",
-                source,
-            })?;
+    // Immediate, not deferred: this transaction reads before it writes, and a deferred one whose snapshot another writer has since
+    // advanced is refused at once (`SQLITE_BUSY_SNAPSHOT`) without waiting. Two runs starting together would then fail one of them.
+    let mut transaction = database
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|source| DatabaseError::Sqlite {
+            operation: "begin a run start",
+            source,
+        })?;
 
     // The identity is checked first so an unseeded profile reports its specific cause. The
     // foreign keys would refuse the insert anyway, but as an opaque constraint failure that
@@ -872,6 +873,35 @@ mod tests {
             at(0),
         )
         .unwrap_or_else(|error| panic!("start input: {error}"))
+    }
+
+    /// Runs started at the same moment all succeed. The start reads (the identity) before it writes, so a deferred transaction lost
+    /// the race with `SQLITE_BUSY_SNAPSHOT` and one caller was told the database was unavailable.
+    #[tokio::test]
+    async fn runs_started_at_the_same_moment_all_succeed() {
+        let (_profile, database) = database().await;
+        let database = std::sync::Arc::new(database);
+        let mut tasks = Vec::new();
+        for index in 0..24 {
+            let database = std::sync::Arc::clone(&database);
+            tasks.push(tokio::spawn(async move {
+                let input = start_input(
+                    &database,
+                    SessionTarget::New,
+                    jarvis_core::SessionId::new().to_string(),
+                    &format!("burst {index}"),
+                )
+                .await;
+                start_run(&database, &input).await.map(|_| ())
+            }));
+        }
+        for task in tasks {
+            let outcome = task.await.unwrap_or_else(|error| panic!("task: {error}"));
+            assert!(
+                outcome.is_ok(),
+                "a concurrent start must not fail: {outcome:?}"
+            );
+        }
     }
 
     /// A second run may be added to an existing conversation, and it joins the same session.

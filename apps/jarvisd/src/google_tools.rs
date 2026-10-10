@@ -165,13 +165,52 @@ impl From<GoogleError> for Failure {
 /// The adapter behind the three Google tools.
 pub struct GoogleTool {
     account: Arc<GoogleAccount>,
+    /// The contact list, when there is one to consult: a send to an address marked do-not-contact is refused (`ADR-0156`).
+    contacts: Option<Arc<jarvis_storage::SqliteDatabase>>,
 }
 
 impl GoogleTool {
     /// Builds the adapter over the shared account.
     #[must_use]
     pub const fn new(account: Arc<GoogleAccount>) -> Self {
-        Self { account }
+        Self {
+            account,
+            contacts: None,
+        }
+    }
+
+    /// Makes sending consult the contact list, so a model that was told to write to leads cannot write to someone the owner
+    /// said not to contact. Enforced here rather than left to the prompt: the guard must hold for a run that ignores its guidance.
+    #[must_use]
+    pub fn with_contacts(mut self, database: Arc<jarvis_storage::SqliteDatabase>) -> Self {
+        self.contacts = Some(database);
+        self
+    }
+
+    /// Refuses an address the owner marked `do_not_contact`. A list that cannot be read refuses too: failing closed.
+    async fn check_contact_list(&self, address: &str) -> Result<(), Failure> {
+        let Some(database) = &self.contacts else {
+            return Ok(());
+        };
+        let blocked = match jarvis_storage::load_local_identity(database).await {
+            Ok(identity) => {
+                jarvis_storage::contact_status_for_email(database, identity.workspace_id(), address)
+                    .await
+                    .map(|status| status == Some(jarvis_storage::ContactStatus::DoNotContact))
+            }
+            Err(error) => Err(error),
+        };
+        match blocked {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(Failure::new(
+                "not_permitted",
+                "that address is marked do_not_contact in the contact list; only the owner can lift that",
+            )),
+            Err(_) => Err(Failure::new(
+                "not_permitted",
+                "the contact list could not be checked, so nothing was sent",
+            )),
+        }
     }
 
     /// The three definitions.
@@ -400,6 +439,7 @@ impl GoogleTool {
                 "to must be exactly one email address such as name@example.com",
             )
         })?;
+        self.check_contact_list(&to).await?;
         let subject = text("subject").trim();
         if subject.is_empty()
             || subject.chars().count() > 150

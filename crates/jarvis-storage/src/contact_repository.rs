@@ -374,6 +374,27 @@ pub async fn search_contacts(
     rows.iter().map(decode).collect()
 }
 
+/// The status of the contact with this address, if there is one. Case is ignored, as in saving.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the read fails.
+pub async fn contact_status_for_email(
+    database: &SqliteDatabase,
+    workspace_id: &str,
+    email: &str,
+) -> Result<Option<ContactStatus>, DatabaseError> {
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM contacts WHERE workspace_id = ?1 AND lower(email) = lower(?2)",
+    )
+    .bind(workspace_id)
+    .bind(email.trim())
+    .fetch_optional(database.pool())
+    .await
+    .map_err(sqlite("read a contact's status"))?;
+    Ok(name.as_deref().and_then(ContactStatus::parse))
+}
+
 /// One page of contacts with `status` (any, when absent), by company: `limit` of them after skipping `offset`. For the owner's own
 /// views and exports, so it is not capped at [`MAX_SEARCH_RESULTS`].
 ///
