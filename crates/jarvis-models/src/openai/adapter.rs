@@ -11,7 +11,7 @@ use crate::error::{ModelError, ModelErrorKind, ProviderRequestId};
 use crate::identity::{ModelId, ProviderId};
 use crate::port::{ModelGateway, ModelStream, ProviderHealth, ProviderStatus};
 use crate::request::{ChatMessage, ChatRequest};
-use crate::response::ChatResponse;
+use crate::response::{ChatResponse, FinishReason};
 use crate::stream::{ProgressKind, StreamEnvelope, StreamEvent, StreamValidator};
 
 use super::config::{ApiKey, BaseUrl};
@@ -508,6 +508,13 @@ impl ModelGateway for OpenAiCompatibleProvider {
 /// How much reasoning or tool-call text accumulates between progress events.
 const PROGRESS_STEP_CHARS: u64 = 240;
 
+/// How long a stream that has given its finish reason is waited on for the usage chunk that follows it.
+///
+/// OpenAI-style providers, and Ollama, send token usage in one more chunk **after** the finish reason and before `[DONE]` (an empty
+/// `choices` list and a `usage` object). Ending the stream at the finish reason lost it, so no run ever recorded a token. The wait is
+/// short and bounded because a server that never closes must not hold a finished answer for the read timeout.
+pub const TRAILING_USAGE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The state of one streaming response.
 struct StreamState {
     body: Box<dyn ResponseBody>,
@@ -528,6 +535,9 @@ struct StreamState {
     tool_reported: u64,
     /// A terminal event has been accepted.
     terminal: bool,
+    /// The finish reason has been seen but not yet delivered: the usage chunk that follows it comes first, because nothing may follow
+    /// the terminal event.
+    held_finish: Option<FinishReason>,
     /// The stream is over, whether by completion or by a reported error.
     exhausted: bool,
 }
@@ -546,6 +556,7 @@ impl StreamState {
             tool_chars: 0,
             tool_reported: 0,
             terminal: false,
+            held_finish: None,
             exhausted: false,
         }
     }
@@ -626,12 +637,26 @@ impl StreamState {
             for call in std::mem::take(&mut self.tool_calls).finish() {
                 self.pending.push_back(StreamEvent::ToolCall { call });
             }
-            self.pending.push_back(StreamEvent::Finished {
-                reason: wire::finish_reason(Some(label)),
-            });
+            let reason = wire::finish_reason(Some(label));
+            if chunk.usage.is_some() {
+                self.pending.push_back(StreamEvent::Finished { reason });
+            } else {
+                self.held_finish = Some(reason);
+            }
         }
 
         Ok(())
+    }
+
+    /// Delivers a finish reason that was held back for a usage chunk that did not come. Returns whether there was one.
+    fn release_held_finish(&mut self) -> bool {
+        match self.held_finish.take() {
+            Some(reason) => {
+                self.pending.push_back(StreamEvent::Finished { reason });
+                true
+            }
+            None => false,
+        }
     }
 
     /// Queues a progress event once enough has been produced since the last one, so a long silent stretch shows as a
@@ -654,6 +679,9 @@ impl StreamState {
     /// early, which is not a completed answer.
     fn finish_provider_stream(&mut self) -> Result<(), ModelError> {
         self.exhausted = true;
+        if self.release_held_finish() {
+            return Ok(());
+        }
         if self.validator.is_finished() || self.terminal {
             return Ok(());
         }
@@ -685,13 +713,29 @@ impl StreamState {
             // reported as incomplete.
             let mut step = self.decoder.push(&[]);
             if matches!(step, SseStep::Incomplete) {
-                let chunk = self.body.next_chunk().await;
+                // With the finish reason in hand only the usage chunk is still to come, so that wait is bounded.
+                let chunk = if self.held_finish.is_some() {
+                    let waited =
+                        tokio::time::timeout(TRAILING_USAGE_WAIT, self.body.next_chunk()).await;
+                    if let Ok(chunk) = waited {
+                        chunk
+                    } else {
+                        self.exhausted = true;
+                        self.release_held_finish();
+                        continue;
+                    }
+                } else {
+                    self.body.next_chunk().await
+                };
                 step = match chunk {
                     Ok(Some(chunk)) => self.decoder.push(&chunk),
                     Ok(None) => {
                         // The connection ended. Without a terminal event this is a
                         // truncated answer, not a finished one.
                         self.exhausted = true;
+                        if self.release_held_finish() {
+                            continue;
+                        }
                         if self.validator.is_finished() || self.terminal {
                             return Ok(None);
                         }
@@ -702,6 +746,10 @@ impl StreamState {
                     }
                     Err(error) => {
                         self.exhausted = true;
+                        // The answer was complete; losing the connection afterwards only loses the usage figure.
+                        if self.release_held_finish() {
+                            continue;
+                        }
                         return Err(map_transport_error(error));
                     }
                 };
@@ -709,10 +757,8 @@ impl StreamState {
 
             match step {
                 SseStep::Data(text) => self.decode_chunk(&text)?,
-                SseStep::Done => {
-                    self.finish_provider_stream()?;
-                    return Ok(None);
-                }
+                // Anything the sentinel releases is delivered by the next pass, before the stream ends.
+                SseStep::Done => self.finish_provider_stream()?,
                 SseStep::Overflow => {
                     self.exhausted = true;
                     return Err(ModelError::from_static(

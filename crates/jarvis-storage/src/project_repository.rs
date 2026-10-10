@@ -125,6 +125,8 @@ pub struct StoredProject {
     pub status: ProjectStatus,
     /// The most runs the scheduler starts for it in a day; zero means no cap.
     pub daily_run_limit: u32,
+    /// The most tokens (input and output) its runs may use in a day before the scheduler stops starting more; zero means no cap.
+    pub daily_token_limit: u32,
     /// When it was made.
     pub created_at: String,
     /// When it was last changed.
@@ -161,6 +163,8 @@ pub struct NewProject {
     pub folder: String,
     /// The most runs the scheduler starts for it in a day; zero means no cap.
     pub daily_run_limit: u32,
+    /// The most tokens its runs may use in a day; zero means no cap.
+    pub daily_token_limit: u32,
 }
 
 /// The fields of a project that may change; `None` leaves a field as it is.
@@ -178,6 +182,8 @@ pub struct ProjectChanges {
     pub status: Option<ProjectStatus>,
     /// A new daily cap on scheduled runs; zero removes it.
     pub daily_run_limit: Option<u32>,
+    /// A new daily cap on tokens; zero removes it.
+    pub daily_token_limit: Option<u32>,
 }
 
 const MAX_NAME_CHARS: usize = 80;
@@ -208,6 +214,16 @@ pub const MAX_DAILY_RUN_LIMIT: u32 = 1000;
 fn check_limit(limit: u32) -> Result<u32, DatabaseError> {
     if limit > MAX_DAILY_RUN_LIMIT {
         return Err(invalid("daily_run_limit"));
+    }
+    Ok(limit)
+}
+
+/// The largest daily token cap that can be set (two billion, the most the column holds).
+pub const MAX_DAILY_TOKEN_LIMIT: u32 = 2_000_000_000;
+
+fn check_token_limit(limit: u32) -> Result<u32, DatabaseError> {
+    if limit > MAX_DAILY_TOKEN_LIMIT {
+        return Err(invalid("daily_token_limit"));
     }
     Ok(limit)
 }
@@ -261,6 +277,13 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<StoredProject, DatabaseError>
             .ok_or(DatabaseError::StoredScheduleInvalid {
                 field: "project run limit",
             })?,
+        daily_token_limit: row
+            .try_get::<i64, _>("daily_token_limit")
+            .ok()
+            .and_then(|limit| u32::try_from(limit).ok())
+            .ok_or(DatabaseError::StoredScheduleInvalid {
+                field: "project token limit",
+            })?,
         created_at: text("created_at")?,
         updated_at: text("updated_at")?,
     })
@@ -268,7 +291,7 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<StoredProject, DatabaseError>
 
 macro_rules! columns {
     () => {
-        "id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, created_at, updated_at"
+        "id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, daily_token_limit, created_at, updated_at"
     };
 }
 
@@ -289,10 +312,11 @@ pub async fn create_project(
     let guidance = check_text(&new.guidance, MAX_GUIDANCE_CHARS, "guidance")?;
     let folder = check_folder(&new.folder)?;
     let limit = check_limit(new.daily_run_limit)?;
+    let token_limit = check_token_limit(new.daily_token_limit)?;
     let id = ProjectId::new().to_string();
     let result = sqlx::query(
-        "INSERT INTO projects (id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?8, ?7, ?7)",
+        "INSERT INTO projects (id, workspace_id, name, goal, guidance, folder, status, daily_run_limit, daily_token_limit, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?8, ?9, ?7, ?7)",
     )
     .bind(&id)
     .bind(workspace_id)
@@ -302,6 +326,7 @@ pub async fn create_project(
     .bind(&folder)
     .bind(now.to_string())
     .bind(i64::from(limit))
+    .bind(i64::from(token_limit))
     .execute(database.pool())
     .await;
     match result {
@@ -400,8 +425,13 @@ pub async fn update_project(
         .map_or_else(|| Ok(current.folder.clone()), check_folder)?;
     let status = changes.status.unwrap_or(current.status);
     let limit = check_limit(changes.daily_run_limit.unwrap_or(current.daily_run_limit))?;
+    let token_limit = check_token_limit(
+        changes
+            .daily_token_limit
+            .unwrap_or(current.daily_token_limit),
+    )?;
     let result = sqlx::query(
-        "UPDATE projects SET name = ?1, goal = ?2, guidance = ?3, folder = ?4, status = ?5, updated_at = ?6, daily_run_limit = ?9 \
+        "UPDATE projects SET name = ?1, goal = ?2, guidance = ?3, folder = ?4, status = ?5, updated_at = ?6, daily_run_limit = ?9, daily_token_limit = ?10 \
          WHERE id = ?7 AND workspace_id = ?8",
     )
     .bind(&name)
@@ -413,6 +443,7 @@ pub async fn update_project(
     .bind(&current.id)
     .bind(workspace_id)
     .bind(i64::from(limit))
+    .bind(i64::from(token_limit))
     .execute(database.pool())
     .await;
     match result {
@@ -686,6 +717,43 @@ pub async fn count_project_runs_since(
         source,
     })?;
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// The tokens used since `since` by runs in conversations that belong to the project, as `(input, output)`: what a daily token cap counts.
+///
+/// Each model call records its own `usage_updated` event, so this is their sum. Cached input is not counted twice: providers report it
+/// inside the input figure or beside it, and this counts only the input and output figures a call reports.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the read fails.
+pub async fn project_tokens_since(
+    database: &SqliteDatabase,
+    project_id: &str,
+    since: UtcTimestamp,
+) -> Result<(u64, u64), DatabaseError> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(json_extract(event.payload, '$.input_tokens')), 0) AS input_tokens, \
+                COALESCE(SUM(json_extract(event.payload, '$.output_tokens')), 0) AS output_tokens \
+         FROM run_events AS event JOIN agent_runs AS run ON run.id = event.run_id \
+         WHERE event.kind = 'usage_updated' AND run.started_at >= ?2 \
+           AND run.session_id IN (SELECT ref_id FROM project_links WHERE kind = 'session' AND project_id = ?1)",
+    )
+    .bind(project_id)
+    .bind(since.to_string())
+    .fetch_one(database.pool())
+    .await
+    .map_err(|source| DatabaseError::Sqlite {
+        operation: "total a project's tokens",
+        source,
+    })?;
+    let read = |column: &str| -> u64 {
+        row.try_get::<i64, _>(column)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    Ok((read("input_tokens"), read("output_tokens")))
 }
 
 /// The project a session or schedule belongs to, if any.

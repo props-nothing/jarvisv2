@@ -257,3 +257,18 @@ invalid-coordinate test asserting the malformed value does not appear in the err
 A live smoke against Ollama or OpenAI remains opt-in and credential-gated, per the
 plan above.
 
+
+## Finding (2026-10-10, live): token usage arrives in a chunk after the finish reason
+
+Read live against `https://ollama.com/v1/chat/completions` with `stream: true` and `stream_options: {"include_usage": true}` (model `glm-5.3-flash`, a one-word prompt, key from the owner's key file), and consistent with OpenAI's documented behaviour for `include_usage` ("an additional chunk will be streamed before the `data: [DONE]` message; its `choices` field is an empty array and `usage` holds the total"):
+
+```text
+data: {... "choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+data: {... "choices":[],"usage":{"prompt_tokens":15,"completion_tokens":32,"total_tokens":47,"prompt_tokens_details":{"cached_tokens":0}}}
+data: [DONE]
+```
+
+- **The bug this found:** the adapter treated the chunk with `finish_reason` as the end of the stream (the finish reason is the terminal event, and nothing may follow it), so it never read the usage chunk. Streaming runs recorded **no** `usage_updated` events at all, for any provider that follows the spec: every digest said "tokens: not reported by the model provider" and a per-project token cap (`ADR-0165`) would have counted zero.
+- **The fix (`ADR-0165`):** the finish reason is held back until the next of: the usage chunk (usage is delivered, then the finish), `[DONE]`, the connection closing, a transport error after a complete answer, or `TRAILING_USAGE_WAIT` (2 s) with nothing more arriving (a keep-alive server that never closes must not hold a finished answer for the read timeout). A chunk that carries both the finish reason and usage is delivered at once, as before.
+- **Verification:** scripted-stream tests for each ending, including a body that never closes; live, a run now records `usage_updated` (see `TODO.md` `P9-086`).
+- **Not verified:** providers that send usage in the same chunk as the finish reason were covered by an existing test only; OpenAI itself was not called with a key for this check.

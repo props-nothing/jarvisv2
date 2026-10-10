@@ -78,10 +78,11 @@ pub use pgvector::{
     encode as encode_embedding, is_indexable,
 };
 pub use project_repository::{
-    LinkKind, MAX_DAILY_RUN_LIMIT, MAX_NOTE_CHARS, NewProject, NoteKind, ProjectChanges,
-    ProjectStatus, StoredProject, StoredProjectNote, add_project_note, count_project_runs_since,
-    create_project, delete_project, earlier_important_notes, find_project, link_project,
-    list_projects, project_for, recent_project_notes, set_project_link, update_project,
+    LinkKind, MAX_DAILY_RUN_LIMIT, MAX_DAILY_TOKEN_LIMIT, MAX_NOTE_CHARS, NewProject, NoteKind,
+    ProjectChanges, ProjectStatus, StoredProject, StoredProjectNote, add_project_note,
+    count_project_runs_since, create_project, delete_project, earlier_important_notes,
+    find_project, link_project, list_projects, project_for, project_tokens_since,
+    recent_project_notes, set_project_link, update_project,
 };
 pub use run_event_repository::{
     NewRunEvent, StoredRunEvent, append_run_event, find_run_event, highest_run_event_sequence,

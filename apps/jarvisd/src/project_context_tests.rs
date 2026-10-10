@@ -13,6 +13,7 @@ fn project(status: ProjectStatus) -> StoredProject {
         folder: "sales".to_owned(),
         status,
         daily_run_limit: 0,
+        daily_token_limit: 0,
         created_at: "2026-01-01T00:00:00Z".to_owned(),
         updated_at: "2026-01-01T00:00:00Z".to_owned(),
     }

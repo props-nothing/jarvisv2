@@ -40,13 +40,38 @@ pub(crate) fn day_window_start() -> UtcTimestamp {
         .unwrap_or_else(|_| UtcTimestamp::now(&SystemClock))
 }
 
-async fn runs_today(state: &GatewayState, project: &StoredProject) -> u32 {
-    jarvis_storage::count_project_runs_since(state.database(), &project.id, day_window_start())
-        .await
-        .unwrap_or(0)
+/// What a project has used in the last 24 hours.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Used {
+    pub runs: u32,
+    /// Input plus output tokens.
+    pub tokens: u64,
 }
 
-pub(crate) fn project_reply(project: &StoredProject, runs_today: u32) -> ProjectReply {
+/// The tokens (input plus output) a project's runs used in the last 24 hours; zero when they cannot be read.
+pub(crate) async fn tokens_today(
+    database: &jarvis_storage::SqliteDatabase,
+    project_id: &str,
+) -> u64 {
+    jarvis_storage::project_tokens_since(database, project_id, day_window_start())
+        .await
+        .map_or(0, |(input, output)| input.saturating_add(output))
+}
+
+async fn used_today(state: &GatewayState, project: &StoredProject) -> Used {
+    Used {
+        runs: jarvis_storage::count_project_runs_since(
+            state.database(),
+            &project.id,
+            day_window_start(),
+        )
+        .await
+        .unwrap_or(0),
+        tokens: tokens_today(state.database(), &project.id).await,
+    }
+}
+
+pub(crate) fn project_reply(project: &StoredProject, used: Used) -> ProjectReply {
     ProjectReply {
         project_id: project.id.clone(),
         name: project.name.clone(),
@@ -55,7 +80,9 @@ pub(crate) fn project_reply(project: &StoredProject, runs_today: u32) -> Project
         folder: project.folder.clone(),
         status: project.status.as_str().to_owned(),
         daily_run_limit: project.daily_run_limit,
-        runs_today,
+        runs_today: used.runs,
+        daily_token_limit: project.daily_token_limit,
+        tokens_today: used.tokens,
         created_at: project.created_at.clone(),
         updated_at: project.updated_at.clone(),
     }
@@ -129,6 +156,7 @@ pub async fn create(
         guidance: request.guidance,
         folder: request.folder,
         daily_run_limit: request.daily_run_limit,
+        daily_token_limit: request.daily_token_limit,
     };
     match jarvis_storage::create_project(
         state.database(),
@@ -138,7 +166,11 @@ pub async fn create(
     )
     .await
     {
-        Ok(project) => (StatusCode::CREATED, Json(project_reply(&project, 0))).into_response(),
+        Ok(project) => (
+            StatusCode::CREATED,
+            Json(project_reply(&project, Used::default())),
+        )
+            .into_response(),
         Err(error) => storage_response(&error),
     }
 }
@@ -153,7 +185,7 @@ pub async fn list(State(state): State<GatewayState>) -> Response {
         Ok(projects) => {
             let mut replies = Vec::with_capacity(projects.len());
             for project in &projects {
-                replies.push(project_reply(project, runs_today(&state, project).await));
+                replies.push(project_reply(project, used_today(&state, project).await));
             }
             let reply = ProjectListReply {
                 total: replies.len(),
@@ -178,7 +210,7 @@ pub async fn read(State(state): State<GatewayState>, Path(id): Path<String>) -> 
     match jarvis_storage::recent_project_notes(state.database(), &project.id, DETAIL_NOTES).await {
         Ok(notes) => {
             let reply = ProjectDetailReply {
-                project: project_reply(&project, runs_today(&state, &project).await),
+                project: project_reply(&project, used_today(&state, &project).await),
                 notes: notes.iter().map(note_reply).collect(),
             };
             (StatusCode::OK, Json(reply)).into_response()
@@ -215,6 +247,7 @@ pub async fn update(
         folder: request.folder,
         status,
         daily_run_limit: request.daily_run_limit,
+        daily_token_limit: request.daily_token_limit,
     };
     match jarvis_storage::update_project(
         state.database(),
@@ -226,7 +259,7 @@ pub async fn update(
     .await
     {
         Ok(project) => {
-            let used = runs_today(&state, &project).await;
+            let used = used_today(&state, &project).await;
             (StatusCode::OK, Json(project_reply(&project, used))).into_response()
         }
         Err(error) => storage_response(&error),

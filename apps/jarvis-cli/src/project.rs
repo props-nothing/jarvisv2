@@ -15,7 +15,7 @@ use crate::schedule::{print_json, report};
 
 /// The usage text for `jarvis project`.
 pub(crate) const fn project_usage() -> &'static str {
-    "usage: jarvis project <add|list|show|set|pause|resume|done|note|remove> [...]\n       jarvis project add NAME [--goal TEXT] [--guidance TEXT | --guidance-file FILE] [--folder RELATIVE/PATH] [--daily-limit N]\n       jarvis project list [--json]\n       jarvis project show NAME [--json]\n       jarvis project set NAME [--name NEW] [--goal TEXT] [--guidance TEXT | --guidance-file FILE] [--folder PATH] [--daily-limit N] [--status active|paused|done]\n       jarvis project pause|resume|done NAME\n       jarvis project note NAME TEXT... [--kind progress|decision|blocker|next|result|owner]\n       jarvis project remove NAME"
+    "usage: jarvis project <add|list|show|set|pause|resume|done|note|remove> [...]\n       jarvis project add NAME [--goal TEXT] [--guidance TEXT | --guidance-file FILE] [--folder RELATIVE/PATH] [--daily-limit N] [--token-limit N]\n       jarvis project list [--json]\n       jarvis project show NAME [--json]\n       jarvis project set NAME [--name NEW] [--goal TEXT] [--guidance TEXT | --guidance-file FILE] [--folder PATH] [--daily-limit N] [--token-limit N] [--status active|paused|done]\n       jarvis project pause|resume|done NAME\n       jarvis project note NAME TEXT... [--kind progress|decision|blocker|next|result|owner]\n       jarvis project remove NAME"
 }
 
 /// Runs one project verb.
@@ -57,6 +57,7 @@ struct Flags {
     folder: Option<String>,
     status: Option<String>,
     daily_limit: Option<u32>,
+    token_limit: Option<u32>,
     kind: Option<String>,
     json: bool,
 }
@@ -98,6 +99,12 @@ impl Flags {
                         "--daily-limit needs a whole number (0 means no cap)".to_owned()
                     })?;
                     flags.daily_limit = Some(limit);
+                }
+                "--token-limit" => {
+                    let limit = value.parse::<u32>().map_err(|_| {
+                        "--token-limit needs a whole number of tokens per 24 hours (0 means no cap)".to_owned()
+                    })?;
+                    flags.token_limit = Some(limit);
                 }
                 "--kind" => flags.kind = Some(value),
                 // Handled before the verb is dispatched.
@@ -165,6 +172,7 @@ async fn add(client: &ApiClient, flags: &Flags) -> ExitStatus {
         guidance: flags.guidance.clone().unwrap_or_default(),
         folder: flags.folder.clone().unwrap_or_default(),
         daily_run_limit: flags.daily_limit.unwrap_or_default(),
+        daily_token_limit: flags.token_limit.unwrap_or_default(),
     };
     match client.create_project(&request).await {
         Ok(project) => {
@@ -236,6 +244,17 @@ async fn show(client: &ApiClient, flags: &Flags) -> ExitStatus {
             project.daily_run_limit, project.runs_today
         );
     }
+    if project.daily_token_limit > 0 {
+        println!(
+            "  tokens:   {} per 24 hours ({} used)",
+            project.daily_token_limit, project.tokens_today
+        );
+    } else if project.tokens_today > 0 {
+        println!(
+            "  tokens:   {} used in the last 24 hours (no cap)",
+            project.tokens_today
+        );
+    }
     if !project.goal.is_empty() {
         println!("  goal:     {}", project.goal);
     }
@@ -283,6 +302,7 @@ async fn set(client: &ApiClient, flags: &Flags) -> ExitStatus {
         folder: flags.folder.clone(),
         status: flags.status.clone(),
         daily_run_limit: flags.daily_limit,
+        daily_token_limit: flags.token_limit,
     };
     if request == UpdateProjectRequest::default() {
         return usage_error("project set needs something to change, for example --goal \"...\"");

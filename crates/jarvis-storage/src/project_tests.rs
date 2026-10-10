@@ -60,6 +60,7 @@ fn new(name: &str) -> NewProject {
         guidance: "Be brief.".to_owned(),
         folder: "sales".to_owned(),
         daily_run_limit: 0,
+        daily_token_limit: 0,
     }
 }
 
@@ -152,6 +153,18 @@ async fn unacceptable_fields_are_refused() {
         create_project(&database, LOCAL_WORKSPACE_ID, &long, at(0)).await,
         Err(DatabaseError::InvalidProject { field: "guidance" })
     ));
+    for over in [MAX_DAILY_TOKEN_LIMIT + 1, u32::MAX] {
+        let capped = NewProject {
+            daily_token_limit: over,
+            ..new("P")
+        };
+        assert!(matches!(
+            create_project(&database, LOCAL_WORKSPACE_ID, &capped, at(0)).await,
+            Err(DatabaseError::InvalidProject {
+                field: "daily_token_limit"
+            })
+        ));
+    }
     let ok = NewProject {
         folder: "a\\b\\".to_owned(),
         ..new("P")

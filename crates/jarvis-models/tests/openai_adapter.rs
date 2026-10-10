@@ -37,6 +37,8 @@ enum Reply {
     Body(&'static str),
     /// A 2xx stream delivering the given chunks.
     Chunks(Vec<&'static [u8]>),
+    /// A 2xx stream delivering the given chunks and then never sending or closing anything more.
+    ChunksThenHang(Vec<&'static [u8]>),
     /// A transport-level failure.
     Failure(TransportError),
 }
@@ -78,6 +80,24 @@ impl ScriptedTransport {
             .ok()
             .and_then(|mut value| value.pop())
             .unwrap_or(Reply::Failure(TransportError::Connect))
+    }
+}
+
+/// A body that delivers its chunks and then waits forever, like a server that keeps the connection open.
+struct HangingBody {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl ResponseBody for HangingBody {
+    fn next_chunk(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, TransportError>> + Send + '_>,
+    > {
+        match self.chunks.pop_front() {
+            Some(chunk) => Box::pin(async move { Ok(Some(chunk)) }),
+            None => Box::pin(std::future::pending()),
+        }
     }
 }
 
@@ -129,6 +149,16 @@ impl Transport for ScriptedTransport {
                 status: 200,
                 provider_request_id: Some("req_fixture_1".to_owned()),
                 body: Box::new(ChunkBody {
+                    chunks: chunks
+                        .into_iter()
+                        .map(<[u8]>::to_vec)
+                        .collect::<std::collections::VecDeque<_>>(),
+                }),
+            }),
+            Reply::ChunksThenHang(chunks) => Ok(TransportResponse::Streaming {
+                status: 200,
+                provider_request_id: Some("req_fixture_1".to_owned()),
+                body: Box::new(HangingBody {
                     chunks: chunks
                         .into_iter()
                         .map(<[u8]>::to_vec)
@@ -834,4 +864,100 @@ async fn a_provider_lists_its_models_and_nothing_secret_is_in_the_request_or_the
         assert!(!format!("{error:?} {error}").contains(CANARY));
         assert_eq!(transport.request_count(), 1, "{kind:?} is not retried");
     }
+}
+
+/// Reads a stream to its end and returns the summary, or the error that stopped it.
+async fn read_stream(
+    provider: &OpenAiCompatibleProvider,
+) -> Result<jarvis_models::StreamSummary, jarvis_models::ModelError> {
+    let mut stream = provider.stream(request()).await.expect("stream starts");
+    let mut validator = StreamValidator::new();
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+        validator.accept(item?).expect("events are ordered");
+    }
+    Ok(validator.finish().expect("the stream completed"))
+}
+
+/// **The usage figure arrives in a chunk of its own after the finish reason, and it is kept.**
+///
+/// This is how `OpenAI` and Ollama report tokens when `include_usage` is asked for: the finish reason, then a chunk with an empty
+/// `choices` list and a `usage` object, then `[DONE]`. Stopping at the finish reason lost it, so no run ever recorded a token.
+#[tokio::test]
+async fn usage_that_follows_the_finish_reason_is_kept() {
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":32,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
+        b"data: [DONE]\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let summary = read_stream(&provider).await.expect("a healthy stream");
+    assert_eq!(summary.text(), "OK");
+    assert_eq!(summary.finish_reason(), Some(FinishReason::Stop));
+    let usage = summary.usage().expect("the trailing usage is kept");
+    assert_eq!((usage.input_tokens(), usage.output_tokens()), (15, 32));
+}
+
+/// A tool-call turn reports usage the same way, and the calls still come out before the end of the turn.
+#[tokio::test]
+async fn usage_after_a_tool_call_turn_is_kept_with_the_calls() {
+    let transport = ScriptedTransport::new(vec![Reply::Chunks(vec![
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"jarvis.files.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7}}\n\n",
+        b"data: [DONE]\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let summary = read_stream(&provider).await.expect("a healthy stream");
+    assert_eq!(summary.tool_calls().len(), 1);
+    assert_eq!(
+        summary.usage().map(jarvis_models::TokenUsage::input_tokens),
+        Some(100)
+    );
+}
+
+/// A provider that sends no usage still finishes cleanly, whether it ends with `[DONE]` or just closes the connection.
+#[tokio::test]
+async fn a_finished_answer_without_usage_is_delivered_when_the_stream_ends_either_way() {
+    for chunks in [
+        vec![
+            &b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"[..],
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ],
+        vec![
+            &b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"[..],
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ],
+    ] {
+        let transport = ScriptedTransport::new(vec![Reply::Chunks(chunks)]);
+        let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+        let summary = read_stream(&provider).await.expect("a finished answer");
+        assert_eq!(summary.text(), "hi");
+        assert_eq!(summary.finish_reason(), Some(FinishReason::Stop));
+        assert!(summary.usage().is_none());
+    }
+}
+
+/// **A server that never closes the connection cannot hold a finished answer.**
+///
+/// After the finish reason only the usage chunk is awaited, and only briefly; without that bound a keep-alive connection would hold a
+/// complete answer for the whole read timeout.
+#[tokio::test]
+async fn a_server_that_never_closes_after_the_finish_reason_does_not_hang_the_answer() {
+    let transport = ScriptedTransport::new(vec![Reply::ChunksThenHang(vec![
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    ])]);
+    let provider = provider_with(Arc::clone(&transport), RetryPolicy::none());
+    let started = std::time::Instant::now();
+    let summary = read_stream(&provider).await.expect("a finished answer");
+    assert_eq!(summary.text(), "done");
+    assert_eq!(summary.finish_reason(), Some(FinishReason::Stop));
+    let waited = started.elapsed();
+    assert!(
+        waited >= jarvis_models::openai::TRAILING_USAGE_WAIT
+            && waited < jarvis_models::openai::TRAILING_USAGE_WAIT * 3,
+        "the wait for usage is bounded: {waited:?}"
+    );
 }

@@ -456,6 +456,97 @@ async fn a_project_that_used_its_daily_cap_gets_no_more_scheduled_runs() {
     );
 }
 
+/// Records what one model call would: a `usage_updated` event on the run.
+async fn record_usage(fixture: &Fixture, run_id: &str, input: u64, output: u64) {
+    let payload =
+        format!(r#"{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0}}"#);
+    let event = must(jarvis_storage::NewRunEvent::new(
+        jarvis_core::RunId::new().to_string(),
+        run_id,
+        jarvis_core::RunEventKind::UsageUpdated,
+        None,
+        must(jarvis_core::RunEventPayload::new(&payload)),
+        jarvis_core::CorrelationId::new(),
+        now(),
+    ));
+    must(jarvis_storage::append_run_event(&fixture.database, &event).await);
+}
+
+#[tokio::test]
+async fn a_project_that_used_its_daily_tokens_gets_no_more_scheduled_runs_and_only_its_own_tokens_count()
+ {
+    let fixture = fixture().await;
+    let body = r#"{"name":"Metered","goal":"g","daily_token_limit":1000}"#;
+    let (status, text) = send(&fixture, "POST", "/api/v1/projects", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let project: ProjectReply = parse(&text);
+    assert_eq!((project.daily_token_limit, project.tokens_today), (1000, 0));
+
+    // A run in another project, however large, is not this project's spend.
+    make(&fixture, "Other").await;
+    let (_, other) = start(&fixture, r#"{"objective":"big","project_id":"Other"}"#).await;
+    let other: RunReply = parse(&other);
+    record_usage(&fixture, &other.run_id, 900_000, 5_000).await;
+
+    let (status, mine) = start(&fixture, r#"{"objective":"look","project_id":"Metered"}"#).await;
+    assert_eq!(status, StatusCode::CREATED, "{mine}");
+    let mine: RunReply = parse(&mine);
+    record_usage(&fixture, &mine.run_id, 600, 50).await;
+    let (_, text) = send(&fixture, "GET", "/api/v1/projects/Metered", None).await;
+    let detail: ProjectDetailReply = parse(&text);
+    assert_eq!(
+        detail.project.tokens_today, 650,
+        "input plus output, this project only"
+    );
+
+    // More usage takes the project over its cap before the task first fires, so a held fire can only be the token cap.
+    record_usage(&fixture, &mine.run_id, 400, 0).await;
+    let task = r#"{"objective":"check","every":"1h","project_id":"Metered"}"#;
+    send(&fixture, "POST", "/api/v1/schedules", Some(task)).await;
+    let hour = 3_700_000_000_000_i128;
+    let first = must(UtcTimestamp::from_unix_nanos(now().unix_nanos() + hour));
+    let report = must(crate::schedule_service::tick(&fixture.state, first).await);
+    assert_eq!(
+        (report.started, report.skipped),
+        (0, 1),
+        "the token cap holds the fire"
+    );
+
+    // The owner's own message is never refused by the cap.
+    let (status, _) = start(
+        &fixture,
+        r#"{"objective":"still me","project_id":"Metered"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Raising the cap above what was used lets the next fire through.
+    let (status, _) = send(
+        &fixture,
+        "PATCH",
+        "/api/v1/projects/Metered",
+        Some(r#"{"daily_token_limit":5000}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = must(UtcTimestamp::from_unix_nanos(first.unix_nanos() + hour));
+    assert_eq!(
+        must(crate::schedule_service::tick(&fixture.state, second).await).started,
+        1
+    );
+    let (status, _) = send(
+        &fixture,
+        "POST",
+        "/api/v1/projects",
+        Some(r#"{"name":"Huge","daily_token_limit":3000000000}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a cap beyond the maximum is refused"
+    );
+}
 #[tokio::test]
 async fn a_run_a_restart_cut_off_is_continued_once_in_its_conversation_and_never_again() {
     let fixture = fixture().await;

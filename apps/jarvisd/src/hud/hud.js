@@ -1677,6 +1677,9 @@
     var cap = textField(project && project.daily_run_limit ? String(project.daily_run_limit) : "", "0 = no cap");
     var used = project && project.daily_run_limit ? " Used in the last 24 hours: " + project.runs_today + "." : "";
     body.appendChild(formRow("Daily runs", cap, "The most runs its scheduled tasks may start in 24 hours; past it they wait. Your own messages are never refused." + used));
+    var tokenCap = textField(project && project.daily_token_limit ? String(project.daily_token_limit) : "", "0 = no cap");
+    var tokensUsed = project ? " Used in the last 24 hours: " + Number(project.tokens_today || 0).toLocaleString() + " tokens." : "";
+    body.appendChild(formRow("Daily tokens", tokenCap, "The most tokens (input plus output) its runs may use in 24 hours; past it, scheduled tasks wait. It counts what runs already used, so one long run can overshoot it; it never stops a run midway or refuses your own messages. Leave empty for no cap." + tokensUsed));
     body.appendChild(formRow("Guidance", guidance, "Your standing instructions. The project cannot widen what JARVIS may do: approvals and permissions stay as they are."));
     var status = null;
     if (project) {
@@ -1694,7 +1697,9 @@
     save.addEventListener("click", function () {
       var limit = cap.value.trim() === "" ? 0 : Number(cap.value);
       if (!Number.isInteger(limit) || limit < 0) { projectNote("Daily runs must be a whole number, or empty for no cap.", true); return; }
-      var fields = { name: name.value, goal: goal.value, folder: folder.value, guidance: guidance.value, daily_run_limit: limit };
+      var tokens = tokenCap.value.trim() === "" ? 0 : Number(tokenCap.value.replace(/[\s,_]/g, ""));
+      if (!Number.isInteger(tokens) || tokens < 0 || tokens > 2000000000) { projectNote("Daily tokens must be a whole number up to two billion, or empty for no cap.", true); return; }
+      var fields = { name: name.value, goal: goal.value, folder: folder.value, guidance: guidance.value, daily_run_limit: limit, daily_token_limit: tokens };
       if (status) fields.status = status.value;
       save.disabled = true;
       putJson(project ? "/projects/" + encodeURIComponent(project.project_id) : "/projects", project ? "PATCH" : "POST", fields).then(function (saved) {

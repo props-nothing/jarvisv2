@@ -261,16 +261,8 @@ pub async fn tick(state: &GatewayState, now: UtcTimestamp) -> Result<TickReport,
         .flatten();
         // A project that has used its daily cap stops getting scheduled runs until the 24 hours roll over: counted as skipped.
         let over_cap = match project.as_ref() {
-            Some(project) if project.daily_run_limit > 0 => {
-                jarvis_storage::count_project_runs_since(
-                    state.database(),
-                    &project.id,
-                    crate::project_service::day_window_start(),
-                )
-                .await
-                .is_ok_and(|used| used >= project.daily_run_limit)
-            }
-            _ => false,
+            Some(project) => over_daily_cap(state, project).await,
+            None => false,
         };
         if over_cap
             || project
@@ -672,6 +664,32 @@ pub async fn list_runs(State(state): State<GatewayState>, RawQuery(raw): RawQuer
         runs: summaries,
     };
     (StatusCode::OK, Json(reply)).into_response()
+}
+
+/// Whether a project has used its daily run cap or its daily token cap (`ADR-0155`, `ADR-0165`).
+///
+/// The run cap is a convenience and fails open if the count cannot be read. The token cap guards spend, so it **fails closed**: when the
+/// tokens used cannot be read, the fire is held rather than allowed.
+async fn over_daily_cap(state: &GatewayState, project: &jarvis_storage::StoredProject) -> bool {
+    let since = crate::project_service::day_window_start();
+    if project.daily_run_limit > 0
+        && jarvis_storage::count_project_runs_since(state.database(), &project.id, since)
+            .await
+            .is_ok_and(|used| used >= project.daily_run_limit)
+    {
+        return true;
+    }
+    if project.daily_token_limit > 0 {
+        return match jarvis_storage::project_tokens_since(state.database(), &project.id, since)
+            .await
+        {
+            Ok((input, output)) => {
+                input.saturating_add(output) >= u64::from(project.daily_token_limit)
+            }
+            Err(_) => true,
+        };
+    }
+    false
 }
 
 #[cfg(test)]

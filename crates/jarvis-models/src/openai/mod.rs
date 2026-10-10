@@ -24,7 +24,9 @@ mod transport;
 mod wire;
 mod wire_embedding;
 
-pub use adapter::{CHAT_COMPLETIONS_PATH, MODELS_PATH, OpenAiCompatibleProvider};
+pub use adapter::{
+    CHAT_COMPLETIONS_PATH, MODELS_PATH, OpenAiCompatibleProvider, TRAILING_USAGE_WAIT,
+};
 pub use config::{ApiKey, ApiKeyError, BaseUrl, BaseUrlError};
 pub use embedding::{EMBEDDINGS_PATH, OpenAiCompatibleEmbeddingProvider, PROVIDER_NORMALIZATION};
 pub use http::{

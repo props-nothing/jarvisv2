@@ -44,6 +44,11 @@ journal; its conversations and schedules stay.
 
 ## Cap how much it runs by itself
 
+Two caps, both for *scheduled* work only: runs and tokens. The project window also shows how many tokens the project used in the last 24 hours, whether or not a cap is set.
+
+**Tokens.** `jarvis project set NAME --token-limit 500000` (or **Daily tokens** in the project window) stops the project's scheduled tasks from starting once its runs have used that many tokens (input plus output) in the last 24 hours; the rest wait and are counted as skipped. It is checked when a task is about to start, so one long run can go past it, and it never stops a run midway or refuses your own messages. If JARVIS cannot read the usage it holds the task rather than risk spending. Zero means no cap, and JARVIS cannot change the cap itself. Tokens, not money: provider prices change, so look up the price per million tokens for your model and multiply.
+
+**Runs.**
 `jarvis project set NAME --daily-limit 12` (or **Daily runs** in the project window) stops the project's *scheduled* tasks from starting more than that many runs in any 24 hours; the rest wait, and are counted as skipped in
 `jarvis schedule list`. Zero means no cap. Your own messages in the project are never refused, and JARVIS cannot change the cap itself.
 
