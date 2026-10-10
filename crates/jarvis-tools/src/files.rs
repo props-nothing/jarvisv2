@@ -61,6 +61,8 @@ pub const WRITE_TOOL: &str = "jarvis.files.write";
 
 /// The tool that replaces one exact piece of text in an existing file.
 pub const EDIT_TOOL: &str = "jarvis.files.edit";
+/// The tool that moves or renames a file or folder inside a granted workspace root.
+pub const MOVE_TOOL: &str = "jarvis.files.move";
 
 /// The tool that searches the text of the files under a folder.
 pub const SEARCH_TOOL: &str = "jarvis.files.search";
@@ -190,6 +192,18 @@ const EDIT_INPUT_SCHEMA: &str = r#"{
   }
 }"#;
 
+/// The input schema of `jarvis.files.move`.
+const MOVE_INPUT_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["from", "to"],
+  "properties": {
+    "from": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "The existing file or folder, relative to a granted workspace root." },
+    "to": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Its new path, in the same root. Missing folders are created. It must not exist: nothing is ever replaced." }
+  }
+}"#;
+
 /// The input schema of `jarvis.files.search`.
 const SEARCH_INPUT_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -224,7 +238,7 @@ const WRITE_OUTPUT_SCHEMA: &str = r#"{
   "additionalProperties": false,
   "required": ["outcome"],
   "properties": {
-    "outcome": { "type": "string", "enum": ["created", "appended", "edited"] },
+    "outcome": { "type": "string", "enum": ["created", "appended", "edited", "moved"] },
     "bytes": { "type": "integer", "description": "Bytes written or added." }
   }
 }"#;
@@ -266,6 +280,7 @@ impl FilesystemTool {
             Self::definition(LIST_TOOL)?,
             Self::definition(WRITE_TOOL)?,
             Self::definition(EDIT_TOOL)?,
+            Self::definition(MOVE_TOOL)?,
             Self::definition(SEARCH_TOOL)?,
         ])
     }
@@ -349,6 +364,19 @@ impl FilesystemTool {
                 output: WRITE_OUTPUT_SCHEMA,
                 effect: ToolEffect::Write,
                 risk: 2,
+                scope: "files.write",
+                reads: false,
+            },
+            MOVE_TOOL => Spec {
+                id: MOVE_TOOL,
+                title: "Move or rename a file",
+                description: "Moves or renames one file or folder inside a granted workspace root, to a new path in the same root. Missing \
+                              folders are created. It never replaces anything: if the new path exists it refuses. Use it to organise a \
+                              project's folders.",
+                input: MOVE_INPUT_SCHEMA,
+                output: WRITE_OUTPUT_SCHEMA,
+                effect: ToolEffect::Write,
+                risk: 1,
                 scope: "files.write",
                 reads: false,
             },
@@ -467,6 +495,7 @@ impl ToolExecutor for FilesystemTool {
             LIST_TOOL => Operation::List,
             WRITE_TOOL => Operation::Write,
             EDIT_TOOL => Operation::Edit,
+            MOVE_TOOL => Operation::Move,
             SEARCH_TOOL => Operation::Search,
             other => {
                 return Err(AdapterError::NotImplemented {
@@ -484,6 +513,12 @@ impl ToolExecutor for FilesystemTool {
             });
         }
 
+        if matches!(operation, Operation::Move) {
+            return match self.move_bounded(request) {
+                Ok(result) => result,
+                Err(error) => refuse(&describe_io_error(&error)),
+            };
+        }
         if matches!(operation, Operation::Search) {
             return match self.search_bounded(request) {
                 Ok(result) => result,
@@ -500,8 +535,8 @@ impl ToolExecutor for FilesystemTool {
             Operation::Read => self.read_bounded(&path),
             Operation::Write => self.write_bounded(request, &path),
             Operation::Edit => self.edit_bounded(request, &path),
-            Operation::Search => {
-                unreachable!("a search is handled before the path argument is read")
+            Operation::Search | Operation::Move => {
+                unreachable!("a search and a move are handled before the path argument is read")
             }
         };
         match outcome {
@@ -518,10 +553,32 @@ enum Operation {
     List,
     Write,
     Edit,
+    Move,
     Search,
 }
 
 impl FilesystemTool {
+    /// Moves or renames a file or folder, and reports it.
+    fn move_bounded(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<Result<ToolCallResult, AdapterError>, std::io::Error> {
+        let from = match text_argument(request, "from", MAX_PATH_ARGUMENT_CHARS, false) {
+            Ok(text) => PathBuf::from(text.trim()),
+            Err(error) => return Ok(Err(error)),
+        };
+        let to = match text_argument(request, "to", MAX_PATH_ARGUMENT_CHARS, false) {
+            Ok(text) => PathBuf::from(text.trim()),
+            Err(error) => return Ok(Err(error)),
+        };
+        let root = self.roots.move_entry(&from, &to)?;
+        let body = json!({ "outcome": "moved", "from": from.display().to_string(), "to": to.display().to_string() });
+        Ok(confirm(
+            &locator("file", &to, root),
+            BoundedOutput::from_bounded(body.to_string(), false),
+        ))
+    }
+
     /// Creates a file or appends to one, and reports what happened.
     ///
     /// Every argument problem is refused **before reaching** the filesystem. The write itself resolves beneath a
@@ -1593,6 +1650,103 @@ mod tests {
             .to_owned()
     }
 
+    fn move_args(from: &str, to: &str) -> Value {
+        json!({"from": from, "to": to})
+    }
+
+    #[test]
+    fn move_is_a_low_risk_write_that_runs_by_default() {
+        let definition = FilesystemTool::definition(MOVE_TOOL).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(definition.effects(), &EffectSet::single(ToolEffect::Write));
+        assert_eq!(definition.risk(), Risk::Low);
+        assert!(definition.approval().is_runnable());
+    }
+
+    #[test]
+    fn move_renames_a_file_into_a_new_folder_and_moves_a_folder_whole() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/draft.txt", "offer");
+        outer.write("root/old/a.txt", "a");
+        outer.write("root/old/sub/b.txt", "b");
+        let executor = adapter(&root);
+
+        let moved = run(
+            &executor,
+            MOVE_TOOL,
+            move_args("draft.txt", "sent/2026/offer.txt"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(moved.outcome(), ToolOutcome::Confirmed);
+        assert!(!root.join("draft.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("sent/2026/offer.txt")).unwrap_or_default(),
+            "offer"
+        );
+
+        let folder = run(&executor, MOVE_TOOL, move_args("old", "archive/old"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(folder.outcome(), ToolOutcome::Confirmed);
+        assert!(!root.join("old").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("archive/old/sub/b.txt")).unwrap_or_default(),
+            "b"
+        );
+    }
+
+    #[test]
+    fn move_never_replaces_anything_and_never_moves_a_folder_into_itself() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/a.txt", "mine");
+        outer.write("root/b.txt", "theirs");
+        outer.write("root/dir/x.txt", "x");
+        let executor = adapter(&root);
+
+        let taken = run(&executor, MOVE_TOOL, move_args("a.txt", "b.txt"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(failure_reason(&taken).contains("already"));
+        assert_eq!(
+            fs::read_to_string(root.join("b.txt")).unwrap_or_default(),
+            "theirs"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap_or_default(),
+            "mine"
+        );
+
+        for (from, to) in [
+            ("a.txt", "a.txt"),
+            ("dir", "dir/inside"),
+            ("missing.txt", "z.txt"),
+        ] {
+            let refused = run(&executor, MOVE_TOOL, move_args(from, to))
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(refused.outcome(), ToolOutcome::Failed, "{from} -> {to}");
+        }
+        assert!(root.join("dir/x.txt").exists());
+    }
+
+    #[test]
+    fn move_cannot_leave_the_root_in_either_direction() {
+        let outer = TestDirectory::new();
+        let root = outer.make_dir("root");
+        outer.write("root/in.txt", "inside");
+        outer.write("outside.txt", "outside");
+        let executor = adapter(&root);
+
+        for (from, to) in [
+            ("../outside.txt", "stolen.txt"),
+            ("in.txt", "../escaped.txt"),
+        ] {
+            let refused = run(&executor, MOVE_TOOL, move_args(from, to))
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(refused.outcome(), ToolOutcome::Failed, "{from} -> {to}");
+        }
+        assert!(outer.path().join("outside.txt").exists() && root.join("in.txt").exists());
+        assert!(!outer.path().join("escaped.txt").exists() && !root.join("stolen.txt").exists());
+    }
+
     #[test]
     fn write_and_edit_are_declared_as_writes_with_the_intended_risk() {
         let write = FilesystemTool::definition(WRITE_TOOL).unwrap_or_else(|e| panic!("{e}"));
@@ -1927,7 +2081,11 @@ mod tests {
     fn both_definitions_are_accepted_and_declare_a_read() {
         let definitions = FilesystemTool::definitions()
             .unwrap_or_else(|error| panic!("both definitions must be accepted: {error}"));
-        assert_eq!(definitions.len(), 5);
+        assert_eq!(
+            definitions.len(),
+            6,
+            "read, list, write, edit, move and search"
+        );
 
         for definition in definitions
             .iter()

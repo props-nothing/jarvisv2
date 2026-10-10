@@ -213,7 +213,9 @@ pub(crate) fn servable_definitions(definitions: &[ToolDefinition]) -> Vec<ToolDe
         .iter()
         .filter(|definition| {
             let id = definition.id().to_string();
-            id != jarvis_tools::WRITE_TOOL && id != jarvis_tools::EDIT_TOOL
+            id != jarvis_tools::WRITE_TOOL
+                && id != jarvis_tools::EDIT_TOOL
+                && id != jarvis_tools::MOVE_TOOL
         })
         .cloned()
         .collect()

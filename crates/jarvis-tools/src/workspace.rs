@@ -256,6 +256,64 @@ impl WorkspaceRoots {
 }
 
 impl WorkspaceRoots {
+    /// Moves or renames a file or folder within one root. It can **never destroy content**: a target that exists is refused.
+    ///
+    /// Both paths resolve through the handle of the root that holds `from`, so neither can leave it, and a move never crosses roots
+    /// (that would be a copy and a delete, which this does not do). A file is moved by linking it to its new name, which fails if the
+    /// name is taken even when something creates it a moment after the check, and then removing the old name; where linking is not
+    /// possible the move is a rename after an existence check. Missing folders on the way are created.
+    ///
+    /// Returns the label of the root that holds both.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when no root holds `from`, `AlreadyExists` when `to` exists, `InvalidInput` for moving a folder into itself or onto
+    /// itself, and whatever the resolution refused.
+    pub fn move_entry(&self, from: &Path, to: &Path) -> Result<&Path, io::Error> {
+        if from == to || to.starts_with(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a path cannot be moved onto itself or into itself",
+            ));
+        }
+        let mut last_error: Option<io::Error> = None;
+        for root in &self.roots {
+            let metadata = match root.handle.symlink_metadata(from) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if root.handle.symlink_metadata(to).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "something already has that name; choose another or move that first",
+                ));
+            }
+            if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                root.handle.create_dir_all(parent)?;
+            }
+            if metadata.is_file() {
+                match root.handle.hard_link(from, &root.handle, to) {
+                    Ok(()) => {
+                        root.handle.remove_file(from)?;
+                        return Ok(root.label.as_path());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(error);
+                    }
+                    // A filesystem that cannot link falls through to the rename below.
+                    Err(_) => {}
+                }
+            }
+            root.handle.rename(from, &root.handle, to)?;
+            return Ok(root.label.as_path());
+        }
+        Err(last_error
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no workspace root")))
+    }
+
     /// Creates a file, or appends to one, beneath the granted roots. It can **never destroy content**.
     ///
     /// An existing file lives in exactly one root, so each root is asked whether it holds the path: if one does,

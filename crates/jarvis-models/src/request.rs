@@ -379,6 +379,13 @@ impl ChatRequest {
         }
     }
 
+    /// Asks another model for the same request: the same messages, tools and settings, a different model identifier.
+    #[must_use]
+    pub fn with_model(mut self, model: ModelId) -> Self {
+        self.model = model;
+        self
+    }
+
     /// Asks a reasoning model to think less (or more) for this request.
     #[must_use]
     pub const fn with_reasoning_effort(mut self, value: Option<ReasoningEffort>) -> Self {

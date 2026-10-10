@@ -103,6 +103,7 @@ default.
   you grant (Settings, Folders & code) and running code needs Docker. More tools (search what it remembers, the clock, scheduling from
   conversation, mail and calendar) are on the roadmap (`P9-024`).
 - **Reading documents.** With a folder granted, `jarvis.files.read_document` reads PDF, Word (`.docx`), spreadsheet (`.xlsx`) and slide (`.pptx`) files in it, a few thousand characters at a time, and treats their text as data to read, never as instructions. It cannot read scanned PDFs (pictures of text), password-protected files or the old `.doc`/`.xls` formats. Together with `jarvis.gmail.save_attachment`, a PDF that arrives by mail can be saved and read.
+- **Organising files.** `jarvis.files.move` moves or renames a file or folder inside a granted folder (missing folders are created). It never replaces anything: if the new name exists it refuses. It runs without asking, like creating a file.
 - **Remembering.** Say "remember that I like short answers". JARVIS offers it in **Waiting for you** as a "remember?" card; **Keep**
   makes it shape later answers, **Dismiss** forgets it. It asks because a web page it read could otherwise tell it what to remember.
 - **Approvals are a yes or no.** Anything it asks about appears with Approve and Deny; you can also say "yes" or "no", or use

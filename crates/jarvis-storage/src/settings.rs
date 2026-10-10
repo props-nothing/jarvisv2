@@ -85,6 +85,16 @@ const SETTINGS: &[Setting] = &[
     },
     Setting {
         table: "daemon",
+        field: "executor_fallback_model_name",
+        kind: Kind::Text,
+        help: "a second model to ask when the main one is rate limited or overloaded",
+        group: "brain",
+        default: None,
+        unset_means: "No fallback: a run waits out a rate limit (up to about five minutes) and then fails. With one, the same provider is asked for this model at once, for that call only; the next call tries the main model again.",
+        example: "glm-5.3:cloud",
+    },
+    Setting {
+        table: "daemon",
         field: "executor_reasoning_effort",
         kind: Kind::Text,
         help: "how hard a reasoning model thinks: none, low, medium or high",

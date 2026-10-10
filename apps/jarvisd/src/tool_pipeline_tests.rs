@@ -231,13 +231,13 @@ async fn a_call_reaches_the_adapter_that_owns_its_definition() {
     )
     .await;
 
-    // Six tools are dispatchable: the filesystem adapter's five and the MCP one. Asserted so a table that
+    // Seven tools are dispatchable: the filesystem adapter's six and the MCP one. Asserted so a table that
     // registered only one cannot make the routing assertion below vacuous — which is exactly how the first
     // version of this test passed a falsification it should have failed.
     assert_eq!(
         pipeline.dispatchable_tools(),
-        6,
-        "the filesystem adapter's five tools and the additional one must all be dispatchable"
+        7,
+        "the filesystem adapter's six tools and the additional one must all be dispatchable"
     );
 
     let arguments = json!({ "q": "pumps" });

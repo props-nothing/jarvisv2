@@ -52,6 +52,7 @@ use jarvis_storage::{
     find_run, find_tool_call, settle_run,
 };
 
+use crate::model_fallback::FallbackGateway;
 use crate::tool_pipeline::{ToolPipeline, ToolPipelineOutcome};
 
 /// Characters of the objective carried in the first context item's source reference.
@@ -243,6 +244,8 @@ pub struct ModelProviderConfig {
     reasoning_effort: Option<jarvis_models::ReasoningEffort>,
     /// The API key, read from the file the operator named.
     api_key: String,
+    /// A second model identifier at the same provider, asked when the first is rate limited or overloaded.
+    fallback_model: Option<String>,
 }
 
 impl ModelProviderConfig {
@@ -258,7 +261,15 @@ impl ModelProviderConfig {
             model: model.into(),
             reasoning_effort: None,
             api_key: api_key.into(),
+            fallback_model: None,
         }
+    }
+
+    /// Sets the model asked instead when the main one is rate limited or overloaded.
+    #[must_use]
+    pub fn with_fallback_model(mut self, model: Option<String>) -> Self {
+        self.fallback_model = model;
+        self
     }
 
     /// Sets the reasoning effort every request asks for unless it chooses its own.
@@ -384,8 +395,20 @@ impl Executor {
             jarvis_models::openai::RetryPolicy::default(),
         )
         .with_default_reasoning_effort(provider.reasoning_effort);
+        let fallback = provider
+            .fallback_model
+            .clone()
+            .map(ModelId::new)
+            .transpose()
+            .map_err(|_| ExecutorBuildError::InvalidProviderField {
+                field: "fallback model",
+            })?
+            .filter(|fallback| *fallback != model_id);
         Ok(Self {
-            model: Box::new(model),
+            model: match fallback {
+                Some(fallback) => Box::new(FallbackGateway::new(Box::new(model), fallback)),
+                None => Box::new(model),
+            },
             model_id,
         })
     }

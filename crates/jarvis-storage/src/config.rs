@@ -131,6 +131,9 @@ pub struct DaemonConfig {
     /// model. A run that overruns its thinking budget still drops to `low` for the rest of that run. Needs a live provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executor_reasoning_effort: Option<String>,
+    /// A second model name, asked at the same provider, when the first is rate limited or overloaded (`ADR-0159`). Needs a live provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_fallback_model_name: Option<String>,
     /// The base URL a **live** provider is called at, including its version path (`https://host/v1`).
     ///
     /// # Why no credential may appear here
@@ -401,6 +404,12 @@ impl DaemonConfig {
     pub fn executor_reasoning_effort(&self) -> Option<&str> {
         self.executor_reasoning_effort.as_deref()
     }
+
+    /// The model asked instead when the main one is rate limited or overloaded, if one is configured.
+    #[must_use]
+    pub fn executor_fallback_model_name(&self) -> Option<&str> {
+        self.executor_fallback_model_name.as_deref()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -414,6 +423,7 @@ impl Default for DaemonConfig {
             executor_model: None,
             executor_model_name: None,
             executor_reasoning_effort: None,
+            executor_fallback_model_name: None,
             executor_base_url: None,
             executor_api_key_ref: None,
             // Empty: no filesystem tool is registered until an operator grants roots.
@@ -733,6 +743,16 @@ impl Config {
             && (!live || !REASONING_EFFORTS.contains(&effort.as_str()))
         {
             return Err(ConfigError::InvalidReasoningEffort);
+        }
+        // A model identifier as providers write them: no spaces or control characters, and the fallback is meaningless without a
+        // live provider to ask it of.
+        if let Some(name) = &self.daemon.executor_fallback_model_name
+            && (!live
+                || name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|byte| byte.is_ascii_graphic()))
+        {
+            return Err(ConfigError::InvalidFallbackModel);
         }
         if let Some(path) = &self.daemon.search_api_key_ref
             && !path.is_absolute()
@@ -1124,6 +1144,11 @@ pub enum ConfigError {
         "daemon.executor_reasoning_effort must be none, low, medium or high, and needs daemon.executor_model = openai-compatible"
     )]
     InvalidReasoningEffort,
+    /// The fallback model name was blank, over-long, had a space or control character, or no live provider is selected.
+    #[error(
+        "daemon.executor_fallback_model_name must be a model identifier with no spaces, and needs daemon.executor_model = openai-compatible"
+    )]
+    InvalidFallbackModel,
     /// The Google sign-in settings were unusable: a client id that is blank or has whitespace or control characters, a secret path that is
     /// not absolute, or a secret with no client id.
     #[error(
@@ -1311,6 +1336,7 @@ fn reject_unknown_keys(table: &Table, version: u32) -> Result<(), ConfigError> {
                 "executor_model",
                 "executor_model_name",
                 "executor_reasoning_effort",
+                "executor_fallback_model_name",
                 "executor_base_url",
                 "executor_api_key_ref",
                 "tool_workspace_roots",
@@ -1918,6 +1944,56 @@ executor_api_key_ref = "/etc/jarvis/model.key"
         assert_eq!(
             parse(scripted).err(),
             Some(ConfigError::InvalidReasoningEffort)
+        );
+    }
+
+    /// **A fallback model is a plain identifier, and only means something with a live model.**
+    #[test]
+    fn a_fallback_model_is_a_plain_identifier_and_needs_a_live_model() {
+        let key = if cfg!(windows) {
+            "C:/keys/model.key"
+        } else {
+            "/keys/model.key"
+        };
+        let live = |extra: &str| {
+            format!(
+                "schema_version = 1\n[profile]\nname = \"home\"\n[logging]\nlevel = \"warn\"\n[daemon]\nshutdown_timeout_seconds = 30\n\
+                 executor_model = \"openai-compatible\"\nexecutor_model_name = \"m\"\n\
+                 executor_base_url = \"http://127.0.0.1:11434/v1\"\nexecutor_api_key_ref = \"{key}\"\n{extra}"
+            )
+        };
+        let parse = |document: &str| {
+            Config::parse_with_environment(document, Vec::<(String, String)>::new())
+        };
+        let loaded = parse(&live("executor_fallback_model_name = \"glm-5.3:cloud\""))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            loaded.config().daemon().executor_fallback_model_name(),
+            Some("glm-5.3:cloud")
+        );
+        assert_eq!(
+            parse(&live(""))
+                .unwrap_or_else(|error| panic!("{error}"))
+                .config()
+                .daemon()
+                .executor_fallback_model_name(),
+            None
+        );
+        for bad in [
+            "executor_fallback_model_name = \"\"",
+            "executor_fallback_model_name = \"has space\"",
+            &format!("executor_fallback_model_name = \"{}\"", "m".repeat(129)),
+        ] {
+            assert_eq!(
+                parse(&live(bad)).err(),
+                Some(ConfigError::InvalidFallbackModel),
+                "{bad}"
+            );
+        }
+        let scripted = "schema_version = 1\n[profile]\nname = \"home\"\n[logging]\nlevel = \"warn\"\n[daemon]\nshutdown_timeout_seconds = 30\nexecutor_fallback_model_name = \"x\"\n";
+        assert_eq!(
+            parse(scripted).err(),
+            Some(ConfigError::InvalidFallbackModel)
         );
     }
 

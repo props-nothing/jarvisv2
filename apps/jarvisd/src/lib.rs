@@ -29,6 +29,7 @@ mod memory_manage;
 mod memory_propose;
 mod memory_search;
 mod memory_service;
+mod model_fallback;
 mod notify;
 mod project_context;
 mod project_service;
@@ -677,7 +678,9 @@ fn compose_model_provider(
             _ => None,
         });
     Ok(Some(
-        executor::ModelProviderConfig::new(base_url, model, key).with_reasoning_effort(effort),
+        executor::ModelProviderConfig::new(base_url, model, key)
+            .with_reasoning_effort(effort)
+            .with_fallback_model(daemon.executor_fallback_model_name().map(str::to_owned)),
     ))
 }
 

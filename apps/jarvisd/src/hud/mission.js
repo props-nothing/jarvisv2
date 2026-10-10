@@ -43,6 +43,7 @@
     "jarvis.files.search": ["file", "Searching files", "in", "radar"],
     "jarvis.files.write": ["file", "Writing", "out", "spark"],
     "jarvis.files.edit": ["file", "Editing", "out", "spark"],
+    "jarvis.files.move": ["file", "Moving a file", "out", "pull"],
     "jarvis.command.run": ["cmd", "Running", "out", "spark"],
     "jarvis.code.run": ["cmd", "Running code", "out", "spark"],
     "jarvis.agent.delegate": ["agent", "Sub-agent", "out", "twin"],
