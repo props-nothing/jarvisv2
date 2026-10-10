@@ -6,6 +6,7 @@
 jarvis eval run evals/basics.toml          # nine plain cases: answers, tool choice, honesty, what a trivial request costs
 jarvis eval run evals/gates.toml           # sending mail must stop and ask
 jarvis eval run my-prospecting.toml --case dutch-offer
+jarvis eval run my-prospecting.toml --repeat 3   # every case three times, with a pass rate
 jarvis eval history                        # every saved run
 ```
 
@@ -19,6 +20,7 @@ description = "What I actually ask it to do."
 
 [[case]]
 id = "dutch-intro"
+project = "Sales"                          # optional, here or at the top: run inside that project so its rules apply
 prompt = "Schrijf een korte, eerlijke introductie in het Nederlands voor een tandartspraktijk."
 [case.expect]
 contains_any = ["tandarts", "praktijk"]    # at least one
@@ -51,12 +53,16 @@ suite basics (model glm-5.3-flash)
 against the previous run (2026-10-10T15:58, 8/9 passed): 0 regression(s), 1 fixed, input tokens +7%
 ```
 
+`--repeat N` (2 to 10) runs every case N times in separate conversations. A case that passed only some of the times shows `2/3` instead of `pass`, and counts as failed, because a rule that holds two times in three is not a rule you can rely on. Tokens are the mean per attempt. The summary says "passed every time (1 sometimes)".
+
+`evals/prospecting.example.toml` is a template for your own rules inside a project. Put your private copy in `evals/local/`, which git ignores.
+
 `jarvis eval run` exits with a non-zero status when any case fails. Results are saved under your data folder (`evals/<name>/`, one JSON file per full run, answers cut to 500 characters). A run with `--case` is shown but not saved.
 
 ## What it cannot tell you
 
 - The checks are plain text. They cannot read negation: "has been deleted" is also in "nothing has been deleted", so name a first-person claim ("I deleted") instead.
 - A tool being *requested* is not it *succeeding*.
-- A model gives different answers each time. One failure is a signal; run it a few times before concluding.
+- A model gives different answers each time. One failure is a signal; run with `--repeat 3` before concluding.
 - Whether an answer is persuasive or well written is not measured. Use the suite for what can be checked (language, tools used, honesty, cost) and read the rest yourself.
 - What stops for approval depends on your own permission settings (Settings, Permissions). A tool you have set to run without asking will not stop, and a case that expects it to will fail, which is the harness telling you something true.

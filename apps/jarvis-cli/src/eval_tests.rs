@@ -29,9 +29,11 @@ fn a_valid_suite_is_read_and_a_wrong_one_is_refused_in_words() {
     let good = r#"
         name = "basics"
         description = "x"
+        project = "Sales"
         [[case]]
         id = "sum"
         prompt = "What is 2 + 2?"
+        project = "Other"
         [case.expect]
         contains = ["4"]
         max_seconds = 60
@@ -42,6 +44,12 @@ fn a_valid_suite_is_read_and_a_wrong_one_is_refused_in_words() {
     let suite = parse_suite(good).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(suite.cases.len(), 2);
     assert_eq!(suite.cases[0].expect.contains, ["4"]);
+    assert_eq!(suite.project.as_deref(), Some("Sales"));
+    assert_eq!(suite.cases[0].project.as_deref(), Some("Other"));
+    assert_eq!(
+        suite.cases[1].project, None,
+        "a case without its own project uses the suite's"
+    );
 
     for (bad, why) in [
         (
@@ -49,6 +57,10 @@ fn a_valid_suite_is_read_and_a_wrong_one_is_refused_in_words() {
             "a name that could leave the history folder",
         ),
         ("name = \"x\"", "no cases"),
+        (
+            "name = \"x\"\nproject = \"\"\n[[case]]\nid = \"a\"\nprompt = \"p\"",
+            "an empty project name",
+        ),
         (
             "name = \"x\"\n[[case]]\nid = \"a\"\nprompt = \"p\"\n[[case]]\nid = \"a\"\nprompt = \"q\"",
             "a repeated id",
@@ -226,6 +238,8 @@ fn record(started: &str, cases: &[(&str, bool, u64)]) -> RunRecord {
                     vec!["completes: Failed".to_owned()]
                 },
                 answer_head: String::new(),
+                attempts: 1,
+                passes: u32::from(*passed),
             })
             .collect(),
     }
@@ -293,4 +307,57 @@ fn a_run_is_saved_under_its_suite_and_read_back_in_order() {
     );
     assert!(saved_runs(&history_dir(&paths, "unknown")).is_empty());
     jarvis_core::remove_scratch_dir(&root);
+}
+
+#[test]
+fn repeated_attempts_fold_into_one_record_with_a_pass_rate() {
+    let expect = Expect {
+        contains: vec!["Geachte".to_owned()],
+        ..Expect::default()
+    };
+    let run = |answer: &str| {
+        let observed = seen(Finish::Completed, Some(answer), &["jarvis.web.search"]);
+        let checks = evaluate(&expect, &observed);
+        (observed, checks)
+    };
+    let attempts = [run("Geachte heer"), run("Geheer"), run("Geachte mevrouw")];
+    let folded = record_case("greeting", &attempts);
+    assert_eq!((folded.attempts, folded.passes), (3, 2));
+    assert!(!folded.passed, "a case passes only when every attempt did");
+    assert_eq!(
+        folded.failures,
+        ["contains \"Geachte\": not in the answer (1 of 3 attempts)"]
+    );
+    assert_eq!(
+        folded.answer_head, "Geheer",
+        "the answer shown is the one that failed"
+    );
+    assert_eq!(folded.tools, ["jarvis.web.search"], "a tool is listed once");
+    assert_eq!(folded.input_tokens, 7_000, "tokens are the mean");
+
+    let all = record_case("greeting", &[run("Geachte heer"), run("Geachte heer")]);
+    assert!(all.passed && all.failures.is_empty());
+    let single = record_case("greeting", &[run("Geheer")]);
+    assert_eq!(
+        single.failures,
+        ["contains \"Geachte\": not in the answer"],
+        "no count for one attempt"
+    );
+
+    let mut record = record("t", &[("a", true, 100)]);
+    record.cases.push(folded);
+    let text = render(&record, None);
+    assert!(text.contains("2/3   greeting"), "{text}");
+    assert!(
+        text.contains("1/2 passed every time (1 sometimes)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_record_saved_before_repeats_existed_still_reads() {
+    let old = r#"{"suite":"s","model":"m","started_at":"t","cases":[{"id":"a","passed":true,"seconds":1,"tools":[],"input_tokens":1,"output_tokens":1,"failures":[],"answer_head":""}]}"#;
+    let record: RunRecord = serde_json::from_str(old).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!((record.cases[0].attempts, record.cases[0].passes), (0, 0));
+    assert_eq!(status_label(&record.cases[0]), "pass");
 }

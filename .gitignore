@@ -25,6 +25,9 @@ Desktop.ini
 .idea/
 *.swp
 
+# The owner's own evaluation suites hold business specifics; the committed ones are generic
+/evals/local/
+
 # Environment and local overrides
 .env
 .env.*

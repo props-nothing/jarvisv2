@@ -22,7 +22,7 @@ use crate::api_client::ApiClient;
 use crate::output::ExitStatus;
 use crate::schedule::print_json;
 
-const USAGE: &str = "usage: jarvis eval run SUITE.toml [--case ID]... [--json]    # run a suite against the daemon and score it\n       jarvis eval history [NAME]                                  # the saved runs of a suite (or all suites)";
+const USAGE: &str = "usage: jarvis eval run SUITE.toml [--case ID]... [--repeat N] [--json]    # run a suite against the daemon and score it (N times each, to see how often a case holds)\n       jarvis eval history [NAME]                                  # the saved runs of a suite (or all suites)";
 
 /// How long a case may take unless it says otherwise.
 const DEFAULT_SECONDS: u64 = 180;
@@ -36,6 +36,8 @@ const MAX_CASES: usize = 200;
 const MAX_PROMPT_CHARS: usize = 4000;
 /// How much of an answer a saved record keeps.
 const ANSWER_HEAD_CHARS: usize = 500;
+/// The most times one case may be repeated in a run.
+const MAX_REPEAT: u32 = 10;
 /// The most event pages read for one run.
 const MAX_EVENT_PAGES: u32 = 20;
 
@@ -48,6 +50,9 @@ pub(crate) struct Suite {
     /// What the suite is for.
     #[serde(default)]
     pub description: String,
+    /// A project (name or id) every case runs in, so its goal, guidance and folder apply, as they do to the owner's own messages there.
+    #[serde(default)]
+    pub project: Option<String>,
     /// The cases, run in order.
     #[serde(rename = "case")]
     pub cases: Vec<Case>,
@@ -61,6 +66,9 @@ pub(crate) struct Case {
     pub id: String,
     /// The message sent, exactly as a person would send it.
     pub prompt: String,
+    /// A project for this case alone, instead of the suite's.
+    #[serde(default)]
+    pub project: Option<String>,
     /// What must hold.
     #[serde(default)]
     pub expect: Expect,
@@ -295,6 +303,12 @@ pub(crate) struct CaseRecord {
     pub output_tokens: u64,
     pub failures: Vec<String>,
     pub answer_head: String,
+    /// How many times the case was run (a record from before repeats existed says 0, and means 1).
+    #[serde(default)]
+    pub attempts: u32,
+    /// How many of those attempts passed every check.
+    #[serde(default)]
+    pub passes: u32,
 }
 
 /// One run of a suite as saved.
@@ -304,6 +318,65 @@ pub(crate) struct RunRecord {
     pub model: String,
     pub started_at: String,
     pub cases: Vec<CaseRecord>,
+}
+
+/// Folds the attempts at one case into one record: it passes only if every attempt did, time and tokens are the mean, and each failure
+/// is listed once with how many attempts had it.
+pub(crate) fn record_case(id: &str, attempts: &[(Observed, Vec<Check>)]) -> CaseRecord {
+    let total = u64::try_from(attempts.len().max(1)).unwrap_or(1);
+    let mean = |value: fn(&Observed) -> u64| {
+        attempts.iter().map(|(seen, _)| value(seen)).sum::<u64>() / total
+    };
+    let held = |checks: &Vec<Check>| checks.iter().all(|check| check.passed);
+    let passes = attempts.iter().filter(|(_, checks)| held(checks)).count();
+    let mut failures: Vec<(String, usize)> = Vec::new();
+    let mut tools: Vec<String> = Vec::new();
+    for (seen, checks) in attempts {
+        for tool in &seen.tools {
+            if !tools.contains(tool) {
+                tools.push(tool.clone());
+            }
+        }
+        for check in checks.iter().filter(|check| !check.passed) {
+            let text = if check.detail.is_empty() {
+                check.name.clone()
+            } else {
+                format!("{}: {}", check.name, check.detail)
+            };
+            match failures.iter_mut().find(|(known, _)| *known == text) {
+                Some((_, count)) => *count += 1,
+                None => failures.push((text, 1)),
+            }
+        }
+    }
+    let shown = attempts
+        .iter()
+        .find(|(_, checks)| !held(checks))
+        .or(attempts.last())
+        .and_then(|(seen, _)| seen.answer.as_deref())
+        .unwrap_or("");
+    let repeated = attempts.len() > 1;
+    CaseRecord {
+        id: id.to_owned(),
+        passed: !attempts.is_empty() && passes == attempts.len(),
+        seconds: mean(|seen| seen.seconds),
+        tools,
+        input_tokens: mean(|seen| seen.input_tokens),
+        output_tokens: mean(|seen| seen.output_tokens),
+        failures: failures
+            .into_iter()
+            .map(|(text, count)| {
+                if repeated {
+                    format!("{text} ({count} of {} attempts)", attempts.len())
+                } else {
+                    text
+                }
+            })
+            .collect(),
+        answer_head: head(shown, ANSWER_HEAD_CHARS),
+        attempts: u32::try_from(attempts.len()).unwrap_or(u32::MAX),
+        passes: u32::try_from(passes).unwrap_or(u32::MAX),
+    }
 }
 
 impl RunRecord {
@@ -376,8 +449,22 @@ pub(crate) fn parse_suite(text: &str) -> Result<Suite, String> {
     if suite.cases.is_empty() || suite.cases.len() > MAX_CASES {
         return Err(format!("a suite needs 1 to {MAX_CASES} cases"));
     }
+    let bad_project = |project: &Option<String>| {
+        project.as_deref().is_some_and(|name| {
+            name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control)
+        })
+    };
+    if bad_project(&suite.project) {
+        return Err("the project must be a name or id of 1 to 80 characters".to_owned());
+    }
     let mut seen = std::collections::HashSet::new();
     for case in &suite.cases {
+        if bad_project(&case.project) {
+            return Err(format!(
+                "the project of {:?} must be 1 to 80 characters",
+                case.id
+            ));
+        }
         if case.id.is_empty() || case.id.len() > 60 || case.id.chars().any(char::is_control) {
             return Err("a case id must be 1 to 60 characters".to_owned());
         }
@@ -550,6 +637,19 @@ fn percent(part: u64, whole: u64) -> String {
     }
 }
 
+fn status_label(case: &CaseRecord) -> String {
+    if case.attempts <= 1 {
+        return if case.passed { "pass" } else { "FAIL" }.to_owned();
+    }
+    if case.passed {
+        "pass".to_owned()
+    } else if case.passes == 0 {
+        "FAIL".to_owned()
+    } else {
+        format!("{}/{}", case.passes, case.attempts)
+    }
+}
+
 /// The run as text, with the comparison with the previous run when there is one.
 pub(crate) fn render(record: &RunRecord, previous: Option<&RunRecord>) -> String {
     let mut text = String::new();
@@ -558,7 +658,7 @@ pub(crate) fn render(record: &RunRecord, previous: Option<&RunRecord>) -> String
         let _ = writeln!(
             text,
             "  {:<5} {:<34} {:>4} s  {:>2} tools  {:>7} in / {:>5} out",
-            if case.passed { "pass" } else { "FAIL" },
+            status_label(case),
             case.id,
             case.seconds,
             case.tools.len(),
@@ -571,9 +671,19 @@ pub(crate) fn render(record: &RunRecord, previous: Option<&RunRecord>) -> String
     }
     let total = record.cases.len();
     let passed = record.passed();
+    let flaky = record
+        .cases
+        .iter()
+        .filter(|case| case.passes > 0 && !case.passed)
+        .count();
     let _ = writeln!(
         text,
-        "{passed}/{total} passed, {} tokens in, {} out, {} s",
+        "{passed}/{total} passed{}, {} tokens in, {} out, {} s",
+        if flaky > 0 {
+            format!(" every time ({flaky} sometimes)")
+        } else {
+            String::new()
+        },
         thousands(record.input_tokens()),
         thousands(record.output_tokens()),
         record.seconds()
@@ -617,12 +727,14 @@ struct Options {
     file: String,
     only: Vec<String>,
     json: bool,
+    repeat: u32,
 }
 
 fn parse_options(arguments: &[String]) -> Result<Options, String> {
     let mut file = None;
     let mut only = Vec::new();
     let mut json = false;
+    let mut repeat = 1_u32;
     let mut iterator = arguments.iter().skip(2);
     while let Some(argument) = iterator.next() {
         match argument.as_str() {
@@ -633,6 +745,13 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             "--case" => {
                 only.push(iterator.next().ok_or("--case needs a case id")?.clone());
             }
+            "--repeat" => {
+                repeat = iterator
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|count| (1..=MAX_REPEAT).contains(count))
+                    .ok_or_else(|| format!("--repeat needs a number from 1 to {MAX_REPEAT}"))?;
+            }
             other if !other.starts_with("--") && file.is_none() => file = Some(other.to_owned()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -641,6 +760,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         file: file.ok_or("name the suite file")?,
         only,
         json,
+        repeat,
     })
 }
 
@@ -686,28 +806,15 @@ async fn run_suite(client: &ApiClient, paths: &AppPaths, arguments: &[String]) -
         if !options.json {
             eprintln!("  running {} ...", case.id);
         }
-        let seen = observe(client, case).await;
-        let checks = evaluate(&case.expect, &seen);
-        cases.push(CaseRecord {
-            id: case.id.clone(),
-            passed: checks.iter().all(|c| c.passed),
-            seconds: seen.seconds,
-            tools: seen.tools.clone(),
-            input_tokens: seen.input_tokens,
-            output_tokens: seen.output_tokens,
-            failures: checks
-                .iter()
-                .filter(|c| !c.passed)
-                .map(|c| {
-                    if c.detail.is_empty() {
-                        c.name.clone()
-                    } else {
-                        format!("{}: {}", c.name, c.detail)
-                    }
-                })
-                .collect(),
-            answer_head: head(seen.answer.as_deref().unwrap_or(""), ANSWER_HEAD_CHARS),
-        });
+        let project = case.project.clone().or_else(|| suite.project.clone());
+        let project_client = client.clone().in_project(project);
+        let mut attempts = Vec::new();
+        for _ in 0..options.repeat {
+            let seen = observe(&project_client, case).await;
+            let checks = evaluate(&case.expect, &seen);
+            attempts.push((seen, checks));
+        }
+        cases.push(record_case(&case.id, &attempts));
     }
     let record = RunRecord {
         suite: suite.name.clone(),
